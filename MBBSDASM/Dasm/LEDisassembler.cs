@@ -1269,6 +1269,11 @@ namespace MBBSDASM.Dasm
                 // Second pass: render with labels and inline xref hints.
                 var sortedFixups = objFixups == null ? null : objFixups.OrderBy(f => f.SiteLinear).ToList();
 
+                // Map instruction offset -> fixups that touch bytes within that instruction.
+                Dictionary<uint, List<LEFixup>> fixupsByInsAddr = null;
+                if (leInsights && sortedFixups != null && sortedFixups.Count > 0)
+                    fixupsByInsAddr = BuildFixupLookupByInstruction(instructions, sortedFixups);
+
                 HashSet<uint> resourceGetterTargets = null;
                 if (leInsights)
                     resourceGetterTargets = DetectResourceGetterTargets(instructions);
@@ -1285,6 +1290,11 @@ namespace MBBSDASM.Dasm
                         sb.AppendLine(";");
                     }
                 }
+
+                // Cache for dispatch-table probes (base address -> note)
+                Dictionary<uint, string> dispatchTableNotes = null;
+                if (leInsights)
+                    dispatchTableNotes = new Dictionary<uint, string>();
 
                 var fixupIdx = 0;
 
@@ -1372,7 +1382,11 @@ namespace MBBSDASM.Dasm
                         if (!string.IsNullOrEmpty(stackHint))
                             insText += $" ; {stackHint}";
 
-                        var vcall = TryAnnotateVirtualCallDetailed(instructions, insLoopIndex, objects, objBytesByIndex, vtblSymbols, vtblSlots);
+                        var dispatchHint = TryAnnotateDispatchTableCall(instructions, insLoopIndex, globalSymbols, objects, objBytesByIndex, dispatchTableNotes);
+                        if (!string.IsNullOrEmpty(dispatchHint))
+                            insText += $" ; {dispatchHint}";
+
+                        var vcall = TryAnnotateVirtualCallDetailed(instructions, insLoopIndex, objects, objBytesByIndex, fixupsByInsAddr, vtblSymbols, vtblSlots);
                         if (!string.IsNullOrEmpty(vcall))
                         {
                             insText += $" ; {vcall}";
@@ -1488,6 +1502,153 @@ namespace MBBSDASM.Dasm
             return true;
         }
 
+        private static Dictionary<uint, List<LEFixup>> BuildFixupLookupByInstruction(List<Instruction> instructions, List<LEFixup> sortedFixups)
+        {
+            if (instructions == null || instructions.Count == 0 || sortedFixups == null || sortedFixups.Count == 0)
+                return null;
+
+            // Build a sorted list of instruction start addresses for binary search.
+            var starts = new uint[instructions.Count];
+            for (var i = 0; i < instructions.Count; i++)
+                starts[i] = (uint)instructions[i].Offset;
+
+            var map = new Dictionary<uint, List<LEFixup>>();
+            foreach (var f in sortedFixups)
+            {
+                var site = f.SiteLinear;
+                var idx = Array.BinarySearch(starts, site);
+                if (idx < 0)
+                    idx = ~idx - 1;
+                if (idx < 0 || idx >= instructions.Count)
+                    continue;
+
+                var ins = instructions[idx];
+                var begin = (uint)ins.Offset;
+                var len = (uint)(ins.Bytes?.Length ?? 0);
+                if (len == 0)
+                    continue;
+
+                // Site must fall within the instruction byte range.
+                if (site < begin || site >= begin + len)
+                    continue;
+
+                if (!map.TryGetValue(begin, out var list))
+                    map[begin] = list = new List<LEFixup>();
+                list.Add(f);
+            }
+
+            return map;
+        }
+
+        private static string TryAnnotateDispatchTableCall(
+            List<Instruction> instructions,
+            int callIdx,
+            Dictionary<uint, string> globalSymbols,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
+            Dictionary<uint, string> dispatchTableNotes)
+        {
+            if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
+                return string.Empty;
+
+            var callText = instructions[callIdx].ToString().Trim();
+            var mc = Regex.Match(callText, @"^call\s+(?:dword\s+)?\[(?<base>e[a-z]{2})(?:\+0x(?<disp>[0-9a-fA-F]+))?\]$", RegexOptions.IgnoreCase);
+            if (!mc.Success)
+                return string.Empty;
+
+            var callBase = mc.Groups["base"].Value.ToLowerInvariant();
+            var callDisp = 0u;
+            if (mc.Groups["disp"].Success)
+                callDisp = Convert.ToUInt32(mc.Groups["disp"].Value, 16);
+
+            // Look back for an indexed table load into the call base register, e.g.:
+            //   mov edx, [edx*4+0xc3040]
+            //   mov eax, [ecx+edx*4+0xNN]
+            // (We mainly care about a constant base because that implies a dispatch table.)
+            for (var i = callIdx - 1; i >= 0 && i >= callIdx - 6; i--)
+            {
+                var t = instructions[i].ToString().Trim();
+
+                // stop at barriers
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) || (t.StartsWith("j", StringComparison.OrdinalIgnoreCase) && !t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase)))
+                {
+                    break;
+                }
+
+                // mov dst, [idx*scale + 0xBASE]
+                var m1 = Regex.Match(t, @"^mov\s+(?<dst>e[a-z]{2}),\s*\[(?<idx>e[a-z]{2})\*(?<scale>[1248])\+0x(?<base>[0-9a-fA-F]+)\]$", RegexOptions.IgnoreCase);
+                if (!m1.Success)
+                {
+                    // mov dst, [base+idx*scale+0xDISP]
+                    m1 = Regex.Match(t, @"^mov\s+(?<dst>e[a-z]{2}),\s*\[(?<basereg>e[a-z]{2})\+(?<idx>e[a-z]{2})\*(?<scale>[1248])\+0x(?<base>[0-9a-fA-F]+)\]$", RegexOptions.IgnoreCase);
+                }
+                if (!m1.Success)
+                    continue;
+
+                var dst = m1.Groups["dst"].Value.ToLowerInvariant();
+                if (dst != callBase)
+                    continue;
+
+                var idxReg = m1.Groups["idx"].Value.ToLowerInvariant();
+                var scale = Convert.ToInt32(m1.Groups["scale"].Value, 10);
+                var baseHex = m1.Groups["base"].Value;
+                if (!TryParseHexUInt("0x" + baseHex, out var baseAddrU))
+                    continue;
+                var baseAddr = (uint)baseAddrU;
+
+                var baseSym = globalSymbols != null && globalSymbols.TryGetValue(baseAddr, out var gs) ? gs : $"0x{baseAddr:X8}";
+
+                // If the call is through [reg+disp], note it as a secondary deref (often vtbl slot or struct member).
+                var callMem = callDisp != 0 ? $"[{callBase}+0x{callDisp:X}]" : $"[{callBase}]";
+
+                // Probe table if it resides in-module; cache per base.
+                string tableNote = null;
+                if (dispatchTableNotes != null && dispatchTableNotes.TryGetValue(baseAddr, out var cached))
+                {
+                    tableNote = cached;
+                }
+                else
+                {
+                    tableNote = string.Empty;
+                    if (objects != null && objBytesByIndex != null && TryMapLinearToObject(objects, baseAddr, out var _, out var _))
+                    {
+                        var inModule = 0;
+                        var samples = 0;
+                        var exampleTargets = new List<uint>();
+                        for (var k = 0; k < 64; k++)
+                        {
+                            var entryAddr = unchecked(baseAddr + (uint)(k * 4));
+                            if (!TryReadDwordAtLinear(objects, objBytesByIndex, entryAddr, out var val) || val == 0)
+                                continue;
+                            samples++;
+                            if (TryMapLinearToObject(objects, val, out var _, out var _))
+                            {
+                                inModule++;
+                                if (exampleTargets.Count < 4)
+                                    exampleTargets.Add(val);
+                            }
+                        }
+
+                        if (samples > 0)
+                        {
+                            tableNote = $" ptrs~{inModule}/{samples}";
+                            if (exampleTargets.Count > 0)
+                                tableNote += $" ex={string.Join(",", exampleTargets.Select(x => $"0x{x:X8}"))}";
+                        }
+                    }
+
+                    if (dispatchTableNotes != null)
+                        dispatchTableNotes[baseAddr] = tableNote;
+                }
+
+                // This is best-effort: we don't know the runtime index value.
+                return $"DISPATCH?: tbl={baseSym} idx={idxReg} scale={scale}{tableNote} -> {callMem}";
+            }
+
+            return string.Empty;
+        }
+
         private static bool TryReadDwordAtLinear(List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex, uint addr, out uint value)
         {
             value = 0;
@@ -1547,7 +1708,9 @@ namespace MBBSDASM.Dasm
                     var src = mm.Groups["src"].Value.ToLowerInvariant();
                     if (dst == vtblReg)
                     {
-                        thisReg = src;
+                        // Avoid treating stack-frame registers as a real "this" pointer.
+                        if (src != "esp" && src != "ebp")
+                            thisReg = src;
                         break;
                     }
                 }
@@ -1627,7 +1790,13 @@ namespace MBBSDASM.Dasm
             return false;
         }
 
-        private static bool TryFindVtableWriteForThis(List<Instruction> instructions, int callIdx, string thisReg, out uint vtblAddr)
+        private static bool TryFindVtableWriteForThis(
+            List<Instruction> instructions,
+            int callIdx,
+            string thisReg,
+            List<LEObject> objects,
+            Dictionary<uint, List<LEFixup>> fixupsByInsAddr,
+            out uint vtblAddr)
         {
             vtblAddr = 0;
             if (instructions == null || callIdx <= 0 || string.IsNullOrEmpty(thisReg))
@@ -1641,10 +1810,48 @@ namespace MBBSDASM.Dasm
                     break;
 
                 var m = Regex.Match(t, $@"^mov\s+(?:dword\s+)?\[{Regex.Escape(thisReg)}\],\s*(?<imm>0x[0-9a-fA-F]{{1,8}})$", RegexOptions.IgnoreCase);
-                if (m.Success && TryParseImm32(m.Groups["imm"].Value, out var imm) && imm != 0)
+                if (m.Success && TryParseImm32(m.Groups["imm"].Value, out var imm))
                 {
-                    vtblAddr = imm;
-                    return true;
+                    // If the immediate is non-zero, accept it directly.
+                    if (imm != 0)
+                    {
+                        vtblAddr = imm;
+                        return true;
+                    }
+
+                    // Otherwise, consult fixups for this instruction (common in LE: placeholder imm32 + relocation).
+                    var insAddr = (uint)instructions[i].Offset;
+                    if (fixupsByInsAddr != null && fixupsByInsAddr.TryGetValue(insAddr, out var fx) && fx != null && fx.Count > 0)
+                    {
+                        foreach (var f in fx)
+                        {
+                            // Prefer resolved 32-bit values when available.
+                            if (f.Value32.HasValue)
+                            {
+                                var cand = f.Value32.Value;
+                                if (cand != 0 && TryMapLinearToObject(objects, cand, out var _, out var _))
+                                {
+                                    vtblAddr = cand;
+                                    return true;
+                                }
+                            }
+
+                            // Fallback: use object+offset mapping when present.
+                            if (objects != null && f.TargetObject.HasValue && f.TargetOffset.HasValue)
+                            {
+                                var objIndex = f.TargetObject.Value;
+                                if (objIndex >= 1 && objIndex <= objects.Count)
+                                {
+                                    var cand2 = unchecked(objects[objIndex - 1].BaseAddress + f.TargetOffset.Value);
+                                    if (cand2 != 0)
+                                    {
+                                        vtblAddr = cand2;
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1656,6 +1863,7 @@ namespace MBBSDASM.Dasm
             int callIdx,
             List<LEObject> objects,
             Dictionary<int, byte[]> objBytesByIndex,
+            Dictionary<uint, List<LEFixup>> fixupsByInsAddr,
             Dictionary<uint, string> vtblSymbols,
             Dictionary<uint, Dictionary<uint, uint>> vtblSlots)
         {
@@ -1668,7 +1876,7 @@ namespace MBBSDASM.Dasm
             if (haveThis)
             {
                 // Try to infer the concrete vtbl address from a nearby constructor-style write.
-                TryFindVtableWriteForThis(instructions, callIdx, thisReg, out vtblAddr);
+                TryFindVtableWriteForThis(instructions, callIdx, thisReg, objects, fixupsByInsAddr, out vtblAddr);
             }
 
             // Path B: table call where vtblReg is resolved from a recent global/immediate load.
@@ -1677,9 +1885,13 @@ namespace MBBSDASM.Dasm
             {
                 if (TryResolveRegisterAsTablePointer(instructions, callIdx, vtblReg, objects, objBytesByIndex, out var tablePtr, out var source))
                 {
-                    // Only treat it as a vtable/table when the pointer is inside the module image.
-                    if (!TryMapLinearToObject(objects, tablePtr, out var tblObj, out var tblOff))
-                        return string.Empty;
+                    // Only promote it to a named vtable when the pointer is inside the module image.
+                    var inModule = TryMapLinearToObject(objects, tablePtr, out var tblObj, out var tblOff);
+                    if (!inModule)
+                    {
+                        // Still emit a useful hint for runtime function tables without polluting the vtable summary.
+                        return $"VCALL?: table=0x{tablePtr:X8} (runtime) slot=0x{slot:X} (base={vtblReg} via {source})";
+                    }
 
                     vtblAddr = tablePtr;
                     if (vtblSymbols != null && !vtblSymbols.ContainsKey(vtblAddr))
@@ -1926,7 +2138,9 @@ namespace MBBSDASM.Dasm
                     var src = mm.Groups["src"].Value.ToLowerInvariant();
                     if (dst == baseReg)
                     {
-                        thisReg = src;
+                        // Avoid treating stack-frame registers as a real "this" pointer.
+                        if (src != "esp" && src != "ebp")
+                            thisReg = src;
                         break;
                     }
                 }
