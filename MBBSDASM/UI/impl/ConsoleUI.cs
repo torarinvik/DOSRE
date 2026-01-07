@@ -116,6 +116,35 @@ namespace MBBSDASM.UI.impl
                 if (string.IsNullOrEmpty(_sInputFile) || !File.Exists(_sInputFile))
                     throw new Exception("Error: Please specify a valid input file");
 
+                //LE/DOS4GW support (minimal): bypass NE-specific pipeline
+                //NOTE: This tool was originally NE-only; LE support does not include relocations/import analysis.
+                if (LEDisassembler.TryDisassembleToString(_sInputFile, out var leOutput, out var leError))
+                {
+                    if (_bAnalysis)
+                        _logger.Warn("Warning: -analysis is not supported for LE inputs, ignoring");
+                    if (_bStrings)
+                        _logger.Warn("Warning: -strings is not supported for LE inputs, ignoring");
+                    if (_bMinimal)
+                        _logger.Warn("Warning: -minimal has no effect for LE inputs (LE output is always minimal)");
+
+                    if (string.IsNullOrEmpty(_sOutputFile))
+                    {
+                        _logger.Info(leOutput);
+                    }
+                    else
+                    {
+                        _logger.Info($"{DateTime.Now} Writing Disassembly to {_sOutputFile}");
+                        File.WriteAllText(_sOutputFile, leOutput);
+                    }
+
+                    _logger.Info($"{DateTime.Now} Done!");
+                    return;
+                }
+                else if (!string.IsNullOrEmpty(leError) && leError != "LE header not found")
+                {
+                    throw new Exception(leError);
+                }
+
                 //Warn of Analysis not being available with minimal output
                 if (_bMinimal && _bAnalysis)
                     _logger.Warn(

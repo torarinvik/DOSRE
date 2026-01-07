@@ -47,28 +47,52 @@ namespace MBBSDASM.Artifacts
             //Verify old DOS header is correct
             if(DOSHeader.Signature != 23117)
                 throw new Exception("Invaid Header");
-            
-            //Locate Windows Header
-            ushort windowsHeaderOffset;
-            if (data[0x18] >= 0x40)
+
+            // Locate the "new" executable header (NE/LX/LE/PE).
+            // Some very old-style MZ executables don't include the extended header fields (including e_lfanew).
+            if (FileContent.Length < 0x40)
+                throw new Exception("Invalid MZ executable (file too small)");
+
+            var relocationTableOffset = BitConverter.ToUInt16(FileContent, 0x18);
+            if (relocationTableOffset < 0x40)
+                throw new Exception("Unsupported executable: DOS MZ without an extended header pointer. MBBSDASM currently supports 16-bit NE files only.");
+
+            var windowsHeaderOffset = (int)BitConverter.ToUInt32(FileContent, 0x3C);
+            if (windowsHeaderOffset <= 0 || windowsHeaderOffset + 2 > FileContent.Length)
+                throw new Exception("Invalid MZ executable (bad new header offset)");
+
+            var newHeaderSig0 = data[windowsHeaderOffset];
+            var newHeaderSig1 = data[windowsHeaderOffset + 1];
+            if (newHeaderSig0 == (byte)'N' && newHeaderSig1 == (byte)'E')
             {
-                windowsHeaderOffset = BitConverter.ToUInt16(FileContent, 0x3C);
+                // OK - continue loading NE below
+            }
+            else if (newHeaderSig0 == (byte)'L' && (newHeaderSig1 == (byte)'E' || newHeaderSig1 == (byte)'X'))
+            {
+                throw new Exception($"Unsupported executable format: {(char)newHeaderSig0}{(char)newHeaderSig1} (Linear Executable). MBBSDASM currently supports 16-bit NE files only.");
+            }
+            else if (newHeaderSig0 == (byte)'P' && newHeaderSig1 == (byte)'E')
+            {
+                throw new Exception("Unsupported executable format: PE (Portable Executable). MBBSDASM currently supports 16-bit NE files only.");
             }
             else
             {
-                throw new Exception("Unable to locate Windows Header location");
+                throw new Exception($"Unsupported executable format: {(char)newHeaderSig0}{(char)newHeaderSig1}. MBBSDASM currently supports 16-bit NE files only.");
             }
 
             //Load Windows Header
-            WindowsHeader = new NEHeader(data.Slice(windowsHeaderOffset, 0x3F).ToArray()) { FileOffset = windowsHeaderOffset };
+            if (windowsHeaderOffset + 0x3F > FileContent.Length)
+                throw new Exception("Invalid NE executable (truncated header)");
+
+            WindowsHeader = new NEHeader(data.Slice(windowsHeaderOffset, 0x3F).ToArray()) { FileOffset = (ushort)windowsHeaderOffset };
             
             //Adjust Offsets According to Spec (Offset from beginning of Windows Header, not file)
-            WindowsHeader.SegmentTableOffset += windowsHeaderOffset;
-            WindowsHeader.ResourceTableOffset += windowsHeaderOffset;
-            WindowsHeader.ResidentNameTableOffset += windowsHeaderOffset;
-            WindowsHeader.ModleReferenceTableOffset += windowsHeaderOffset;
-            WindowsHeader.ImportedNamesTableOffset += windowsHeaderOffset;
-            WindowsHeader.EntryTableOffset += windowsHeaderOffset;
+            WindowsHeader.SegmentTableOffset = (ushort)(WindowsHeader.SegmentTableOffset + windowsHeaderOffset);
+            WindowsHeader.ResourceTableOffset = (ushort)(WindowsHeader.ResourceTableOffset + windowsHeaderOffset);
+            WindowsHeader.ResidentNameTableOffset = (ushort)(WindowsHeader.ResidentNameTableOffset + windowsHeaderOffset);
+            WindowsHeader.ModleReferenceTableOffset = (ushort)(WindowsHeader.ModleReferenceTableOffset + windowsHeaderOffset);
+            WindowsHeader.ImportedNamesTableOffset = (ushort)(WindowsHeader.ImportedNamesTableOffset + windowsHeaderOffset);
+            WindowsHeader.EntryTableOffset = (ushort)(WindowsHeader.EntryTableOffset + windowsHeaderOffset);
 
             //Load Segment Table
             SegmentTable = new List<Segment>(WindowsHeader.SegmentTableEntries);
