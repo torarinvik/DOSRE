@@ -651,7 +651,7 @@ namespace MBBSDASM.Dasm
         }
 
         private static void RecordSymbolXrefs(Dictionary<string, HashSet<uint>> symXrefs, uint from, List<LEFixup> fixupsHere,
-            Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols)
+            Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> resourceSymbols)
         {
             if (symXrefs == null || fixupsHere == null || fixupsHere.Count == 0)
                 return;
@@ -666,6 +666,8 @@ namespace MBBSDASM.Dasm
                     AddXref(symXrefs, g, from);
                 if (stringSymbols != null && stringSymbols.TryGetValue(v, out var s))
                     AddXref(symXrefs, s, from);
+                if (resourceSymbols != null && resourceSymbols.TryGetValue(v, out var r))
+                    AddXref(symXrefs, r, from);
             }
         }
 
@@ -680,11 +682,11 @@ namespace MBBSDASM.Dasm
 
         private static readonly Regex HexLiteralRegex = new Regex("0x[0-9A-Fa-f]{1,8}", RegexOptions.Compiled);
 
-        private static string RewriteKnownAddressLiterals(string insText, Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols)
+        private static string RewriteKnownAddressLiterals(string insText, Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> resourceSymbols = null)
         {
             if (string.IsNullOrEmpty(insText))
                 return insText;
-            if ((globalSymbols == null || globalSymbols.Count == 0) && (stringSymbols == null || stringSymbols.Count == 0))
+            if ((globalSymbols == null || globalSymbols.Count == 0) && (stringSymbols == null || stringSymbols.Count == 0) && (resourceSymbols == null || resourceSymbols.Count == 0))
                 return insText;
 
             return HexLiteralRegex.Replace(insText, m =>
@@ -695,6 +697,8 @@ namespace MBBSDASM.Dasm
                 // Prefer string symbols over globals when both exist.
                 if (stringSymbols != null && stringSymbols.TryGetValue(v, out var s))
                     return s;
+                if (resourceSymbols != null && resourceSymbols.TryGetValue(v, out var r))
+                    return r;
                 if (globalSymbols != null && globalSymbols.TryGetValue(v, out var g))
                     return g;
 
@@ -1054,9 +1058,11 @@ namespace MBBSDASM.Dasm
             // String symbol table (linear address -> symbol)
             Dictionary<uint, string> stringSymbols = null;
             Dictionary<uint, string> stringPreview = null;
+            Dictionary<uint, string> resourceSymbols = null;
             if (leInsights)
             {
                 ScanStrings(objects, objBytesByIndex, out stringSymbols, out stringPreview);
+                resourceSymbols = new Dictionary<uint, string>();
                 if (stringSymbols.Count > 0)
                 {
                     sb.AppendLine("; Strings (best-effort, ASCII/CP437-ish)");
@@ -1227,6 +1233,10 @@ namespace MBBSDASM.Dasm
                 // Second pass: render with labels and inline xref hints.
                 var sortedFixups = objFixups == null ? null : objFixups.OrderBy(f => f.SiteLinear).ToList();
 
+                HashSet<uint> resourceGetterTargets = null;
+                if (leInsights)
+                    resourceGetterTargets = DetectResourceGetterTargets(instructions);
+
                 Dictionary<uint, string> globalSymbols = null;
                 if (leGlobals && sortedFixups != null && sortedFixups.Count > 0)
                 {
@@ -1265,6 +1275,9 @@ namespace MBBSDASM.Dasm
                         sb.AppendLine($"func_{addr:X8}:");
                         if (callXrefs.TryGetValue(addr, out var callers) && callers.Count > 0)
                             sb.AppendLine($"; XREF: called from {string.Join(", ", callers.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}");
+
+                        if (leInsights && resourceGetterTargets != null && resourceGetterTargets.Contains(addr))
+                            sb.AppendLine("; ROLE: res_get(base=edx, id=eax) -> eax (best-effort)");
 
                         if (leInsights && funcSummaries != null && funcSummaries.TryGetValue(addr, out var summary))
                             sb.AppendLine(summary.ToComment());
@@ -1309,11 +1322,11 @@ namespace MBBSDASM.Dasm
                             insText = ApplyStringSymbolRewrites(ins, insText, fixupsHere, stringSymbols);
 
                         // Replace any matching 0x... literal with known symbol.
-                        insText = RewriteKnownAddressLiterals(insText, globalSymbols, stringSymbols);
+                        insText = RewriteKnownAddressLiterals(insText, globalSymbols, stringSymbols, resourceSymbols);
 
                         // Record xrefs from fixups -> symbols
                         if (symXrefs != null && fixupsHere.Count > 0)
-                            RecordSymbolXrefs(symXrefs, (uint)ins.Offset, fixupsHere, globalSymbols, stringSymbols);
+                            RecordSymbolXrefs(symXrefs, (uint)ins.Offset, fixupsHere, globalSymbols, stringSymbols, resourceSymbols);
 
                         var callHint = TryGetCallArgHint(instructions, insIndexByAddr, ins, fixupsHere, globalSymbols, stringSymbols);
                         if (!string.IsNullOrEmpty(callHint))
@@ -1323,11 +1336,11 @@ namespace MBBSDASM.Dasm
                         if (!string.IsNullOrEmpty(stackHint))
                             insText += $" ; {stackHint}";
 
-                        var resStrHint = TryAnnotateResourceStringCall(instructions, insLoopIndex, stringSymbols, stringPreview);
+                        var resStrHint = TryAnnotateResourceStringCall(instructions, insLoopIndex, stringSymbols, stringPreview, resourceSymbols, resourceGetterTargets);
                         if (!string.IsNullOrEmpty(resStrHint))
                             insText += $" ; {resStrHint}";
 
-                        var fmtHint = TryAnnotateFormatCall(instructions, insLoopIndex, globalSymbols, stringSymbols, stringPreview);
+                        var fmtHint = TryAnnotateFormatCall(instructions, insLoopIndex, globalSymbols, stringSymbols, stringPreview, resourceGetterTargets);
                         if (!string.IsNullOrEmpty(fmtHint))
                             insText += $" ; {fmtHint}";
 
@@ -1340,7 +1353,7 @@ namespace MBBSDASM.Dasm
                             insText += $" ; {intHint}";
 
                         // If this instruction references a string symbol (or computes one), inline a short preview.
-                        var strInline = TryInlineStringPreview(insText, stringPreview, instructions, insLoopIndex, stringSymbols);
+                        var strInline = TryInlineStringPreview(insText, stringPreview, instructions, insLoopIndex, stringSymbols, resourceGetterTargets);
                         if (!string.IsNullOrEmpty(strInline))
                             insText += $" ; {strInline}";
                     }
@@ -1375,13 +1388,33 @@ namespace MBBSDASM.Dasm
                 sb.AppendLine();
             }
 
+            if (leInsights && resourceSymbols != null && resourceSymbols.Count > 0)
+            {
+                sb.AppendLine(";");
+                sb.AppendLine("; Resource Symbols (best-effort: inferred from resource-getter call patterns)");
+                foreach (var kvp in resourceSymbols.OrderBy(k => k.Key).Take(1024))
+                {
+                    var addr2 = kvp.Key;
+                    var sym2 = kvp.Value;
+                    var prev2 = (stringPreview != null && stringPreview.TryGetValue(addr2, out var p2)) ? p2 : string.Empty;
+                    if (!string.IsNullOrEmpty(prev2))
+                        sb.AppendLine($"{sym2} EQU 0x{addr2:X8} ; \"{prev2}\"");
+                    else
+                        sb.AppendLine($"{sym2} EQU 0x{addr2:X8}");
+                }
+                if (resourceSymbols.Count > 1024)
+                    sb.AppendLine($"; (resource symbols truncated: {resourceSymbols.Count} total)");
+                sb.AppendLine(";");
+            }
+
             output = sb.ToString();
             return true;
         }
         private static string TryAnnotateFormatCall(List<Instruction> instructions, int callIdx,
             Dictionary<uint, string> globalSymbols,
             Dictionary<uint, string> stringSymbols,
-            Dictionary<uint, string> stringPreview)
+            Dictionary<uint, string> stringPreview,
+            HashSet<uint> resourceGetterTargets = null)
         {
             if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
                 return string.Empty;
@@ -1428,7 +1461,7 @@ namespace MBBSDASM.Dasm
             for (var k = 0; k < pushedOperands.Count; k++)
             {
                 var op = pushedOperands[k];
-                if (!TryResolveStringSymFromOperand(instructions, callIdx, op, stringSymbols, stringPreview, out var sym, out var preview))
+                if (!TryResolveStringSymFromOperand(instructions, callIdx, op, stringSymbols, stringPreview, resourceGetterTargets, out var sym, out var preview))
                     continue;
 
                 var isFmt = LooksLikePrintfFormat(preview);
@@ -1495,16 +1528,26 @@ namespace MBBSDASM.Dasm
             List<Instruction> instructions,
             int callIdx,
             Dictionary<uint, string> stringSymbols,
-            Dictionary<uint, string> stringPreview)
+            Dictionary<uint, string> stringPreview,
+            Dictionary<uint, string> resourceSymbols,
+            HashSet<uint> resourceGetterTargets)
         {
             if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
                 return string.Empty;
-            if (stringSymbols == null || stringSymbols.Count == 0 || stringPreview == null || stringPreview.Count == 0)
+            if (stringPreview == null)
                 return string.Empty;
 
             var callText = instructions[callIdx].ToString();
             if (!callText.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
                 return string.Empty;
+
+            // If we detected specific resource-getter call targets, require this call to match.
+            if (resourceGetterTargets != null && resourceGetterTargets.Count > 0)
+            {
+                var mcall = Regex.Match(callText.Trim(), @"^call\s+(?<target>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                if (!mcall.Success || !TryParseHexUInt(mcall.Groups["target"].Value, out var tgt) || !resourceGetterTargets.Contains(tgt))
+                    return string.Empty;
+            }
 
             // Look back for the common pattern:
             //   mov eax, imm
@@ -1556,13 +1599,19 @@ namespace MBBSDASM.Dasm
                 return string.Empty;
 
             var addr = unchecked(regionBase.Value + offsetImm.Value);
-            if (!stringSymbols.TryGetValue(addr, out var sym))
+            // Always record a resource symbol for this derived address.
+            if (resourceSymbols != null && !resourceSymbols.ContainsKey(addr))
+                resourceSymbols[addr] = $"r_{addr:X8}";
+
+            string sym = null;
+            var haveStringSym = stringSymbols != null && stringSymbols.TryGetValue(addr, out sym);
+            if (!haveStringSym)
             {
                 // Still useful: show the derived resource address when it points into a typical resource/string region.
                 // (Avoid spamming for small constants or unrelated addresses.)
                 var rb = regionBase.Value;
                 if (rb >= 0x000C0000 && rb <= 0x000F0000 && (rb % 0x10000 == 0))
-                    return $"RESOFF: base=0x{rb:X} off=0x{offsetImm.Value:X} => 0x{addr:X}";
+                    return $"RESOFF: base=0x{rb:X} off=0x{offsetImm.Value:X} => r_{addr:X8} ; RET=eax=r_{addr:X8}";
                 return string.Empty;
             }
 
@@ -1570,17 +1619,18 @@ namespace MBBSDASM.Dasm
             if (!string.IsNullOrEmpty(prev))
             {
                 var kind = LooksLikePrintfFormat(prev) ? "RESFMT" : "RESSTR";
-                return $"{kind}: {sym} \"{prev}\"";
+                return $"{kind}: {sym} \"{prev}\" ; RET=eax=r_{addr:X8}";
             }
 
-            return $"RESSTR: {sym}";
+            return $"RESSTR: {sym} ; RET=eax=r_{addr:X8}";
         }
 
         private static string TryInlineStringPreview(string insText,
             Dictionary<uint, string> stringPreview,
             List<Instruction> instructions,
             int insIdx,
-            Dictionary<uint, string> stringSymbols)
+            Dictionary<uint, string> stringSymbols,
+            HashSet<uint> resourceGetterTargets)
         {
             if (string.IsNullOrEmpty(insText) || stringPreview == null || stringPreview.Count == 0)
                 return string.Empty;
@@ -1605,7 +1655,7 @@ namespace MBBSDASM.Dasm
                 return string.Empty;
 
             var raw = instructions[insIdx].ToString();
-            if (TryResolveStringFromInstruction(instructions, insIdx, raw, stringSymbols, stringPreview, out var p1))
+            if (TryResolveStringFromInstruction(instructions, insIdx, raw, stringSymbols, stringPreview, resourceGetterTargets, out var p1))
                 return $"STR: \"{p1}\"";
 
             return string.Empty;
@@ -1617,6 +1667,7 @@ namespace MBBSDASM.Dasm
             string operandText,
             Dictionary<uint, string> stringSymbols,
             Dictionary<uint, string> stringPreview,
+            HashSet<uint> resourceGetterTargets,
             out string sym,
             out string preview)
         {
@@ -1641,7 +1692,7 @@ namespace MBBSDASM.Dasm
 
             // Register operand (e.g. push eax)
             var op = operandText.Trim();
-            if (IsRegister32(op) && TryResolveRegisterValueBefore(instructions, callIdx, op, out var raddr))
+            if (IsRegister32(op) && TryResolveRegisterValueBefore(instructions, callIdx, op, out var raddr, resourceGetterTargets))
             {
                 if (stringSymbols.TryGetValue(raddr, out var rsym) && stringPreview.TryGetValue(raddr, out var rp) && !string.IsNullOrEmpty(rp))
                 {
@@ -1669,6 +1720,7 @@ namespace MBBSDASM.Dasm
             string rawInstruction,
             Dictionary<uint, string> stringSymbols,
             Dictionary<uint, string> stringPreview,
+            HashSet<uint> resourceGetterTargets,
             out string preview)
         {
             preview = string.Empty;
@@ -1683,7 +1735,7 @@ namespace MBBSDASM.Dasm
             if (t.StartsWith("push ", StringComparison.OrdinalIgnoreCase))
             {
                 var op = t.Substring(5).Trim();
-                if (IsRegister32(op) && TryResolveRegisterValueBefore(instructions, insIdx, op, out var addr) &&
+                if (IsRegister32(op) && TryResolveRegisterValueBefore(instructions, insIdx, op, out var addr, resourceGetterTargets) &&
                     stringPreview.TryGetValue(addr, out var p) && !string.IsNullOrEmpty(p) && stringSymbols.ContainsKey(addr))
                 {
                     preview = p;
@@ -1722,7 +1774,7 @@ namespace MBBSDASM.Dasm
                 {
                     var baseReg = m.Groups["base"].Value;
                     var disp = Convert.ToUInt32(m.Groups["disp"].Value, 16);
-                    if (TryResolveRegisterValueBefore(instructions, insIdx, baseReg, out var baseVal))
+                    if (TryResolveRegisterValueBefore(instructions, insIdx, baseReg, out var baseVal, resourceGetterTargets))
                     {
                         var addr = baseVal + disp;
                         if (stringPreview.TryGetValue(addr, out var p) && !string.IsNullOrEmpty(p) && stringSymbols.ContainsKey(addr))
@@ -1772,7 +1824,7 @@ namespace MBBSDASM.Dasm
             return true;
         }
 
-        private static bool TryResolveRegisterValueBefore(List<Instruction> instructions, int indexExclusive, string reg, out uint value)
+        private static bool TryResolveRegisterValueBefore(List<Instruction> instructions, int indexExclusive, string reg, out uint value, HashSet<uint> resourceGetterTargets = null)
         {
             value = 0;
             if (instructions == null || indexExclusive <= 0)
@@ -1795,6 +1847,24 @@ namespace MBBSDASM.Dasm
                 var t = instructions[i].ToString().Trim();
                 if (string.IsNullOrEmpty(t))
                     continue;
+
+                // Resource getter: if (edx = regionBase) and (eax = smallId), then call resGet => eax = edx + eax.
+                // This helps propagate computed resource pointers to later push/call sites.
+                if (resourceGetterTargets != null && resourceGetterTargets.Count > 0)
+                {
+                    var mcall = Regex.Match(t, @"^call\s+(?<target>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                    if (mcall.Success && TryParseHexUInt(mcall.Groups["target"].Value, out var tgt) && resourceGetterTargets.Contains(tgt))
+                    {
+                        if (known.TryGetValue("edx", out var edxKnown) && edxKnown && vals.TryGetValue("edx", out var edxVal) &&
+                            known.TryGetValue("eax", out var eaxKnown) && eaxKnown && vals.TryGetValue("eax", out var eaxVal) &&
+                            eaxVal < 0x10000 && edxVal >= 0x000C0000 && edxVal <= 0x000F0000 && (edxVal % 0x10000 == 0))
+                        {
+                            known["eax"] = true;
+                            vals["eax"] = unchecked(edxVal + eaxVal);
+                        }
+                        continue;
+                    }
+                }
 
                 // xor r, r => 0
                 var mxor = Regex.Match(t, @"^xor\s+(?<r>e[a-z]{2}),\s*\k<r>$", RegexOptions.IgnoreCase);
@@ -1889,6 +1959,66 @@ namespace MBBSDASM.Dasm
             }
 
             return false;
+        }
+
+        private static HashSet<uint> DetectResourceGetterTargets(List<Instruction> instructions)
+        {
+            var result = new HashSet<uint>();
+            if (instructions == null || instructions.Count == 0)
+                return result;
+
+            var counts = new Dictionary<uint, int>();
+
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                var t = instructions[i].ToString().Trim();
+                var mcall = Regex.Match(t, @"^call\s+(?<target>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                if (!mcall.Success)
+                    continue;
+
+                if (!TryParseHexUInt(mcall.Groups["target"].Value, out var tgt))
+                    continue;
+
+                uint? id = null;
+                uint? baseImm = null;
+
+                for (var k = i - 1; k >= 0 && k >= i - 10; k--)
+                {
+                    var back = instructions[k].ToString().Trim();
+                    if (back.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || back.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
+                        break;
+
+                    var mmov = Regex.Match(back, @"^mov\s+eax,\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                    if (id == null && mmov.Success && TryParseHexUInt(mmov.Groups["imm"].Value, out var vi) && vi < 0x2000)
+                    {
+                        id = vi;
+                        continue;
+                    }
+
+                    var madd = Regex.Match(back, @"^add\s+edx,\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                    if (baseImm == null && madd.Success && TryParseHexUInt(madd.Groups["imm"].Value, out var vb) && vb >= 0x000C0000 && vb <= 0x000F0000 && (vb % 0x10000 == 0))
+                    {
+                        baseImm = vb;
+                        continue;
+                    }
+                }
+
+                if (id.HasValue && baseImm.HasValue)
+                {
+                    if (!counts.ContainsKey(tgt))
+                        counts[tgt] = 0;
+                    counts[tgt]++;
+                }
+            }
+
+            foreach (var kvp in counts)
+            {
+                // Threshold: show up in multiple places before we treat it as a helper.
+                if (kvp.Value >= 3)
+                    result.Add(kvp.Key);
+            }
+
+            return result;
         }
 
         private static string ExtractStringSym(string text)
