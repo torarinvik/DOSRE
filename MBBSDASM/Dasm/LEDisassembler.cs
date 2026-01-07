@@ -54,7 +54,7 @@ namespace MBBSDASM.Dasm
             public uint PageCount;
         }
 
-        public static bool TryDisassembleToString(string inputFile, out string output, out string error)
+        public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, out string output, out string error)
         {
             output = string.Empty;
             error = string.Empty;
@@ -90,6 +90,10 @@ namespace MBBSDASM.Dasm
             sb.AppendLine($"; PageSize: {header.PageSize}  LastPageSize: {header.LastPageSize}  Pages: {header.NumberOfPages}");
             sb.AppendLine($"; Entry: Obj {header.EntryEipObject} + 0x{header.EntryEip:X} (Linear 0x{ComputeEntryLinear(header, objects):X})");
             sb.AppendLine($"; NOTE: Minimal LE support (no fixups/import analysis)");
+            if (leFull)
+                sb.AppendLine("; LE mode: FULL (disassemble from object start)");
+            if (!leFull && leBytesLimit.HasValue)
+                sb.AppendLine($"; LE mode: LIMIT {leBytesLimit.Value} bytes");
             sb.AppendLine(";");
 
             foreach (var obj in objects)
@@ -111,19 +115,22 @@ namespace MBBSDASM.Dasm
                     continue;
 
                 var startOffsetWithinObject = 0;
-                if (header.EntryEipObject == (uint)obj.Index && header.EntryEip < (uint)maxLen)
+                if (!leFull)
                 {
-                    startOffsetWithinObject = (int)header.EntryEip;
-                }
-                else
-                {
-                    // Heuristic: avoid producing huge runs of "add [eax], al" from zero-filled regions.
-                    for (var i = 0; i < maxLen; i++)
+                    if (header.EntryEipObject == (uint)obj.Index && header.EntryEip < (uint)maxLen)
                     {
-                        if (objBytes[i] != 0)
+                        startOffsetWithinObject = (int)header.EntryEip;
+                    }
+                    else
+                    {
+                        // Heuristic: avoid producing huge runs of "add [eax], al" from zero-filled regions.
+                        for (var i = 0; i < maxLen; i++)
                         {
-                            startOffsetWithinObject = i;
-                            break;
+                            if (objBytes[i] != 0)
+                            {
+                                startOffsetWithinObject = i;
+                                break;
+                            }
                         }
                     }
                 }
@@ -142,6 +149,8 @@ namespace MBBSDASM.Dasm
                 }
 
                 var codeLen = maxLen - startOffsetWithinObject;
+                if (!leFull && leBytesLimit.HasValue)
+                    codeLen = Math.Min(codeLen, leBytesLimit.Value);
                 if (codeLen <= 0)
                 {
                     sb.AppendLine("; (No bytes to disassemble)");
