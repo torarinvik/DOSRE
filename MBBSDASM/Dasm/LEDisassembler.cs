@@ -1,10 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using MBBSDASM.Logging;
 using NLog;
 using SharpDisasm;
+using SharpDisasm.Udis86;
 
 namespace MBBSDASM.Dasm
 {
@@ -90,6 +92,7 @@ namespace MBBSDASM.Dasm
             sb.AppendLine($"; PageSize: {header.PageSize}  LastPageSize: {header.LastPageSize}  Pages: {header.NumberOfPages}");
             sb.AppendLine($"; Entry: Obj {header.EntryEipObject} + 0x{header.EntryEip:X} (Linear 0x{ComputeEntryLinear(header, objects):X})");
             sb.AppendLine($"; NOTE: Minimal LE support (no fixups/import analysis)");
+            sb.AppendLine($"; XREFS: derived from relative CALL/JMP/Jcc only");
             if (leFull)
                 sb.AppendLine("; LE mode: FULL (disassemble from object start)");
             if (!leFull && leBytesLimit.HasValue)
@@ -161,11 +164,78 @@ namespace MBBSDASM.Dasm
                 var code = new byte[codeLen];
                 Buffer.BlockCopy(objBytes, startOffsetWithinObject, code, 0, codeLen);
 
-                var dis = new SharpDisasm.Disassembler(code, ArchitectureMode.x86_32, obj.BaseAddress + (uint)startOffsetWithinObject, true);
-                foreach (var ins in dis.Disassemble())
+                var startLinear = obj.BaseAddress + (uint)startOffsetWithinObject;
+                var endLinear = startLinear + (uint)codeLen;
+
+                // First pass: disassemble and collect basic xrefs and function/label targets.
+                var dis = new SharpDisasm.Disassembler(code, ArchitectureMode.x86_32, startLinear, true);
+                var instructions = dis.Disassemble().ToList();
+
+                var functionStarts = new HashSet<uint>();
+                var labelTargets = new HashSet<uint>();
+                var callXrefs = new Dictionary<uint, List<uint>>();
+                var jumpXrefs = new Dictionary<uint, List<uint>>();
+
+                if (header.EntryEipObject == (uint)obj.Index)
                 {
+                    var entryLinear = obj.BaseAddress + header.EntryEip;
+                    if (entryLinear >= startLinear && entryLinear < endLinear)
+                        functionStarts.Add(entryLinear);
+                }
+
+                foreach (var ins in instructions)
+                {
+                    if (TryGetRelativeBranchTarget(ins, out var target, out var isCall))
+                    {
+                        if (target >= startLinear && target < endLinear)
+                        {
+                            if (isCall)
+                            {
+                                functionStarts.Add(target);
+                                if (!callXrefs.TryGetValue(target, out var callers))
+                                    callXrefs[target] = callers = new List<uint>();
+                                callers.Add((uint)ins.Offset);
+                            }
+                            else
+                            {
+                                labelTargets.Add(target);
+                                if (!jumpXrefs.TryGetValue(target, out var sources))
+                                    jumpXrefs[target] = sources = new List<uint>();
+                                sources.Add((uint)ins.Offset);
+                            }
+                        }
+                    }
+                }
+
+                // Second pass: render with labels and inline xref hints.
+                foreach (var ins in instructions)
+                {
+                    var addr = (uint)ins.Offset;
+
+                    if (functionStarts.Contains(addr))
+                    {
+                        sb.AppendLine();
+                        sb.AppendLine($"func_{addr:X8}:");
+                        if (callXrefs.TryGetValue(addr, out var callers) && callers.Count > 0)
+                            sb.AppendLine($"; XREF: called from {string.Join(", ", callers.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}");
+                    }
+                    else if (labelTargets.Contains(addr))
+                    {
+                        sb.AppendLine($"loc_{addr:X8}:");
+                        if (jumpXrefs.TryGetValue(addr, out var sources) && sources.Count > 0)
+                            sb.AppendLine($"; XREF: jumped from {string.Join(", ", sources.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}");
+                    }
+
                     var bytes = BitConverter.ToString(ins.Bytes).Replace("-", string.Empty);
-                    sb.AppendLine($"{ins.Offset:X8}h {bytes.PadRight(Constants.MAX_INSTRUCTION_LENGTH, ' ')} {ins}");
+                    var line = $"{ins.Offset:X8}h {bytes.PadRight(Constants.MAX_INSTRUCTION_LENGTH, ' ')} {ins}";
+
+                    if (TryGetRelativeBranchTarget(ins, out var branchTarget, out var isCall2))
+                    {
+                        var label = isCall2 ? $"func_{branchTarget:X8}" : $"loc_{branchTarget:X8}";
+                        line += $" ; {(isCall2 ? "call" : "jmp")} {label}";
+                    }
+
+                    sb.AppendLine(line);
                 }
 
                 sb.AppendLine();
@@ -358,6 +428,65 @@ namespace MBBSDASM.Dasm
                           (data[offset + 1] << 8) |
                           (data[offset + 2] << 16) |
                           (data[offset + 3] << 24));
+        }
+
+        private static bool TryGetRelativeBranchTarget(Instruction ins, out uint target, out bool isCall)
+        {
+            target = 0;
+            isCall = false;
+
+            if (ins == null || ins.Bytes == null || ins.Bytes.Length < 2)
+                return false;
+
+            // CALL rel32: E8 xx xx xx xx
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Icall && ins.Bytes[0] == 0xE8 && ins.Bytes.Length >= 5)
+            {
+                var rel = BitConverter.ToInt32(ins.Bytes, 1);
+                var next = unchecked((long)ins.Offset + ins.Length);
+                target = unchecked((uint)(next + rel));
+                isCall = true;
+                return true;
+            }
+
+            // JMP rel32: E9 xx xx xx xx
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Ijmp && ins.Bytes[0] == 0xE9 && ins.Bytes.Length >= 5)
+            {
+                var rel = BitConverter.ToInt32(ins.Bytes, 1);
+                var next = unchecked((long)ins.Offset + ins.Length);
+                target = unchecked((uint)(next + rel));
+                return true;
+            }
+
+            // JMP rel8: EB xx
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Ijmp && ins.Bytes[0] == 0xEB && ins.Bytes.Length >= 2)
+            {
+                var rel = unchecked((sbyte)ins.Bytes[1]);
+                var next = unchecked((long)ins.Offset + ins.Length);
+                target = unchecked((uint)(next + rel));
+                return true;
+            }
+
+            // Jcc rel8: 70-7F xx
+            if (MnemonicGroupings.JumpGroup.Contains(ins.Mnemonic) && ins.Bytes[0] >= 0x70 && ins.Bytes[0] <= 0x7F &&
+                ins.Bytes.Length >= 2)
+            {
+                var rel = unchecked((sbyte)ins.Bytes[1]);
+                var next = unchecked((long)ins.Offset + ins.Length);
+                target = unchecked((uint)(next + rel));
+                return true;
+            }
+
+            // Jcc rel32: 0F 80-8F xx xx xx xx
+            if (MnemonicGroupings.JumpGroup.Contains(ins.Mnemonic) && ins.Bytes[0] == 0x0F && ins.Bytes.Length >= 6 &&
+                ins.Bytes[1] >= 0x80 && ins.Bytes[1] <= 0x8F)
+            {
+                var rel = BitConverter.ToInt32(ins.Bytes, 2);
+                var next = unchecked((long)ins.Offset + ins.Length);
+                target = unchecked((uint)(next + rel));
+                return true;
+            }
+
+            return false;
         }
     }
 }

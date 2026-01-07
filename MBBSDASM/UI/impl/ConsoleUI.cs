@@ -84,6 +84,13 @@ namespace MBBSDASM.UI.impl
         private int? _splitKb;
 
         /// <summary>
+        ///     Macro de-duplication
+        ///     Specified with the -macros argument
+        ///     Post-processes output to collapse repeated straight-line instruction chunks into macros.
+        /// </summary>
+        private bool _bMacros;
+
+        /// <summary>
         ///     Default Constructor
         /// </summary>
         /// <param name="args">string - Command Line Arguments</param>
@@ -141,6 +148,9 @@ namespace MBBSDASM.UI.impl
                             _splitKb = splitKb;
                             i++;
                             break;
+                        case "-MACROS":
+                            _bMacros = true;
+                            break;
                         case "-?":
                             Console.WriteLine("-I <file> -- Input File to DisassembleSegment");
                             Console.WriteLine("-O <file> -- Output File for Disassembly (Default ConsoleUI)");
@@ -155,6 +165,8 @@ namespace MBBSDASM.UI.impl
                                 "-LEBYTES <n> -- (LE inputs) Limit disassembly to n bytes from start offset");
                             Console.WriteLine(
                                 "-SPLITKB <n> -- (with -O) Split output into ~n KB chunks (out.001.asm, out.002.asm, ...)");
+                            Console.WriteLine(
+                                "-MACROS -- Replace repeated straight-line chunks with macros (best-effort, readability)");
                             return;
                     }
                 }
@@ -180,10 +192,14 @@ namespace MBBSDASM.UI.impl
                     {
                         if (_splitKb.HasValue)
                             _logger.Warn("Warning: -splitkb requires -o, ignoring");
+                        if (_bMacros)
+                            leOutput = MacroDeduper.Apply(leOutput);
                         _logger.Info(leOutput);
                     }
                     else
                     {
+                        if (_bMacros)
+                            leOutput = MacroDeduper.Apply(leOutput);
                         if (_splitKb.HasValue)
                         {
                             WriteSplitFiles(_sOutputFile, leOutput, _splitKb.Value);
@@ -242,22 +258,26 @@ namespace MBBSDASM.UI.impl
                     output.Append(renderer.RenderStrings());
                 }
 
+                var finalOutput = output.ToString();
+                if (_bMacros)
+                    finalOutput = MacroDeduper.Apply(finalOutput);
+
                 if (string.IsNullOrEmpty(_sOutputFile))
                 {
                     if (_splitKb.HasValue)
                         _logger.Warn("Warning: -splitkb requires -o, ignoring");
-                    _logger.Info(output.ToString());
+                    _logger.Info(finalOutput);
                 }
                 else
                 {
                     if (_splitKb.HasValue)
                     {
-                        WriteSplitFiles(_sOutputFile, output.ToString(), _splitKb.Value);
+                        WriteSplitFiles(_sOutputFile, finalOutput, _splitKb.Value);
                     }
                     else
                     {
                         _logger.Info($"{DateTime.Now} Writing Disassembly to {_sOutputFile}");
-                        File.WriteAllText(_sOutputFile, output.ToString());
+                        File.WriteAllText(_sOutputFile, finalOutput);
                     }
                 }
 
