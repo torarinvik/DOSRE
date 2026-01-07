@@ -1319,6 +1319,14 @@ namespace MBBSDASM.Dasm
                         if (!string.IsNullOrEmpty(callHint))
                             insText += $" ; CALLHINT: {callHint}";
 
+                        var stackHint = TryAnnotateCallStackCleanup(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(stackHint))
+                            insText += $" ; {stackHint}";
+
+                        var resStrHint = TryAnnotateResourceStringCall(instructions, insLoopIndex, stringSymbols, stringPreview);
+                        if (!string.IsNullOrEmpty(resStrHint))
+                            insText += $" ; {resStrHint}";
+
                         var fmtHint = TryAnnotateFormatCall(instructions, insLoopIndex, globalSymbols, stringSymbols, stringPreview);
                         if (!string.IsNullOrEmpty(fmtHint))
                             insText += $" ; {fmtHint}";
@@ -1449,6 +1457,123 @@ namespace MBBSDASM.Dasm
                 return $"STRCALL: text={bestSym} args~{pushedOperands.Count} \"{bestPreview}\"";
 
             return $"STRCALL: text={bestSym} args~{pushedOperands.Count}";
+        }
+
+        private static string TryAnnotateCallStackCleanup(List<Instruction> instructions, int callIdx)
+        {
+            if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
+                return string.Empty;
+
+            var callText = instructions[callIdx].ToString();
+            if (!callText.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
+                return string.Empty;
+
+            if (callIdx + 1 >= instructions.Count)
+                return string.Empty;
+
+            var next = instructions[callIdx + 1].ToString().Trim();
+
+            // Common cdecl cleanup: add esp, 0xNN
+            var m = Regex.Match(next, @"^add\s+esp,\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return string.Empty;
+
+            if (!TryParseImm32(m.Groups["imm"].Value, out var imm))
+                return string.Empty;
+
+            if (imm == 0)
+                return string.Empty;
+
+            // Heuristic: args are 4-byte pushes
+            var argc = (imm % 4 == 0) ? (imm / 4) : 0;
+            return argc > 0
+                ? $"ARGC: ~{argc} (stack +0x{imm:X})"
+                : $"ARGC: stack +0x{imm:X}";
+        }
+
+        private static string TryAnnotateResourceStringCall(
+            List<Instruction> instructions,
+            int callIdx,
+            Dictionary<uint, string> stringSymbols,
+            Dictionary<uint, string> stringPreview)
+        {
+            if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
+                return string.Empty;
+            if (stringSymbols == null || stringSymbols.Count == 0 || stringPreview == null || stringPreview.Count == 0)
+                return string.Empty;
+
+            var callText = instructions[callIdx].ToString();
+            if (!callText.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
+                return string.Empty;
+
+            // Look back for the common pattern:
+            //   mov eax, imm
+            //   add edx, 0xE0000 (or lea edx, [reg+0xE0000])
+            //   call ...
+            // Treat imm as an offset into the region; if (regionBase+imm) matches an s_ symbol, annotate it.
+            uint? offsetImm = null;
+            uint? regionBase = null;
+
+            for (var i = callIdx - 1; i >= 0 && i >= callIdx - 12; i--)
+            {
+                var t = instructions[i].ToString().Trim();
+
+                // Stop at control-flow barriers
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) || (t.StartsWith("j", StringComparison.OrdinalIgnoreCase) && !t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase)))
+                {
+                    break;
+                }
+
+                var mo = Regex.Match(t, @"^mov\s+e[a-z]{2},\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                if (offsetImm == null && mo.Success && TryParseImm32(mo.Groups["imm"].Value, out var oi) && oi < 0x10000)
+                {
+                    offsetImm = oi;
+                    continue;
+                }
+
+                var ma = Regex.Match(t, @"^add\s+e[a-z]{2},\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                if (regionBase == null && ma.Success && TryParseImm32(ma.Groups["imm"].Value, out var rb) && rb >= 0x10000)
+                {
+                    regionBase = rb;
+                    continue;
+                }
+
+                var ml = Regex.Match(t, @"^lea\s+e[a-z]{2},\s*\[e[a-z]{2}\+0x(?<disp>[0-9a-fA-F]+)\]$", RegexOptions.IgnoreCase);
+                if (regionBase == null && ml.Success)
+                {
+                    var disp = Convert.ToUInt32(ml.Groups["disp"].Value, 16);
+                    if (disp >= 0x10000)
+                        regionBase = disp;
+                    continue;
+                }
+
+                if (offsetImm.HasValue && regionBase.HasValue)
+                    break;
+            }
+
+            if (!offsetImm.HasValue || !regionBase.HasValue)
+                return string.Empty;
+
+            var addr = unchecked(regionBase.Value + offsetImm.Value);
+            if (!stringSymbols.TryGetValue(addr, out var sym))
+            {
+                // Still useful: show the derived resource address when it points into a typical resource/string region.
+                // (Avoid spamming for small constants or unrelated addresses.)
+                var rb = regionBase.Value;
+                if (rb >= 0x000C0000 && rb <= 0x000F0000 && (rb % 0x10000 == 0))
+                    return $"RESOFF: base=0x{rb:X} off=0x{offsetImm.Value:X} => 0x{addr:X}";
+                return string.Empty;
+            }
+
+            var prev = stringPreview.TryGetValue(addr, out var p) ? p : string.Empty;
+            if (!string.IsNullOrEmpty(prev))
+            {
+                var kind = LooksLikePrintfFormat(prev) ? "RESFMT" : "RESSTR";
+                return $"{kind}: {sym} \"{prev}\"";
+            }
+
+            return $"RESSTR: {sym}";
         }
 
         private static string TryInlineStringPreview(string insText,
