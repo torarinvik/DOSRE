@@ -1368,6 +1368,10 @@ namespace MBBSDASM.Dasm
                         if (!string.IsNullOrEmpty(stackHint))
                             insText += $" ; {stackHint}";
 
+                        var virtHint = TryAnnotateVirtualCall(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(virtHint))
+                            insText += $" ; {virtHint}";
+
                         var resStrHint = TryAnnotateResourceStringCall(instructions, insLoopIndex, stringSymbols, stringPreview, objects, objBytesByIndex, resourceSymbols, resourceGetterTargets);
                         if (!string.IsNullOrEmpty(resStrHint))
                             insText += $" ; {resStrHint}";
@@ -1557,6 +1561,70 @@ namespace MBBSDASM.Dasm
             return argc > 0
                 ? $"ARGC: ~{argc} (stack +0x{imm:X})"
                 : $"ARGC: stack +0x{imm:X}";
+        }
+
+        private static string TryAnnotateVirtualCall(List<Instruction> instructions, int callIdx)
+        {
+            if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
+                return string.Empty;
+
+            var callText = instructions[callIdx].ToString().Trim();
+            if (!callText.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
+                return string.Empty;
+
+            // Looking for an indirect call through a memory operand:
+            //   call dword [eax+0xNN]
+            //   call [eax+0xNN]
+            // Common C++ virtual pattern in 32-bit:
+            //   mov vt, [this]
+            //   call [vt+slot]
+            var m = Regex.Match(callText, @"^call\s+(?:dword\s+)?\[(?<base>e[a-z]{2})(?<disp>\+0x[0-9a-fA-F]+)?\]$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return string.Empty;
+
+            var baseReg = m.Groups["base"].Value.ToLowerInvariant();
+            var dispHex = m.Groups["disp"].Success ? m.Groups["disp"].Value.Substring(1) : string.Empty; // drop leading '+'
+            var slot = 0u;
+            var haveSlot = !string.IsNullOrEmpty(dispHex) && TryParseImm32(dispHex, out slot);
+
+            // Look back a short window for: mov baseReg, [thisReg]
+            string thisReg = null;
+            for (var i = callIdx - 1; i >= 0 && i >= callIdx - 6; i--)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) || (t.StartsWith("j", StringComparison.OrdinalIgnoreCase) && !t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase)))
+                {
+                    break;
+                }
+
+                // mov eax, [ecx]
+                var mm = Regex.Match(t, @"^mov\s+(?<dst>e[a-z]{2}),\s*\[(?<src>e[a-z]{2})\]$", RegexOptions.IgnoreCase);
+                if (mm.Success)
+                {
+                    var dst = mm.Groups["dst"].Value.ToLowerInvariant();
+                    var src = mm.Groups["src"].Value.ToLowerInvariant();
+                    if (dst == baseReg)
+                    {
+                        thisReg = src;
+                        break;
+                    }
+                }
+            }
+
+            // If we couldn't infer a this-reg, still annotate as an indirect call.
+            if (string.IsNullOrEmpty(thisReg))
+            {
+                return haveSlot
+                    ? $"VIRT?: call [{baseReg}+0x{slot:X}] (indirect)"
+                    : $"VIRT?: call [{baseReg}] (indirect)";
+            }
+
+            // Favor C++ thiscall intuition: ECX is often 'this'.
+            var thisHint = thisReg == "ecx" ? "this=ecx" : $"this~{thisReg}";
+            if (haveSlot)
+                return $"VIRT: {thisHint} vtbl=[{thisReg}] slot=0x{slot:X}";
+            return $"VIRT: {thisHint} vtbl=[{thisReg}]";
         }
 
         private static string TryAnnotateResourceStringCall(
