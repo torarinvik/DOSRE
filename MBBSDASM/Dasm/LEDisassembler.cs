@@ -52,6 +52,266 @@ namespace MBBSDASM.Dasm
         private static readonly Regex StringSymRegex = new Regex("s_[0-9A-Fa-f]{8}", RegexOptions.Compiled);
         private static readonly Regex ResourceSymRegex = new Regex("r_[0-9A-Fa-f]{8}", RegexOptions.Compiled);
 
+        private static readonly Regex MovRegRegRegex = new Regex(
+            @"^mov\s+(?<dst>e[a-z]{2}),\s*(?<src>e[a-z]{2})$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static readonly Regex MovRegFromArgRegex = new Regex(
+            @"^mov\s+(?<dst>e[a-z]{2}),\s*\[arg_(?<arg>[0-9]+)\]$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static readonly Regex MovRegFromEbpDispRegex = new Regex(
+            @"^mov\s+(?<dst>e[a-z]{2}),\s*\[ebp\s*\+\s*(?<hex>0x[0-9A-Fa-f]+)\]$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static readonly Regex LeaRegFromArgRegex = new Regex(
+            @"^lea\s+(?<dst>e[a-z]{2}),\s*\[arg_(?<arg>[0-9]+)\]$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static readonly Regex WritesRegRegex = new Regex(
+            @"^(?<mn>mov|lea|add|sub|xor|and|or|imul|shl|shr|sar|rol|ror|inc|dec|pop|xchg)\s+(?<dst>e[a-z]{2})\b",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static readonly Regex MemOpRegex = new Regex(
+            @"\[(?<base>e[a-z]{2})(?:\+0x(?<disp>[0-9A-Fa-f]+))?\]",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static readonly Regex MemOpWithSizeRegex = new Regex(
+            @"(?<size>byte|word|dword)\s+\[(?<base>e[a-z]{2})(?:\+0x(?<disp>[0-9A-Fa-f]+))?\]",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private sealed class FieldAccessStats
+        {
+            public int ReadCount;
+            public int WriteCount;
+            public string Size = string.Empty;
+        }
+
+        private static bool TryParseEbpArgIndex(string hex, out int argIndex)
+        {
+            argIndex = -1;
+            if (!TryParseHexUInt(hex, out var offU))
+                return false;
+
+            var off = (int)offU;
+            if (off < 8)
+                return false;
+            if ((off - 8) % 4 != 0)
+                return false;
+            argIndex = (off - 8) / 4;
+            return argIndex >= 0;
+        }
+
+        private static void UpdatePointerAliases(string insText, Dictionary<string, string> aliases)
+        {
+            if (aliases == null || string.IsNullOrEmpty(insText))
+                return;
+
+            // Normalize spacing a bit for regexes.
+            var t = insText.Trim();
+
+            // Propagate pointer aliases: mov dst, src
+            var mrr = MovRegRegRegex.Match(t);
+            if (mrr.Success)
+            {
+                var dst = mrr.Groups["dst"].Value.ToLowerInvariant();
+                var src = mrr.Groups["src"].Value.ToLowerInvariant();
+                if (aliases.TryGetValue(src, out var a))
+                    aliases[dst] = a;
+                else
+                    aliases.Remove(dst);
+                return;
+            }
+
+            // mov dst, [arg_N]
+            var mfa = MovRegFromArgRegex.Match(t);
+            if (mfa.Success)
+            {
+                var dst = mfa.Groups["dst"].Value.ToLowerInvariant();
+                var arg = mfa.Groups["arg"].Value;
+                aliases[dst] = $"arg{arg}";
+                return;
+            }
+
+            // lea dst, [arg_N]
+            var lfa = LeaRegFromArgRegex.Match(t);
+            if (lfa.Success)
+            {
+                var dst = lfa.Groups["dst"].Value.ToLowerInvariant();
+                var arg = lfa.Groups["arg"].Value;
+                aliases[dst] = $"arg{arg}";
+                return;
+            }
+
+            // mov dst, [ebp+0xNN] (before stack rewrite) => argK if it matches a typical arg slot
+            var mebp = MovRegFromEbpDispRegex.Match(t);
+            if (mebp.Success)
+            {
+                var dst = mebp.Groups["dst"].Value.ToLowerInvariant();
+                var hex = mebp.Groups["hex"].Value;
+                if (TryParseEbpArgIndex(hex, out var argIndex))
+                {
+                    aliases[dst] = $"arg{argIndex}";
+                    return;
+                }
+            }
+
+            // If instruction writes to a register in some other way, drop its alias to avoid staleness.
+            var wr = WritesRegRegex.Match(t);
+            if (wr.Success)
+            {
+                var dst = wr.Groups["dst"].Value.ToLowerInvariant();
+                if (dst != "ecx")
+                    aliases.Remove(dst);
+            }
+        }
+
+        private static void RecordFieldAccess(
+            Dictionary<string, Dictionary<uint, FieldAccessStats>> statsByBase,
+            string baseAlias,
+            uint disp,
+            bool isWrite,
+            string size)
+        {
+            if (statsByBase == null || string.IsNullOrEmpty(baseAlias))
+                return;
+
+            if (!statsByBase.TryGetValue(baseAlias, out var byDisp))
+                statsByBase[baseAlias] = byDisp = new Dictionary<uint, FieldAccessStats>();
+
+            if (!byDisp.TryGetValue(disp, out var st))
+                byDisp[disp] = st = new FieldAccessStats();
+
+            if (!string.IsNullOrEmpty(size) && string.IsNullOrEmpty(st.Size))
+                st.Size = size;
+
+            if (isWrite)
+                st.WriteCount++;
+            else
+                st.ReadCount++;
+        }
+
+        private static void CollectFieldAccessesForFunction(
+            List<Instruction> instructions,
+            int startIdx,
+            int endIdxExclusive,
+            out Dictionary<string, Dictionary<uint, FieldAccessStats>> statsByBase)
+        {
+            statsByBase = new Dictionary<string, Dictionary<uint, FieldAccessStats>>(StringComparer.Ordinal);
+            if (instructions == null || startIdx < 0 || endIdxExclusive > instructions.Count || startIdx >= endIdxExclusive)
+                return;
+
+            // Track pointer-ish aliases: ecx is likely this.
+            var aliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["ecx"] = "this"
+            };
+
+            for (var i = startIdx; i < endIdxExclusive; i++)
+            {
+                var insText = instructions[i].ToString().Trim();
+
+                // Update aliases first so we model dataflow forward.
+                UpdatePointerAliases(insText, aliases);
+
+                // Determine a very rough read/write for simple mov forms.
+                var isMov = insText.StartsWith("mov ", StringComparison.OrdinalIgnoreCase);
+                var movWritesMem = isMov && Regex.IsMatch(insText, @"^mov\s+\[", RegexOptions.IgnoreCase);
+                var movReadsMem = isMov && Regex.IsMatch(insText, @"^mov\s+e[a-z]{2},\s*\[", RegexOptions.IgnoreCase);
+
+                // Prefer size when present (byte/word/dword).
+                var size = string.Empty;
+                var ms = MemOpWithSizeRegex.Match(insText);
+                if (ms.Success)
+                    size = ms.Groups["size"].Value.ToLowerInvariant();
+
+                foreach (Match m in MemOpRegex.Matches(insText))
+                {
+                    var baseReg = m.Groups["base"].Value.ToLowerInvariant();
+                    if (baseReg == "esp" || baseReg == "ebp")
+                        continue;
+
+                    if (!aliases.TryGetValue(baseReg, out var baseAlias))
+                    {
+                        if (baseReg == "ecx")
+                            baseAlias = "this";
+                        else
+                            continue;
+                    }
+
+                    var disp = 0u;
+                    if (m.Groups["disp"].Success)
+                        disp = Convert.ToUInt32(m.Groups["disp"].Value, 16);
+
+                    // Heuristic: for mov, decide direction; otherwise treat as read.
+                    var isWrite = movWritesMem;
+                    if (!isWrite && movReadsMem)
+                        isWrite = false;
+
+                    RecordFieldAccess(statsByBase, baseAlias, disp, isWrite, size);
+                }
+            }
+        }
+
+        private static string FormatFieldSummary(Dictionary<string, Dictionary<uint, FieldAccessStats>> statsByBase)
+        {
+            if (statsByBase == null || statsByBase.Count == 0)
+                return string.Empty;
+
+            // Keep it compact: show up to 2 bases, 6 fields each.
+            var parts = new List<string>();
+            foreach (var baseKvp in statsByBase.OrderByDescending(k => k.Value.Sum(x => x.Value.ReadCount + x.Value.WriteCount)).ThenBy(k => k.Key).Take(2))
+            {
+                var baseAlias = baseKvp.Key;
+                var fields = baseKvp.Value
+                    .OrderByDescending(k => k.Value.ReadCount + k.Value.WriteCount)
+                    .ThenBy(k => k.Key)
+                    .Take(6)
+                    .Select(k =>
+                    {
+                        var disp = k.Key;
+                        var st = k.Value;
+                        var rw = $"r{st.ReadCount}/w{st.WriteCount}";
+                        var sz = string.IsNullOrEmpty(st.Size) ? "" : $" {st.Size}";
+                        return $"+0x{disp:X}({rw}{sz})";
+                    });
+                parts.Add($"{baseAlias}: {string.Join(", ", fields)}");
+            }
+
+            if (parts.Count == 0)
+                return string.Empty;
+            return $"FIELDS: {string.Join(" | ", parts)}";
+        }
+
+        private static string RewriteFieldOperands(string insText, Dictionary<string, string> aliases)
+        {
+            if (string.IsNullOrEmpty(insText) || aliases == null || aliases.Count == 0)
+                return insText;
+
+            // Rewrite [reg+0xNN] -> [alias+field_NN] for aliases like this/arg0.
+            return MemOpRegex.Replace(insText, m =>
+            {
+                var baseReg = m.Groups["base"].Value.ToLowerInvariant();
+                if (baseReg == "esp" || baseReg == "ebp")
+                    return m.Value;
+
+                if (!aliases.TryGetValue(baseReg, out var a))
+                {
+                    if (baseReg == "ecx")
+                        a = "this";
+                    else
+                        return m.Value;
+                }
+
+                var disp = 0u;
+                if (m.Groups["disp"].Success)
+                    disp = Convert.ToUInt32(m.Groups["disp"].Value, 16);
+
+                // Avoid rewriting huge displacements (often absolute addresses or jump tables already handled elsewhere).
+                if (disp > 0x4000)
+                    return m.Value;
+
+                // Use field_0 for vptr-like deref.
+                return disp == 0
+                    ? $"[{a}+field_0]"
+                    : $"[{a}+field_{disp:X}]";
+            });
+        }
+
         private static string RewriteStackFrameOperands(string insText)
         {
             if (string.IsNullOrEmpty(insText))
@@ -1311,6 +1571,35 @@ namespace MBBSDASM.Dasm
                     funcSummaries = SummarizeFunctions(instructions, functionStarts, blockStarts, sortedFixups, globalSymbols, stringSymbols);
                 }
 
+                // Per-function field summaries (insights)
+                Dictionary<uint, string> funcFieldSummaries = null;
+                if (leInsights && functionStarts != null && functionStarts.Count > 0)
+                {
+                    funcFieldSummaries = new Dictionary<uint, string>();
+                    var sortedStarts = functionStarts.OrderBy(x => x).ToList();
+                    for (var si = 0; si < sortedStarts.Count; si++)
+                    {
+                        var startAddr = sortedStarts[si];
+                        if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                            continue;
+
+                        var endIdx = instructions.Count;
+                        if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                            endIdx = nextIdx;
+
+                        CollectFieldAccessesForFunction(instructions, startIdx, endIdx, out var stats);
+                        var summary = FormatFieldSummary(stats);
+                        if (!string.IsNullOrEmpty(summary))
+                            funcFieldSummaries[startAddr] = summary;
+                    }
+                }
+
+                // Live alias tracking for operand rewriting during rendering.
+                var liveAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["ecx"] = "this"
+                };
+
                 for (var insLoopIndex = 0; insLoopIndex < instructions.Count; insLoopIndex++)
                 {
                     var ins = instructions[insLoopIndex];
@@ -1328,6 +1617,13 @@ namespace MBBSDASM.Dasm
 
                         if (leInsights && funcSummaries != null && funcSummaries.TryGetValue(addr, out var summary))
                             sb.AppendLine(summary.ToComment());
+
+                        if (leInsights && funcFieldSummaries != null && funcFieldSummaries.TryGetValue(addr, out var fsum))
+                            sb.AppendLine($"; {fsum}");
+
+                        // Reset aliases at function boundary.
+                        liveAliases.Clear();
+                        liveAliases["ecx"] = "this";
                     }
                     else if (labelTargets.Contains(addr))
                     {
@@ -1348,6 +1644,12 @@ namespace MBBSDASM.Dasm
                     if (leInsights)
                     {
                         insText = RewriteStackFrameOperands(insText);
+
+                        // Update aliases based on the *current* instruction before rewriting.
+                        UpdatePointerAliases(insText, liveAliases);
+
+                        // Rewrite [reg+disp] into [this/argX + field_..] when it looks like a struct access.
+                        insText = RewriteFieldOperands(insText, liveAliases);
                     }
 
                     if (TryGetRelativeBranchTarget(ins, out var branchTarget, out var isCall2))
