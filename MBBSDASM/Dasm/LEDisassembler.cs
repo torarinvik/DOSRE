@@ -1093,12 +1093,16 @@ namespace MBBSDASM.Dasm
             Dictionary<uint, string> resourceSymbols = null;
             Dictionary<uint, string> vtblSymbols = null;
             Dictionary<uint, Dictionary<uint, uint>> vtblSlots = null;
+            Dictionary<uint, string> dispatchTableNotes = null;
+            Dictionary<uint, string> dispatchTableSymbols = null;
             if (leInsights)
             {
                 ScanStrings(objects, objBytesByIndex, out stringSymbols, out stringPreview);
                 resourceSymbols = new Dictionary<uint, string>();
                 vtblSymbols = new Dictionary<uint, string>();
                 vtblSlots = new Dictionary<uint, Dictionary<uint, uint>>();
+                dispatchTableNotes = new Dictionary<uint, string>();
+                dispatchTableSymbols = new Dictionary<uint, string>();
                 if (stringSymbols.Count > 0)
                 {
                     sb.AppendLine("; Strings (best-effort, ASCII/CP437-ish)");
@@ -1291,10 +1295,7 @@ namespace MBBSDASM.Dasm
                     }
                 }
 
-                // Cache for dispatch-table probes (base address -> note)
-                Dictionary<uint, string> dispatchTableNotes = null;
-                if (leInsights)
-                    dispatchTableNotes = new Dictionary<uint, string>();
+                // dispatchTableNotes/dispatchTableSymbols are per-run caches (declared above).
 
                 var fixupIdx = 0;
 
@@ -1382,7 +1383,7 @@ namespace MBBSDASM.Dasm
                         if (!string.IsNullOrEmpty(stackHint))
                             insText += $" ; {stackHint}";
 
-                        var dispatchHint = TryAnnotateDispatchTableCall(instructions, insLoopIndex, globalSymbols, objects, objBytesByIndex, dispatchTableNotes);
+                        var dispatchHint = TryAnnotateDispatchTableCall(instructions, insLoopIndex, globalSymbols, objects, objBytesByIndex, dispatchTableNotes, dispatchTableSymbols);
                         if (!string.IsNullOrEmpty(dispatchHint))
                             insText += $" ; {dispatchHint}";
 
@@ -1449,6 +1450,27 @@ namespace MBBSDASM.Dasm
                 }
 
                 sb.AppendLine();
+            }
+
+            if (leInsights && dispatchTableSymbols != null && dispatchTableSymbols.Count > 0)
+            {
+                sb.AppendLine(";");
+                sb.AppendLine("; Dispatch Tables (best-effort: inferred from indexed indirect calls)");
+
+                foreach (var kvp in dispatchTableSymbols.OrderBy(k => k.Key).Take(256))
+                {
+                    var baseAddr = kvp.Key;
+                    var sym = kvp.Value;
+                    var note = dispatchTableNotes != null && dispatchTableNotes.TryGetValue(baseAddr, out var n) ? n : string.Empty;
+                    if (!string.IsNullOrEmpty(note))
+                        sb.AppendLine($"{sym} EQU 0x{baseAddr:X8} ;{note.TrimStart()}");
+                    else
+                        sb.AppendLine($"{sym} EQU 0x{baseAddr:X8}");
+                }
+
+                if (dispatchTableSymbols.Count > 256)
+                    sb.AppendLine($"; (dispatch tables truncated: {dispatchTableSymbols.Count} total)");
+                sb.AppendLine(";");
             }
 
             if (leInsights && vtblSymbols != null && vtblSymbols.Count > 0)
@@ -1546,7 +1568,8 @@ namespace MBBSDASM.Dasm
             Dictionary<uint, string> globalSymbols,
             List<LEObject> objects,
             Dictionary<int, byte[]> objBytesByIndex,
-            Dictionary<uint, string> dispatchTableNotes)
+            Dictionary<uint, string> dispatchTableNotes,
+            Dictionary<uint, string> dispatchTableSymbols)
         {
             if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
                 return string.Empty;
@@ -1597,7 +1620,14 @@ namespace MBBSDASM.Dasm
                     continue;
                 var baseAddr = (uint)baseAddrU;
 
-                var baseSym = globalSymbols != null && globalSymbols.TryGetValue(baseAddr, out var gs) ? gs : $"0x{baseAddr:X8}";
+                if (dispatchTableSymbols != null && !dispatchTableSymbols.ContainsKey(baseAddr))
+                {
+                    if (objects != null && TryMapLinearToObject(objects, baseAddr, out var _, out var _))
+                        dispatchTableSymbols[baseAddr] = $"dtbl_{baseAddr:X8}";
+                }
+
+                var baseSym = dispatchTableSymbols != null && dispatchTableSymbols.TryGetValue(baseAddr, out var dt) ? dt :
+                    (globalSymbols != null && globalSymbols.TryGetValue(baseAddr, out var gs) ? gs : $"0x{baseAddr:X8}");
 
                 // If the call is through [reg+disp], note it as a secondary deref (often vtbl slot or struct member).
                 var callMem = callDisp != 0 ? $"[{callBase}+0x{callDisp:X}]" : $"[{callBase}]";
