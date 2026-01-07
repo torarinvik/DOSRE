@@ -98,6 +98,18 @@ namespace MBBSDASM.UI.impl
         private bool _bLeFixups;
 
         /// <summary>
+        ///     LE (DOS4GW) fixup dump
+        ///     Specified with the -lefixdump [maxPages] argument
+        ///     For LE inputs, emits a raw per-page fixup table dump to help reverse the record layout.
+        /// </summary>
+        private bool _bLeFixDump;
+
+        /// <summary>
+        ///     Optional page limit for -lefixdump
+        /// </summary>
+        private int? _leFixDumpMaxPages;
+
+        /// <summary>
         ///     Default Constructor
         /// </summary>
         /// <param name="args">string - Command Line Arguments</param>
@@ -150,6 +162,14 @@ namespace MBBSDASM.UI.impl
                         case "-LEFIXUPS":
                             _bLeFixups = true;
                             break;
+                        case "-LEFIXDUMP":
+                            _bLeFixDump = true;
+                            if (i + 1 < _args.Length && int.TryParse(_args[i + 1], out var maxPages) && maxPages > 0)
+                            {
+                                _leFixDumpMaxPages = maxPages;
+                                i++;
+                            }
+                            break;
                         case "-SPLITKB":
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -SPLITKB requires a value");
@@ -176,6 +196,8 @@ namespace MBBSDASM.UI.impl
                             Console.WriteLine(
                                 "-LEFIXUPS -- (LE inputs) Annotate output with best-effort LE fixups/import targets");
                             Console.WriteLine(
+                                "-LEFIXDUMP [maxPages] -- (LE inputs) Dump raw fixup pages + decoding hints (writes <out>.fixups.txt if -O is used)");
+                            Console.WriteLine(
                                 "-SPLITKB <n> -- (with -O) Split output into ~n KB chunks (out.001.asm, out.002.asm, ...)");
                             Console.WriteLine(
                                 "-MACROS -- Replace repeated straight-line chunks with macros (best-effort, readability)");
@@ -201,6 +223,29 @@ namespace MBBSDASM.UI.impl
                         _logger.Warn("Warning: -lebytes is ignored when -lefull is specified");
                     if (_bLeFixups)
                         _logger.Info("LE fixup annotations enabled (best-effort)");
+
+                    if (_bLeFixDump)
+                    {
+                        if (LEDisassembler.TryDumpFixupsToString(_sInputFile, _leFixDumpMaxPages, 512, out var dump, out var dumpErr))
+                        {
+                            if (string.IsNullOrEmpty(_sOutputFile))
+                            {
+                                _logger.Info(dump);
+                            }
+                            else
+                            {
+                                var dir = Path.GetDirectoryName(_sOutputFile) ?? string.Empty;
+                                var baseName = Path.GetFileNameWithoutExtension(_sOutputFile);
+                                var dumpPath = Path.Combine(dir, baseName + ".fixups.txt");
+                                _logger.Info($"{DateTime.Now} Writing LE fixup dump to {dumpPath}");
+                                File.WriteAllText(dumpPath, dump);
+                            }
+                        }
+                        else
+                        {
+                            _logger.Warn($"Warning: -lefixdump requested but dump failed: {dumpErr}");
+                        }
+                    }
 
                     if (string.IsNullOrEmpty(_sOutputFile))
                     {

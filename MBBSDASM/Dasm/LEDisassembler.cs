@@ -67,6 +67,149 @@ namespace MBBSDASM.Dasm
             public uint PageCount;
         }
 
+        public static bool TryDumpFixupsToString(string inputFile, int? maxPages, int maxBytesPerPage, out string output, out string error)
+        {
+            output = string.Empty;
+            error = string.Empty;
+
+            if (!File.Exists(inputFile))
+            {
+                error = "Input file not found";
+                return false;
+            }
+
+            if (maxBytesPerPage <= 0)
+                maxBytesPerPage = 256;
+
+            var fileBytes = File.ReadAllBytes(inputFile);
+            if (!TryFindLEHeaderOffset(fileBytes, out var leHeaderOffset))
+            {
+                error = "LE header not found";
+                return false;
+            }
+
+            if (!TryParseHeader(fileBytes, leHeaderOffset, out var header, out error))
+                return false;
+
+            var objects = ParseObjects(fileBytes, header);
+            var pageMap = ParseObjectPageMap(fileBytes, header);
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"; LE FIXUP DUMP (DOS4GW-focused) - {Path.GetFileName(inputFile)}");
+            sb.AppendLine($"; HeaderOffset: 0x{header.HeaderOffset:X}");
+            sb.AppendLine($"; Pages: {header.NumberOfPages}  PageSize: {header.PageSize}  LastPageSize: {header.LastPageSize}");
+            sb.AppendLine($"; FixupPageTableOffset: 0x{header.FixupPageTableOffset:X}  FixupRecordTableOffset: 0x{header.FixupRecordTableOffset:X}");
+            sb.AppendLine($"; ImportModuleTableOffset: 0x{header.ImportModuleTableOffset:X}  Entries: {header.ImportModuleTableEntries}");
+            sb.AppendLine($"; ImportProcTableOffset: 0x{header.ImportProcTableOffset:X}");
+            sb.AppendLine(";");
+
+            var importModules = TryParseImportModules(fileBytes, header);
+            if (importModules != null && importModules.Count > 0)
+            {
+                sb.AppendLine("; Import Modules");
+                for (var i = 0; i < importModules.Count; i++)
+                {
+                    var name = string.IsNullOrEmpty(importModules[i]) ? "(empty)" : importModules[i];
+                    sb.AppendLine($";   [{i + 1}] {name}");
+                }
+                sb.AppendLine(";");
+            }
+
+            if (!TryGetFixupStreams(fileBytes, header, out var fixupPageOffsets, out var fixupRecordStream) || fixupPageOffsets == null || fixupRecordStream == null)
+            {
+                sb.AppendLine("; No fixup streams available (or failed to parse fixup tables)");
+                output = sb.ToString();
+                return true;
+            }
+
+            var recordFileStart = header.HeaderOffset + (int)header.FixupRecordTableOffset;
+            sb.AppendLine($"; Fixup record stream length: 0x{fixupRecordStream.Length:X} ({fixupRecordStream.Length} bytes)");
+            sb.AppendLine($"; Fixup record stream file offset: 0x{recordFileStart:X}");
+            sb.AppendLine(";");
+
+            sb.AppendLine("; Objects (for context)");
+            foreach (var obj in objects)
+                sb.AppendLine($";   Obj{obj.Index} Base=0x{obj.BaseAddress:X8} Size=0x{obj.VirtualSize:X} PageMapIndex={obj.PageMapIndex} PageCount={obj.PageCount} Flags=0x{obj.Flags:X8}");
+            sb.AppendLine(";");
+
+            var pagesToDump = (int)header.NumberOfPages;
+            if (maxPages.HasValue && maxPages.Value > 0)
+                pagesToDump = Math.Min(pagesToDump, maxPages.Value);
+
+            sb.AppendLine("; Per-page fixup slices");
+            sb.AppendLine("; NOTE: LE fixup page table is indexed by *logical page number* (1..NumberOfPages)");
+            sb.AppendLine("; NOTE: Below includes a 'stride=16 hypothesis' view used by DOS4GW in many builds (not guaranteed)");
+            sb.AppendLine(";");
+
+            for (var page1 = 1; page1 <= pagesToDump; page1++)
+            {
+                var idx0 = page1 - 1;
+                if (idx0 + 1 >= fixupPageOffsets.Length)
+                    break;
+
+                var start = fixupPageOffsets[idx0];
+                var end = fixupPageOffsets[idx0 + 1];
+                if (end <= start)
+                    continue;
+
+                if (end > (uint)fixupRecordStream.Length)
+                    continue;
+
+                var len = (int)(end - start);
+                sb.AppendLine($"; -------- Page {page1} --------");
+                sb.AppendLine($"; RecordStreamOff: 0x{start:X}..0x{end:X} (len=0x{len:X})");
+
+                // Raw hexdump (capped)
+                var dumpLen = Math.Min(len, maxBytesPerPage);
+                sb.AppendLine($"; Raw bytes (first {dumpLen} of {len})");
+                sb.AppendLine(HexDump(fixupRecordStream, (int)start, dumpLen));
+
+                // Stride=16 hypothesis view
+                sb.AppendLine("; Stride16 hypothesis (each entry: srcType flags srcOff w1 d1 w2 d2)");
+                var p = (int)start;
+                var limit = (int)end;
+                var entry = 0;
+                while (p + 16 <= limit && entry < 64)
+                {
+                    var srcType = fixupRecordStream[p + 0];
+                    var flags = fixupRecordStream[p + 1];
+                    var srcOff = (ushort)(fixupRecordStream[p + 2] | (fixupRecordStream[p + 3] << 8));
+                    var w1 = (ushort)(fixupRecordStream[p + 4] | (fixupRecordStream[p + 5] << 8));
+                    var d1 = ReadUInt32(fixupRecordStream, p + 6);
+                    var w2 = (ushort)(fixupRecordStream[p + 10] | (fixupRecordStream[p + 11] << 8));
+                    var d2 = ReadUInt32(fixupRecordStream, p + 12);
+
+                    // Try to interpret import module/proc if plausible
+                    var maybeModName = (importModules != null && w1 > 0 && w1 <= importModules.Count) ? importModules[w1 - 1] : string.Empty;
+                    var maybeProcName = !string.IsNullOrEmpty(maybeModName) ? TryReadImportProcName(fileBytes, header, d1) : string.Empty;
+
+                    var hint = string.Empty;
+                    if (w1 >= 1 && w1 <= header.ObjectCount)
+                    {
+                        var objEntry = objects.FirstOrDefault(o => o.Index == w1);
+                        hint = $" ; internal? obj{w1}+0x{d1:X} => 0x{unchecked(objEntry.BaseAddress + d1):X8}";
+                    }
+                    else if (!string.IsNullOrEmpty(maybeModName) && !string.IsNullOrEmpty(maybeProcName))
+                    {
+                        hint = $" ; import? {maybeModName}!{maybeProcName}";
+                    }
+                    else if (!string.IsNullOrEmpty(maybeModName))
+                    {
+                        hint = $" ; import? {maybeModName}!@0x{d1:X}";
+                    }
+
+                    sb.AppendLine($";   [{entry:00}] +0x{(p - (int)start):X3}  type=0x{srcType:X2} flags=0x{flags:X2} srcOff=0x{srcOff:X4}  w1=0x{w1:X4} d1=0x{d1:X8} w2=0x{w2:X4} d2=0x{d2:X8}{hint}");
+                    p += 16;
+                    entry++;
+                }
+
+                sb.AppendLine(";");
+            }
+
+            output = sb.ToString();
+            return true;
+        }
+
         public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, bool leFixups, out string output, out string error)
         {
             output = string.Empty;
@@ -764,6 +907,29 @@ namespace MBBSDASM.Dasm
                           (data[offset + 1] << 8) |
                           (data[offset + 2] << 16) |
                           (data[offset + 3] << 24));
+        }
+
+        private static string HexDump(byte[] data, int offset, int length, int bytesPerLine = 16)
+        {
+            if (data == null || length <= 0)
+                return string.Empty;
+
+            var sb = new StringBuilder();
+            var end = Math.Min(data.Length, offset + length);
+            for (var i = offset; i < end; i += bytesPerLine)
+            {
+                var lineLen = Math.Min(bytesPerLine, end - i);
+                sb.Append(";   ");
+                sb.Append($"0x{(i - offset):X4}: ");
+                for (var j = 0; j < lineLen; j++)
+                {
+                    sb.Append(data[i + j].ToString("X2"));
+                    if (j + 1 < lineLen)
+                        sb.Append(' ');
+                }
+                sb.AppendLine();
+            }
+            return sb.ToString().TrimEnd();
         }
 
         private static bool TryGetRelativeBranchTarget(Instruction ins, out uint target, out bool isCall)

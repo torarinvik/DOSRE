@@ -290,3 +290,4 @@ __pycache__/
 *.exe
 EUROBLST.entry-xrefs.disasm.txt
 EUROBLST.entry-fixups.disasm.txt
+EUROBLST.entry-fixups.disasm.fixups.txt
