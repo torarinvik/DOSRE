@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using MBBSDASM.Logging;
 using NLog;
 using SharpDisasm;
@@ -26,6 +27,497 @@ namespace MBBSDASM.Dasm
         private static readonly Logger _logger = LogManager.GetCurrentClassLogger(typeof(CustomLogger));
 
         private const ushort LE_OBJECT_ENTRY_SIZE = 24;
+
+        private sealed class FunctionSummary
+        {
+            public uint Start;
+            public int InstructionCount;
+            public int BlockCount;
+            public readonly HashSet<uint> Calls = new HashSet<uint>();
+            public readonly HashSet<string> Globals = new HashSet<string>(StringComparer.Ordinal);
+            public readonly HashSet<string> Strings = new HashSet<string>(StringComparer.Ordinal);
+
+            public string ToComment()
+            {
+                var calls = Calls.Count > 0 ? string.Join(", ", Calls.OrderBy(x => x).Take(12).Select(x => $"func_{x:X8}")) : "(none)";
+                var globs = Globals.Count > 0 ? string.Join(", ", Globals.OrderBy(x => x).Take(12)) : "(none)";
+                var strs = Strings.Count > 0 ? string.Join(", ", Strings.OrderBy(x => x).Take(12)) : "(none)";
+                return $"; SUMMARY: ins={InstructionCount} blocks={BlockCount} calls={calls} globals={globs} strings={strs}";
+            }
+        }
+
+        private static readonly Regex EbpDispRegex = new Regex(
+            "\\[(?<reg>ebp)\\s*(?<sign>[\\+\\-])\\s*(?<hex>0x[0-9A-Fa-f]+)\\]",
+            RegexOptions.Compiled);
+
+        private static string RewriteStackFrameOperands(string insText)
+        {
+            if (string.IsNullOrEmpty(insText))
+                return insText;
+
+            // Best-effort: rewrite [ebp +/- 0xNN] to [arg_N]/[local_NN]
+            // Assumes typical 32-bit stack frame: [ebp+8] is arg0.
+            return EbpDispRegex.Replace(insText, m =>
+            {
+                var sign = m.Groups["sign"].Value;
+                var hex = m.Groups["hex"].Value;
+                if (!TryParseHexUInt(hex, out var off))
+                    return m.Value;
+
+                if (sign == "-")
+                {
+                    // locals grow downward
+                    return $"[local_{off:X}]";
+                }
+
+                // args: ebp+8 is first arg
+                if (off >= 8 && (off - 8) % 4 == 0)
+                {
+                    var argIndex = (off - 8) / 4;
+                    return $"[arg_{argIndex}]";
+                }
+
+                return m.Value;
+            });
+        }
+
+        private static void ScanStrings(List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex, out Dictionary<uint, string> symbols, out Dictionary<uint, string> preview)
+        {
+            symbols = new Dictionary<uint, string>();
+            preview = new Dictionary<uint, string>();
+
+            if (objects == null || objBytesByIndex == null)
+                return;
+
+            // Very lightweight string scan: runs of printable bytes terminated by 0.
+            // To reduce noise, prefer scanning non-executable objects (data-ish).
+            foreach (var obj in objects)
+            {
+                var isExecutable = (obj.Flags & 0x0004) != 0;
+                if (isExecutable)
+                    continue;
+
+                if (!objBytesByIndex.TryGetValue(obj.Index, out var bytes) || bytes == null || bytes.Length == 0)
+                    continue;
+
+                var maxLen = (int)Math.Min(obj.VirtualSize, (uint)bytes.Length);
+                var i = 0;
+                while (i < maxLen)
+                {
+                    // Find start of a printable run.
+                    if (!IsLikelyStringChar(bytes[i]))
+                    {
+                        i++;
+                        continue;
+                    }
+
+                    var start = i;
+                    var sb = new StringBuilder();
+                    while (i < maxLen && IsLikelyStringChar(bytes[i]) && sb.Length < 200)
+                    {
+                        sb.Append((char)bytes[i]);
+                        i++;
+                    }
+
+                    // Require NUL terminator nearby to avoid random data.
+                    var nul = (i < maxLen && bytes[i] == 0x00);
+                    var s = sb.ToString();
+                    if (nul && s.Length >= 4 && LooksLikeHumanString(s))
+                    {
+                        var linear = obj.BaseAddress + (uint)start;
+                        if (!symbols.ContainsKey(linear))
+                        {
+                            symbols[linear] = $"s_{linear:X8}";
+                            preview[linear] = EscapeForComment(s);
+                        }
+                    }
+
+                    // Skip the terminator if present.
+                    if (nul)
+                        i++;
+                }
+            }
+        }
+
+        private static bool LooksLikeHumanString(string s)
+        {
+            if (string.IsNullOrEmpty(s) || s.Length < 4)
+                return false;
+
+            var letters = 0;
+            var digits = 0;
+            var spaces = 0;
+            var punctuation = 0;
+
+            foreach (var ch in s)
+            {
+                if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'))
+                    letters++;
+                else if (ch >= '0' && ch <= '9')
+                    digits++;
+                else if (ch == ' ')
+                    spaces++;
+                else if (".,:;!?/\\-_()[]{}'\"".IndexOf(ch) >= 0)
+                    punctuation++;
+            }
+
+            // Require at least some real “text signal”.
+            if (letters < 2)
+                return false;
+
+            // Avoid things that are almost all hex-ish or symbols.
+            if (letters + digits + spaces + punctuation == 0)
+                return false;
+
+            // Prefer either spaces or common punctuation or longer strings.
+            return spaces > 0 || punctuation > 0 || s.Length >= 10;
+        }
+
+        private static bool IsLikelyStringChar(byte b)
+        {
+            // Accept basic printable ASCII plus a few common CP437 punctuation bytes.
+            if (b >= 0x20 && b <= 0x7E)
+                return true;
+            // Tab
+            if (b == 0x09)
+                return true;
+            return false;
+        }
+
+        private static string EscapeForComment(string s)
+        {
+            if (string.IsNullOrEmpty(s))
+                return string.Empty;
+
+            // Keep comments readable
+            s = s.Replace("\\r", " ").Replace("\\n", " ").Replace("\t", " ");
+            if (s.Length > 120)
+                s = s.Substring(0, 120) + "...";
+            return s;
+        }
+
+        private static string ApplyStringSymbolRewrites(Instruction ins, string insText, List<LEFixup> fixupsHere, Dictionary<uint, string> stringSymbols)
+        {
+            if (stringSymbols == null || stringSymbols.Count == 0 || fixupsHere == null || fixupsHere.Count == 0)
+                return insText;
+
+            var rewritten = insText;
+            foreach (var f in fixupsHere)
+            {
+                if (!f.Value32.HasValue)
+                    continue;
+                if (!stringSymbols.TryGetValue(f.Value32.Value, out var sym))
+                    continue;
+
+                var delta = unchecked((int)(f.SiteLinear - (uint)ins.Offset));
+                if (!TryClassifyFixupKind(ins, delta, out var kind))
+                    continue;
+
+                // Strings typically appear as imm32 addresses (push/mov) but can be disp32 too.
+                if (kind != "imm32" && kind != "imm32?" && kind != "disp32")
+                    continue;
+
+                var needleLower = $"0x{f.Value32.Value:x}";
+                var needleUpper = $"0x{f.Value32.Value:X}";
+                rewritten = rewritten.Replace(needleLower, sym).Replace(needleUpper, sym);
+            }
+
+            return rewritten;
+        }
+
+        private static void BuildBasicBlocks(List<Instruction> instructions, uint startLinear, uint endLinear, HashSet<uint> functionStarts, HashSet<uint> labelTargets,
+            out HashSet<uint> blockStarts, out Dictionary<uint, List<uint>> blockPreds)
+        {
+            blockStarts = new HashSet<uint>();
+            blockPreds = new Dictionary<uint, List<uint>>();
+
+            if (instructions == null || instructions.Count == 0)
+                return;
+
+            foreach (var f in functionStarts)
+                blockStarts.Add(f);
+            foreach (var t in labelTargets)
+                blockStarts.Add(t);
+
+            // Add fallthrough starts after conditional branches.
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                var ins = instructions[i];
+                var addr = (uint)ins.Offset;
+                var nextAddr = addr + (uint)ins.Length;
+
+                if (TryGetRelativeBranchTarget(ins, out var target, out var isCall))
+                {
+                    if (!isCall)
+                    {
+                        // Branch target is already a block start via labelTargets.
+                        if (nextAddr >= startLinear && nextAddr < endLinear && IsConditionalBranch(ins))
+                            blockStarts.Add(nextAddr);
+
+                        // Precompute preds
+                        AddPred(blockPreds, target, addr);
+                        if (IsConditionalBranch(ins))
+                            AddPred(blockPreds, nextAddr, addr);
+                    }
+                }
+            }
+        }
+
+        private static void AddPred(Dictionary<uint, List<uint>> preds, uint dst, uint src)
+        {
+            if (!preds.TryGetValue(dst, out var list))
+                preds[dst] = list = new List<uint>();
+            list.Add(src);
+        }
+
+        private static bool IsConditionalBranch(Instruction ins)
+        {
+            if (ins == null)
+                return false;
+            // Cheap heuristic based on mnemonic text
+            var s = ins.ToString();
+            return s.StartsWith("j", StringComparison.OrdinalIgnoreCase) &&
+                   !s.StartsWith("jmp", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static Dictionary<uint, FunctionSummary> SummarizeFunctions(List<Instruction> instructions, HashSet<uint> functionStarts, HashSet<uint> blockStarts, List<LEFixup> sortedFixups,
+            Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols)
+        {
+            var summaries = new Dictionary<uint, FunctionSummary>();
+            if (instructions == null || instructions.Count == 0 || functionStarts == null || functionStarts.Count == 0)
+                return summaries;
+
+            // Sort function starts by address and use next start as boundary.
+            var starts = functionStarts.OrderBy(x => x).ToList();
+            var insByAddr = instructions.ToDictionary(i => (uint)i.Offset, i => i);
+
+            for (var si = 0; si < starts.Count; si++)
+            {
+                var start = starts[si];
+                var end = (si + 1 < starts.Count) ? starts[si + 1] : uint.MaxValue;
+
+                var summary = new FunctionSummary { Start = start };
+                summaries[start] = summary;
+
+                // Walk linear instruction list from first instruction >= start until end.
+                for (var ii = 0; ii < instructions.Count; ii++)
+                {
+                    var ins = instructions[ii];
+                    var addr = (uint)ins.Offset;
+                    if (addr < start)
+                        continue;
+                    if (addr >= end)
+                        break;
+
+                    summary.InstructionCount++;
+
+                    if (TryGetRelativeBranchTarget(ins, out var target, out var isCall) && isCall)
+                        summary.Calls.Add(target);
+
+                    if (sortedFixups != null)
+                    {
+                        // Very cheap: look for fixups that land within this instruction.
+                        // (We don't want to advance a shared index here.)
+                        var insStart = addr;
+                        var insEnd = addr + (uint)ins.Length;
+                        foreach (var f in sortedFixups)
+                        {
+                            if (f.SiteLinear < insStart)
+                                continue;
+                            if (f.SiteLinear >= insEnd)
+                                break;
+                            if (!f.Value32.HasValue)
+                                continue;
+
+                            if (globalSymbols != null && globalSymbols.TryGetValue(f.Value32.Value, out var g))
+                                summary.Globals.Add(g);
+                            if (stringSymbols != null && stringSymbols.TryGetValue(f.Value32.Value, out var s))
+                                summary.Strings.Add(s);
+                        }
+                    }
+                }
+
+                if (blockStarts != null && blockStarts.Count > 0)
+                    summary.BlockCount = blockStarts.Count(a => a >= start && a < end);
+            }
+
+            return summaries;
+        }
+
+        private static string TryGetCallArgHint(List<Instruction> instructions, Dictionary<uint, int> insIndexByAddr, Instruction ins, List<LEFixup> fixupsHere,
+            Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols)
+        {
+            if (ins == null || instructions == null || insIndexByAddr == null)
+                return string.Empty;
+
+            // Only for call instructions.
+            var text = ins.ToString();
+            if (!text.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
+                return string.Empty;
+
+            if (!insIndexByAddr.TryGetValue((uint)ins.Offset, out var idx))
+                return string.Empty;
+
+            // Count push instructions immediately preceding within a short window.
+            var pushes = 0;
+            for (var i = idx - 1; i >= 0 && i >= idx - 8; i--)
+            {
+                var t = instructions[i].ToString();
+                if (t.StartsWith("push ", StringComparison.OrdinalIgnoreCase))
+                {
+                    pushes++;
+                    continue;
+                }
+                // Stop if stack pointer adjusted or another call/ret/branch intervenes.
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) || t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase))
+                    break;
+                if (t.StartsWith("add esp", StringComparison.OrdinalIgnoreCase) || t.StartsWith("sub esp", StringComparison.OrdinalIgnoreCase))
+                    break;
+            }
+
+            // Heuristic for return usage: next instruction mentions eax.
+            var retUsed = false;
+            if (idx + 1 < instructions.Count)
+            {
+                var next = instructions[idx + 1].ToString();
+                if (next.IndexOf("eax", StringComparison.OrdinalIgnoreCase) >= 0)
+                    retUsed = true;
+            }
+
+            return $"args~{pushes} ret={(retUsed ? "eax" : "(unused?)")}";
+        }
+
+        private static string TryAnnotateInterrupt(string insText)
+        {
+            if (string.IsNullOrEmpty(insText))
+                return string.Empty;
+            // Minimal DOS/BIOS interrupt hints.
+            if (insText.StartsWith("int 0x21", StringComparison.OrdinalIgnoreCase))
+                return "INT: DOS int 21h";
+            if (insText.StartsWith("int 0x10", StringComparison.OrdinalIgnoreCase))
+                return "INT: BIOS video int 10h";
+            if (insText.StartsWith("int 0x16", StringComparison.OrdinalIgnoreCase))
+                return "INT: BIOS keyboard int 16h";
+            if (insText.StartsWith("int 0x33", StringComparison.OrdinalIgnoreCase))
+                return "INT: Mouse int 33h";
+            return string.Empty;
+        }
+
+        private static string TryAnnotateJumpTable(Instruction ins, List<LEFixup> fixupsHere, List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex,
+            Dictionary<uint, string> stringSymbols, Dictionary<uint, string> globalSymbols)
+        {
+            if (ins?.Bytes == null || ins.Bytes.Length < 6)
+                return string.Empty;
+
+            // Look for: FF 24 85 xx xx xx xx  (jmp dword [eax*4 + disp32])
+            // ModRM=0x24 => rm=100 (SIB), reg=4 (JMP), mod=00
+            var b = ins.Bytes;
+            if (b[0] != 0xFF || b[1] != 0x24)
+                return string.Empty;
+
+            var sib = b[2];
+            var scale = (sib >> 6) & 0x3;
+            var baseReg = sib & 0x7;
+            if (baseReg != 5)
+                return string.Empty; // we only handle disp32 base
+
+            if (scale != 2)
+                return string.Empty; // scale 4 => likely jump table
+
+            if (b.Length < 7)
+                return string.Empty;
+
+            var disp = (uint)(b[3] | (b[4] << 8) | (b[5] << 16) | (b[6] << 24));
+            // disp is a linear address in flat model.
+            if (!TryMapLinearToObject(objects, disp, out var tobj, out var toff))
+                return $"JUMPTABLE: base=0x{disp:X8} (unmapped)";
+
+            if (!objBytesByIndex.TryGetValue(tobj, out var tgtBytes) || tgtBytes == null)
+                return $"JUMPTABLE: base=0x{disp:X8} (no bytes)";
+
+            var max = 16;
+            var entries = new List<uint>();
+            for (var i = 0; i < max; i++)
+            {
+                var off = (int)toff + i * 4;
+                if (off + 4 > tgtBytes.Length)
+                    break;
+                var v = (uint)(tgtBytes[off] | (tgtBytes[off + 1] << 8) | (tgtBytes[off + 2] << 16) | (tgtBytes[off + 3] << 24));
+                // Only keep plausible in-module targets.
+                if (!TryMapLinearToObject(objects, v, out var _, out var __))
+                    break;
+                entries.Add(v);
+            }
+
+            var sym = globalSymbols != null && globalSymbols.TryGetValue(disp, out var g) ? g : $"0x{disp:X8}";
+            if (entries.Count == 0)
+                return $"JUMPTABLE: base={sym} entries=0";
+
+            var shown = string.Join(", ", entries.Select(x => $"0x{x:X8}").Take(8));
+            return $"JUMPTABLE: base={sym} entries~{entries.Count} [{shown}{(entries.Count > 8 ? ", ..." : string.Empty)}]";
+        }
+
+        private static bool TryParseHexUInt(string s, out uint v)
+        {
+            v = 0;
+            if (string.IsNullOrEmpty(s))
+                return false;
+            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                s = s.Substring(2);
+            return uint.TryParse(s, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out v);
+        }
+
+        private static void RecordSymbolXrefs(Dictionary<string, HashSet<uint>> symXrefs, uint from, List<LEFixup> fixupsHere,
+            Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols)
+        {
+            if (symXrefs == null || fixupsHere == null || fixupsHere.Count == 0)
+                return;
+
+            foreach (var f in fixupsHere)
+            {
+                if (!f.Value32.HasValue)
+                    continue;
+
+                var v = f.Value32.Value;
+                if (globalSymbols != null && globalSymbols.TryGetValue(v, out var g))
+                    AddXref(symXrefs, g, from);
+                if (stringSymbols != null && stringSymbols.TryGetValue(v, out var s))
+                    AddXref(symXrefs, s, from);
+            }
+        }
+
+        private static void AddXref(Dictionary<string, HashSet<uint>> symXrefs, string sym, uint from)
+        {
+            if (string.IsNullOrEmpty(sym))
+                return;
+            if (!symXrefs.TryGetValue(sym, out var set))
+                symXrefs[sym] = set = new HashSet<uint>();
+            set.Add(from);
+        }
+
+        private static readonly Regex HexLiteralRegex = new Regex("0x[0-9A-Fa-f]{7,8}", RegexOptions.Compiled);
+
+        private static string RewriteKnownAddressLiterals(string insText, Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols)
+        {
+            if (string.IsNullOrEmpty(insText))
+                return insText;
+            if ((globalSymbols == null || globalSymbols.Count == 0) && (stringSymbols == null || stringSymbols.Count == 0))
+                return insText;
+
+            return HexLiteralRegex.Replace(insText, m =>
+            {
+                if (!TryParseHexUInt(m.Value, out var v))
+                    return m.Value;
+
+                // Prefer string symbols over globals when both exist.
+                if (stringSymbols != null && stringSymbols.TryGetValue(v, out var s))
+                    return s;
+                if (globalSymbols != null && globalSymbols.TryGetValue(v, out var g))
+                    return g;
+
+                return m.Value;
+            });
+        }
 
         private sealed class LEFixup
         {
@@ -304,7 +796,7 @@ namespace MBBSDASM.Dasm
             return sb.ToString().TrimEnd();
         }
 
-        public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, bool leFixups, bool leGlobals, out string output, out string error)
+        public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, bool leFixups, bool leGlobals, bool leInsights, out string output, out string error)
         {
             output = string.Empty;
             error = string.Empty;
@@ -356,12 +848,48 @@ namespace MBBSDASM.Dasm
 
             if (leGlobals)
                 sb.AppendLine($"; NOTE: LE globals enabled (disp32 fixups become g_XXXXXXXX symbols)");
+            if (leInsights)
+                sb.AppendLine($"; NOTE: LE insights enabled (best-effort function/CFG/xref/stack-var/string analysis)");
             sb.AppendLine($"; XREFS: derived from relative CALL/JMP/Jcc only");
             if (leFull)
                 sb.AppendLine("; LE mode: FULL (disassemble from object start)");
             if (!leFull && leBytesLimit.HasValue)
                 sb.AppendLine($"; LE mode: LIMIT {leBytesLimit.Value} bytes");
             sb.AppendLine(";");
+
+            // Reconstruct all object bytes once so we can scan data objects (strings) and map xrefs.
+            var objBytesByIndex = new Dictionary<int, byte[]>();
+            foreach (var o in objects)
+            {
+                if (o.VirtualSize == 0 || o.PageCount == 0)
+                    continue;
+                var bytes = ReconstructObjectBytes(fileBytes, header, pageMap, dataPagesBase, o);
+                if (bytes != null && bytes.Length > 0)
+                    objBytesByIndex[o.Index] = bytes;
+            }
+
+            // String symbol table (linear address -> symbol)
+            Dictionary<uint, string> stringSymbols = null;
+            Dictionary<uint, string> stringPreview = null;
+            if (leInsights)
+            {
+                ScanStrings(objects, objBytesByIndex, out stringSymbols, out stringPreview);
+                if (stringSymbols.Count > 0)
+                {
+                    sb.AppendLine("; Strings (best-effort, ASCII/CP437-ish)");
+                    foreach (var kvp in stringSymbols.OrderBy(k => k.Key).Take(512))
+                    {
+                        var prev = stringPreview.TryGetValue(kvp.Key, out var p) ? p : string.Empty;
+                        if (!string.IsNullOrEmpty(prev))
+                            sb.AppendLine($"{kvp.Value} EQU 0x{kvp.Key:X8} ; \"{prev}\"");
+                        else
+                            sb.AppendLine($"{kvp.Value} EQU 0x{kvp.Key:X8}");
+                    }
+                    if (stringSymbols.Count > 512)
+                        sb.AppendLine($"; (strings truncated: {stringSymbols.Count} total)");
+                    sb.AppendLine(";");
+                }
+            }
 
             foreach (var obj in objects)
             {
@@ -372,7 +900,8 @@ namespace MBBSDASM.Dasm
                 // Some toolchains may set different flags; if this is wrong, we still allow disassembling.
                 var isExecutable = (obj.Flags & 0x0004) != 0;
 
-                var objBytes = ReconstructObjectBytes(fileBytes, header, pageMap, dataPagesBase, obj);
+                if (!objBytesByIndex.TryGetValue(obj.Index, out var objBytes))
+                    objBytes = null;
                 if (objBytes == null || objBytes.Length == 0)
                     continue;
 
@@ -452,6 +981,11 @@ namespace MBBSDASM.Dasm
                 var dis = new SharpDisasm.Disassembler(code, ArchitectureMode.x86_32, startLinear, true);
                 var instructions = dis.Disassemble().ToList();
 
+                // Address->instruction index for fast lookups.
+                var insIndexByAddr = new Dictionary<uint, int>(instructions.Count);
+                for (var ii = 0; ii < instructions.Count; ii++)
+                    insIndexByAddr[(uint)instructions[ii].Offset] = ii;
+
                 var functionStarts = new HashSet<uint>();
                 var labelTargets = new HashSet<uint>();
                 var callXrefs = new Dictionary<uint, List<uint>>();
@@ -462,6 +996,17 @@ namespace MBBSDASM.Dasm
                     var entryLinear = obj.BaseAddress + header.EntryEip;
                     if (entryLinear >= startLinear && entryLinear < endLinear)
                         functionStarts.Add(entryLinear);
+                }
+
+                if (leInsights)
+                {
+                    // Add obvious prologues as function starts: 55 8B EC
+                    foreach (var ins in instructions)
+                    {
+                        var b = ins.Bytes;
+                        if (b != null && b.Length >= 3 && b[0] == 0x55 && b[1] == 0x8B && b[2] == 0xEC)
+                            functionStarts.Add((uint)ins.Offset);
+                    }
                 }
 
                 foreach (var ins in instructions)
@@ -488,6 +1033,14 @@ namespace MBBSDASM.Dasm
                     }
                 }
 
+                // Basic-block starts (for insights mode)
+                HashSet<uint> blockStarts = null;
+                Dictionary<uint, List<uint>> blockPreds = null;
+                if (leInsights)
+                {
+                    BuildBasicBlocks(instructions, startLinear, endLinear, functionStarts, labelTargets, out blockStarts, out blockPreds);
+                }
+
                 // Second pass: render with labels and inline xref hints.
                 var sortedFixups = objFixups == null ? null : objFixups.OrderBy(f => f.SiteLinear).ToList();
 
@@ -505,6 +1058,19 @@ namespace MBBSDASM.Dasm
                 }
 
                 var fixupIdx = 0;
+
+                // Cross references to symbols (insights)
+                Dictionary<string, HashSet<uint>> symXrefs = null;
+                if (leInsights)
+                    symXrefs = new Dictionary<string, HashSet<uint>>(StringComparer.Ordinal);
+
+                // Per-function summaries (insights)
+                Dictionary<uint, FunctionSummary> funcSummaries = null;
+                if (leInsights)
+                {
+                    funcSummaries = SummarizeFunctions(instructions, functionStarts, blockStarts, sortedFixups, globalSymbols, stringSymbols);
+                }
+
                 foreach (var ins in instructions)
                 {
                     var addr = (uint)ins.Offset;
@@ -515,6 +1081,9 @@ namespace MBBSDASM.Dasm
                         sb.AppendLine($"func_{addr:X8}:");
                         if (callXrefs.TryGetValue(addr, out var callers) && callers.Count > 0)
                             sb.AppendLine($"; XREF: called from {string.Join(", ", callers.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}");
+
+                        if (leInsights && funcSummaries != null && funcSummaries.TryGetValue(addr, out var summary))
+                            sb.AppendLine(summary.ToComment());
                     }
                     else if (labelTargets.Contains(addr))
                     {
@@ -522,9 +1091,20 @@ namespace MBBSDASM.Dasm
                         if (jumpXrefs.TryGetValue(addr, out var sources) && sources.Count > 0)
                             sb.AppendLine($"; XREF: jumped from {string.Join(", ", sources.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}");
                     }
+                    else if (leInsights && blockStarts != null && blockStarts.Contains(addr))
+                    {
+                        sb.AppendLine($"bb_{addr:X8}:");
+                        if (blockPreds != null && blockPreds.TryGetValue(addr, out var preds) && preds.Count > 0)
+                            sb.AppendLine($"; CFG: preds {string.Join(", ", preds.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}");
+                    }
 
                     var bytes = BitConverter.ToString(ins.Bytes).Replace("-", string.Empty);
                     var insText = ins.ToString();
+
+                    if (leInsights)
+                    {
+                        insText = RewriteStackFrameOperands(insText);
+                    }
 
                     if (TryGetRelativeBranchTarget(ins, out var branchTarget, out var isCall2))
                     {
@@ -538,6 +1118,30 @@ namespace MBBSDASM.Dasm
                         if (leGlobals && globalSymbols != null && globalSymbols.Count > 0)
                             insText = ApplyGlobalSymbolRewrites(ins, insText, fixupsHere, globalSymbols);
 
+                        if (leInsights)
+                        {
+                            insText = ApplyStringSymbolRewrites(ins, insText, fixupsHere, stringSymbols);
+
+                            // Record xrefs from fixups -> symbols
+                            if (symXrefs != null)
+                                RecordSymbolXrefs(symXrefs, (uint)ins.Offset, fixupsHere, globalSymbols, stringSymbols);
+
+                            // Extra rewrite pass: replace any matching 0xXXXXXXXX literal with known symbol (even if fixup decoding missed it).
+                            insText = RewriteKnownAddressLiterals(insText, globalSymbols, stringSymbols);
+
+                            var callHint = TryGetCallArgHint(instructions, insIndexByAddr, ins, fixupsHere, globalSymbols, stringSymbols);
+                            if (!string.IsNullOrEmpty(callHint))
+                                insText += $" ; CALLHINT: {callHint}";
+
+                            var jt = TryAnnotateJumpTable(ins, fixupsHere, objects, objBytesByIndex, stringSymbols, globalSymbols);
+                            if (!string.IsNullOrEmpty(jt))
+                                insText += $" ; {jt}";
+
+                            var intHint = TryAnnotateInterrupt(insText);
+                            if (!string.IsNullOrEmpty(intHint))
+                                insText += $" ; {intHint}";
+                        }
+
                         var fixupText = FormatFixupAnnotation(ins, fixupsHere);
                         if (!string.IsNullOrEmpty(fixupText))
                             insText += $" ; FIXUP: {fixupText}";
@@ -546,6 +1150,21 @@ namespace MBBSDASM.Dasm
                     var line = $"{ins.Offset:X8}h {bytes.PadRight(Constants.MAX_INSTRUCTION_LENGTH, ' ')} {insText}";
 
                     sb.AppendLine(line);
+                }
+
+                if (leInsights && symXrefs != null && symXrefs.Count > 0)
+                {
+                    sb.AppendLine(";");
+                    sb.AppendLine("; Symbol XREFS (within this object, best-effort)");
+
+                    foreach (var kvp in symXrefs.OrderByDescending(k => k.Value.Count).ThenBy(k => k.Key).Take(64))
+                    {
+                        var refs = kvp.Value.OrderBy(x => x).Take(12).Select(x => $"0x{x:X8}");
+                        sb.AppendLine($";   {kvp.Key} ({kvp.Value.Count}) <- {string.Join(", ", refs)}{(kvp.Value.Count > 12 ? ", ..." : string.Empty)}");
+                    }
+
+                    if (symXrefs.Count > 64)
+                        sb.AppendLine($";   (xref table truncated: {symXrefs.Count} symbols)");
                 }
 
                 sb.AppendLine();
