@@ -1091,10 +1091,14 @@ namespace MBBSDASM.Dasm
             Dictionary<uint, string> stringSymbols = null;
             Dictionary<uint, string> stringPreview = null;
             Dictionary<uint, string> resourceSymbols = null;
+            Dictionary<uint, string> vtblSymbols = null;
+            Dictionary<uint, Dictionary<uint, uint>> vtblSlots = null;
             if (leInsights)
             {
                 ScanStrings(objects, objBytesByIndex, out stringSymbols, out stringPreview);
                 resourceSymbols = new Dictionary<uint, string>();
+                vtblSymbols = new Dictionary<uint, string>();
+                vtblSlots = new Dictionary<uint, Dictionary<uint, uint>>();
                 if (stringSymbols.Count > 0)
                 {
                     sb.AppendLine("; Strings (best-effort, ASCII/CP437-ish)");
@@ -1368,9 +1372,18 @@ namespace MBBSDASM.Dasm
                         if (!string.IsNullOrEmpty(stackHint))
                             insText += $" ; {stackHint}";
 
-                        var virtHint = TryAnnotateVirtualCall(instructions, insLoopIndex);
-                        if (!string.IsNullOrEmpty(virtHint))
-                            insText += $" ; {virtHint}";
+                        var vcall = TryAnnotateVirtualCallDetailed(instructions, insLoopIndex, objects, objBytesByIndex, vtblSymbols, vtblSlots);
+                        if (!string.IsNullOrEmpty(vcall))
+                        {
+                            insText += $" ; {vcall}";
+                        }
+                        else
+                        {
+                            // Fallback: still mark indirect calls even when we can't resolve the vtable.
+                            var virtHint = TryAnnotateVirtualCall(instructions, insLoopIndex);
+                            if (!string.IsNullOrEmpty(virtHint))
+                                insText += $" ; {virtHint}";
+                        }
 
                         var resStrHint = TryAnnotateResourceStringCall(instructions, insLoopIndex, stringSymbols, stringPreview, objects, objBytesByIndex, resourceSymbols, resourceGetterTargets);
                         if (!string.IsNullOrEmpty(resStrHint))
@@ -1424,6 +1437,34 @@ namespace MBBSDASM.Dasm
                 sb.AppendLine();
             }
 
+            if (leInsights && vtblSymbols != null && vtblSymbols.Count > 0)
+            {
+                sb.AppendLine(";");
+                sb.AppendLine("; VTables (best-effort: inferred from constructor writes + indirect calls)");
+
+                foreach (var kvp in vtblSymbols.OrderBy(k => k.Key).Take(128))
+                {
+                    var vtblAddr = kvp.Key;
+                    var vtblSym = kvp.Value;
+                    sb.AppendLine($"; {vtblSym} = 0x{vtblAddr:X8}");
+
+                    if (vtblSlots != null && vtblSlots.TryGetValue(vtblAddr, out var slots) && slots.Count > 0)
+                    {
+                        foreach (var s in slots.OrderBy(x => x.Key).Take(32))
+                        {
+                            var slot = s.Key;
+                            var target = s.Value;
+                            sb.AppendLine($";   slot 0x{slot:X} -> func_{target:X8}");
+                        }
+                        if (slots.Count > 32)
+                            sb.AppendLine($";   (slots truncated: {slots.Count} total)");
+                    }
+                }
+                if (vtblSymbols.Count > 128)
+                    sb.AppendLine($"; (vtables truncated: {vtblSymbols.Count} total)");
+                sb.AppendLine(";");
+            }
+
             if (leInsights && resourceSymbols != null && resourceSymbols.Count > 0)
             {
                 sb.AppendLine(";");
@@ -1445,6 +1486,285 @@ namespace MBBSDASM.Dasm
 
             output = sb.ToString();
             return true;
+        }
+
+        private static bool TryReadDwordAtLinear(List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex, uint addr, out uint value)
+        {
+            value = 0;
+            if (objects == null || objBytesByIndex == null)
+                return false;
+
+            if (!TryMapLinearToObject(objects, addr, out var objIndex, out var off))
+                return false;
+
+            if (!objBytesByIndex.TryGetValue(objIndex, out var bytes) || bytes == null)
+                return false;
+
+            var ioff = (int)off;
+            if (ioff < 0 || ioff + 4 > bytes.Length)
+                return false;
+
+            value = ReadUInt32(bytes, ioff);
+            return true;
+        }
+
+        private static bool TryDetectVirtualCallSite(List<Instruction> instructions, int callIdx, out string vtblReg, out uint slot, out string thisReg)
+        {
+            vtblReg = string.Empty;
+            slot = 0;
+            thisReg = string.Empty;
+
+            if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
+                return false;
+
+            var callText = instructions[callIdx].ToString().Trim();
+            var m = Regex.Match(callText, @"^call\s+(?:dword\s+)?\[(?<base>e[a-z]{2})(?:\+0x(?<disp>[0-9a-fA-F]+))?\]$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            vtblReg = m.Groups["base"].Value.ToLowerInvariant();
+            if (m.Groups["disp"].Success)
+                slot = Convert.ToUInt32(m.Groups["disp"].Value, 16);
+
+            // Exclude stack-based indirect calls; those are rarely C++ vtables.
+            if (vtblReg == "esp" || vtblReg == "ebp")
+                return false;
+
+            // Look back for: mov vtblReg, [thisReg]
+            for (var i = callIdx - 1; i >= 0 && i >= callIdx - 8; i--)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) || (t.StartsWith("j", StringComparison.OrdinalIgnoreCase) && !t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase)))
+                {
+                    break;
+                }
+
+                var mm = Regex.Match(t, @"^mov\s+(?<dst>e[a-z]{2}),\s*\[(?<src>e[a-z]{2})\]$", RegexOptions.IgnoreCase);
+                if (mm.Success)
+                {
+                    var dst = mm.Groups["dst"].Value.ToLowerInvariant();
+                    var src = mm.Groups["src"].Value.ToLowerInvariant();
+                    if (dst == vtblReg)
+                    {
+                        thisReg = src;
+                        break;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        private static bool TryResolveRegisterAsTablePointer(
+            List<Instruction> instructions,
+            int callIdx,
+            string reg,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
+            out uint tablePtr,
+            out string source)
+        {
+            tablePtr = 0;
+            source = string.Empty;
+            if (instructions == null || callIdx <= 0 || string.IsNullOrEmpty(reg))
+                return false;
+
+            // Scan backwards for a defining assignment to the base reg.
+            // We mainly want: mov reg, [abs] (global pointer) or mov reg, imm32.
+            for (var i = callIdx - 1; i >= 0 && i >= callIdx - 16; i--)
+            {
+                var t = instructions[i].ToString().Trim();
+
+                // stop at barriers
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) || (t.StartsWith("j", StringComparison.OrdinalIgnoreCase) && !t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase)))
+                {
+                    break;
+                }
+
+                // mov reg, 0xXXXXXXXX
+                var mi = Regex.Match(t, $@"^mov\s+{Regex.Escape(reg)},\s*(?<imm>0x[0-9a-fA-F]{{1,8}})$", RegexOptions.IgnoreCase);
+                if (mi.Success && TryParseImm32(mi.Groups["imm"].Value, out var imm) && imm != 0)
+                {
+                    tablePtr = imm;
+                    source = "imm";
+                    return true;
+                }
+
+                // mov reg, [0xXXXXXXXX]
+                var ma = Regex.Match(t, $@"^mov\s+{Regex.Escape(reg)},\s*\[(?<addr>0x[0-9a-fA-F]{{1,8}})\]$", RegexOptions.IgnoreCase);
+                if (ma.Success && TryParseImm32(ma.Groups["addr"].Value, out var addr) && addr != 0)
+                {
+                    if (TryReadDwordAtLinear(objects, objBytesByIndex, addr, out var ptr) && ptr != 0)
+                    {
+                        tablePtr = ptr;
+                        source = $"[{addr:X8}]";
+                        return true;
+                    }
+                    break;
+                }
+
+                // lea reg, [0xXXXXXXXX]
+                var la = Regex.Match(t, $@"^lea\s+{Regex.Escape(reg)},\s*\[(?<addr>0x[0-9a-fA-F]{{1,8}})\]$", RegexOptions.IgnoreCase);
+                if (la.Success && TryParseImm32(la.Groups["addr"].Value, out var leaAddr) && leaAddr != 0)
+                {
+                    tablePtr = leaAddr;
+                    source = "lea";
+                    return true;
+                }
+
+                // If we see the base register being assigned in some other way, stop.
+                // Otherwise we'd risk picking an older (stale) definition and inventing nonsense table pointers.
+                if (Regex.IsMatch(t, $@"^(mov|lea)\s+{Regex.Escape(reg)}\b", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(t, $@"^(pop|xchg)\s+{Regex.Escape(reg)}\b", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(t, $@"^(xor|sub|add|and|or|imul|shl|shr|sar)\s+{Regex.Escape(reg)}\b", RegexOptions.IgnoreCase))
+                {
+                    break;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TryFindVtableWriteForThis(List<Instruction> instructions, int callIdx, string thisReg, out uint vtblAddr)
+        {
+            vtblAddr = 0;
+            if (instructions == null || callIdx <= 0 || string.IsNullOrEmpty(thisReg))
+                return false;
+
+            // Typical ctor: mov dword [ecx], 0xXXXXXXXX
+            for (var i = callIdx - 1; i >= 0 && i >= callIdx - 64; i--)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
+                    break;
+
+                var m = Regex.Match(t, $@"^mov\s+(?:dword\s+)?\[{Regex.Escape(thisReg)}\],\s*(?<imm>0x[0-9a-fA-F]{{1,8}})$", RegexOptions.IgnoreCase);
+                if (m.Success && TryParseImm32(m.Groups["imm"].Value, out var imm) && imm != 0)
+                {
+                    vtblAddr = imm;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static string TryAnnotateVirtualCallDetailed(
+            List<Instruction> instructions,
+            int callIdx,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
+            Dictionary<uint, string> vtblSymbols,
+            Dictionary<uint, Dictionary<uint, uint>> vtblSlots)
+        {
+            if (!TryDetectVirtualCallSite(instructions, callIdx, out var vtblReg, out var slot, out var thisReg))
+                return string.Empty;
+
+            // Path A: true C++-style vcall (vtblReg loaded from [thisReg]).
+            uint vtblAddr = 0;
+            var haveThis = !string.IsNullOrEmpty(thisReg) && IsRegister32(thisReg);
+            if (haveThis)
+            {
+                // Try to infer the concrete vtbl address from a nearby constructor-style write.
+                TryFindVtableWriteForThis(instructions, callIdx, thisReg, out vtblAddr);
+            }
+
+            // Path B: table call where vtblReg is resolved from a recent global/immediate load.
+            // This catches patterns like: mov eax, [abs_ptr] ; call [eax+0xC]
+            if (vtblAddr == 0)
+            {
+                if (TryResolveRegisterAsTablePointer(instructions, callIdx, vtblReg, objects, objBytesByIndex, out var tablePtr, out var source))
+                {
+                    // Only treat it as a vtable/table when the pointer is inside the module image.
+                    if (!TryMapLinearToObject(objects, tablePtr, out var tblObj, out var tblOff))
+                        return string.Empty;
+
+                    vtblAddr = tablePtr;
+                    if (vtblSymbols != null && !vtblSymbols.ContainsKey(vtblAddr))
+                        vtblSymbols[vtblAddr] = $"vtbl_{vtblAddr:X8}";
+
+                    uint target2 = 0;
+                    if (slot % 4 == 0 && TryReadDwordAtLinear(objects, objBytesByIndex, unchecked(vtblAddr + slot), out var fnPtr2) &&
+                        TryMapLinearToObject(objects, fnPtr2, out var fnObj2, out var fnOff2))
+                    {
+                        var obj2 = objects.FirstOrDefault(o => o.Index == fnObj2);
+                        var isExec2 = obj2.Index != 0 && (obj2.Flags & 0x0004) != 0;
+                        if (isExec2)
+                            target2 = fnPtr2;
+                    }
+
+                    if (target2 != 0)
+                    {
+                        if (vtblSlots != null)
+                        {
+                            if (!vtblSlots.TryGetValue(vtblAddr, out var slots2))
+                                vtblSlots[vtblAddr] = slots2 = new Dictionary<uint, uint>();
+                            if (!slots2.ContainsKey(slot))
+                                slots2[slot] = target2;
+                        }
+
+                        var tableSymResolved = vtblSymbols != null && vtblSymbols.TryGetValue(vtblAddr, out var vsTableResolved) ? vsTableResolved : $"0x{vtblAddr:X8}";
+                        return $"VCALL: table={tableSymResolved} slot=0x{slot:X} -> func_{target2:X8} (base={vtblReg} via {source})";
+                    }
+
+                    var tableSymUnresolved = vtblSymbols != null && vtblSymbols.TryGetValue(vtblAddr, out var vsTableUnresolved) ? vsTableUnresolved : $"0x{vtblAddr:X8}";
+                    return $"VCALL?: table={tableSymUnresolved} slot=0x{slot:X} (base={vtblReg} via {source})";
+                }
+            }
+
+            // If we still don't have a concrete vtbl address, only emit a soft hint for true vcall sites.
+            if (vtblAddr == 0)
+            {
+                if (!haveThis)
+                    return string.Empty;
+
+                var thisHint0 = thisReg == "ecx" ? "this=ecx" : $"this~{thisReg}";
+                return slot != 0
+                    ? $"VCALL?: {thisHint0} vtbl=[{thisReg}] slot=0x{slot:X}"
+                    : $"VCALL?: {thisHint0} vtbl=[{thisReg}]";
+            }
+
+            // Validate vtblAddr is in-module.
+            if (!TryMapLinearToObject(objects, vtblAddr, out var vtblObj, out var vtblOff))
+            {
+                var thisHint1 = thisReg == "ecx" ? "this=ecx" : $"this~{thisReg}";
+                return $"VCALL?: {thisHint1} vtbl=0x{vtblAddr:X8} slot=0x{slot:X}";
+            }
+
+            if (vtblSymbols != null && !vtblSymbols.ContainsKey(vtblAddr))
+                vtblSymbols[vtblAddr] = $"vtbl_{vtblAddr:X8}";
+
+            uint target = 0;
+            if (slot % 4 == 0 && TryReadDwordAtLinear(objects, objBytesByIndex, unchecked(vtblAddr + slot), out var fnPtr) &&
+                TryMapLinearToObject(objects, fnPtr, out var fnObj, out var fnOff))
+            {
+                // Prefer executable targets.
+                var obj = objects.FirstOrDefault(o => o.Index == fnObj);
+                var isExec = obj.Index != 0 && (obj.Flags & 0x0004) != 0;
+                if (isExec)
+                    target = fnPtr;
+            }
+
+            if (target != 0)
+            {
+                if (vtblSlots != null)
+                {
+                    if (!vtblSlots.TryGetValue(vtblAddr, out var slots))
+                        vtblSlots[vtblAddr] = slots = new Dictionary<uint, uint>();
+                    if (!slots.ContainsKey(slot))
+                        slots[slot] = target;
+                }
+
+                var thisHint2 = thisReg == "ecx" ? "this=ecx" : $"this~{thisReg}";
+                var vtblSym = vtblSymbols != null && vtblSymbols.TryGetValue(vtblAddr, out var vs) ? vs : $"0x{vtblAddr:X8}";
+                return $"VCALL: {thisHint2} vtbl={vtblSym} slot=0x{slot:X} -> func_{target:X8}";
+            }
+
+            var thisHint3 = thisReg == "ecx" ? "this=ecx" : $"this~{thisReg}";
+            var vtblSym2 = vtblSymbols != null && vtblSymbols.TryGetValue(vtblAddr, out var vs2) ? vs2 : $"0x{vtblAddr:X8}";
+            return $"VCALL?: {thisHint3} vtbl={vtblSym2} slot=0x{slot:X}";
         }
         private static string TryAnnotateFormatCall(List<Instruction> instructions, int callIdx,
             Dictionary<uint, string> globalSymbols,
