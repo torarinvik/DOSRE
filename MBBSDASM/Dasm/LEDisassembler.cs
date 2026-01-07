@@ -49,7 +49,8 @@ namespace MBBSDASM.Dasm
         private static readonly Regex EbpDispRegex = new Regex(
             "\\[(?<reg>ebp)\\s*(?<sign>[\\+\\-])\\s*(?<hex>0x[0-9A-Fa-f]+)\\]",
             RegexOptions.Compiled);
-            private static readonly Regex StringSymRegex = new Regex("s_[0-9A-Fa-f]{8}", RegexOptions.Compiled);
+        private static readonly Regex StringSymRegex = new Regex("s_[0-9A-Fa-f]{8}", RegexOptions.Compiled);
+        private static readonly Regex ResourceSymRegex = new Regex("r_[0-9A-Fa-f]{8}", RegexOptions.Compiled);
 
         private static string RewriteStackFrameOperands(string insText)
         {
@@ -197,7 +198,7 @@ namespace MBBSDASM.Dasm
             return s;
         }
 
-        private static string ApplyStringSymbolRewrites(Instruction ins, string insText, List<LEFixup> fixupsHere, Dictionary<uint, string> stringSymbols)
+        private static string ApplyStringSymbolRewrites(Instruction ins, string insText, List<LEFixup> fixupsHere, Dictionary<uint, string> stringSymbols, List<LEObject> objects = null)
         {
             if (stringSymbols == null || stringSymbols.Count == 0 || fixupsHere == null || fixupsHere.Count == 0)
                 return insText;
@@ -207,7 +208,38 @@ namespace MBBSDASM.Dasm
             {
                 if (!f.Value32.HasValue)
                     continue;
-                if (!stringSymbols.TryGetValue(f.Value32.Value, out var sym))
+
+                var raw = f.Value32.Value;
+                string sym = null;
+
+                // Common case: raw already equals a linear string address.
+                if (!stringSymbols.TryGetValue(raw, out sym))
+                {
+                    // Common DOS4GW pattern: raw is a small offset into a fixed resource region.
+                    // If base+raw matches a known string symbol, rewrite the raw immediate to that symbol.
+                    if (raw < 0x10000)
+                    {
+                        foreach (var baseAddr in new[] { 0x000C0000u, 0x000D0000u, 0x000E0000u, 0x000F0000u })
+                        {
+                            var linear = unchecked(baseAddr + raw);
+                            if (stringSymbols.TryGetValue(linear, out sym))
+                                break;
+                        }
+                    }
+
+                    // Fallback: sometimes raw is object-relative and the fixup mapping tells us the true target.
+                    if (objects != null && f.TargetObject.HasValue && f.TargetOffset.HasValue)
+                    {
+                        var objIndex = f.TargetObject.Value;
+                        if (objIndex >= 1 && objIndex <= objects.Count)
+                        {
+                            var linear = unchecked(objects[objIndex - 1].BaseAddress + f.TargetOffset.Value);
+                            stringSymbols.TryGetValue(linear, out sym);
+                        }
+                    }
+                }
+
+                if (string.IsNullOrEmpty(sym))
                     continue;
 
                 var delta = unchecked((int)(f.SiteLinear - (uint)ins.Offset));
@@ -218,8 +250,8 @@ namespace MBBSDASM.Dasm
                 if (kind != "imm32" && kind != "imm32?" && kind != "disp32")
                     continue;
 
-                var needleLower = $"0x{f.Value32.Value:x}";
-                var needleUpper = $"0x{f.Value32.Value:X}";
+                var needleLower = $"0x{raw:x}";
+                var needleUpper = $"0x{raw:X}";
                 rewritten = rewritten.Replace(needleLower, sym).Replace(needleUpper, sym);
             }
 
@@ -1319,7 +1351,7 @@ namespace MBBSDASM.Dasm
                     {
                         // Fixup-based string rewrites (optional)
                         if (fixupsHere.Count > 0)
-                            insText = ApplyStringSymbolRewrites(ins, insText, fixupsHere, stringSymbols);
+                            insText = ApplyStringSymbolRewrites(ins, insText, fixupsHere, stringSymbols, objects);
 
                         // Replace any matching 0x... literal with known symbol.
                         insText = RewriteKnownAddressLiterals(insText, globalSymbols, stringSymbols, resourceSymbols);
@@ -1336,11 +1368,11 @@ namespace MBBSDASM.Dasm
                         if (!string.IsNullOrEmpty(stackHint))
                             insText += $" ; {stackHint}";
 
-                        var resStrHint = TryAnnotateResourceStringCall(instructions, insLoopIndex, stringSymbols, stringPreview, resourceSymbols, resourceGetterTargets);
+                        var resStrHint = TryAnnotateResourceStringCall(instructions, insLoopIndex, stringSymbols, stringPreview, objects, objBytesByIndex, resourceSymbols, resourceGetterTargets);
                         if (!string.IsNullOrEmpty(resStrHint))
                             insText += $" ; {resStrHint}";
 
-                        var fmtHint = TryAnnotateFormatCall(instructions, insLoopIndex, globalSymbols, stringSymbols, stringPreview, resourceGetterTargets);
+                        var fmtHint = TryAnnotateFormatCall(instructions, insLoopIndex, globalSymbols, stringSymbols, stringPreview, objects, objBytesByIndex, resourceSymbols, resourceGetterTargets);
                         if (!string.IsNullOrEmpty(fmtHint))
                             insText += $" ; {fmtHint}";
 
@@ -1353,7 +1385,7 @@ namespace MBBSDASM.Dasm
                             insText += $" ; {intHint}";
 
                         // If this instruction references a string symbol (or computes one), inline a short preview.
-                        var strInline = TryInlineStringPreview(insText, stringPreview, instructions, insLoopIndex, stringSymbols, resourceGetterTargets);
+                        var strInline = TryInlineStringPreview(insText, stringPreview, objects, objBytesByIndex, instructions, insLoopIndex, stringSymbols, resourceGetterTargets);
                         if (!string.IsNullOrEmpty(strInline))
                             insText += $" ; {strInline}";
                     }
@@ -1414,6 +1446,9 @@ namespace MBBSDASM.Dasm
             Dictionary<uint, string> globalSymbols,
             Dictionary<uint, string> stringSymbols,
             Dictionary<uint, string> stringPreview,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
+            Dictionary<uint, string> resourceSymbols = null,
             HashSet<uint> resourceGetterTargets = null)
         {
             if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
@@ -1444,7 +1479,7 @@ namespace MBBSDASM.Dasm
                 if (!t.StartsWith("push ", StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                t = RewriteKnownAddressLiterals(t, globalSymbols, stringSymbols);
+                t = RewriteKnownAddressLiterals(t, globalSymbols, stringSymbols, resourceSymbols);
                 pushedOperands.Add(t.Substring(5).Trim());
                 if (pushedOperands.Count >= 12)
                     break;
@@ -1461,7 +1496,7 @@ namespace MBBSDASM.Dasm
             for (var k = 0; k < pushedOperands.Count; k++)
             {
                 var op = pushedOperands[k];
-                if (!TryResolveStringSymFromOperand(instructions, callIdx, op, stringSymbols, stringPreview, resourceGetterTargets, out var sym, out var preview))
+                if (!TryResolveStringSymFromOperand(instructions, callIdx, op, stringSymbols, stringPreview, objects, objBytesByIndex, resourceGetterTargets, out var sym, out var preview))
                     continue;
 
                 var isFmt = LooksLikePrintfFormat(preview);
@@ -1529,6 +1564,8 @@ namespace MBBSDASM.Dasm
             int callIdx,
             Dictionary<uint, string> stringSymbols,
             Dictionary<uint, string> stringPreview,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
             Dictionary<uint, string> resourceSymbols,
             HashSet<uint> resourceGetterTargets)
         {
@@ -1576,9 +1613,9 @@ namespace MBBSDASM.Dasm
                 }
 
                 var ma = Regex.Match(t, @"^add\s+e[a-z]{2},\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
-                if (regionBase == null && ma.Success && TryParseImm32(ma.Groups["imm"].Value, out var rb) && rb >= 0x10000)
+                if (regionBase == null && ma.Success && TryParseImm32(ma.Groups["imm"].Value, out var baseImm) && baseImm >= 0x10000)
                 {
-                    regionBase = rb;
+                    regionBase = baseImm;
                     continue;
                 }
 
@@ -1605,28 +1642,26 @@ namespace MBBSDASM.Dasm
 
             string sym = null;
             var haveStringSym = stringSymbols != null && stringSymbols.TryGetValue(addr, out sym);
-            if (!haveStringSym)
-            {
-                // Still useful: show the derived resource address when it points into a typical resource/string region.
-                // (Avoid spamming for small constants or unrelated addresses.)
-                var rb = regionBase.Value;
-                if (rb >= 0x000C0000 && rb <= 0x000F0000 && (rb % 0x10000 == 0))
-                    return $"RESOFF: base=0x{rb:X} off=0x{offsetImm.Value:X} => r_{addr:X8} ; RET=eax=r_{addr:X8}";
-                return string.Empty;
-            }
-
-            var prev = stringPreview.TryGetValue(addr, out var p) ? p : string.Empty;
-            if (!string.IsNullOrEmpty(prev))
+            if (TryGetStringPreviewAt(addr, stringPreview, objects, objBytesByIndex, out var prev) && !string.IsNullOrEmpty(prev))
             {
                 var kind = LooksLikePrintfFormat(prev) ? "RESFMT" : "RESSTR";
-                return $"{kind}: {sym} \"{prev}\" ; RET=eax=r_{addr:X8}";
+                var label = haveStringSym ? sym : $"r_{addr:X8}";
+                return $"{kind}: {label} \"{prev}\" ; RET=eax=r_{addr:X8}";
             }
 
-            return $"RESSTR: {sym} ; RET=eax=r_{addr:X8}";
+            // Still useful: show the derived resource address when it points into a typical resource/string region.
+            // (Avoid spamming for small constants or unrelated addresses.)
+            var rb = regionBase.Value;
+            if (rb >= 0x000C0000 && rb <= 0x000F0000 && (rb % 0x10000 == 0))
+                return $"RESOFF: base=0x{rb:X} off=0x{offsetImm.Value:X} => r_{addr:X8} ; RET=eax=r_{addr:X8}";
+
+            return string.Empty;
         }
 
         private static string TryInlineStringPreview(string insText,
             Dictionary<uint, string> stringPreview,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
             List<Instruction> instructions,
             int insIdx,
             Dictionary<uint, string> stringSymbols,
@@ -1650,12 +1685,20 @@ namespace MBBSDASM.Dasm
                 return $"STR: \"{p0}\"";
             }
 
+            // Fast path: r_XXXXXXXX token that also points to a known string preview
+            var rsym = ExtractResourceSym(insText);
+            if (!string.IsNullOrEmpty(rsym) && TryParseResourceSym(rsym, out var raddr) &&
+                TryGetStringPreviewAt(raddr, stringPreview, objects, objBytesByIndex, out var rp0) && !string.IsNullOrEmpty(rp0))
+            {
+                return $"STR: \"{rp0}\"";
+            }
+
             // Heuristic path: try to resolve a computed/pushed register value to a known string address.
             if (instructions == null || insIdx < 0 || insIdx >= instructions.Count)
                 return string.Empty;
 
             var raw = instructions[insIdx].ToString();
-            if (TryResolveStringFromInstruction(instructions, insIdx, raw, stringSymbols, stringPreview, resourceGetterTargets, out var p1))
+            if (TryResolveStringFromInstruction(instructions, insIdx, raw, stringSymbols, stringPreview, objects, objBytesByIndex, resourceGetterTargets, out var p1))
                 return $"STR: \"{p1}\"";
 
             return string.Empty;
@@ -1667,6 +1710,8 @@ namespace MBBSDASM.Dasm
             string operandText,
             Dictionary<uint, string> stringSymbols,
             Dictionary<uint, string> stringPreview,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
             HashSet<uint> resourceGetterTargets,
             out string sym,
             out string preview)
@@ -1683,10 +1728,20 @@ namespace MBBSDASM.Dasm
             // Direct s_ token
             var direct = ExtractStringSym(operandText);
             if (!string.IsNullOrEmpty(direct) && TryParseStringSym(direct, out var daddr) &&
-                stringPreview.TryGetValue(daddr, out var dp) && !string.IsNullOrEmpty(dp))
+                TryGetStringPreviewAt(daddr, stringPreview, objects, objBytesByIndex, out var dp) && !string.IsNullOrEmpty(dp))
             {
                 sym = direct;
                 preview = dp;
+                return true;
+            }
+
+            // Direct r_ token (resource-derived). If it points to a known string preview, treat it as a string too.
+            var rdirect = ExtractResourceSym(operandText);
+            if (!string.IsNullOrEmpty(rdirect) && TryParseResourceSym(rdirect, out var rdaddr) &&
+                TryGetStringPreviewAt(rdaddr, stringPreview, objects, objBytesByIndex, out var rdp) && !string.IsNullOrEmpty(rdp))
+            {
+                sym = rdirect;
+                preview = rdp;
                 return true;
             }
 
@@ -1694,21 +1749,63 @@ namespace MBBSDASM.Dasm
             var op = operandText.Trim();
             if (IsRegister32(op) && TryResolveRegisterValueBefore(instructions, callIdx, op, out var raddr, resourceGetterTargets))
             {
-                if (stringSymbols.TryGetValue(raddr, out var rsym) && stringPreview.TryGetValue(raddr, out var rp) && !string.IsNullOrEmpty(rp))
+                if (TryResolveStringAddressFromRaw(raddr, stringSymbols, out var resolvedAddr, out var resolvedSym) &&
+                    TryGetStringPreviewAt(resolvedAddr, stringPreview, objects, objBytesByIndex, out var rp) && !string.IsNullOrEmpty(rp))
                 {
-                    sym = rsym;
+                    sym = resolvedSym;
                     preview = rp;
                     return true;
                 }
             }
 
             // Immediate literal (0x...)
-            if (TryParseImm32(op, out var imm) && stringSymbols.TryGetValue(imm, out var isym) &&
-                stringPreview.TryGetValue(imm, out var ip) && !string.IsNullOrEmpty(ip))
+            if (TryParseImm32(op, out var imm) && TryResolveStringAddressFromRaw(imm, stringSymbols, out var iaddr, out var isym) &&
+                TryGetStringPreviewAt(iaddr, stringPreview, objects, objBytesByIndex, out var ip) && !string.IsNullOrEmpty(ip))
             {
                 sym = isym;
                 preview = ip;
                 return true;
+            }
+
+            // Embedded literal (e.g. dword [0x4988])
+            var hm = HexLiteralRegex.Match(operandText);
+            if (hm.Success && TryParseHexUInt(hm.Value, out var rawLit) &&
+                TryResolveStringAddressFromRaw(rawLit, stringSymbols, out var haddr, out var hsym) &&
+                TryGetStringPreviewAt(haddr, stringPreview, objects, objBytesByIndex, out var hp) && !string.IsNullOrEmpty(hp))
+            {
+                sym = hsym;
+                preview = hp;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryResolveStringAddressFromRaw(uint raw, Dictionary<uint, string> stringSymbols, out uint addr, out string sym)
+        {
+            addr = 0;
+            sym = string.Empty;
+            if (stringSymbols == null || stringSymbols.Count == 0)
+                return false;
+
+            if (stringSymbols.TryGetValue(raw, out sym))
+            {
+                addr = raw;
+                return true;
+            }
+
+            // Common DOS4GW convention: strings live in C/D/E/F0000 regions and code references them by 16-bit offsets.
+            if (raw < 0x10000)
+            {
+                foreach (var baseAddr in new[] { 0x000C0000u, 0x000D0000u, 0x000E0000u, 0x000F0000u })
+                {
+                    var candidate = unchecked(baseAddr + raw);
+                    if (stringSymbols.TryGetValue(candidate, out sym))
+                    {
+                        addr = candidate;
+                        return true;
+                    }
+                }
             }
 
             return false;
@@ -1720,6 +1817,8 @@ namespace MBBSDASM.Dasm
             string rawInstruction,
             Dictionary<uint, string> stringSymbols,
             Dictionary<uint, string> stringPreview,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
             HashSet<uint> resourceGetterTargets,
             out string preview)
         {
@@ -1736,13 +1835,13 @@ namespace MBBSDASM.Dasm
             {
                 var op = t.Substring(5).Trim();
                 if (IsRegister32(op) && TryResolveRegisterValueBefore(instructions, insIdx, op, out var addr, resourceGetterTargets) &&
-                    stringPreview.TryGetValue(addr, out var p) && !string.IsNullOrEmpty(p) && stringSymbols.ContainsKey(addr))
+                    TryGetStringPreviewAt(addr, stringPreview, objects, objBytesByIndex, out var p) && !string.IsNullOrEmpty(p))
                 {
                     preview = p;
                     return true;
                 }
 
-                if (TryParseImm32(op, out var imm) && stringPreview.TryGetValue(imm, out var p2) && !string.IsNullOrEmpty(p2) && stringSymbols.ContainsKey(imm))
+                if (TryParseImm32(op, out var imm) && TryGetStringPreviewAt(imm, stringPreview, objects, objBytesByIndex, out var p2) && !string.IsNullOrEmpty(p2))
                 {
                     preview = p2;
                     return true;
@@ -1757,7 +1856,7 @@ namespace MBBSDASM.Dasm
                 {
                     var dst = parts[0].Trim();
                     var src = parts[1].Trim();
-                    if (IsRegister32(dst) && TryParseImm32(src, out var imm) && stringPreview.TryGetValue(imm, out var p) && !string.IsNullOrEmpty(p) && stringSymbols.ContainsKey(imm))
+                    if (IsRegister32(dst) && TryParseImm32(src, out var imm) && TryGetStringPreviewAt(imm, stringPreview, objects, objBytesByIndex, out var p) && !string.IsNullOrEmpty(p))
                     {
                         preview = p;
                         return true;
@@ -1777,13 +1876,85 @@ namespace MBBSDASM.Dasm
                     if (TryResolveRegisterValueBefore(instructions, insIdx, baseReg, out var baseVal, resourceGetterTargets))
                     {
                         var addr = baseVal + disp;
-                        if (stringPreview.TryGetValue(addr, out var p) && !string.IsNullOrEmpty(p) && stringSymbols.ContainsKey(addr))
+                        if (TryGetStringPreviewAt(addr, stringPreview, objects, objBytesByIndex, out var p) && !string.IsNullOrEmpty(p))
                         {
                             preview = p;
                             return true;
                         }
                     }
                 }
+            }
+
+            return false;
+        }
+
+        private static bool TryGetStringPreviewAt(uint addr,
+            Dictionary<uint, string> stringPreview,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
+            out string preview)
+        {
+            preview = string.Empty;
+
+            if (stringPreview != null && stringPreview.TryGetValue(addr, out var p0) && !string.IsNullOrEmpty(p0))
+            {
+                preview = p0;
+                return true;
+            }
+
+            if (TryReadCStringAtLinear(objects, objBytesByIndex, addr, out var p1))
+            {
+                preview = p1;
+                if (stringPreview != null && !stringPreview.ContainsKey(addr))
+                    stringPreview[addr] = p1;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryReadCStringAtLinear(List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex, uint addr, out string preview)
+        {
+            preview = string.Empty;
+            if (objects == null || objBytesByIndex == null)
+                return false;
+
+            foreach (var obj in objects)
+            {
+                if (addr < obj.BaseAddress)
+                    continue;
+                var end = obj.BaseAddress + obj.VirtualSize;
+                if (addr >= end)
+                    continue;
+
+                if (!objBytesByIndex.TryGetValue(obj.Index, out var bytes) || bytes == null || bytes.Length == 0)
+                    return false;
+
+                var start = (int)(addr - obj.BaseAddress);
+                if (start < 0 || start >= bytes.Length)
+                    return false;
+
+                var maxLen = Math.Min(bytes.Length, (int)Math.Min(obj.VirtualSize, (uint)bytes.Length));
+                if (start >= maxLen)
+                    return false;
+
+                var i = start;
+                var sb = new StringBuilder();
+                while (i < maxLen && IsLikelyStringChar(bytes[i]) && sb.Length < 200)
+                {
+                    sb.Append((char)bytes[i]);
+                    i++;
+                }
+
+                var nul = (i < maxLen && bytes[i] == 0x00);
+                var s = sb.ToString();
+                if (!nul || s.Length < 4)
+                    return false;
+                if (!LooksLikeHumanString(s))
+                    return false;
+
+                preview = EscapeForComment(s);
+                return true;
             }
 
             return false;
@@ -1848,19 +2019,18 @@ namespace MBBSDASM.Dasm
                 if (string.IsNullOrEmpty(t))
                     continue;
 
-                // Resource getter: if (edx = regionBase) and (eax = smallId), then call resGet => eax = edx + eax.
-                // This helps propagate computed resource pointers to later push/call sites.
+                // Resource getter: best-effort propagate eax = base + id across detected helper calls.
+                // We intentionally do not require that edx was tracked as a constant: instead we re-scan the
+                // immediate window before the call for the typical (base,id) setup pattern.
                 if (resourceGetterTargets != null && resourceGetterTargets.Count > 0)
                 {
                     var mcall = Regex.Match(t, @"^call\s+(?<target>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
                     if (mcall.Success && TryParseHexUInt(mcall.Groups["target"].Value, out var tgt) && resourceGetterTargets.Contains(tgt))
                     {
-                        if (known.TryGetValue("edx", out var edxKnown) && edxKnown && vals.TryGetValue("edx", out var edxVal) &&
-                            known.TryGetValue("eax", out var eaxKnown) && eaxKnown && vals.TryGetValue("eax", out var eaxVal) &&
-                            eaxVal < 0x10000 && edxVal >= 0x000C0000 && edxVal <= 0x000F0000 && (edxVal % 0x10000 == 0))
+                        if (TryComputeResourceGetterReturn(instructions, i, out var derived))
                         {
                             known["eax"] = true;
-                            vals["eax"] = unchecked(edxVal + eaxVal);
+                            vals["eax"] = derived;
                         }
                         continue;
                     }
@@ -1961,6 +2131,78 @@ namespace MBBSDASM.Dasm
             return false;
         }
 
+        private static bool TryComputeResourceGetterReturn(List<Instruction> instructions, int callIdx, out uint value)
+        {
+            value = 0;
+            if (instructions == null || callIdx <= 0 || callIdx >= instructions.Count)
+                return false;
+
+            uint? offsetImm = null;
+            uint? regionBase = null;
+
+            for (var i = callIdx - 1; i >= 0 && i >= callIdx - 12; i--)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (string.IsNullOrEmpty(t))
+                    continue;
+
+                // Stop at control-flow barriers
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) || (t.StartsWith("j", StringComparison.OrdinalIgnoreCase) && !t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase)))
+                {
+                    break;
+                }
+
+                // id: mov eax, 0xNNNN (small)
+                var mo = Regex.Match(t, @"^mov\s+eax,\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                if (offsetImm == null && mo.Success && TryParseImm32(mo.Groups["imm"].Value, out var oi) && oi < 0x10000)
+                {
+                    offsetImm = oi;
+                    continue;
+                }
+
+                // base: add edx, 0xE0000 (or similar)
+                var ma = Regex.Match(t, @"^add\s+edx,\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                if (regionBase == null && ma.Success && TryParseImm32(ma.Groups["imm"].Value, out var rb) && rb >= 0x10000)
+                {
+                    regionBase = rb;
+                    continue;
+                }
+
+                // base: mov edx, 0xE0000
+                var mm = Regex.Match(t, @"^mov\s+edx,\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                if (regionBase == null && mm.Success && TryParseImm32(mm.Groups["imm"].Value, out var rb2) && rb2 >= 0x10000)
+                {
+                    regionBase = rb2;
+                    continue;
+                }
+
+                // base: lea edx, [<reg>+0xE0000]
+                var ml = Regex.Match(t, @"^lea\s+edx,\s*\[e[a-z]{2}\+0x(?<disp>[0-9a-fA-F]+)\]$", RegexOptions.IgnoreCase);
+                if (regionBase == null && ml.Success)
+                {
+                    var disp = Convert.ToUInt32(ml.Groups["disp"].Value, 16);
+                    if (disp >= 0x10000)
+                        regionBase = disp;
+                    continue;
+                }
+
+                if (offsetImm.HasValue && regionBase.HasValue)
+                    break;
+            }
+
+            if (!offsetImm.HasValue || !regionBase.HasValue)
+                return false;
+
+            // Keep it conservative: common DOS4GW resource region patterns
+            var rbv = regionBase.Value;
+            if (!(rbv >= 0x000C0000 && rbv <= 0x000F0000 && (rbv % 0x10000 == 0)))
+                return false;
+
+            value = unchecked(rbv + offsetImm.Value);
+            return true;
+        }
+
         private static HashSet<uint> DetectResourceGetterTargets(List<Instruction> instructions)
         {
             var result = new HashSet<uint>();
@@ -2033,6 +2275,22 @@ namespace MBBSDASM.Dasm
         {
             addr = 0;
             if (string.IsNullOrEmpty(sym) || sym.Length != 10 || !sym.StartsWith("s_", StringComparison.OrdinalIgnoreCase))
+                return false;
+            return uint.TryParse(sym.Substring(2), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out addr);
+        }
+
+        private static string ExtractResourceSym(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return string.Empty;
+            var m = ResourceSymRegex.Match(text);
+            return m.Success ? m.Value : string.Empty;
+        }
+
+        private static bool TryParseResourceSym(string sym, out uint addr)
+        {
+            addr = 0;
+            if (string.IsNullOrEmpty(sym) || sym.Length != 10 || !sym.StartsWith("r_", StringComparison.OrdinalIgnoreCase))
                 return false;
             return uint.TryParse(sym.Substring(2), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out addr);
         }
@@ -2609,20 +2867,44 @@ namespace MBBSDASM.Dasm
 
                     if (objOffset >= 0)
                     {
-                        // Try to find a 32-bit in-module pointer within +0..+3.
-                        for (var delta = 0; delta <= 3; delta++)
+                        // Recover small object-relative offsets first (common for DOS4GW resource/string regions like 0xE0000+off).
+                        // This avoids accidentally treating opcode+imm byte sequences as in-module pointers.
+                        for (var delta = -3; delta <= 3; delta++)
                         {
                             var off = objOffset + delta;
+                            if (off < 0)
+                                continue;
                             if (off + 4 > objBytes.Length)
-                                break;
+                                continue;
                             var v = ReadUInt32(objBytes, off);
-                            if (TryMapLinearToObject(objects, v, out var tobj, out var toff))
+                            if (v != 0 && v < 0x10000)
                             {
                                 value32 = v;
                                 chosenDelta = delta;
-                                mappedObj = tobj;
-                                mappedOff = toff;
                                 break;
+                            }
+                        }
+
+                        // If no small offset candidate, try to find a 32-bit in-module pointer near the fixup site.
+                        // Some records point into the middle of an imm32/disp32 field, so probe both backward and forward.
+                        if (!value32.HasValue)
+                        {
+                            for (var delta = -3; delta <= 3; delta++)
+                            {
+                                var off = objOffset + delta;
+                                if (off < 0)
+                                    continue;
+                                if (off + 4 > objBytes.Length)
+                                    continue;
+                                var v = ReadUInt32(objBytes, off);
+                                if (TryMapLinearToObject(objects, v, out var tobj, out var toff))
+                                {
+                                    value32 = v;
+                                    chosenDelta = delta;
+                                    mappedObj = tobj;
+                                    mappedOff = toff;
+                                    break;
+                                }
                             }
                         }
 
@@ -2637,9 +2919,10 @@ namespace MBBSDASM.Dasm
                     }
 
                     // For DOS4GW/MS-DOS game workflows we mostly care about internal pointers.
-                    // If we couldn't map a 32-bit value into a known object, don't print it as it
-                    // frequently represents opcode bytes or plain constants.
-                    if (value32.HasValue && !mappedObj.HasValue)
+                    // If we couldn't map a 32-bit value into a known object, it often represents
+                    // opcode bytes or plain constants. However, DOS4GW fixups frequently also
+                    // carry small object-relative offsets (e.g., into a C/D/E/F0000 string/resource region).
+                    if (value32.HasValue && !mappedObj.HasValue && value32.Value >= 0x10000)
                         value32 = null;
 
                     var desc = $"type=0x{srcType:X2} flags=0x{flags:X2} stride={stride}";
