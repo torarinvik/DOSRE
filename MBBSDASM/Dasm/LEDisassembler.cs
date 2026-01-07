@@ -164,7 +164,8 @@ namespace MBBSDASM.Dasm
             Dictionary<string, Dictionary<uint, FieldAccessStats>> statsByBase,
             string baseAlias,
             uint disp,
-            bool isWrite,
+            int readInc,
+            int writeInc,
             string size)
         {
             if (statsByBase == null || string.IsNullOrEmpty(baseAlias))
@@ -179,10 +180,92 @@ namespace MBBSDASM.Dasm
             if (!string.IsNullOrEmpty(size) && string.IsNullOrEmpty(st.Size))
                 st.Size = size;
 
-            if (isWrite)
-                st.WriteCount++;
-            else
-                st.ReadCount++;
+            if (readInc > 0)
+                st.ReadCount += readInc;
+            if (writeInc > 0)
+                st.WriteCount += writeInc;
+        }
+
+        private static void GetMemAccessRW(string insText, string memOperandText, out int reads, out int writes)
+        {
+            reads = 0;
+            writes = 0;
+
+            if (string.IsNullOrEmpty(insText) || string.IsNullOrEmpty(memOperandText))
+                return;
+
+            var t = insText.Trim();
+            var sp = t.IndexOf(' ');
+            var mnemonic = sp > 0 ? t.Substring(0, sp).ToLowerInvariant() : t.ToLowerInvariant();
+
+            // Split operands roughly (best-effort).
+            var ops = sp > 0 ? t.Substring(sp + 1) : string.Empty;
+            var parts = ops.Split(',').Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+            var op0 = parts.Count > 0 ? parts[0] : string.Empty;
+
+            var memIsDest = !string.IsNullOrEmpty(op0) && op0.Contains(memOperandText, StringComparison.OrdinalIgnoreCase);
+
+            // Treat various instruction families.
+            if (mnemonic == "mov")
+            {
+                if (memIsDest)
+                    writes = 1;
+                else
+                    reads = 1;
+                return;
+            }
+
+            // Read-modify-write when memory is destination.
+            switch (mnemonic)
+            {
+                case "add":
+                case "sub":
+                case "and":
+                case "or":
+                case "xor":
+                case "adc":
+                case "sbb":
+                case "imul":
+                case "shl":
+                case "shr":
+                case "sar":
+                case "rol":
+                case "ror":
+                case "inc":
+                case "dec":
+                case "xchg":
+                    if (memIsDest)
+                    {
+                        reads = 1;
+                        writes = 1;
+                    }
+                    else
+                    {
+                        reads = 1;
+                    }
+                    return;
+                case "cmp":
+                case "test":
+                case "push":
+                case "call":
+                    reads = 1;
+                    return;
+            }
+
+            // FP memory ops: fstp writes; fld reads. Others default to read.
+            if (mnemonic.StartsWith("fst", StringComparison.OrdinalIgnoreCase))
+            {
+                writes = 1;
+                return;
+            }
+            if (mnemonic.StartsWith("fld", StringComparison.OrdinalIgnoreCase))
+            {
+                reads = 1;
+                return;
+            }
+
+            // Default: assume read.
+            reads = 1;
         }
 
         private static void CollectFieldAccessesForFunction(
@@ -208,11 +291,6 @@ namespace MBBSDASM.Dasm
                 // Update aliases first so we model dataflow forward.
                 UpdatePointerAliases(insText, aliases);
 
-                // Determine a very rough read/write for simple mov forms.
-                var isMov = insText.StartsWith("mov ", StringComparison.OrdinalIgnoreCase);
-                var movWritesMem = isMov && Regex.IsMatch(insText, @"^mov\s+\[", RegexOptions.IgnoreCase);
-                var movReadsMem = isMov && Regex.IsMatch(insText, @"^mov\s+e[a-z]{2},\s*\[", RegexOptions.IgnoreCase);
-
                 // Prefer size when present (byte/word/dword).
                 var size = string.Empty;
                 var ms = MemOpWithSizeRegex.Match(insText);
@@ -237,12 +315,10 @@ namespace MBBSDASM.Dasm
                     if (m.Groups["disp"].Success)
                         disp = Convert.ToUInt32(m.Groups["disp"].Value, 16);
 
-                    // Heuristic: for mov, decide direction; otherwise treat as read.
-                    var isWrite = movWritesMem;
-                    if (!isWrite && movReadsMem)
-                        isWrite = false;
-
-                    RecordFieldAccess(statsByBase, baseAlias, disp, isWrite, size);
+                    // Best-effort per-operand read/write classification.
+                    var memText = m.Value; // e.g. [ecx+0x10]
+                    GetMemAccessRW(insText, memText, out var r, out var w);
+                    RecordFieldAccess(statsByBase, baseAlias, disp, r, w, size);
                 }
             }
         }
@@ -258,6 +334,18 @@ namespace MBBSDASM.Dasm
             {
                 var baseAlias = baseKvp.Key;
                 var fields = baseKvp.Value
+                    // De-noise: drop field_0 unless it looks like a dword vptr/first-field.
+                    .Where(k =>
+                    {
+                        if (k.Key != 0)
+                            return true;
+                        var st = k.Value;
+                        if (string.Equals(st.Size, "dword", StringComparison.OrdinalIgnoreCase))
+                            return true;
+                        // If size is unknown, allow only low-frequency field_0.
+                        var tot = st.ReadCount + st.WriteCount;
+                        return string.IsNullOrEmpty(st.Size) && tot <= 8;
+                    })
                     .OrderByDescending(k => k.Value.ReadCount + k.Value.WriteCount)
                     .ThenBy(k => k.Key)
                     .Take(6)
