@@ -98,6 +98,13 @@ namespace MBBSDASM.UI.impl
         private bool _bLeFixups;
 
         /// <summary>
+        ///     LE (DOS4GW) globals/symbolization
+        ///     Specified with the -leglobals argument
+        ///     For LE inputs, emits g_XXXXXXXX EQU 0xXXXXXXXX derived from disp32 fixups and rewrites operands.
+        /// </summary>
+        private bool _bLeGlobals;
+
+        /// <summary>
         ///     LE (DOS4GW) fixup dump
         ///     Specified with the -lefixdump [maxPages] argument
         ///     For LE inputs, emits a raw per-page fixup table dump to help reverse the record layout.
@@ -162,6 +169,9 @@ namespace MBBSDASM.UI.impl
                         case "-LEFIXUPS":
                             _bLeFixups = true;
                             break;
+                        case "-LEGLOBALS":
+                            _bLeGlobals = true;
+                            break;
                         case "-LEFIXDUMP":
                             _bLeFixDump = true;
                             if (i + 1 < _args.Length && int.TryParse(_args[i + 1], out var maxPages) && maxPages > 0)
@@ -196,6 +206,8 @@ namespace MBBSDASM.UI.impl
                             Console.WriteLine(
                                 "-LEFIXUPS -- (LE inputs) Annotate output with best-effort LE fixups/import targets");
                             Console.WriteLine(
+                                "-LEGLOBALS -- (LE inputs) Emit g_XXXXXXXX EQU 0xXXXXXXXX from disp32 fixups + rewrite operands (LLM-friendly)");
+                            Console.WriteLine(
                                 "-LEFIXDUMP [maxPages] -- (LE inputs) Dump raw fixup pages + decoding hints (writes <out>.fixups.txt if -O is used)");
                             Console.WriteLine(
                                 "-SPLITKB <n> -- (with -O) Split output into ~n KB chunks (out.001.asm, out.002.asm, ...)");
@@ -211,7 +223,7 @@ namespace MBBSDASM.UI.impl
 
                 //LE/DOS4GW support (minimal): bypass NE-specific pipeline
                 //NOTE: This tool was originally NE-only; LE support does not include relocations/import analysis.
-                if (LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, out var leOutput, out var leError))
+                if (LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, out var leOutput, out var leError))
                 {
                     if (_bAnalysis)
                         _logger.Warn("Warning: -analysis is not supported for LE inputs, ignoring");
@@ -223,6 +235,8 @@ namespace MBBSDASM.UI.impl
                         _logger.Warn("Warning: -lebytes is ignored when -lefull is specified");
                     if (_bLeFixups)
                         _logger.Info("LE fixup annotations enabled (best-effort)");
+                    if (_bLeGlobals && !_bLeFixups)
+                        _logger.Warn("Warning: -leglobals works best with -lefixups (globals are derived from fixups)");
 
                     if (_bLeFixDump)
                     {

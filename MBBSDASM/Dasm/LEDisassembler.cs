@@ -32,7 +32,13 @@ namespace MBBSDASM.Dasm
             public uint SourceLinear;
             public ushort SourceOffsetInPage;
             public uint PageNumber; // 1-based physical page
-            public string Description = string.Empty;
+            public uint SiteLinear;
+            public byte SiteDelta;
+            public uint? Value32;
+            public int? TargetObject;
+            public uint? TargetOffset;
+            public byte Type;
+            public byte Flags;
         }
 
         private struct LEHeader
@@ -138,8 +144,10 @@ namespace MBBSDASM.Dasm
 
             sb.AppendLine("; Per-page fixup slices");
             sb.AppendLine("; NOTE: LE fixup page table is indexed by *logical page number* (1..NumberOfPages)");
-            sb.AppendLine("; NOTE: Below includes a 'stride=16 hypothesis' view used by DOS4GW in many builds (not guaranteed)");
+            sb.AppendLine("; NOTE: Below includes a stride auto-detect (candidates: 8/10/12/16) and a stride-based view.");
             sb.AppendLine(";");
+
+            var strideCounts = new Dictionary<int, int>();
 
             for (var page1 = 1; page1 <= pagesToDump; page1++)
             {
@@ -159,50 +167,28 @@ namespace MBBSDASM.Dasm
                 sb.AppendLine($"; -------- Page {page1} --------");
                 sb.AppendLine($"; RecordStreamOff: 0x{start:X}..0x{end:X} (len=0x{len:X})");
 
+                var strideGuess = GuessStride(fixupRecordStream, (int)start, len, (int)header.PageSize);
+                if (!strideCounts.ContainsKey(strideGuess.Stride))
+                    strideCounts[strideGuess.Stride] = 0;
+                strideCounts[strideGuess.Stride]++;
+                sb.AppendLine($"; Best stride guess: {strideGuess.Stride} bytes (score={strideGuess.Score:0.00}, validSrcOff={strideGuess.ValidSrcOff}/{strideGuess.EntriesChecked})");
+
                 // Raw hexdump (capped)
                 var dumpLen = Math.Min(len, maxBytesPerPage);
                 sb.AppendLine($"; Raw bytes (first {dumpLen} of {len})");
                 sb.AppendLine(HexDump(fixupRecordStream, (int)start, dumpLen));
 
-                // Stride=16 hypothesis view
-                sb.AppendLine("; Stride16 hypothesis (each entry: srcType flags srcOff w1 d1 w2 d2)");
-                var p = (int)start;
-                var limit = (int)end;
-                var entry = 0;
-                while (p + 16 <= limit && entry < 64)
-                {
-                    var srcType = fixupRecordStream[p + 0];
-                    var flags = fixupRecordStream[p + 1];
-                    var srcOff = (ushort)(fixupRecordStream[p + 2] | (fixupRecordStream[p + 3] << 8));
-                    var w1 = (ushort)(fixupRecordStream[p + 4] | (fixupRecordStream[p + 5] << 8));
-                    var d1 = ReadUInt32(fixupRecordStream, p + 6);
-                    var w2 = (ushort)(fixupRecordStream[p + 10] | (fixupRecordStream[p + 11] << 8));
-                    var d2 = ReadUInt32(fixupRecordStream, p + 12);
+                sb.AppendLine($"; Stride-based view (stride={strideGuess.Stride})");
+                sb.AppendLine(DumpStrideView(fixupRecordStream, (int)start, (int)end, strideGuess.Stride, 64));
 
-                    // Try to interpret import module/proc if plausible
-                    var maybeModName = (importModules != null && w1 > 0 && w1 <= importModules.Count) ? importModules[w1 - 1] : string.Empty;
-                    var maybeProcName = !string.IsNullOrEmpty(maybeModName) ? TryReadImportProcName(fileBytes, header, d1) : string.Empty;
+                sb.AppendLine(";");
+            }
 
-                    var hint = string.Empty;
-                    if (w1 >= 1 && w1 <= header.ObjectCount)
-                    {
-                        var objEntry = objects.FirstOrDefault(o => o.Index == w1);
-                        hint = $" ; internal? obj{w1}+0x{d1:X} => 0x{unchecked(objEntry.BaseAddress + d1):X8}";
-                    }
-                    else if (!string.IsNullOrEmpty(maybeModName) && !string.IsNullOrEmpty(maybeProcName))
-                    {
-                        hint = $" ; import? {maybeModName}!{maybeProcName}";
-                    }
-                    else if (!string.IsNullOrEmpty(maybeModName))
-                    {
-                        hint = $" ; import? {maybeModName}!@0x{d1:X}";
-                    }
-
-                    sb.AppendLine($";   [{entry:00}] +0x{(p - (int)start):X3}  type=0x{srcType:X2} flags=0x{flags:X2} srcOff=0x{srcOff:X4}  w1=0x{w1:X4} d1=0x{d1:X8} w2=0x{w2:X4} d2=0x{d2:X8}{hint}");
-                    p += 16;
-                    entry++;
-                }
-
+            if (strideCounts.Count > 0)
+            {
+                sb.AppendLine("; -------- Stride summary --------");
+                foreach (var kvp in strideCounts.OrderBy(k => k.Key))
+                    sb.AppendLine($"; stride {kvp.Key}: {kvp.Value} page(s)");
                 sb.AppendLine(";");
             }
 
@@ -210,7 +196,115 @@ namespace MBBSDASM.Dasm
             return true;
         }
 
-        public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, bool leFixups, out string output, out string error)
+        private readonly struct StrideGuess
+        {
+            public int Stride { get; }
+            public double Score { get; }
+            public int ValidSrcOff { get; }
+            public int EntriesChecked { get; }
+
+            public StrideGuess(int stride, double score, int validSrcOff, int entriesChecked)
+            {
+                Stride = stride;
+                Score = score;
+                ValidSrcOff = validSrcOff;
+                EntriesChecked = entriesChecked;
+            }
+        }
+
+        private static StrideGuess GuessStride(byte[] data, int start, int len, int pageSize)
+        {
+            // DOS4GW fixup record streams often appear to be fixed-stride within a page.
+            // We'll score likely strides based on whether the 16-bit source offset field looks plausible.
+            var candidates = new[] { 8, 10, 12, 16 };
+            var best = new StrideGuess(16, double.NegativeInfinity, 0, 0);
+
+            foreach (var stride in candidates)
+            {
+                if (stride <= 0 || len < stride)
+                    continue;
+
+                var entries = Math.Min(len / stride, 128);
+                var checkedEntries = 0;
+                var validSrcOff = 0;
+                double score = 0;
+
+                for (var i = 0; i < entries; i++)
+                {
+                    var off = start + i * stride;
+                    if (off + 4 > start + len)
+                        break;
+
+                    var srcType = data[off + 0];
+                    var flags = data[off + 1];
+                    var srcOff = (ushort)(data[off + 2] | (data[off + 3] << 8));
+
+                    checkedEntries++;
+
+                    // Source offset should generally be within the page.
+                    if (srcOff < pageSize)
+                    {
+                        validSrcOff++;
+                        score += 2.0;
+                    }
+                    else
+                    {
+                        score -= 2.0;
+                    }
+
+                    // Mild preference for non-trivial values (avoid matching on all-zeros garbage).
+                    if (srcType != 0x00 && srcType != 0xFF)
+                        score += 0.25;
+                    if (flags != 0x00 && flags != 0xFF)
+                        score += 0.10;
+                }
+
+                if (len % stride == 0)
+                    score += 5.0;
+
+                // Prefer higher valid ratio.
+                if (checkedEntries > 0)
+                    score += 5.0 * ((double)validSrcOff / checkedEntries);
+
+                if (score > best.Score)
+                    best = new StrideGuess(stride, score, validSrcOff, checkedEntries);
+            }
+
+            // Fallback
+            if (double.IsNegativeInfinity(best.Score))
+                return new StrideGuess(16, 0, 0, 0);
+
+            return best;
+        }
+
+        private static string DumpStrideView(byte[] data, int start, int end, int stride, int maxEntries)
+        {
+            if (data == null || stride <= 0 || start < 0 || end > data.Length || end <= start)
+                return string.Empty;
+
+            var sb = new StringBuilder();
+            var len = end - start;
+            var entries = Math.Min(len / stride, maxEntries);
+
+            for (var i = 0; i < entries; i++)
+            {
+                var off = start + i * stride;
+                if (off + stride > end)
+                    break;
+
+                var srcType = data[off + 0];
+                var flags = data[off + 1];
+                var srcOff = (ushort)(data[off + 2] | (data[off + 3] << 8));
+                var restLen = Math.Max(0, stride - 4);
+                var rest = restLen == 0 ? string.Empty : BitConverter.ToString(data, off + 4, restLen).Replace("-", " ");
+
+                sb.AppendLine($";   [{i:00}] +0x{(off - start):X3}  type=0x{srcType:X2} flags=0x{flags:X2} srcOff=0x{srcOff:X4}  rest={rest}");
+            }
+
+            return sb.ToString().TrimEnd();
+        }
+
+        public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, bool leFixups, bool leGlobals, out string output, out string error)
         {
             output = string.Empty;
             error = string.Empty;
@@ -259,6 +353,9 @@ namespace MBBSDASM.Dasm
                 sb.AppendLine($"; NOTE: LE fixup annotations enabled (best-effort)");
             else
                 sb.AppendLine($"; NOTE: Minimal LE support (no fixups/import analysis)");
+
+            if (leGlobals)
+                sb.AppendLine($"; NOTE: LE globals enabled (disp32 fixups become g_XXXXXXXX symbols)");
             sb.AppendLine($"; XREFS: derived from relative CALL/JMP/Jcc only");
             if (leFull)
                 sb.AppendLine("; LE mode: FULL (disassemble from object start)");
@@ -345,6 +442,7 @@ namespace MBBSDASM.Dasm
                         fileBytes,
                         fixupPageOffsets,
                         fixupRecordStream,
+                    objBytes,
                         obj,
                         startLinear,
                         endLinear);
@@ -391,7 +489,21 @@ namespace MBBSDASM.Dasm
                 }
 
                 // Second pass: render with labels and inline xref hints.
-                var sortedFixups = objFixups == null ? null : objFixups.OrderBy(f => f.SourceLinear).ToList();
+                var sortedFixups = objFixups == null ? null : objFixups.OrderBy(f => f.SiteLinear).ToList();
+
+                Dictionary<uint, string> globalSymbols = null;
+                if (leGlobals && sortedFixups != null && sortedFixups.Count > 0)
+                {
+                    globalSymbols = CollectGlobalSymbols(instructions, sortedFixups);
+                    if (globalSymbols.Count > 0)
+                    {
+                        sb.AppendLine("; Globals (derived from disp32 fixups)");
+                        foreach (var kvp in globalSymbols.OrderBy(k => k.Key))
+                            sb.AppendLine($"{kvp.Value} EQU 0x{kvp.Key:X8}");
+                        sb.AppendLine(";");
+                    }
+                }
+
                 var fixupIdx = 0;
                 foreach (var ins in instructions)
                 {
@@ -412,22 +524,26 @@ namespace MBBSDASM.Dasm
                     }
 
                     var bytes = BitConverter.ToString(ins.Bytes).Replace("-", string.Empty);
-                    var line = $"{ins.Offset:X8}h {bytes.PadRight(Constants.MAX_INSTRUCTION_LENGTH, ' ')} {ins}";
+                    var insText = ins.ToString();
 
                     if (TryGetRelativeBranchTarget(ins, out var branchTarget, out var isCall2))
                     {
                         var label = isCall2 ? $"func_{branchTarget:X8}" : $"loc_{branchTarget:X8}";
-                        line += $" ; {(isCall2 ? "call" : "jmp")} {label}";
+                        insText += $" ; {(isCall2 ? "call" : "jmp")} {label}";
                     }
 
                     if (sortedFixups != null && sortedFixups.Count > 0)
                     {
-                        var insStart = (uint)ins.Offset;
-                        var insEnd = unchecked((uint)(insStart + (uint)ins.Length));
-                        var fixupText = BuildFixupAnnotation(sortedFixups, insStart, insEnd, ref fixupIdx);
+                        var fixupsHere = GetFixupsForInstruction(sortedFixups, ins, ref fixupIdx);
+                        if (leGlobals && globalSymbols != null && globalSymbols.Count > 0)
+                            insText = ApplyGlobalSymbolRewrites(ins, insText, fixupsHere, globalSymbols);
+
+                        var fixupText = FormatFixupAnnotation(ins, fixupsHere);
                         if (!string.IsNullOrEmpty(fixupText))
-                            line += $" ; FIXUP: {fixupText}";
+                            insText += $" ; FIXUP: {fixupText}";
                     }
+
+                    var line = $"{ins.Offset:X8}h {bytes.PadRight(Constants.MAX_INSTRUCTION_LENGTH, ' ')} {insText}";
 
                     sb.AppendLine(line);
                 }
@@ -439,39 +555,247 @@ namespace MBBSDASM.Dasm
             return true;
         }
 
-        private static string BuildFixupAnnotation(List<LEFixup> fixups, uint insStart, uint insEnd, ref int idx)
+        private static Dictionary<uint, string> CollectGlobalSymbols(List<Instruction> instructions, List<LEFixup> sortedFixups)
         {
-            if (fixups == null || fixups.Count == 0)
-                return string.Empty;
+            var globals = new Dictionary<uint, string>();
+            if (instructions == null || sortedFixups == null || sortedFixups.Count == 0)
+                return globals;
+
+            var idx = 0;
+            foreach (var ins in instructions)
+            {
+                var fixupsHere = GetFixupsForInstruction(sortedFixups, ins, ref idx);
+                foreach (var f in fixupsHere)
+                {
+                    // Only globalize memory absolute displacements.
+                    if (!f.Value32.HasValue || !f.TargetObject.HasValue)
+                        continue;
+                    var delta = unchecked((int)(f.SiteLinear - (uint)ins.Offset));
+                    if (!TryClassifyFixupKind(ins, delta, out var kind) || kind != "disp32")
+                        continue;
+
+                    var addr = f.Value32.Value;
+                    if (!globals.ContainsKey(addr))
+                        globals[addr] = $"g_{addr:X8}";
+                }
+            }
+
+            return globals;
+        }
+
+        private static string ApplyGlobalSymbolRewrites(Instruction ins, string insText, List<LEFixup> fixupsHere, Dictionary<uint, string> globals)
+        {
+            if (string.IsNullOrEmpty(insText) || fixupsHere == null || fixupsHere.Count == 0 || globals == null || globals.Count == 0)
+                return insText;
+
+            var rewritten = insText;
+            foreach (var f in fixupsHere)
+            {
+                if (!f.Value32.HasValue || !globals.TryGetValue(f.Value32.Value, out var sym))
+                    continue;
+
+                var delta = unchecked((int)(f.SiteLinear - (uint)ins.Offset));
+                if (!TryClassifyFixupKind(ins, delta, out var kind) || kind != "disp32")
+                    continue;
+
+                // SharpDisasm tends to render these as 0x????? (lowercase hex). Replace both just in case.
+                var needleLower = $"0x{f.Value32.Value:x}";
+                var needleUpper = $"0x{f.Value32.Value:X}";
+                rewritten = rewritten.Replace(needleLower, sym).Replace(needleUpper, sym);
+            }
+
+            return rewritten;
+        }
+
+        private static List<LEFixup> GetFixupsForInstruction(List<LEFixup> fixups, Instruction ins, ref int idx)
+        {
+            if (fixups == null || fixups.Count == 0 || ins == null)
+                return new List<LEFixup>(0);
+
+            var insStart = (uint)ins.Offset;
+            var insEnd = unchecked((uint)(insStart + (uint)ins.Length));
 
             // Advance past fixups that are below this instruction.
-            while (idx < fixups.Count && fixups[idx].SourceLinear < insStart)
+            while (idx < fixups.Count && fixups[idx].SiteLinear < insStart)
                 idx++;
 
             if (idx >= fixups.Count)
-                return string.Empty;
+                return new List<LEFixup>(0);
 
-            var hit = new List<string>();
+            var hit = new List<LEFixup>();
             var scan = idx;
             while (scan < fixups.Count)
             {
                 var f = fixups[scan];
-                if (f.SourceLinear >= insEnd)
+                if (f.SiteLinear >= insEnd)
                     break;
-                hit.Add(f.Description);
+                hit.Add(f);
                 scan++;
             }
 
-            if (hit.Count == 0)
+            return hit;
+        }
+
+        private static string FormatFixupAnnotation(Instruction ins, List<LEFixup> fixupsHere)
+        {
+            if (fixupsHere == null || fixupsHere.Count == 0 || ins == null)
                 return string.Empty;
 
-            // Cap spammy cases (some pages can have many fixups that land within a single instruction range).
-            var distinct = hit.Distinct().ToList();
+            var insStart = (uint)ins.Offset;
+            var parts = new List<string>();
+
+            foreach (var f in fixupsHere)
+            {
+                var delta = unchecked((int)(f.SiteLinear - insStart));
+                var kind = TryClassifyFixupKind(ins, delta, out var k) ? k : "unk";
+
+                var mapped = (f.TargetObject.HasValue && f.TargetOffset.HasValue)
+                    ? $" => obj{f.TargetObject.Value}+0x{f.TargetOffset.Value:X}"
+                    : string.Empty;
+
+                var v32 = f.Value32.HasValue ? $" val32=0x{f.Value32.Value:X8}" : string.Empty;
+
+                parts.Add($"{kind} site+{delta} type=0x{f.Type:X2} flags=0x{f.Flags:X2}{v32}{mapped}");
+            }
+
+            if (parts.Count == 0)
+                return string.Empty;
+
+            var distinct = parts.Distinct().ToList();
             const int maxShown = 3;
             if (distinct.Count <= maxShown)
                 return string.Join(" | ", distinct);
 
             return string.Join(" | ", distinct.Take(maxShown)) + $" | (+{distinct.Count - maxShown} more)";
+        }
+
+        private static bool TryClassifyFixupKind(Instruction ins, int fixupDelta, out string kind)
+        {
+            kind = string.Empty;
+
+            if (ins?.Bytes == null || ins.Bytes.Length == 0)
+                return false;
+            if (fixupDelta < 0 || fixupDelta >= ins.Bytes.Length)
+                return false;
+
+            var b = ins.Bytes;
+
+            // Skip common prefixes
+            var p = 0;
+            while (p < b.Length)
+            {
+                var x = b[p];
+                // operand-size, address-size, rep/lock, segment overrides
+                if (x == 0x66 || x == 0x67 || x == 0xF0 || x == 0xF2 || x == 0xF3 ||
+                    x == 0x2E || x == 0x36 || x == 0x3E || x == 0x26 || x == 0x64 || x == 0x65)
+                {
+                    p++;
+                    continue;
+                }
+                break;
+            }
+
+            if (p >= b.Length)
+                return false;
+
+            var op0 = b[p];
+
+            // MOV moffs: A0-A3 (disp32 right after opcode in 32-bit addr mode)
+            if (op0 >= 0xA0 && op0 <= 0xA3)
+            {
+                var dispOff = p + 1;
+                if (fixupDelta == dispOff)
+                {
+                    kind = "disp32";
+                    return true;
+                }
+            }
+
+            // Two-byte opcodes
+            var opLen = 1;
+            byte op1 = 0;
+            if (op0 == 0x0F)
+            {
+                if (p + 1 >= b.Length)
+                    return false;
+                op1 = b[p + 1];
+                opLen = 2;
+            }
+
+            var opIndexEnd = p + opLen;
+            if (opIndexEnd >= b.Length)
+                return false;
+
+            // Patterns with ModRM + disp32 + immediate (very common in DOS4GW code)
+            // 80/81/83 grp1, C6/C7 mov r/m, imm
+            if (op0 == 0x80 || op0 == 0x81 || op0 == 0x83 || op0 == 0xC6 || op0 == 0xC7)
+            {
+                var modrmIndex = opIndexEnd;
+                var modrm = b[modrmIndex];
+                var mod = (modrm >> 6) & 0x3;
+                var rm = modrm & 0x7;
+
+                // Only handle the simple disp32 form: mod=00 rm=101 (no SIB)
+                if (mod == 0 && rm == 5)
+                {
+                    var dispOff = modrmIndex + 1;
+                    var afterDisp = dispOff + 4;
+
+                    if (fixupDelta == dispOff)
+                    {
+                        kind = "disp32";
+                        return true;
+                    }
+
+                    // Immediate offset depends on opcode.
+                    if (op0 == 0x81 || op0 == 0xC7)
+                    {
+                        if (fixupDelta == afterDisp)
+                        {
+                            kind = "imm32";
+                            return true;
+                        }
+                    }
+                    else if (op0 == 0x80 || op0 == 0x83 || op0 == 0xC6)
+                    {
+                        if (fixupDelta == afterDisp)
+                        {
+                            kind = "imm8";
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // Common reg/mem ops with disp32 only (no immediate): 8B/89/8D, etc.
+            if (op0 == 0x8B || op0 == 0x89 || op0 == 0x8D)
+            {
+                var modrmIndex = opIndexEnd;
+                if (modrmIndex < b.Length)
+                {
+                    var modrm = b[modrmIndex];
+                    var mod = (modrm >> 6) & 0x3;
+                    var rm = modrm & 0x7;
+                    if (mod == 0 && rm == 5)
+                    {
+                        var dispOff = modrmIndex + 1;
+                        if (fixupDelta == dispOff)
+                        {
+                            kind = "disp32";
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // Fallback heuristic: if fixup hits the last 4 bytes, it’s likely an imm32 or disp32.
+            if (ins.Bytes.Length >= 4 && fixupDelta == ins.Bytes.Length - 4)
+            {
+                kind = "imm32?";
+                return true;
+            }
+
+            return false;
         }
 
         private static ulong ComputeEntryLinear(LEHeader header, List<LEObject> objects)
@@ -684,13 +1008,20 @@ namespace MBBSDASM.Dasm
             byte[] fileBytes,
             uint[] fixupPageOffsets,
             byte[] fixupRecordStream,
+            byte[] objBytes,
             LEObject obj,
             uint startLinear,
             uint endLinear)
         {
-            // Best-effort decoder for a subset of LE fixup records.
-            // It’s deliberately defensive; if parsing goes off-rails for a page, we stop for that page.
+            // DOS4GW/MS-DOS focused fixup decoder.
+            // Empirically, many DOS4GW LEs use a fixed record stride per page (often 8/10/12/16).
+            // We use the stride-guessing logic to parse records consistently and then enrich by
+            // reading the value at the fixup site and mapping it to an object+offset when it looks
+            // like an internal pointer.
             var fixups = new List<LEFixup>();
+
+            if (objBytes == null || objBytes.Length == 0)
+                return fixups;
 
             for (var i = 0; i < obj.PageCount; i++)
             {
@@ -723,92 +1054,164 @@ namespace MBBSDASM.Dasm
                 if (recEnd > fixupRecordStream.Length)
                     continue;
 
-                var p = (int)recStart;
-                var limit = (int)recEnd;
-                while (p + 4 <= limit)
+                var len = (int)(recEnd - recStart);
+                var guess = GuessStride(fixupRecordStream, (int)recStart, len, (int)header.PageSize);
+                var stride = guess.Stride;
+                if (stride <= 0)
+                    stride = 16;
+
+                var entries = len / stride;
+                if (entries <= 0)
+                    continue;
+
+                // Keep a reasonable cap to avoid pathological pages.
+                entries = Math.Min(entries, 4096);
+
+                for (var entry = 0; entry < entries; entry++)
                 {
-                    var srcType = fixupRecordStream[p++];
-                    var flags = fixupRecordStream[p++];
-                    var srcOff = (ushort)(fixupRecordStream[p] | (fixupRecordStream[p + 1] << 8));
-                    p += 2;
-
-                    var sourceLinear = unchecked(pageLinearBase + srcOff);
-
-                    // The LE/LX fixup format is nuanced. We'll decode a small, validated subset.
-                    // If validation fails, we fall back to a compact raw marker while still advancing.
-                    string desc;
-
-                    // Most fixup records we care about include at least 6 more bytes.
-                    if (p + 6 > limit)
+                    var p = (int)recStart + entry * stride;
+                    if (p + 4 > (int)recEnd)
                         break;
 
-                    var w1 = (ushort)(fixupRecordStream[p] | (fixupRecordStream[p + 1] << 8));
-                    var d1 = ReadUInt32(fixupRecordStream, p + 2);
+                    var srcType = fixupRecordStream[p + 0];
+                    var flags = fixupRecordStream[p + 1];
+                    var srcOff = (ushort)(fixupRecordStream[p + 2] | (fixupRecordStream[p + 3] << 8));
+                    var sourceLinear = unchecked(pageLinearBase + srcOff);
 
-                    // Heuristic 1: internal object+offset
-                    if (w1 >= 1 && w1 <= header.ObjectCount)
+                    // Best-effort: read value at/near fixup site from reconstructed object bytes.
+                    // Some DOS4GW records appear to point slightly before the relocated field; probing
+                    // a few bytes forward greatly reduces false positives (e.g., reading opcode bytes).
+                    var objOffset = (int)((uint)i * header.PageSize + srcOff);
+                    uint? value32 = null;
+                    ushort? value16 = null;
+                    int chosenDelta = 0;
+                    int? mappedObj = null;
+                    uint mappedOff = 0;
+
+                    if (objOffset >= 0)
                     {
-                        var targetObj = w1;
-                        var targetOff = d1;
-                        var objEntry = objects.FirstOrDefault(o => o.Index == targetObj);
-                        // targetOff should usually be within virtual size when it points into object memory.
-                        if (objEntry.VirtualSize == 0 || targetOff < objEntry.VirtualSize + header.PageSize)
+                        // Try to find a 32-bit in-module pointer within +0..+3.
+                        for (var delta = 0; delta <= 3; delta++)
                         {
-                            var targetLinear = unchecked(objEntry.BaseAddress + targetOff);
-                            desc = $"internal obj{targetObj}+0x{targetOff:X} (0x{targetLinear:X8})";
+                            var off = objOffset + delta;
+                            if (off + 4 > objBytes.Length)
+                                break;
+                            var v = ReadUInt32(objBytes, off);
+                            if (TryMapLinearToObject(objects, v, out var tobj, out var toff))
+                            {
+                                value32 = v;
+                                chosenDelta = delta;
+                                mappedObj = tobj;
+                                mappedOff = toff;
+                                break;
+                            }
+                        }
+
+                        // If no mapped pointer found, read the raw dword/word at the original site.
+                        if (!value32.HasValue)
+                        {
+                            if (objOffset + 4 <= objBytes.Length)
+                                value32 = ReadUInt32(objBytes, objOffset);
+                            else if (objOffset + 2 <= objBytes.Length)
+                                value16 = ReadUInt16(objBytes, objOffset);
+                        }
+                    }
+
+                    // For DOS4GW/MS-DOS game workflows we mostly care about internal pointers.
+                    // If we couldn't map a 32-bit value into a known object, don't print it as it
+                    // frequently represents opcode bytes or plain constants.
+                    if (value32.HasValue && !mappedObj.HasValue)
+                        value32 = null;
+
+                    var desc = $"type=0x{srcType:X2} flags=0x{flags:X2} stride={stride}";
+
+                    if (value32.HasValue)
+                    {
+                        if (mappedObj.HasValue)
+                        {
+                            desc += $" site+{chosenDelta} val32=0x{value32.Value:X8} => obj{mappedObj.Value}+0x{mappedOff:X}";
                         }
                         else
                         {
-                            desc = $"fixup type=0x{srcType:X2} flags=0x{flags:X2}";
+                            // Still useful to print the value when it looks like an in-module linear address.
+                            desc += $" val32=0x{value32.Value:X8}";
                         }
                     }
-                    else
+                    else if (value16.HasValue)
                     {
-                        // Heuristic 2: import by name (module index + proc name offset)
-                        var mod = w1;
-                        var procOff = d1;
-                        var modName = (importModules != null && mod > 0 && mod <= importModules.Count) ? importModules[mod - 1] : string.Empty;
-                        var procName = !string.IsNullOrEmpty(modName) ? TryReadImportProcName(fileBytes, header, procOff) : string.Empty;
-                        if (!string.IsNullOrEmpty(modName) && !string.IsNullOrEmpty(procName))
-                        {
-                            desc = $"import {modName}!{procName}";
-                        }
-                        else
-                        {
-                            // Heuristic 3: import by ordinal (module index + ordinal in low word of d1)
-                            var ord = (ushort)(d1 & 0xFFFF);
-                            if (!string.IsNullOrEmpty(modName) && ord != 0)
-                                desc = $"import {modName}!#{ord}";
-                            else
-                                desc = $"fixup type=0x{srcType:X2} flags=0x{flags:X2}";
-                        }
+                        desc += $" val16=0x{value16.Value:X4}";
                     }
 
-                    // Advance past the fields we just sampled.
-                    p += 6;
-
-                    // Best-effort: additive value present
-                    if ((flags & 0x04) != 0)
+                    // (Optional) try to interpret import module/proc table if present.
+                    // Many DOS4GW games have ImportModuleTableEntries=0, so this often won't apply.
+                    if (importModules != null && importModules.Count > 0 && stride >= 10)
                     {
-                        if (p + 4 <= limit)
-                            p += 4;
+                        // Try a lightweight hint: treat next 2 bytes as module index and next 4 as name offset.
+                        if (p + 10 <= (int)recEnd)
+                        {
+                            var mod = (ushort)(fixupRecordStream[p + 4] | (fixupRecordStream[p + 5] << 8));
+                            var procOff = ReadUInt32(fixupRecordStream, p + 6);
+                            if (mod > 0 && mod <= importModules.Count)
+                            {
+                                var modName = importModules[mod - 1];
+                                var procName = TryReadImportProcName(fileBytes, header, procOff);
+                                if (!string.IsNullOrEmpty(modName) && !string.IsNullOrEmpty(procName))
+                                    desc += $" import={modName}!{procName}";
+                                else if (!string.IsNullOrEmpty(modName))
+                                    desc += $" import={modName}!@0x{procOff:X}";
+                            }
+                        }
                     }
 
                     // Only keep fixups within the current disassembly window.
                     if (sourceLinear >= startLinear && sourceLinear < endLinear)
                     {
+                        var siteLinear = unchecked(sourceLinear + (uint)chosenDelta);
                         fixups.Add(new LEFixup
                         {
                             SourceLinear = sourceLinear,
                             SourceOffsetInPage = srcOff,
                             PageNumber = physicalPage,
-                            Description = desc
+                            SiteLinear = siteLinear,
+                            SiteDelta = (byte)Math.Min(255, Math.Max(0, chosenDelta)),
+                            Value32 = value32,
+                            TargetObject = mappedObj,
+                            TargetOffset = mappedObj.HasValue ? (uint?)mappedOff : null,
+                            Type = srcType,
+                            Flags = flags
                         });
                     }
                 }
             }
 
             return fixups;
+        }
+
+        private static bool TryMapLinearToObject(List<LEObject> objects, uint linear, out int objIndex, out uint offset)
+        {
+            objIndex = 0;
+            offset = 0;
+
+            if (objects == null || objects.Count == 0)
+                return false;
+
+            // Objects are typically few (here: 3), so linear scan is fine.
+            foreach (var obj in objects)
+            {
+                if (obj.VirtualSize == 0)
+                    continue;
+
+                // Allow a small slack for references that land in padding past VirtualSize.
+                var end = unchecked(obj.BaseAddress + obj.VirtualSize + 0x1000);
+                if (linear >= obj.BaseAddress && linear < end)
+                {
+                    objIndex = obj.Index;
+                    offset = unchecked(linear - obj.BaseAddress);
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static List<LEObject> ParseObjects(byte[] fileBytes, LEHeader header)
