@@ -91,6 +91,13 @@ namespace MBBSDASM.UI.impl
         private bool _bMacros;
 
         /// <summary>
+        ///     LE (DOS4GW) fixup annotations
+        ///     Specified with the -lefixups argument
+        ///     For LE inputs, parses fixup records (best-effort) and annotates instructions when fixups apply.
+        /// </summary>
+        private bool _bLeFixups;
+
+        /// <summary>
         ///     Default Constructor
         /// </summary>
         /// <param name="args">string - Command Line Arguments</param>
@@ -140,6 +147,9 @@ namespace MBBSDASM.UI.impl
                             _leBytesLimit = bytesLimit;
                             i++;
                             break;
+                        case "-LEFIXUPS":
+                            _bLeFixups = true;
+                            break;
                         case "-SPLITKB":
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -SPLITKB requires a value");
@@ -164,6 +174,8 @@ namespace MBBSDASM.UI.impl
                             Console.WriteLine(
                                 "-LEBYTES <n> -- (LE inputs) Limit disassembly to n bytes from start offset");
                             Console.WriteLine(
+                                "-LEFIXUPS -- (LE inputs) Annotate output with best-effort LE fixups/import targets");
+                            Console.WriteLine(
                                 "-SPLITKB <n> -- (with -O) Split output into ~n KB chunks (out.001.asm, out.002.asm, ...)");
                             Console.WriteLine(
                                 "-MACROS -- Replace repeated straight-line chunks with macros (best-effort, readability)");
@@ -177,7 +189,7 @@ namespace MBBSDASM.UI.impl
 
                 //LE/DOS4GW support (minimal): bypass NE-specific pipeline
                 //NOTE: This tool was originally NE-only; LE support does not include relocations/import analysis.
-                if (LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, out var leOutput, out var leError))
+                if (LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, out var leOutput, out var leError))
                 {
                     if (_bAnalysis)
                         _logger.Warn("Warning: -analysis is not supported for LE inputs, ignoring");
@@ -187,6 +199,8 @@ namespace MBBSDASM.UI.impl
                         _logger.Warn("Warning: -minimal has no effect for LE inputs (LE output is always minimal)");
                     if (_bLeFull && _leBytesLimit.HasValue)
                         _logger.Warn("Warning: -lebytes is ignored when -lefull is specified");
+                    if (_bLeFixups)
+                        _logger.Info("LE fixup annotations enabled (best-effort)");
 
                     if (string.IsNullOrEmpty(_sOutputFile))
                     {

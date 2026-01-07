@@ -27,6 +27,14 @@ namespace MBBSDASM.Dasm
 
         private const ushort LE_OBJECT_ENTRY_SIZE = 24;
 
+        private sealed class LEFixup
+        {
+            public uint SourceLinear;
+            public ushort SourceOffsetInPage;
+            public uint PageNumber; // 1-based physical page
+            public string Description = string.Empty;
+        }
+
         private struct LEHeader
         {
             public int HeaderOffset;
@@ -43,6 +51,9 @@ namespace MBBSDASM.Dasm
             public uint ObjectPageMapOffset;
             public uint FixupPageTableOffset;
             public uint FixupRecordTableOffset;
+            public uint ImportModuleTableOffset;
+            public uint ImportModuleTableEntries;
+            public uint ImportProcTableOffset;
             public uint DataPagesOffset;
         }
 
@@ -56,7 +67,7 @@ namespace MBBSDASM.Dasm
             public uint PageCount;
         }
 
-        public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, out string output, out string error)
+        public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, bool leFixups, out string output, out string error)
         {
             output = string.Empty;
             error = string.Empty;
@@ -80,6 +91,16 @@ namespace MBBSDASM.Dasm
             var objects = ParseObjects(fileBytes, header);
             var pageMap = ParseObjectPageMap(fileBytes, header);
 
+            List<string> importModules = null;
+            byte[] fixupRecordStream = null;
+            uint[] fixupPageOffsets = null;
+
+            if (leFixups)
+            {
+                importModules = TryParseImportModules(fileBytes, header);
+                TryGetFixupStreams(fileBytes, header, out fixupPageOffsets, out fixupRecordStream);
+            }
+
             var dataPagesBase = header.HeaderOffset + (int)header.DataPagesOffset;
             if (dataPagesBase <= 0 || dataPagesBase >= fileBytes.Length)
             {
@@ -91,7 +112,10 @@ namespace MBBSDASM.Dasm
             sb.AppendLine($"; Disassembly of {Path.GetFileName(inputFile)} (LE / DOS4GW)");
             sb.AppendLine($"; PageSize: {header.PageSize}  LastPageSize: {header.LastPageSize}  Pages: {header.NumberOfPages}");
             sb.AppendLine($"; Entry: Obj {header.EntryEipObject} + 0x{header.EntryEip:X} (Linear 0x{ComputeEntryLinear(header, objects):X})");
-            sb.AppendLine($"; NOTE: Minimal LE support (no fixups/import analysis)");
+            if (leFixups)
+                sb.AppendLine($"; NOTE: LE fixup annotations enabled (best-effort)");
+            else
+                sb.AppendLine($"; NOTE: Minimal LE support (no fixups/import analysis)");
             sb.AppendLine($"; XREFS: derived from relative CALL/JMP/Jcc only");
             if (leFull)
                 sb.AppendLine("; LE mode: FULL (disassemble from object start)");
@@ -167,6 +191,22 @@ namespace MBBSDASM.Dasm
                 var startLinear = obj.BaseAddress + (uint)startOffsetWithinObject;
                 var endLinear = startLinear + (uint)codeLen;
 
+                List<LEFixup> objFixups = null;
+                if (leFixups && fixupRecordStream != null && fixupPageOffsets != null)
+                {
+                    objFixups = ParseFixupsForWindow(
+                        header,
+                        objects,
+                        pageMap,
+                        importModules,
+                        fileBytes,
+                        fixupPageOffsets,
+                        fixupRecordStream,
+                        obj,
+                        startLinear,
+                        endLinear);
+                }
+
                 // First pass: disassemble and collect basic xrefs and function/label targets.
                 var dis = new SharpDisasm.Disassembler(code, ArchitectureMode.x86_32, startLinear, true);
                 var instructions = dis.Disassemble().ToList();
@@ -208,6 +248,8 @@ namespace MBBSDASM.Dasm
                 }
 
                 // Second pass: render with labels and inline xref hints.
+                var sortedFixups = objFixups == null ? null : objFixups.OrderBy(f => f.SourceLinear).ToList();
+                var fixupIdx = 0;
                 foreach (var ins in instructions)
                 {
                     var addr = (uint)ins.Offset;
@@ -235,6 +277,15 @@ namespace MBBSDASM.Dasm
                         line += $" ; {(isCall2 ? "call" : "jmp")} {label}";
                     }
 
+                    if (sortedFixups != null && sortedFixups.Count > 0)
+                    {
+                        var insStart = (uint)ins.Offset;
+                        var insEnd = unchecked((uint)(insStart + (uint)ins.Length));
+                        var fixupText = BuildFixupAnnotation(sortedFixups, insStart, insEnd, ref fixupIdx);
+                        if (!string.IsNullOrEmpty(fixupText))
+                            line += $" ; FIXUP: {fixupText}";
+                    }
+
                     sb.AppendLine(line);
                 }
 
@@ -243,6 +294,41 @@ namespace MBBSDASM.Dasm
 
             output = sb.ToString();
             return true;
+        }
+
+        private static string BuildFixupAnnotation(List<LEFixup> fixups, uint insStart, uint insEnd, ref int idx)
+        {
+            if (fixups == null || fixups.Count == 0)
+                return string.Empty;
+
+            // Advance past fixups that are below this instruction.
+            while (idx < fixups.Count && fixups[idx].SourceLinear < insStart)
+                idx++;
+
+            if (idx >= fixups.Count)
+                return string.Empty;
+
+            var hit = new List<string>();
+            var scan = idx;
+            while (scan < fixups.Count)
+            {
+                var f = fixups[scan];
+                if (f.SourceLinear >= insEnd)
+                    break;
+                hit.Add(f.Description);
+                scan++;
+            }
+
+            if (hit.Count == 0)
+                return string.Empty;
+
+            // Cap spammy cases (some pages can have many fixups that land within a single instruction range).
+            var distinct = hit.Distinct().ToList();
+            const int maxShown = 3;
+            if (distinct.Count <= maxShown)
+                return string.Join(" | ", distinct);
+
+            return string.Join(" | ", distinct.Take(maxShown)) + $" | (+{distinct.Count - maxShown} more)";
         }
 
         private static ulong ComputeEntryLinear(LEHeader header, List<LEObject> objects)
@@ -316,6 +402,11 @@ namespace MBBSDASM.Dasm
             header.FixupPageTableOffset = ReadUInt32(fileBytes, headerOffset + 0x68);
             header.FixupRecordTableOffset = ReadUInt32(fileBytes, headerOffset + 0x6C);
 
+            // Best-effort: import tables (offsets are relative to LE header)
+            header.ImportModuleTableOffset = ReadUInt32(fileBytes, headerOffset + 0x70);
+            header.ImportModuleTableEntries = ReadUInt32(fileBytes, headerOffset + 0x74);
+            header.ImportProcTableOffset = ReadUInt32(fileBytes, headerOffset + 0x78);
+
             header.DataPagesOffset = ReadUInt32(fileBytes, headerOffset + 0x80);
 
             if (header.PageSize == 0 || header.ObjectCount == 0 || header.NumberOfPages == 0)
@@ -330,6 +421,251 @@ namespace MBBSDASM.Dasm
 
             _logger.Info($"Detected LE header at 0x{headerOffset:X} (Objects={header.ObjectCount}, Pages={header.NumberOfPages}, PageSize={header.PageSize})");
             return true;
+        }
+
+        private static List<string> TryParseImportModules(byte[] fileBytes, LEHeader header)
+        {
+            try
+            {
+                if (header.ImportModuleTableOffset == 0 || header.ImportModuleTableEntries == 0)
+                    return null;
+
+                var start = header.HeaderOffset + (int)header.ImportModuleTableOffset;
+                if (start < 0 || start >= fileBytes.Length)
+                    return null;
+
+                var modules = new List<string>((int)Math.Min(header.ImportModuleTableEntries, 4096));
+                var off = start;
+                for (var i = 0; i < header.ImportModuleTableEntries; i++)
+                {
+                    if (off >= fileBytes.Length)
+                        break;
+                    var len = fileBytes[off];
+                    off++;
+                    if (len == 0)
+                    {
+                        modules.Add(string.Empty);
+                        continue;
+                    }
+                    if (off + len > fileBytes.Length)
+                        break;
+                    var name = Encoding.ASCII.GetString(fileBytes, off, len);
+                    modules.Add(name);
+                    off += len;
+                }
+
+                return modules;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string TryReadImportProcName(byte[] fileBytes, LEHeader header, uint procNameOffset)
+        {
+            try
+            {
+                if (header.ImportProcTableOffset == 0)
+                    return string.Empty;
+
+                var baseOff = header.HeaderOffset + (int)header.ImportProcTableOffset;
+                var off = baseOff + (int)procNameOffset;
+                if (off < 0 || off >= fileBytes.Length)
+                    return string.Empty;
+                var len = fileBytes[off];
+                off++;
+                if (len == 0)
+                    return string.Empty;
+                if (off + len > fileBytes.Length)
+                    return string.Empty;
+                return Encoding.ASCII.GetString(fileBytes, off, len);
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        private static bool TryGetFixupStreams(byte[] fileBytes, LEHeader header, out uint[] fixupPageOffsets, out byte[] fixupRecordStream)
+        {
+            fixupPageOffsets = null;
+            fixupRecordStream = null;
+
+            try
+            {
+                if (header.FixupPageTableOffset == 0 || header.FixupRecordTableOffset == 0 || header.NumberOfPages == 0)
+                    return false;
+
+                var pageTableStart = header.HeaderOffset + (int)header.FixupPageTableOffset;
+                var recordStart = header.HeaderOffset + (int)header.FixupRecordTableOffset;
+                if (pageTableStart < 0 || pageTableStart >= fileBytes.Length)
+                    return false;
+                if (recordStart < 0 || recordStart >= fileBytes.Length)
+                    return false;
+
+                var count = checked((int)header.NumberOfPages + 1);
+                var offsets = new uint[count];
+                for (var i = 0; i < count; i++)
+                {
+                    var off = pageTableStart + i * 4;
+                    if (off + 4 > fileBytes.Length)
+                        return false;
+                    offsets[i] = ReadUInt32(fileBytes, off);
+                }
+
+                var total = offsets[count - 1];
+                if (total == 0)
+                    return false;
+                if (recordStart + total > fileBytes.Length)
+                    total = (uint)Math.Max(0, fileBytes.Length - recordStart);
+
+                var records = new byte[total];
+                Buffer.BlockCopy(fileBytes, recordStart, records, 0, (int)total);
+
+                fixupPageOffsets = offsets;
+                fixupRecordStream = records;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static List<LEFixup> ParseFixupsForWindow(
+            LEHeader header,
+            List<LEObject> objects,
+            uint[] pageMap,
+            List<string> importModules,
+            byte[] fileBytes,
+            uint[] fixupPageOffsets,
+            byte[] fixupRecordStream,
+            LEObject obj,
+            uint startLinear,
+            uint endLinear)
+        {
+            // Best-effort decoder for a subset of LE fixup records.
+            // It’s deliberately defensive; if parsing goes off-rails for a page, we stop for that page.
+            var fixups = new List<LEFixup>();
+
+            for (var i = 0; i < obj.PageCount; i++)
+            {
+                // IMPORTANT: Fixup page table is indexed by the logical page-map entry index,
+                // not the physical page number.
+                var logicalPageIndex0 = (int)obj.PageMapIndex - 1 + i;
+                if (logicalPageIndex0 < 0 || logicalPageIndex0 >= pageMap.Length)
+                    break;
+
+                var logicalPageNumber1 = (uint)(logicalPageIndex0 + 1);
+                if (logicalPageNumber1 == 0 || logicalPageNumber1 > header.NumberOfPages)
+                    continue;
+
+                var physicalPage = pageMap[logicalPageIndex0]; // may be 0
+                var pageLinearBase = unchecked(obj.BaseAddress + (uint)(i * header.PageSize));
+
+                // quick window reject
+                var pageLinearEnd = unchecked(pageLinearBase + header.PageSize);
+                if (pageLinearEnd <= startLinear || pageLinearBase >= endLinear)
+                    continue;
+
+                var pageIndex0 = (int)(logicalPageNumber1 - 1);
+                if (pageIndex0 < 0 || pageIndex0 + 1 >= fixupPageOffsets.Length)
+                    continue;
+
+                var recStart = fixupPageOffsets[pageIndex0];
+                var recEnd = fixupPageOffsets[pageIndex0 + 1];
+                if (recEnd <= recStart)
+                    continue;
+                if (recEnd > fixupRecordStream.Length)
+                    continue;
+
+                var p = (int)recStart;
+                var limit = (int)recEnd;
+                while (p + 4 <= limit)
+                {
+                    var srcType = fixupRecordStream[p++];
+                    var flags = fixupRecordStream[p++];
+                    var srcOff = (ushort)(fixupRecordStream[p] | (fixupRecordStream[p + 1] << 8));
+                    p += 2;
+
+                    var sourceLinear = unchecked(pageLinearBase + srcOff);
+
+                    // The LE/LX fixup format is nuanced. We'll decode a small, validated subset.
+                    // If validation fails, we fall back to a compact raw marker while still advancing.
+                    string desc;
+
+                    // Most fixup records we care about include at least 6 more bytes.
+                    if (p + 6 > limit)
+                        break;
+
+                    var w1 = (ushort)(fixupRecordStream[p] | (fixupRecordStream[p + 1] << 8));
+                    var d1 = ReadUInt32(fixupRecordStream, p + 2);
+
+                    // Heuristic 1: internal object+offset
+                    if (w1 >= 1 && w1 <= header.ObjectCount)
+                    {
+                        var targetObj = w1;
+                        var targetOff = d1;
+                        var objEntry = objects.FirstOrDefault(o => o.Index == targetObj);
+                        // targetOff should usually be within virtual size when it points into object memory.
+                        if (objEntry.VirtualSize == 0 || targetOff < objEntry.VirtualSize + header.PageSize)
+                        {
+                            var targetLinear = unchecked(objEntry.BaseAddress + targetOff);
+                            desc = $"internal obj{targetObj}+0x{targetOff:X} (0x{targetLinear:X8})";
+                        }
+                        else
+                        {
+                            desc = $"fixup type=0x{srcType:X2} flags=0x{flags:X2}";
+                        }
+                    }
+                    else
+                    {
+                        // Heuristic 2: import by name (module index + proc name offset)
+                        var mod = w1;
+                        var procOff = d1;
+                        var modName = (importModules != null && mod > 0 && mod <= importModules.Count) ? importModules[mod - 1] : string.Empty;
+                        var procName = !string.IsNullOrEmpty(modName) ? TryReadImportProcName(fileBytes, header, procOff) : string.Empty;
+                        if (!string.IsNullOrEmpty(modName) && !string.IsNullOrEmpty(procName))
+                        {
+                            desc = $"import {modName}!{procName}";
+                        }
+                        else
+                        {
+                            // Heuristic 3: import by ordinal (module index + ordinal in low word of d1)
+                            var ord = (ushort)(d1 & 0xFFFF);
+                            if (!string.IsNullOrEmpty(modName) && ord != 0)
+                                desc = $"import {modName}!#{ord}";
+                            else
+                                desc = $"fixup type=0x{srcType:X2} flags=0x{flags:X2}";
+                        }
+                    }
+
+                    // Advance past the fields we just sampled.
+                    p += 6;
+
+                    // Best-effort: additive value present
+                    if ((flags & 0x04) != 0)
+                    {
+                        if (p + 4 <= limit)
+                            p += 4;
+                    }
+
+                    // Only keep fixups within the current disassembly window.
+                    if (sourceLinear >= startLinear && sourceLinear < endLinear)
+                    {
+                        fixups.Add(new LEFixup
+                        {
+                            SourceLinear = sourceLinear,
+                            SourceOffsetInPage = srcOff,
+                            PageNumber = physicalPage,
+                            Description = desc
+                        });
+                    }
+                }
+            }
+
+            return fixups;
         }
 
         private static List<LEObject> ParseObjects(byte[] fileBytes, LEHeader header)
