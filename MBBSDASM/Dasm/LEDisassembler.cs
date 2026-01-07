@@ -49,6 +49,7 @@ namespace MBBSDASM.Dasm
         private static readonly Regex EbpDispRegex = new Regex(
             "\\[(?<reg>ebp)\\s*(?<sign>[\\+\\-])\\s*(?<hex>0x[0-9A-Fa-f]+)\\]",
             RegexOptions.Compiled);
+            private static readonly Regex StringSymRegex = new Regex("s_[0-9A-Fa-f]{8}", RegexOptions.Compiled);
 
         private static string RewriteStackFrameOperands(string insText)
         {
@@ -677,7 +678,7 @@ namespace MBBSDASM.Dasm
             set.Add(from);
         }
 
-        private static readonly Regex HexLiteralRegex = new Regex("0x[0-9A-Fa-f]{7,8}", RegexOptions.Compiled);
+        private static readonly Regex HexLiteralRegex = new Regex("0x[0-9A-Fa-f]{1,8}", RegexOptions.Compiled);
 
         private static string RewriteKnownAddressLiterals(string insText, Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols)
         {
@@ -1295,36 +1296,49 @@ namespace MBBSDASM.Dasm
                         insText += $" ; {(isCall2 ? "call" : "jmp")} {label}";
                     }
 
-                    if (sortedFixups != null && sortedFixups.Count > 0)
-                    {
-                        var fixupsHere = GetFixupsForInstruction(sortedFixups, ins, ref fixupIdx);
-                        if (leGlobals && globalSymbols != null && globalSymbols.Count > 0)
-                            insText = ApplyGlobalSymbolRewrites(ins, insText, fixupsHere, globalSymbols);
+                    var haveFixups = sortedFixups != null && sortedFixups.Count > 0;
+                    var fixupsHere = haveFixups ? GetFixupsForInstruction(sortedFixups, ins, ref fixupIdx) : new List<LEFixup>(0);
 
-                        if (leInsights)
-                        {
+                    if (leGlobals && globalSymbols != null && globalSymbols.Count > 0 && fixupsHere.Count > 0)
+                        insText = ApplyGlobalSymbolRewrites(ins, insText, fixupsHere, globalSymbols);
+
+                    if (leInsights)
+                    {
+                        // Fixup-based string rewrites (optional)
+                        if (fixupsHere.Count > 0)
                             insText = ApplyStringSymbolRewrites(ins, insText, fixupsHere, stringSymbols);
 
-                            // Record xrefs from fixups -> symbols
-                            if (symXrefs != null)
-                                RecordSymbolXrefs(symXrefs, (uint)ins.Offset, fixupsHere, globalSymbols, stringSymbols);
+                        // Replace any matching 0x... literal with known symbol.
+                        insText = RewriteKnownAddressLiterals(insText, globalSymbols, stringSymbols);
 
-                            // Extra rewrite pass: replace any matching 0xXXXXXXXX literal with known symbol (even if fixup decoding missed it).
-                            insText = RewriteKnownAddressLiterals(insText, globalSymbols, stringSymbols);
+                        // Record xrefs from fixups -> symbols
+                        if (symXrefs != null && fixupsHere.Count > 0)
+                            RecordSymbolXrefs(symXrefs, (uint)ins.Offset, fixupsHere, globalSymbols, stringSymbols);
 
-                            var callHint = TryGetCallArgHint(instructions, insIndexByAddr, ins, fixupsHere, globalSymbols, stringSymbols);
-                            if (!string.IsNullOrEmpty(callHint))
-                                insText += $" ; CALLHINT: {callHint}";
+                        var callHint = TryGetCallArgHint(instructions, insIndexByAddr, ins, fixupsHere, globalSymbols, stringSymbols);
+                        if (!string.IsNullOrEmpty(callHint))
+                            insText += $" ; CALLHINT: {callHint}";
 
-                            var jt = TryAnnotateJumpTable(ins, fixupsHere, objects, objBytesByIndex, stringSymbols, globalSymbols);
-                            if (!string.IsNullOrEmpty(jt))
-                                insText += $" ; {jt}";
+                        var fmtHint = TryAnnotateFormatCall(instructions, insLoopIndex, globalSymbols, stringSymbols, stringPreview);
+                        if (!string.IsNullOrEmpty(fmtHint))
+                            insText += $" ; {fmtHint}";
 
-                            var intHint = TryAnnotateInterrupt(instructions, insLoopIndex);
-                            if (!string.IsNullOrEmpty(intHint))
-                                insText += $" ; {intHint}";
-                        }
+                        var jt = TryAnnotateJumpTable(ins, fixupsHere, objects, objBytesByIndex, stringSymbols, globalSymbols);
+                        if (!string.IsNullOrEmpty(jt))
+                            insText += $" ; {jt}";
 
+                        var intHint = TryAnnotateInterrupt(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(intHint))
+                            insText += $" ; {intHint}";
+
+                        // If this instruction references a string symbol (or computes one), inline a short preview.
+                        var strInline = TryInlineStringPreview(insText, stringPreview, instructions, insLoopIndex, stringSymbols);
+                        if (!string.IsNullOrEmpty(strInline))
+                            insText += $" ; {strInline}";
+                    }
+
+                    if (haveFixups && fixupsHere.Count > 0)
+                    {
                         var fixupText = FormatFixupAnnotation(ins, fixupsHere);
                         if (!string.IsNullOrEmpty(fixupText))
                             insText += $" ; FIXUP: {fixupText}";
@@ -1355,6 +1369,454 @@ namespace MBBSDASM.Dasm
 
             output = sb.ToString();
             return true;
+        }
+        private static string TryAnnotateFormatCall(List<Instruction> instructions, int callIdx,
+            Dictionary<uint, string> globalSymbols,
+            Dictionary<uint, string> stringSymbols,
+            Dictionary<uint, string> stringPreview)
+        {
+            if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
+                return string.Empty;
+
+            var callIns = instructions[callIdx];
+            var callText = callIns.ToString();
+            if (!callText.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
+                return string.Empty;
+
+            // Collect pushes immediately preceding this call.
+            // In cdecl-style code, the format string is often the *last* push before the call.
+            var pushedOperands = new List<string>();
+            for (var i = callIdx - 1; i >= 0 && i >= callIdx - 16; i--)
+            {
+                var t = instructions[i].ToString();
+
+                // stop at barriers
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) || (t.StartsWith("j", StringComparison.OrdinalIgnoreCase) && !t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase)))
+                {
+                    break;
+                }
+
+                if (t.StartsWith("add esp", StringComparison.OrdinalIgnoreCase) || t.StartsWith("sub esp", StringComparison.OrdinalIgnoreCase))
+                    break;
+
+                if (!t.StartsWith("push ", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                t = RewriteKnownAddressLiterals(t, globalSymbols, stringSymbols);
+                pushedOperands.Add(t.Substring(5).Trim());
+                if (pushedOperands.Count >= 12)
+                    break;
+            }
+
+            if (pushedOperands.Count == 0)
+                return string.Empty;
+
+            // Find any pushed operand that resolves to a known string symbol (prefer a printf-like format).
+            string bestSym = string.Empty;
+            string bestPreview = string.Empty;
+            var bestIsFmt = false;
+
+            for (var k = 0; k < pushedOperands.Count; k++)
+            {
+                var op = pushedOperands[k];
+                if (!TryResolveStringSymFromOperand(instructions, callIdx, op, stringSymbols, stringPreview, out var sym, out var preview))
+                    continue;
+
+                var isFmt = LooksLikePrintfFormat(preview);
+                if (isFmt)
+                {
+                    bestSym = sym;
+                    bestPreview = preview;
+                    bestIsFmt = true;
+                    break;
+                }
+
+                if (string.IsNullOrEmpty(bestSym))
+                {
+                    bestSym = sym;
+                    bestPreview = preview;
+                }
+            }
+
+            if (string.IsNullOrEmpty(bestSym))
+                return string.Empty;
+
+            if (bestIsFmt)
+                return $"FMT: printf-like fmt={bestSym} args~{pushedOperands.Count} \"{bestPreview}\"";
+
+            if (!string.IsNullOrEmpty(bestPreview))
+                return $"STRCALL: text={bestSym} args~{pushedOperands.Count} \"{bestPreview}\"";
+
+            return $"STRCALL: text={bestSym} args~{pushedOperands.Count}";
+        }
+
+        private static string TryInlineStringPreview(string insText,
+            Dictionary<uint, string> stringPreview,
+            List<Instruction> instructions,
+            int insIdx,
+            Dictionary<uint, string> stringSymbols)
+        {
+            if (string.IsNullOrEmpty(insText) || stringPreview == null || stringPreview.Count == 0)
+                return string.Empty;
+
+            // Keep this conservative to avoid spam.
+            var lower = insText.TrimStart();
+            if (!lower.StartsWith("push ", StringComparison.OrdinalIgnoreCase) &&
+                !lower.StartsWith("lea ", StringComparison.OrdinalIgnoreCase) &&
+                !lower.StartsWith("mov ", StringComparison.OrdinalIgnoreCase))
+                return string.Empty;
+
+            // Fast path: already has an s_XXXXXXXX token
+            var sym = ExtractStringSym(insText);
+            if (!string.IsNullOrEmpty(sym) && TryParseStringSym(sym, out var addr) &&
+                stringPreview.TryGetValue(addr, out var p0) && !string.IsNullOrEmpty(p0))
+            {
+                return $"STR: \"{p0}\"";
+            }
+
+            // Heuristic path: try to resolve a computed/pushed register value to a known string address.
+            if (instructions == null || insIdx < 0 || insIdx >= instructions.Count)
+                return string.Empty;
+
+            var raw = instructions[insIdx].ToString();
+            if (TryResolveStringFromInstruction(instructions, insIdx, raw, stringSymbols, stringPreview, out var p1))
+                return $"STR: \"{p1}\"";
+
+            return string.Empty;
+        }
+
+        private static bool TryResolveStringSymFromOperand(
+            List<Instruction> instructions,
+            int callIdx,
+            string operandText,
+            Dictionary<uint, string> stringSymbols,
+            Dictionary<uint, string> stringPreview,
+            out string sym,
+            out string preview)
+        {
+            sym = string.Empty;
+            preview = string.Empty;
+
+            if (stringSymbols == null || stringSymbols.Count == 0 || stringPreview == null || stringPreview.Count == 0)
+                return false;
+
+            if (string.IsNullOrWhiteSpace(operandText))
+                return false;
+
+            // Direct s_ token
+            var direct = ExtractStringSym(operandText);
+            if (!string.IsNullOrEmpty(direct) && TryParseStringSym(direct, out var daddr) &&
+                stringPreview.TryGetValue(daddr, out var dp) && !string.IsNullOrEmpty(dp))
+            {
+                sym = direct;
+                preview = dp;
+                return true;
+            }
+
+            // Register operand (e.g. push eax)
+            var op = operandText.Trim();
+            if (IsRegister32(op) && TryResolveRegisterValueBefore(instructions, callIdx, op, out var raddr))
+            {
+                if (stringSymbols.TryGetValue(raddr, out var rsym) && stringPreview.TryGetValue(raddr, out var rp) && !string.IsNullOrEmpty(rp))
+                {
+                    sym = rsym;
+                    preview = rp;
+                    return true;
+                }
+            }
+
+            // Immediate literal (0x...)
+            if (TryParseImm32(op, out var imm) && stringSymbols.TryGetValue(imm, out var isym) &&
+                stringPreview.TryGetValue(imm, out var ip) && !string.IsNullOrEmpty(ip))
+            {
+                sym = isym;
+                preview = ip;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryResolveStringFromInstruction(
+            List<Instruction> instructions,
+            int insIdx,
+            string rawInstruction,
+            Dictionary<uint, string> stringSymbols,
+            Dictionary<uint, string> stringPreview,
+            out string preview)
+        {
+            preview = string.Empty;
+            if (stringSymbols == null || stringSymbols.Count == 0 || stringPreview == null || stringPreview.Count == 0)
+                return false;
+            if (string.IsNullOrWhiteSpace(rawInstruction))
+                return false;
+
+            var t = rawInstruction.Trim();
+
+            // push <reg>
+            if (t.StartsWith("push ", StringComparison.OrdinalIgnoreCase))
+            {
+                var op = t.Substring(5).Trim();
+                if (IsRegister32(op) && TryResolveRegisterValueBefore(instructions, insIdx, op, out var addr) &&
+                    stringPreview.TryGetValue(addr, out var p) && !string.IsNullOrEmpty(p) && stringSymbols.ContainsKey(addr))
+                {
+                    preview = p;
+                    return true;
+                }
+
+                if (TryParseImm32(op, out var imm) && stringPreview.TryGetValue(imm, out var p2) && !string.IsNullOrEmpty(p2) && stringSymbols.ContainsKey(imm))
+                {
+                    preview = p2;
+                    return true;
+                }
+            }
+
+            // mov <reg>, 0x...
+            if (t.StartsWith("mov ", StringComparison.OrdinalIgnoreCase))
+            {
+                var parts = t.Substring(4).Split(',');
+                if (parts.Length == 2)
+                {
+                    var dst = parts[0].Trim();
+                    var src = parts[1].Trim();
+                    if (IsRegister32(dst) && TryParseImm32(src, out var imm) && stringPreview.TryGetValue(imm, out var p) && !string.IsNullOrEmpty(p) && stringSymbols.ContainsKey(imm))
+                    {
+                        preview = p;
+                        return true;
+                    }
+                }
+            }
+
+            // lea <reg>, [<base>+0x<disp>] where base resolves to a constant
+            if (t.StartsWith("lea ", StringComparison.OrdinalIgnoreCase))
+            {
+                // Example: lea eax, [ebx+0x4e]
+                var m = Regex.Match(t, @"^lea\s+(?<dst>e[a-z]{2}),\s*\[(?<base>e[a-z]{2})\+0x(?<disp>[0-9a-fA-F]+)\]$", RegexOptions.IgnoreCase);
+                if (m.Success)
+                {
+                    var baseReg = m.Groups["base"].Value;
+                    var disp = Convert.ToUInt32(m.Groups["disp"].Value, 16);
+                    if (TryResolveRegisterValueBefore(instructions, insIdx, baseReg, out var baseVal))
+                    {
+                        var addr = baseVal + disp;
+                        if (stringPreview.TryGetValue(addr, out var p) && !string.IsNullOrEmpty(p) && stringSymbols.ContainsKey(addr))
+                        {
+                            preview = p;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsRegister32(string token)
+        {
+            if (string.IsNullOrEmpty(token))
+                return false;
+            switch (token.Trim().ToLowerInvariant())
+            {
+                case "eax":
+                case "ebx":
+                case "ecx":
+                case "edx":
+                case "esi":
+                case "edi":
+                case "ebp":
+                case "esp":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static bool TryParseImm32(string token, out uint value)
+        {
+            value = 0;
+            if (string.IsNullOrWhiteSpace(token))
+                return false;
+
+            var t = token.Trim();
+            var m = Regex.Match(t, @"^0x(?<hex>[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            value = Convert.ToUInt32(m.Groups["hex"].Value, 16);
+            return true;
+        }
+
+        private static bool TryResolveRegisterValueBefore(List<Instruction> instructions, int indexExclusive, string reg, out uint value)
+        {
+            value = 0;
+            if (instructions == null || indexExclusive <= 0)
+                return false;
+            if (!IsRegister32(reg))
+                return false;
+
+            var start = Math.Min(indexExclusive - 1, instructions.Count - 1);
+            var stop = Math.Max(0, start - 64);
+
+            // Small forward constant-tracker across a short window.
+            // This is intentionally conservative: it only tracks immediate constants and simple arithmetic.
+            var known = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            var vals = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in new[] { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp" })
+                known[r] = false;
+
+            for (var i = stop; i <= start; i++)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (string.IsNullOrEmpty(t))
+                    continue;
+
+                // xor r, r => 0
+                var mxor = Regex.Match(t, @"^xor\s+(?<r>e[a-z]{2}),\s*\k<r>$", RegexOptions.IgnoreCase);
+                if (mxor.Success)
+                {
+                    var r0 = mxor.Groups["r"].Value.ToLowerInvariant();
+                    known[r0] = true;
+                    vals[r0] = 0;
+                    continue;
+                }
+
+                // mov r, 0x...
+                var mmovImm = Regex.Match(t, @"^mov\s+(?<dst>e[a-z]{2}),\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                if (mmovImm.Success)
+                {
+                    var dst = mmovImm.Groups["dst"].Value.ToLowerInvariant();
+                    if (TryParseImm32(mmovImm.Groups["imm"].Value, out var imm))
+                    {
+                        known[dst] = true;
+                        vals[dst] = imm;
+                    }
+                    continue;
+                }
+
+                // mov r, r
+                var mmovReg = Regex.Match(t, @"^mov\s+(?<dst>e[a-z]{2}),\s*(?<src>e[a-z]{2})$", RegexOptions.IgnoreCase);
+                if (mmovReg.Success)
+                {
+                    var dst = mmovReg.Groups["dst"].Value.ToLowerInvariant();
+                    var src = mmovReg.Groups["src"].Value.ToLowerInvariant();
+                    if (known.TryGetValue(src, out var srcKnown) && srcKnown && vals.TryGetValue(src, out var srcVal))
+                    {
+                        known[dst] = true;
+                        vals[dst] = srcVal;
+                    }
+                    else
+                    {
+                        known[dst] = false;
+                    }
+                    continue;
+                }
+
+                // add r, 0x...
+                var madd = Regex.Match(t, @"^add\s+(?<dst>e[a-z]{2}),\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                if (madd.Success)
+                {
+                    var dst = madd.Groups["dst"].Value.ToLowerInvariant();
+                    if (TryParseImm32(madd.Groups["imm"].Value, out var imm) && known.TryGetValue(dst, out var dstKnown) && dstKnown && vals.TryGetValue(dst, out var cur))
+                    {
+                        vals[dst] = unchecked(cur + imm);
+                    }
+                    continue;
+                }
+
+                // sub r, 0x...
+                var msub = Regex.Match(t, @"^sub\s+(?<dst>e[a-z]{2}),\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                if (msub.Success)
+                {
+                    var dst = msub.Groups["dst"].Value.ToLowerInvariant();
+                    if (TryParseImm32(msub.Groups["imm"].Value, out var imm) && known.TryGetValue(dst, out var dstKnown) && dstKnown && vals.TryGetValue(dst, out var cur))
+                    {
+                        vals[dst] = unchecked(cur - imm);
+                    }
+                    continue;
+                }
+
+                // lea r, [base+0xdisp] or lea r, [base+disp]
+                var mlea = Regex.Match(t, @"^lea\s+(?<dst>e[a-z]{2}),\s*\[(?<base>e[a-z]{2})\+0x(?<disp>[0-9a-fA-F]+)\]$", RegexOptions.IgnoreCase);
+                if (mlea.Success)
+                {
+                    var dst = mlea.Groups["dst"].Value.ToLowerInvariant();
+                    var bas = mlea.Groups["base"].Value.ToLowerInvariant();
+                    var disp = Convert.ToUInt32(mlea.Groups["disp"].Value, 16);
+                    if (known.TryGetValue(bas, out var baseKnown) && baseKnown && vals.TryGetValue(bas, out var baseVal))
+                    {
+                        known[dst] = true;
+                        vals[dst] = unchecked(baseVal + disp);
+                    }
+                    else
+                    {
+                        known[dst] = false;
+                    }
+                    continue;
+                }
+            }
+
+            var rr = reg.Trim().ToLowerInvariant();
+            if (known.TryGetValue(rr, out var k) && k && vals.TryGetValue(rr, out var v))
+            {
+                value = v;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static string ExtractStringSym(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return string.Empty;
+            var m = StringSymRegex.Match(text);
+            return m.Success ? m.Value : string.Empty;
+        }
+
+        private static bool TryParseStringSym(string sym, out uint addr)
+        {
+            addr = 0;
+            if (string.IsNullOrEmpty(sym) || sym.Length != 10 || !sym.StartsWith("s_", StringComparison.OrdinalIgnoreCase))
+                return false;
+            return uint.TryParse(sym.Substring(2), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out addr);
+        }
+
+        private static bool LooksLikePrintfFormat(string s)
+        {
+            if (string.IsNullOrEmpty(s))
+                return false;
+
+            // Basic heuristic: contains a % that isn't only %%
+            for (var i = 0; i < s.Length - 1; i++)
+            {
+                if (s[i] != '%')
+                    continue;
+                if (s[i + 1] == '%')
+                {
+                    i++;
+                    continue;
+                }
+
+                // Skip flags/width/precision
+                var j = i + 1;
+                while (j < s.Length && "-+ #0".IndexOf(s[j]) >= 0) j++;
+                while (j < s.Length && char.IsDigit(s[j])) j++;
+                if (j < s.Length && s[j] == '.')
+                {
+                    j++;
+                    while (j < s.Length && char.IsDigit(s[j])) j++;
+                }
+
+                if (j < s.Length)
+                {
+                    var c = s[j];
+                    if ("duxXscpfegEGi".IndexOf(c) >= 0)
+                        return true;
+                }
+            }
+
+            return false;
         }
 
         private static Dictionary<uint, string> CollectGlobalSymbols(List<Instruction> instructions, List<LEFixup> sortedFixups)
