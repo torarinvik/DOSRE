@@ -1165,6 +1165,11 @@ namespace DOSRE.Dasm
 
             var intNo = b[1];
 
+            if (intNo == 0x20) return "terminate (CP/M style)";
+            if (intNo == 0x27) return "terminate and stay resident (TSR)";
+            if (intNo == 0x24) return "critical error handler service (internal)";
+            if (intNo == 0x29) return "fast console output (internal)";
+
             // Prefer database-driven descriptions.
             string dbDesc;
             if (DosInterruptDatabase.Instance.TryDescribe(intNo, lastAh, lastAxImm, out dbDesc) && !string.IsNullOrEmpty(dbDesc))
@@ -1186,6 +1191,39 @@ namespace DOSRE.Dasm
                             dbDesc += " ; returns CX bits: 0x01=RO 0x02=Hidden 0x04=System 0x08=VolLabel 0x10=Dir 0x20=Archive";
                         else if (al == 0x01)
                             dbDesc += " ; CX bits: 0x01=RO 0x02=Hidden 0x04=System 0x08=VolLabel 0x10=Dir 0x20=Archive";
+                    }
+
+                    // AH=0Eh: Select Default Drive
+                    if (ah == 0x0E)
+                    {
+                        if (lastDxImm.HasValue) dbDesc += $" ; DL={lastDxImm.Value & 0xFF} ({ (char)('A' + (lastDxImm.Value & 0xFF)) }:)";
+                        dbDesc += " ; DL=drive(0=A 1=B)";
+                    }
+
+                    // AH=19h: Get Default Drive
+                    if (ah == 0x19)
+                    {
+                        dbDesc += " ; (returns AL=drive 0=A 1=B)";
+                    }
+
+                    // AH=33h: Get/Set Ctrl-Break
+                    if (ah == 0x33)
+                    {
+                        byte? al = lastAl;
+                        if (!al.HasValue && lastAxImm.HasValue) al = (byte)(lastAxImm.Value & 0xFF);
+                        if (al.HasValue)
+                        {
+                            var sub = al.Value switch { 0 => "Get", 1 => "Set", 5 => "GetBootDrive", _ => $"sub=0x{al.Value:X2}" };
+                            dbDesc += $" ; {sub}";
+                        }
+                        dbDesc += " ; AL: 0=Get 1=Set 5=BootDrive ; DL=state(0=off 1=on)";
+                    }
+
+                    // AH=36h: Get Free Space
+                    if (ah == 0x36)
+                    {
+                        if (lastDxImm.HasValue) dbDesc += $" ; DL={lastDxImm.Value & 0xFF} (0=def 1=A)";
+                        dbDesc += " ; DL=drive";
                     }
 
                     // AH=3Dh: Open file
@@ -1277,6 +1315,13 @@ namespace DOSRE.Dasm
                         dbDesc += " ; DS:DX=DTA buffer";
                     }
 
+                    // AH=2Ah/2Bh/2Ch/2Dh: Date/Time
+                    if (ah == 0x2A || ah == 0x2B || ah == 0x2C || ah == 0x2D)
+                    {
+                        var mode = ah switch { 0x2A => "GetDate", 0x2B => "SetDate", 0x2C => "GetTime", 0x2D => "SetTime", _ => "" };
+                        dbDesc += $" ; {mode}";
+                    }
+
                     // AH=25h, 0x35h: Interrupt vectors
                     if (ah == 0x25)
                     {
@@ -1326,6 +1371,34 @@ namespace DOSRE.Dasm
                         dbDesc += " ; DS:DX=oldpath ES:DI=newpath";
                     }
 
+                    // AH=57h: Get/Set File Time
+                    if (ah == 0x57)
+                    {
+                        byte? al = lastAl;
+                        if (!al.HasValue && lastAxImm.HasValue) al = (byte)(lastAxImm.Value & 0xFF);
+                        if (al.HasValue) dbDesc += $" ; {(al.Value == 0 ? "Get" : "Set")}";
+                        dbDesc += " ; AL: 0=Get 1=Set ; BX=handle CX=time DX=date";
+                    }
+
+                    // AH=58h: Get/Set Alloc Strategy
+                    if (ah == 0x58)
+                    {
+                        byte? al = lastAl;
+                        if (!al.HasValue && lastAxImm.HasValue) al = (byte)(lastAxImm.Value & 0xFF);
+                        if (al.HasValue)
+                        {
+                            var sub = al.Value switch { 0 => "GetStrat", 1 => "SetStrat", 2 => "GetUMB", 3 => "SetUMB", _ => $"sub=0x{al.Value:X2}" };
+                            dbDesc += $" ; {sub}";
+                        }
+                        dbDesc += " ; AL: 0=Get 1=Set 2=GetUMB 3=SetUMB";
+                    }
+
+                    // AH=62h: Get PSP
+                    if (ah == 0x62)
+                    {
+                        dbDesc += " ; (returns BX=PSP segment)";
+                    }
+
                     // AH=6Ch: Extended Open/Create
                     if (ah == 0x6C)
                     {
@@ -1346,18 +1419,54 @@ namespace DOSRE.Dasm
                         {
                             var sub = al.Value switch
                             {
-                                0 => "GetDeviceInfo",
-                                1 => "SetDeviceInfo",
-                                2 => "Receive(Char)",
-                                3 => "Send(Char)",
-                                6 => "GetInputStat",
-                                7 => "GetOutputStat",
-                                8 => "IsRemovable",
+                                0x00 => "GetDeviceInfo",
+                                0x01 => "SetDeviceInfo",
+                                0x02 => "Receive(Char)",
+                                0x03 => "Send(Char)",
+                                0x04 => "Receive(Control)",
+                                0x05 => "Send(Control)",
+                                0x06 => "GetInputStat",
+                                0x07 => "GetOutputStat",
+                                0x08 => "IsRemovable",
+                                0x09 => "IsRemoteDrive",
+                                0x0A => "IsRemoteHandle",
+                                0x0B => "SetSharingRetry",
+                                0x0D => "GenericBlockDevice",
+                                0x0E => "GetDriveLogical",
+                                0x0F => "SetDriveLogical",
                                 _ => $"sub=0x{al.Value:X2}"
                             };
                             dbDesc += $" ; {sub}";
                         }
-                        dbDesc += " ; AL: 0=Get 1=Set 2=Rd 3=Wr 6=InStat 7=OutStat 8=Remov";
+                        if (lastBxImm.HasValue) dbDesc += $" ; BX={lastBxImm.Value}";
+                        dbDesc += " ; AL: 0=Get 1=Set 2=Rd 3=Wr 4=RdCtl 5=WrCtl 6=InStat 7=OutStat 8=Remov";
+                    }
+
+                    // AH=5Ch: Lock/Unlock
+                    if (ah == 0x5C)
+                    {
+                        byte? al = lastAl;
+                        if (!al.HasValue && lastAxImm.HasValue) al = (byte)(lastAxImm.Value & 0xFF);
+                        if (al.HasValue) dbDesc += $" ; {(al.Value == 0 ? "Lock" : "Unlock")}";
+                        dbDesc += " ; AL: 0=Lock 1=Unlock ; BX=handle CX:DX=offset SI:DI=length";
+                    }
+
+                    // AH=5Dh: File Sharing
+                    if (ah == 0x5D)
+                    {
+                        byte? al = lastAl;
+                        if (!al.HasValue && lastAxImm.HasValue) al = (byte)(lastAxImm.Value & 0xFF);
+                        if (al.HasValue)
+                        {
+                            var sub = al.Value switch { 0x00 => "ServerDosError", 0x06 => "GetAddressOfPSP", 0x0A => "SetExtendedError", _ => $"sub=0x{al.Value:X2}" };
+                            dbDesc += $" ; {sub}";
+                        }
+                    }
+
+                    // AH=5Eh/5Fh: Network
+                    if (ah == 0x5E || ah == 0x5F)
+                    {
+                        dbDesc += " ; Network/Redirection Service";
                     }
 
                     // FCB-based: 0x0F, 0x10, 0x11, 0x12, 0x13, 0x16, 0x17, 0x21, 0x22, 0x23, 0x24, 0x27, 0x28
@@ -1408,15 +1517,46 @@ namespace DOSRE.Dasm
                         };
                         dbDesc += $" ; {mode}";
                     }
+                    else if (ah == 0x01) // Set Cursor Shape
+                    {
+                        if (lastCxImm.HasValue) dbDesc += $" ; shape=0x{lastCxImm.Value:X4} (CH=start CL=end)";
+                        dbDesc += " ; CH=start CL=end";
+                    }
                     else if (ah == 0x02) // Set Cursor
                     {
                         if (lastDxImm.HasValue) dbDesc += $" ; row={lastDxImm.Value >> 8} col={lastDxImm.Value & 0xFF}";
                         dbDesc += " ; BH=page DH=row DL=col";
                     }
+                    else if (ah == 0x03) // Get Cursor
+                    {
+                        dbDesc += " ; BH=page (returns CX=shape DX=pos)";
+                    }
+                    else if (ah == 0x06 || ah == 0x07) // Scroll Up/Down
+                    {
+                        if (lastAl.HasValue) dbDesc += $" ; lines={lastAl.Value}";
+                        dbDesc += " ; AL=lines BH=attr CH,CL=top left DH,DL=bottom right";
+                    }
+                    else if (ah == 0x08) // Read Char/Attr
+                    {
+                        dbDesc += " ; BH=page (returns AL=char AH=attr)";
+                    }
                     else if (ah == 0x09 || ah == 0x0A) // Write Char/Attr
                     {
                         if (lastAxImm.HasValue) dbDesc += $" ; char='{(char)(lastAxImm.Value & 0xFF)}'";
                         dbDesc += " ; AL=char BH=page BL=attr CX=count";
+                    }
+                    else if (ah == 0x0C) // Write Pixel
+                    {
+                        if (lastAl.HasValue) dbDesc += $" ; color={lastAl.Value}";
+                        dbDesc += " ; AL=color BH=page CX=x DX=y";
+                    }
+                    else if (ah == 0x0D) // Read Pixel
+                    {
+                        dbDesc += " ; BH=page CX=x DX=y (returns AL=color)";
+                    }
+                    else if (ah == 0x0F) // Get Mode
+                    {
+                        dbDesc += " ; (returns AL=mode AH=cols BH=page)";
                     }
                     else if (ah == 0x13) // Write String
                     {
@@ -1436,6 +1576,9 @@ namespace DOSRE.Dasm
                     }
                 }
 
+                // BIOS Serial
+                if (intNo == 0x14) dbDesc += " ; AH=0:Init AH=1:Send AH=2:Recv AH=3:Status ; DX=port";
+
                 // BIOS System
                 if (intNo == 0x15 && lastAh.HasValue)
                 {
@@ -1447,27 +1590,76 @@ namespace DOSRE.Dasm
 
                 // BIOS Keyboard/Timer/System
                 if (intNo == 0x16) dbDesc += " ; AH=0:Get AH=1:Peek AH=2:ShiftFlags";
+                if (intNo == 0x17) dbDesc += " ; AH=0:Print AH=1:Init AH=2:Status ; DX=port";
                 if (intNo == 0x1A) dbDesc += " ; AH=0:GetTicks AH=1:SetTicks AH=2:GetTime AH=4:GetDate";
 
                 // Multiplex
-                if (intNo == 0x2F && lastAxImm.HasValue)
+                if (intNo == 0x2F && lastAh.HasValue)
                 {
-                    var ax = lastAxImm.Value;
-                    if (ax == 0x1680) dbDesc += " ; DPMI: release time slice";
-                    else if (ax == 0x1687) dbDesc += " ; DPMI: get entry point";
-                    else if (ax == 0x4300) dbDesc += " ; XMS: check presence";
-                    else if (ax == 0x4310) dbDesc += " ; XMS: get entry point";
+                    var ah = lastAh.Value;
+                    if (ah == 0x15) // MSCDEX
+                    {
+                        var al = lastAl ?? (byte)(lastAxImm ?? 0);
+                        var sub = al switch
+                        {
+                            0x00 => "CheckPresence",
+                            0x0B => "GetDriveList",
+                            0x0C => "GetVersion",
+                            0x10 => "GetDeviceInfo",
+                            _ => $"MSCDEX sub=0x{al:X2}"
+                        };
+                        dbDesc += $" ; {sub}";
+                    }
+                    else if (lastAxImm.HasValue)
+                    {
+                        var ax = lastAxImm.Value;
+                        if (ax == 0x1680) dbDesc += " ; DPMI: release time slice";
+                        else if (ax == 0x1687) dbDesc += " ; DPMI: get entry point";
+                        else if (ax == 0x1689) dbDesc += " ; DPMI: get version";
+                        else if (ax == 0x4300) dbDesc += " ; XMS: check presence";
+                        else if (ax == 0x4310) dbDesc += " ; XMS: get entry point";
+                        else if (ah == 0x11) dbDesc += " ; Network: redirector (AL=func)";
+                        else if (ah == 0x12) dbDesc += " ; DOS: internal services (AL=func)";
+                        else if (ax == 0x1600) dbDesc += " ; Windows: check presence (enhanced mode)";
+                        else if (ax == 0x4A11) dbDesc += " ; DoubleSpace: check presence";
+                    }
                 }
 
                 // DPMI
                 if (intNo == 0x31 && lastAxImm.HasValue)
                 {
                     var ax = lastAxImm.Value;
-                    if (ax == 0x0000) dbDesc += " ; DPMI: alloc LDT descriptor (CX=count)";
-                    else if (ax == 0x0100) dbDesc += " ; DPMI: alloc DOS memory (BX=paras)";
-                    else if (ax == 0x0200) dbDesc += " ; DPMI: get real mode vector (BL=int)";
-                    else if (ax == 0x0300) dbDesc += " ; DPMI: simulate real mode int (BL=int ES:DI=regs)";
-                    else if (ax == 0x0501) dbDesc += " ; DPMI: alloc memory block (BX:CX=size)";
+                    var name = ax switch
+                    {
+                        0x0000 => "Alloc Desc",
+                        0x0001 => "Free Desc",
+                        0x0002 => "Seg to Desc",
+                        0x0003 => "Get Next Desc",
+                        0x0006 => "Get Base",
+                        0x0007 => "Set Base",
+                        0x0008 => "Set Limit",
+                        0x0009 => "Set Access Rights",
+                        0x0100 => "Alloc DOS Mem",
+                        0x0101 => "Free DOS Mem",
+                        0x0200 => "Get Real Int",
+                        0x0201 => "Set Real Int",
+                        0x0204 => "Get Exc Vector",
+                        0x0205 => "Set Exc Vector",
+                        0x0300 => "Sim Real Int",
+                        0x0301 => "Call Real Far",
+                        0x0500 => "Get Info",
+                        0x0501 => "Alloc Block",
+                        0x0502 => "Free Block",
+                        0x0503 => "Resize Block",
+                        0x0600 => "Lock Region",
+                        0x0800 => "Map Physical",
+                        0x0900 => "Get State",
+                        _ => $"sub=0x{ax:X4}"
+                    };
+                    dbDesc += $" ; DPMI: {name}";
+                    if (ax == 0x0000) dbDesc += " ; CX=count";
+                    if (ax == 0x0100) dbDesc += " ; BX=paras";
+                    if (ax == 0x0501) dbDesc += " ; BX:CX=size";
                 }
 
                 // Mouse
@@ -1487,6 +1679,28 @@ namespace DOSRE.Dasm
                         _ => $"sub=0x{ax:X4}"
                     };
                     dbDesc += $" ; Mouse: {name}";
+                }
+
+                // EMS
+                if (intNo == 0x67 && lastAh.HasValue)
+                {
+                    var ah = lastAh.Value;
+                    var name = ah switch
+                    {
+                        0x40 => "Get Status",
+                        0x41 => "Get Page Frame",
+                        0x42 => "Get Page Count",
+                        0x43 => "Alloc Pages",
+                        0x44 => "Map Page",
+                        0x45 => "Dealloc Pages",
+                        0x46 => "Get Version",
+                        0x47 => "Save Context",
+                        0x48 => "Restore Context",
+                        _ => $"sub=0x{ah:X2}"
+                    };
+                    dbDesc += $" ; EMS: {name}";
+                    if (ah == 0x43) dbDesc += " ; BX=pages";
+                    if (ah == 0x44) dbDesc += " ; AL=phys BX=log DX=handle";
                 }
 
                 return dbDesc;
