@@ -252,6 +252,35 @@ namespace DOSRE.UI.impl
                                 throw new Exception("Error: -BORLAND and -WATCOM are mutually exclusive");
                             _toolchainHint = EnumToolchainHint.Watcom;
                             break;
+                        case "-INTSKELETON":
+                            // Generate an editable JSON skeleton from dosre.unknown-ints.txt.
+                            // Usage:
+                            //   -intskeleton <out.json>
+                            //   -intskeleton <in.txt> <out.json>
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -INTSKELETON requires <out.json> or <in.txt> <out.json>");
+
+                            var a1 = _args[i + 1];
+                            var a2 = (i + 2 < _args.Length) ? _args[i + 2] : null;
+
+                            string inPath;
+                            string outPath;
+                            if (!string.IsNullOrEmpty(a2) && !a2.StartsWith("-", StringComparison.Ordinal))
+                            {
+                                inPath = a1;
+                                outPath = a2;
+                                i += 2;
+                            }
+                            else
+                            {
+                                inPath = "dosre.unknown-ints.txt";
+                                outPath = a1;
+                                i += 1;
+                            }
+
+                            UnknownInterruptSkeletonGenerator.Generate(inPath, outPath);
+                            _logger.Info($"Wrote interrupt skeleton to {outPath}");
+                            return;
                         case "-SPLITKB":
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -SPLITKB requires a value");
@@ -295,6 +324,10 @@ namespace DOSRE.UI.impl
                                 "-BORLAND -- Toolchain hint: use Borland/Turbo-era heuristics (best-effort; currently impacts MZ output)");
                             Console.WriteLine(
                                 "-WATCOM -- Toolchain hint: use Watcom-era heuristics (best-effort; currently impacts MZ output)");
+                            Console.WriteLine(
+                                "-INTSKELETON <out.json> -- Generate an editable interrupt JSON skeleton from dosre.unknown-ints.txt");
+                            Console.WriteLine(
+                                "-INTSKELETON <in.txt> <out.json> -- Same, but read from a specific input file");
                             Console.WriteLine(
                                 "-SPLITKB <n> -- (with -O) Split output into ~n KB chunks (out.001.asm, out.002.asm, ...)");
                             Console.WriteLine(

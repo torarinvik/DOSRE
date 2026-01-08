@@ -829,6 +829,9 @@ namespace DOSRE.Dasm
                 return dbDesc;
             }
 
+            // Opt-in: record unknown interrupt usage for building local packs.
+            UnknownInterruptRecorder.Record(intNo, lastAh, null);
+
             if (intNo == 0x21)
             {
                 if (!lastAh.HasValue)

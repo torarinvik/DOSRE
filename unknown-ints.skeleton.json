@@ -1,0 +1,107 @@
+{
+  "meta": {
+    "description": "Skeleton interrupt pack generated from dosre.unknown-ints.txt (fill in names/params/returns).",
+    "notes": [
+      "This file contains only interrupt numbers and observed selector values (AH/AX) from analyzed binaries.",
+      "Populate names/params/returns using your own references.",
+      "If both AH and AX were seen for the same interrupt, codes are emitted under selector AX and AH codes are included as 0x00AH-style values for convenience."
+    ]
+  },
+  "interrupts": [
+    {
+      "int": "0x02",
+      "name": "",
+      "selector": "",
+      "functions": []
+    },
+    {
+      "int": "0x34",
+      "name": "",
+      "selector": "AH",
+      "functions": [
+        {
+          "code": "0x4D",
+          "name": "",
+          "params": [],
+          "returns": []
+        }
+      ]
+    },
+    {
+      "int": "0x35",
+      "name": "",
+      "selector": "AH",
+      "functions": [
+        {
+          "code": "0x4D",
+          "name": "",
+          "params": [],
+          "returns": []
+        }
+      ]
+    },
+    {
+      "int": "0x37",
+      "name": "",
+      "selector": "",
+      "functions": []
+    },
+    {
+      "int": "0x38",
+      "name": "",
+      "selector": "",
+      "functions": []
+    },
+    {
+      "int": "0x39",
+      "name": "",
+      "selector": "",
+      "functions": []
+    },
+    {
+      "int": "0x3A",
+      "name": "",
+      "selector": "AH",
+      "functions": [
+        {
+          "code": "0x4D",
+          "name": "",
+          "params": [],
+          "returns": []
+        }
+      ]
+    },
+    {
+      "int": "0x3B",
+      "name": "",
+      "selector": "AH",
+      "functions": [
+        {
+          "code": "0x4D",
+          "name": "",
+          "params": [],
+          "returns": []
+        }
+      ]
+    },
+    {
+      "int": "0x3C",
+      "name": "",
+      "selector": "",
+      "functions": []
+    },
+    {
+      "int": "0x3D",
+      "name": "",
+      "selector": "AH",
+      "functions": [
+        {
+          "code": "0x4D",
+          "name": "",
+          "params": [],
+          "returns": []
+        }
+      ]
+    }
+  ]
+}

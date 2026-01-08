@@ -44,9 +44,6 @@ Minimal will output the disassembled x86 code segments labeled with SEGMENT:OFFS
 00000C71h:0002.0071h 6A07            push 0x7
 00000C73h:0002.0073h 9AFFFF0000      call word 0x0:0xffff
 00000C78h:0002.0078h 83C406          add sp, 0x6
-00000C7Bh:0002.007Bh A3EC02          mov [0x2ec], ax
-00000C7Eh:0002.007Eh 6A08            push 0x8
-00000C80h:0002.0080h 9AFFFF0000      call word 0x0:0xffff
 00000C85h:0002.0085h 59              pop cx
 00000C86h:0002.0086h 89160403        mov [0x304], dx
 00000C8Ah:0002.008Ah A30203          mov [0x302], ax
@@ -56,9 +53,6 @@ Normal will output the disassembled x86 code segments labeled with SEGMENT:OFFSE
 * Processing Segment Relocation Table Entries
 * Resolve External References
 * String Reference Resolution (best guess)
-* Identify and Label Conditional/Unconditional Jumps as well as Function Calls
-```asm
-00000C68h:0002.0068h 83C408          add sp, 0x8
 00000C6Bh:0002.006Bh 68FF7F          push 0x7fff
 00000C6Eh:0002.006Eh 680180          push 0x8001
 00000C71h:0002.0071h 6A07            push 0x7
@@ -111,6 +105,29 @@ The Enhanced Analysis mode can be extended through pull requests by adding Modul
 # Reference Docs
 
 This repo includes a `DosDocs/` folder with PDFs covering DOS assembly/interrupts and Borland/Watcom documentation. These are reference materials intended to inform disassembly annotations and reverse engineering notes.
+
+# Interrupt Database Workflow (Recommended)
+
+DOSRE ships with an embedded interrupt database, but you can scale it up safely using *local packs* and a *missing-interrupt recorder*.
+
+### Local interrupt packs (not committed)
+
+- Create a folder named `DosInterrupts/` in the repo root (or set `DOSRE_INTS_DIR` to another folder).
+- Drop one or more `*.json` packs in that folder using the same schema as `DOSRE/Analysis/Assets/DOSINTS_def.json`.
+- DOSRE will merge them at startup (best-effort).
+
+`DosInterrupts/` is ignored by git.
+
+### Record missing interrupt usage (opt-in)
+
+- Set `DOSRE_DUMP_UNKNOWN_INTS=1`
+- Run a disassembly
+- DOSRE writes/updates `dosre.unknown-ints.txt` in the working directory
+
+### Generate a JSON skeleton from the recorded list
+
+- `dotnet run --project DOSRE -- -intskeleton out.json`
+- `dotnet run --project DOSRE -- -intskeleton in.txt out.json`
 
 # Thanks
 

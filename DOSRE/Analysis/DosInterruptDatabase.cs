@@ -12,6 +12,12 @@ namespace DOSRE.Analysis
         private const string PrimaryResourceName = "DOSRE.Analysis.Assets.DOSINTS_def.json";
         private const string ResourceSuffix = "INTS_def.json";
 
+        // Optional: allow users to drop large interrupt databases locally without embedding/committing them.
+        // - If DOSRE_INTS_DIR is set, load *.json from that folder (non-recursive).
+        // - Otherwise, if ./DosInterrupts exists, load *.json from there (non-recursive).
+        private const string LocalInterruptDirEnvVar = "DOSRE_INTS_DIR";
+        private const string DefaultLocalInterruptDirName = "DosInterrupts";
+
         private readonly Dictionary<byte, InterruptEntry> _intsByNo;
 
         // Default to a common "90s DOS" baseline (MS-DOS 6.22).
@@ -34,9 +40,59 @@ namespace DOSRE.Analysis
                 {
                     if (_instance != null)
                         return _instance;
-                    _instance = LoadFromEmbeddedResources() ?? new DosInterruptDatabase(new Dictionary<byte, InterruptEntry>());
+
+                    var embedded = LoadFromEmbeddedResources();
+                    var merged = embedded?._intsByNo != null
+                        ? new Dictionary<byte, InterruptEntry>(embedded._intsByNo)
+                        : new Dictionary<byte, InterruptEntry>();
+
+                    TryMergeLocalInterruptPacksInto(merged);
+                    _instance = new DosInterruptDatabase(merged);
                     return _instance;
                 }
+            }
+        }
+
+        private static void TryMergeLocalInterruptPacksInto(Dictionary<byte, InterruptEntry> dest)
+        {
+            try
+            {
+                if (dest == null)
+                    return;
+
+                var dir = Environment.GetEnvironmentVariable(LocalInterruptDirEnvVar);
+                if (string.IsNullOrWhiteSpace(dir))
+                {
+                    var cwd = Directory.GetCurrentDirectory();
+                    dir = Path.Combine(cwd, DefaultLocalInterruptDirName);
+                }
+
+                if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir))
+                    return;
+
+                var files = Directory.GetFiles(dir, "*.json", SearchOption.TopDirectoryOnly)
+                    .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                foreach (var path in files)
+                {
+                    try
+                    {
+                        var json = File.ReadAllText(path);
+                        var db = Parse(json);
+                        if (db == null)
+                            continue;
+                        MergeInto(dest, db._intsByNo);
+                    }
+                    catch
+                    {
+                        // Ignore malformed local packs; keep core DB working.
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore; local packs are best-effort.
             }
         }
 

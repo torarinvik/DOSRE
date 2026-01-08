@@ -798,6 +798,9 @@ namespace DOSRE.Dasm
                 return "INT: " + db;
             }
 
+            // Opt-in: record unknown interrupt usage for building local packs.
+            UnknownInterruptRecorder.Record(intNo, dbAh, dbAx);
+
             // BIOS/DOS/high-level tags
             if (intNo == 0x10)
                 return "INT: BIOS video int 10h";
