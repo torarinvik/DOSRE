@@ -1706,7 +1706,7 @@ namespace DOSRE.Dasm
             if (intNo == 0x08) return "IRQ0: System Timer Tick";
             if (intNo == 0x09) return "IRQ1: Keyboard String / IRQ9: Redirected IRQ2";
 
-            if (intNo == 0x10) return "BIOS: VIDEO SERVICES (AH=mode/pos/char/scroll/VBE)";
+            // NOTE: Don't return early for INT 10h; we want the richer AH-specific decoding below.
             if (intNo == 0x11) return "BIOS: Get Equipment List ; AX bits: 0=diskette, 1=8087, 4-5=video, 6-7=drives";
             if (intNo == 0x12) return "BIOS: Get Memory Size ; AX=KB (max 640)";
             if (intNo == 0x13) return "BIOS: DISK I/O (CH/CL=cyl/sec, DH/DL=head/drive, ES:BX=buffer)";
@@ -2417,7 +2417,81 @@ namespace DOSRE.Dasm
             {
                 if (!lastAh.HasValue)
                     return "INT 10h";
-                return $"INT 10h AH=0x{lastAh.Value:X2} (BIOS video)";
+
+                var ah = lastAh.Value;
+                var desc = $"BIOS: VIDEO SERVICES (AH=0x{ah:X2})";
+
+                if (ah == 0x00) // Set Mode
+                {
+                    var al = lastAl ?? (byte)(lastAxImm ?? 0);
+                    var mode = al switch
+                    {
+                        0x03 => "80x25 Text",
+                        0x04 => "320x200 4-color",
+                        0x06 => "640x200 BW",
+                        0x0D => "320x200 16-color (EGA)",
+                        0x0E => "640x200 16-color (EGA)",
+                        0x10 => "640x350 16-color (EGA)",
+                        0x12 => "640x480 16-color (VGA)",
+                        0x13 => "320x200 256-color (VGA)",
+                        _ => $"mode 0x{al:X2}"
+                    };
+                    desc += $" ; {mode}";
+                }
+                else if (ah == 0x01) // Set Cursor Shape
+                {
+                    if (lastCxImm.HasValue) desc += $" ; shape=0x{lastCxImm.Value:X4} (CH=start CL=end)";
+                    desc += " ; CH=start CL=end";
+                }
+                else if (ah == 0x02) // Set Cursor
+                {
+                    if (lastDxImm.HasValue) desc += $" ; row={lastDxImm.Value >> 8} col={lastDxImm.Value & 0xFF}";
+                    desc += " ; BH=page DH=row DL=col";
+                }
+                else if (ah == 0x03) // Get Cursor
+                {
+                    desc += " ; BH=page (returns CX=shape DX=pos)";
+                }
+                else if (ah == 0x06 || ah == 0x07) // Scroll Up/Down
+                {
+                    if (lastAl.HasValue) desc += $" ; lines={lastAl.Value}";
+                    desc += " ; AL=lines BH=attr CH,CL=top left DH,DL=bottom right";
+                }
+                else if (ah == 0x08) // Read Char/Attr
+                {
+                    desc += " ; BH=page (returns AL=char AH=attr)";
+                }
+                else if (ah == 0x09 || ah == 0x0A) // Write Char/Attr
+                {
+                    if (lastAxImm.HasValue) desc += $" ; char='{(char)(lastAxImm.Value & 0xFF)}'";
+                    desc += " ; AL=char BH=page BL=attr CX=count";
+                }
+                else if (ah == 0x0C) // Write Pixel
+                {
+                    if (lastAl.HasValue) desc += $" ; color={lastAl.Value}";
+                    desc += " ; AL=color BH=page CX=x DX=y";
+                }
+                else if (ah == 0x0D) // Read Pixel
+                {
+                    desc += " ; BH=page CX=x DX=y (returns AL=color)";
+                }
+                else if (ah == 0x0F) // Get Mode
+                {
+                    desc += " ; (returns AL=mode AH=cols BH=page)";
+                }
+                else if (ah == 0x13) // Write String
+                {
+                    if (lastEsImm.HasValue && lastBpImm.HasValue && lastCxImm.HasValue)
+                    {
+                        var linear = (uint)((lastEsImm.Value << 4) + lastBpImm.Value);
+                        var s = TryReadAsciiStringFixed(module, linear, Math.Min((int)lastCxImm.Value, 256));
+                        if (!string.IsNullOrEmpty(s))
+                            desc += $" ; \"{s}\"";
+                    }
+                    desc += " ; AL=mode BH=page BL=attr CX=len DX=row/col ES:BP=string";
+                }
+
+                return desc;
             }
 
             return $"INT 0x{intNo:X2}";
