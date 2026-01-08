@@ -13,6 +13,33 @@ namespace DOSRE.Renderer.impl
     /// </summary>
     public class StringRenderer
     {
+        private static string[] WrapComment(string text, int maxWidth)
+        {
+            if (string.IsNullOrEmpty(text) || maxWidth <= 8)
+                return new[] { text ?? string.Empty };
+
+            var t = text.Trim();
+            var lines = new System.Collections.Generic.List<string>();
+
+            while (t.Length > maxWidth)
+            {
+                var breakAt = t.LastIndexOf(' ', maxWidth);
+                if (breakAt <= 0)
+                    breakAt = maxWidth;
+
+                var line = t.Substring(0, breakAt).TrimEnd();
+                if (line.Length > 0)
+                    lines.Add(line);
+
+                t = t.Substring(breakAt).TrimStart();
+            }
+
+            if (t.Length > 0)
+                lines.Add(t);
+
+            return lines.Count > 0 ? lines.ToArray() : new[] { string.Empty };
+        }
+
         /// <summary>
         ///     Input File
         /// </summary>
@@ -162,19 +189,24 @@ namespace DOSRE.Renderer.impl
                         var firstCommentIndex = 0;
                         foreach (var c in d.Comments)
                         {
+                            var wrapped = WrapComment(c, maxWidth: 120);
                             if (!newLine)
                             {
                                 var l = maxDecodeLength - sOutputLine.Length;
                                 if (l<0) l = 0;
-                                sOutputLine += $"{new string(' ', l)}; {c}";
+                                sOutputLine += $"{new string(' ', l)}; {wrapped[0]}";
 
                                 //Set variables to help us keep the following comments lined up with the first one
                                 firstCommentIndex = sOutputLine.IndexOf(';');
                                 newLine = true;
+
+                                for (var wi = 1; wi < wrapped.Length; wi++)
+                                    sOutputLine += $"\r\n{new string(' ', firstCommentIndex)}; {wrapped[wi]}";
                                 continue;
                             }
 
-                            sOutputLine += $"\r\n{new string(' ', firstCommentIndex)}; {c}";
+                            foreach (var w in wrapped)
+                                sOutputLine += $"\r\n{new string(' ', firstCommentIndex)}; {w}";
                         }
                     }
 

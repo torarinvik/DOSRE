@@ -222,7 +222,7 @@ namespace DOSRE.Dasm
                     sb.AppendLine();
                     sb.AppendLine($"func_{addr:X5}:");
                     if (callXrefs.TryGetValue(addr, out var callers))
-                        sb.AppendLine($"; XREF: called from {string.Join(", ", callers.Distinct().OrderBy(x => x).Select(x => $"0x{x:X}"))}");
+                        AppendWrappedDisasmLine(sb, string.Empty, $" ; XREF: called from {string.Join(", ", callers.Distinct().OrderBy(x => x).Select(x => $"0x{x:X}"))}", commentColumn: 0, maxWidth: 160);
 
                     currentFunc = funcInfos.TryGetValue(addr, out var fi) ? fi : null;
 
@@ -305,29 +305,29 @@ namespace DOSRE.Dasm
                             {
                                 var args = FormatArgs(currentFunc.ArgOffsets);
                                 if (!string.IsNullOrEmpty(args))
-                                    sb.AppendLine($"; ARGS: {args}");
+                                    AppendWrappedDisasmLine(sb, string.Empty, $" ; ARGS: {args}", commentColumn: 0, maxWidth: 160);
                             }
 
                             if (currentFunc.LocalOffsets.Count > 0)
                             {
                                 var locals = FormatLocals(currentFunc.LocalOffsets, maxToShow: 40);
                                 if (!string.IsNullOrEmpty(locals))
-                                    sb.AppendLine($"; LOCALS: {locals}");
+                                    AppendWrappedDisasmLine(sb, string.Empty, $" ; LOCALS: {locals}", commentColumn: 0, maxWidth: 160);
                             }
                         }
                         if (currentFunc.RetPopBytes > 0)
-                            sb.AppendLine($"; PROTO?: callee pops {currentFunc.RetPopBytes} bytes (~{currentFunc.RetPopBytes / 2} args)");
+                            AppendWrappedDisasmLine(sb, string.Empty, $" ; PROTO?: callee pops {currentFunc.RetPopBytes} bytes (~{currentFunc.RetPopBytes / 2} args)", commentColumn: 0, maxWidth: 160);
 
                         var summary = TrySummarizeFunction(currentFunc, instructions);
                         if (!string.IsNullOrEmpty(summary))
-                            sb.AppendLine($"; SUMMARY: {summary}");
+                            AppendWrappedDisasmLine(sb, string.Empty, $" ; SUMMARY: {summary}", commentColumn: 0, maxWidth: 160);
                     }
                 }
                 else if (mzInsights && labelTargets.Contains(addr))
                 {
                     sb.AppendLine($"loc_{addr:X5}:");
                     if (jumpXrefs.TryGetValue(addr, out var sources))
-                        sb.AppendLine($"; XREF: jumped from {string.Join(", ", sources.Distinct().OrderBy(x => x).Select(x => $"0x{x:X}"))}");
+                        AppendWrappedDisasmLine(sb, string.Empty, $" ; XREF: jumped from {string.Join(", ", sources.Distinct().OrderBy(x => x).Select(x => $"0x{x:X}"))}", commentColumn: 0, maxWidth: 160);
                 }
 
                 var bytes = BitConverter.ToString(ins.Bytes).Replace("-", "");
@@ -422,7 +422,8 @@ namespace DOSRE.Dasm
                     }
                 }
 
-                sb.AppendLine($"{addr:X5}h {bytes.PadRight(16)} {insText}");
+                // Keep long hint chains readable by wrapping '; ...' comments onto aligned follow-up lines.
+                AppendWrappedDisasmLine(sb, $"{addr:X5}h {bytes.PadRight(16)} ", insText, commentColumn: 60, maxWidth: 150);
             }
 
             output = sb.ToString();

@@ -76,6 +76,89 @@ namespace DOSRE.Dasm
             @"(?<size>byte|word|dword)\s+\[(?<base>e[a-z]{2})(?:\+0x(?<disp>[0-9A-Fa-f]+))?\]",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+        private static void SplitInstructionAndComments(string insText, out string instruction, out List<string> comments)
+        {
+            instruction = insText ?? string.Empty;
+            comments = new List<string>();
+            if (string.IsNullOrEmpty(insText))
+                return;
+
+            var parts = insText.Split(new[] { " ; " }, StringSplitOptions.None);
+            if (parts.Length <= 1)
+                return;
+
+            instruction = parts[0];
+            comments = parts.Skip(1).Where(p => !string.IsNullOrWhiteSpace(p)).Select(p => p.Trim()).ToList();
+        }
+
+        private static IEnumerable<string> WrapText(string text, int maxWidth)
+        {
+            if (string.IsNullOrEmpty(text))
+                yield break;
+
+            if (maxWidth <= 8)
+            {
+                yield return text;
+                yield break;
+            }
+
+            var t = text.Trim();
+            while (t.Length > maxWidth)
+            {
+                var breakAt = t.LastIndexOf(' ', maxWidth);
+                if (breakAt <= 0)
+                    breakAt = maxWidth;
+
+                var line = t[..breakAt].TrimEnd();
+                if (!string.IsNullOrEmpty(line))
+                    yield return line;
+
+                t = t[breakAt..].TrimStart();
+            }
+
+            if (t.Length > 0)
+                yield return t;
+        }
+
+        private static void AppendWrappedDisasmLine(StringBuilder sb, string prefix, string insText, int commentColumn, int maxWidth)
+        {
+            if (sb == null)
+                return;
+
+            SplitInstructionAndComments(insText, out var instruction, out var comments);
+            var baseLine = (prefix ?? string.Empty) + (instruction ?? string.Empty);
+            if (comments == null || comments.Count == 0)
+            {
+                sb.AppendLine(baseLine);
+                return;
+            }
+
+            var commentIndent = new string(' ', Math.Max(0, commentColumn));
+            var first = true;
+
+            foreach (var c in comments)
+            {
+                foreach (var wrapped in WrapText(c, Math.Max(16, maxWidth - (commentColumn + 2))))
+                {
+                    if (first)
+                    {
+                        var line = baseLine;
+                        if (line.Length < commentColumn)
+                            line += new string(' ', commentColumn - line.Length);
+                        else if (!string.IsNullOrEmpty(line))
+                            line += " ";
+                        line += $"; {wrapped}";
+                        sb.AppendLine(line);
+                        first = false;
+                    }
+                    else
+                    {
+                        sb.AppendLine($"{commentIndent}; {wrapped}");
+                    }
+                }
+            }
+        }
+
         private sealed class FieldAccessStats
         {
             public int ReadCount;
@@ -1528,39 +1611,47 @@ namespace DOSRE.Dasm
             }
 
             var sb = new StringBuilder();
-            sb.AppendLine($"; Disassembly of {Path.GetFileName(inputFile)} (LE / DOS4GW)");
-            sb.AppendLine($"; PageSize: {header.PageSize}  LastPageSize: {header.LastPageSize}  Pages: {header.NumberOfPages}");
-            sb.AppendLine($"; Entry: Obj {header.EntryEipObject} + 0x{header.EntryEip:X} (Linear 0x{ComputeEntryLinear(header, objects):X})");
+            AppendWrappedDisasmLine(sb, string.Empty, $" ; Disassembly of {Path.GetFileName(inputFile)} (LE / DOS4GW)", commentColumn: 0, maxWidth: 160);
+            AppendWrappedDisasmLine(sb, string.Empty, $" ; PageSize: {header.PageSize}  LastPageSize: {header.LastPageSize}  Pages: {header.NumberOfPages}", commentColumn: 0, maxWidth: 160);
+            AppendWrappedDisasmLine(sb, string.Empty, $" ; Entry: Obj {header.EntryEipObject} + 0x{header.EntryEip:X} (Linear 0x{ComputeEntryLinear(header, objects):X})", commentColumn: 0, maxWidth: 160);
             if (toolchainHint != EnumToolchainHint.None)
             {
-                sb.AppendLine($"; Toolchain hint: {toolchainHint}");
+                AppendWrappedDisasmLine(sb, string.Empty, $" ; Toolchain hint: {toolchainHint}", commentColumn: 0, maxWidth: 160);
 
                 var markers = FindToolchainMarkers(fileBytes, toolchainHint, 12);
                 if (markers.Count > 0)
                 {
-                    sb.AppendLine("; Toolchain markers (best-effort)");
+                    AppendWrappedDisasmLine(sb, string.Empty, " ; Toolchain markers (best-effort)", commentColumn: 0, maxWidth: 160);
                     foreach (var m in markers.OrderBy(m => m.Offset))
-                        sb.AppendLine($"; 0x{m.Offset:X}  {m.Text}");
+                        AppendWrappedDisasmLine(sb, string.Empty, $" ; 0x{m.Offset:X}  {m.Text}", commentColumn: 0, maxWidth: 160);
                 }
                 else
                 {
-                    sb.AppendLine("; Toolchain markers (best-effort): none found");
+                    AppendWrappedDisasmLine(sb, string.Empty, " ; Toolchain markers (best-effort): none found", commentColumn: 0, maxWidth: 160);
                 }
             }
             if (leFixups)
-                sb.AppendLine($"; NOTE: LE fixup annotations enabled (best-effort)");
+                AppendWrappedDisasmLine(sb, string.Empty, " ; NOTE: LE fixup annotations enabled (best-effort)", commentColumn: 0, maxWidth: 160);
             else
-                sb.AppendLine($"; NOTE: Minimal LE support (no fixups/import analysis)");
+                AppendWrappedDisasmLine(sb, string.Empty, " ; NOTE: Minimal LE support (no fixups/import analysis)", commentColumn: 0, maxWidth: 160);
 
             if (leGlobals)
-                sb.AppendLine($"; NOTE: LE globals enabled (disp32 fixups become g_XXXXXXXX symbols)");
+                AppendWrappedDisasmLine(sb, string.Empty, " ; NOTE: LE globals enabled (disp32 fixups become g_XXXXXXXX symbols)", commentColumn: 0, maxWidth: 160);
             if (leInsights)
-                sb.AppendLine($"; NOTE: LE insights enabled (best-effort function/CFG/xref/stack-var/string analysis)");
-            sb.AppendLine($"; XREFS: derived from relative CALL/JMP/Jcc only");
+                AppendWrappedDisasmLine(sb, string.Empty, " ; NOTE: LE insights enabled (best-effort function/CFG/xref/stack-var/string analysis)", commentColumn: 0, maxWidth: 160);
+            AppendWrappedDisasmLine(sb, string.Empty, " ; XREFS: derived from relative CALL/JMP/Jcc only", commentColumn: 0, maxWidth: 160);
             if (leFull)
-                sb.AppendLine("; LE mode: FULL (disassemble from object start)");
+                AppendWrappedDisasmLine(sb, string.Empty, " ; LE mode: FULL (disassemble from object start)", commentColumn: 0, maxWidth: 160);
             if (!leFull && leBytesLimit.HasValue)
-                sb.AppendLine($"; LE mode: LIMIT {leBytesLimit.Value} bytes");
+                AppendWrappedDisasmLine(sb, string.Empty, $" ; LE mode: LIMIT {leBytesLimit.Value} bytes", commentColumn: 0, maxWidth: 160);
+            sb.AppendLine(";");
+
+            AppendWrappedDisasmLine(sb, string.Empty, " ; Legend:", commentColumn: 0, maxWidth: 160);
+            AppendWrappedDisasmLine(sb, string.Empty, " ;   func_XXXXXXXX: function entry (best-effort)", commentColumn: 0, maxWidth: 160);
+            AppendWrappedDisasmLine(sb, string.Empty, " ;   loc_XXXXXXXX: local label (branch/jump target)", commentColumn: 0, maxWidth: 160);
+            AppendWrappedDisasmLine(sb, string.Empty, " ;   bb_XXXXXXXX: basic block label (CFG)", commentColumn: 0, maxWidth: 160);
+            AppendWrappedDisasmLine(sb, string.Empty, " ;   CALLHINT: heuristic call signature (args~/ret=)", commentColumn: 0, maxWidth: 160);
+            AppendWrappedDisasmLine(sb, string.Empty, " ;   FIXUP: kind site+N type/flags val32 => objK+off (linear 0x........) (best-effort)", commentColumn: 0, maxWidth: 160);
             sb.AppendLine(";");
 
             // Reconstruct all object bytes once so we can scan data objects (strings) and map xrefs.
@@ -1592,17 +1683,17 @@ namespace DOSRE.Dasm
                 dispatchTableSymbols = new Dictionary<uint, string>();
                 if (stringSymbols.Count > 0)
                 {
-                    sb.AppendLine("; Strings (best-effort, ASCII/CP437-ish)");
+                    AppendWrappedDisasmLine(sb, string.Empty, " ; Strings (best-effort, ASCII/CP437-ish)", commentColumn: 0, maxWidth: 160);
                     foreach (var kvp in stringSymbols.OrderBy(k => k.Key).Take(512))
                     {
                         var prev = stringPreview.TryGetValue(kvp.Key, out var p) ? p : string.Empty;
                         if (!string.IsNullOrEmpty(prev))
-                            sb.AppendLine($"{kvp.Value} EQU 0x{kvp.Key:X8} ; \"{prev}\"");
+                            AppendWrappedDisasmLine(sb, string.Empty, $"{kvp.Value} EQU 0x{kvp.Key:X8} ; \"{prev}\"", commentColumn: 40, maxWidth: 160);
                         else
                             sb.AppendLine($"{kvp.Value} EQU 0x{kvp.Key:X8}");
                     }
                     if (stringSymbols.Count > 512)
-                        sb.AppendLine($"; (strings truncated: {stringSymbols.Count} total)");
+                        AppendWrappedDisasmLine(sb, string.Empty, $" ; (strings truncated: {stringSymbols.Count} total)", commentColumn: 0, maxWidth: 160);
                     sb.AppendLine(";");
                 }
             }
@@ -1648,14 +1739,14 @@ namespace DOSRE.Dasm
                 }
 
                 sb.AppendLine(";-------------------------------------------");
-                sb.AppendLine($"; Object {obj.Index}  Base: 0x{obj.BaseAddress:X8}  Size: 0x{obj.VirtualSize:X}  Flags: 0x{obj.Flags:X8}  Pages: {obj.PageCount}  {(isExecutable ? "CODE" : "DATA?")}");
-                sb.AppendLine($"; Disassembly start: +0x{startOffsetWithinObject:X} (Linear 0x{(obj.BaseAddress + (uint)startOffsetWithinObject):X8})");
-                sb.AppendLine("; LINEAR_ADDR BYTES DISASSEMBLY");
+                AppendWrappedDisasmLine(sb, string.Empty, $" ; Object {obj.Index}  Base: 0x{obj.BaseAddress:X8}  Size: 0x{obj.VirtualSize:X}  Flags: 0x{obj.Flags:X8}  Pages: {obj.PageCount}  {(isExecutable ? "CODE" : "DATA?")}", commentColumn: 0, maxWidth: 160);
+                AppendWrappedDisasmLine(sb, string.Empty, $" ; Disassembly start: +0x{startOffsetWithinObject:X} (Linear 0x{(obj.BaseAddress + (uint)startOffsetWithinObject):X8})", commentColumn: 0, maxWidth: 160);
+                AppendWrappedDisasmLine(sb, string.Empty, " ; LINEAR_ADDR BYTES DISASSEMBLY", commentColumn: 0, maxWidth: 160);
                 sb.AppendLine(";-------------------------------------------");
 
                 if (!isExecutable)
                 {
-                    sb.AppendLine("; Skipping non-executable object (use -minimal later if you want raw dump support)");
+                    AppendWrappedDisasmLine(sb, string.Empty, " ; Skipping non-executable object (use -minimal later if you want raw dump support)", commentColumn: 0, maxWidth: 160);
                     sb.AppendLine();
                     continue;
                 }
@@ -1665,7 +1756,7 @@ namespace DOSRE.Dasm
                     codeLen = Math.Min(codeLen, leBytesLimit.Value);
                 if (codeLen <= 0)
                 {
-                    sb.AppendLine("; (No bytes to disassemble)");
+                    AppendWrappedDisasmLine(sb, string.Empty, " ; (No bytes to disassemble)", commentColumn: 0, maxWidth: 160);
                     sb.AppendLine();
                     continue;
                 }
@@ -1837,16 +1928,16 @@ namespace DOSRE.Dasm
                         sb.AppendLine();
                         sb.AppendLine($"func_{addr:X8}:");
                         if (callXrefs.TryGetValue(addr, out var callers) && callers.Count > 0)
-                            sb.AppendLine($"; XREF: called from {string.Join(", ", callers.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}");
+                            AppendWrappedDisasmLine(sb, string.Empty, $" ; XREF: called from {string.Join(", ", callers.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}", commentColumn: 0, maxWidth: 160);
 
                         if (leInsights && resourceGetterTargets != null && resourceGetterTargets.Contains(addr))
-                            sb.AppendLine("; ROLE: res_get(base=edx, id=eax) -> eax (best-effort)");
+                            AppendWrappedDisasmLine(sb, string.Empty, " ; ROLE: res_get(base=edx, id=eax) -> eax (best-effort)", commentColumn: 0, maxWidth: 160);
 
                         if (leInsights && funcSummaries != null && funcSummaries.TryGetValue(addr, out var summary))
-                            sb.AppendLine(summary.ToComment());
+                            AppendWrappedDisasmLine(sb, string.Empty, $" {summary.ToComment()}", commentColumn: 0, maxWidth: 160);
 
                         if (leInsights && funcFieldSummaries != null && funcFieldSummaries.TryGetValue(addr, out var fsum))
-                            sb.AppendLine($"; {fsum}");
+                            AppendWrappedDisasmLine(sb, string.Empty, $" ; {fsum}", commentColumn: 0, maxWidth: 160);
 
                         // Reset aliases at function boundary.
                         liveAliases.Clear();
@@ -1856,13 +1947,13 @@ namespace DOSRE.Dasm
                     {
                         sb.AppendLine($"loc_{addr:X8}:");
                         if (jumpXrefs.TryGetValue(addr, out var sources) && sources.Count > 0)
-                            sb.AppendLine($"; XREF: jumped from {string.Join(", ", sources.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}");
+                            AppendWrappedDisasmLine(sb, string.Empty, $" ; XREF: jumped from {string.Join(", ", sources.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}", commentColumn: 0, maxWidth: 160);
                     }
                     else if (leInsights && blockStarts != null && blockStarts.Contains(addr))
                     {
                         sb.AppendLine($"bb_{addr:X8}:");
                         if (blockPreds != null && blockPreds.TryGetValue(addr, out var preds) && preds.Count > 0)
-                            sb.AppendLine($"; CFG: preds {string.Join(", ", preds.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}");
+                            AppendWrappedDisasmLine(sb, string.Empty, $" ; CFG: preds {string.Join(", ", preds.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}", commentColumn: 0, maxWidth: 160);
                     }
 
                     var bytes = BitConverter.ToString(ins.Bytes).Replace("-", string.Empty);
@@ -1954,14 +2045,13 @@ namespace DOSRE.Dasm
 
                     if (haveFixups && fixupsHere.Count > 0)
                     {
-                        var fixupText = FormatFixupAnnotation(ins, fixupsHere);
+                        var fixupText = FormatFixupAnnotation(ins, fixupsHere, objects);
                         if (!string.IsNullOrEmpty(fixupText))
                             insText += $" ; FIXUP: {fixupText}";
                     }
 
-                    var line = $"{ins.Offset:X8}h {bytes.PadRight(Constants.MAX_INSTRUCTION_LENGTH, ' ')} {insText}";
-
-                    sb.AppendLine(line);
+                    var prefix = $"{ins.Offset:X8}h {bytes.PadRight(Constants.MAX_INSTRUCTION_LENGTH, ' ')} ";
+                    AppendWrappedDisasmLine(sb, prefix, insText, commentColumn: 56, maxWidth: 160);
                 }
 
                 if (leInsights && symXrefs != null && symXrefs.Count > 0)
@@ -3804,7 +3894,7 @@ namespace DOSRE.Dasm
             return hit;
         }
 
-        private static string FormatFixupAnnotation(Instruction ins, List<LEFixup> fixupsHere)
+        private static string FormatFixupAnnotation(Instruction ins, List<LEFixup> fixupsHere, List<LEObject> objects)
         {
             if (fixupsHere == null || fixupsHere.Count == 0 || ins == null)
                 return string.Empty;
@@ -3817,9 +3907,20 @@ namespace DOSRE.Dasm
                 var delta = unchecked((int)(f.SiteLinear - insStart));
                 var kind = TryClassifyFixupKind(ins, delta, out var k) ? k : "unk";
 
-                var mapped = (f.TargetObject.HasValue && f.TargetOffset.HasValue)
-                    ? $" => obj{f.TargetObject.Value}+0x{f.TargetOffset.Value:X}"
-                    : string.Empty;
+                var mapped = string.Empty;
+                if (f.TargetObject.HasValue && f.TargetOffset.HasValue)
+                {
+                    mapped = $" => obj{f.TargetObject.Value}+0x{f.TargetOffset.Value:X}";
+                    if (objects != null)
+                    {
+                        var oi = objects.FindIndex(o => o.Index == (uint)f.TargetObject.Value);
+                        if (oi >= 0)
+                        {
+                            var linear = objects[oi].BaseAddress + (ulong)f.TargetOffset.Value;
+                            mapped += $" (linear 0x{linear:X8})";
+                        }
+                    }
+                }
 
                 var v32 = f.Value32.HasValue ? $" val32=0x{f.Value32.Value:X8}" : string.Empty;
 

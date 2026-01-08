@@ -1,10 +1,98 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 
 namespace DOSRE.Dasm
 {
     public static partial class MZDisassembler
     {
+        private static void SplitInstructionAndComments(string insText, out string instruction, out List<string> comments)
+        {
+            instruction = insText ?? string.Empty;
+            comments = new List<string>();
+            if (string.IsNullOrEmpty(insText))
+                return;
+
+            // We only treat " ; " as a comment separator so we don't break things like "[ss:0x10]".
+            var parts = insText.Split(new[] { " ; " }, StringSplitOptions.None);
+            if (parts.Length <= 1)
+                return;
+
+            instruction = parts[0];
+            comments = parts.Skip(1).Where(p => !string.IsNullOrWhiteSpace(p)).Select(p => p.Trim()).ToList();
+        }
+
+        private static IEnumerable<string> WrapText(string text, int maxWidth)
+        {
+            if (string.IsNullOrEmpty(text))
+                yield break;
+
+            if (maxWidth <= 8)
+            {
+                yield return text;
+                yield break;
+            }
+
+            var t = text.Trim();
+            while (t.Length > maxWidth)
+            {
+                var breakAt = t.LastIndexOf(' ', maxWidth);
+                if (breakAt <= 0)
+                    breakAt = maxWidth;
+
+                var line = t[..breakAt].TrimEnd();
+                if (!string.IsNullOrEmpty(line))
+                    yield return line;
+
+                t = t[breakAt..].TrimStart();
+            }
+
+            if (t.Length > 0)
+                yield return t;
+        }
+
+        private static void AppendWrappedDisasmLine(StringBuilder sb, string prefix, string insText, int commentColumn, int maxWidth)
+        {
+            if (sb == null)
+                return;
+
+            SplitInstructionAndComments(insText, out var instruction, out var comments);
+
+            var baseLine = (prefix ?? string.Empty) + (instruction ?? string.Empty);
+            if (comments == null || comments.Count == 0)
+            {
+                sb.AppendLine(baseLine);
+                return;
+            }
+
+            var commentIndent = new string(' ', Math.Max(0, commentColumn));
+            var first = true;
+
+            foreach (var c in comments)
+            {
+                foreach (var wrapped in WrapText(c, Math.Max(16, maxWidth - (commentColumn + 2))))
+                {
+                    if (first)
+                    {
+                        var line = baseLine;
+                        if (line.Length < commentColumn)
+                            line += new string(' ', commentColumn - line.Length);
+                        else if (!string.IsNullOrEmpty(line))
+                            line += " ";
+
+                        line += $"; {wrapped}";
+                        sb.AppendLine(line);
+                        first = false;
+                    }
+                    else
+                    {
+                        sb.AppendLine($"{commentIndent}; {wrapped}");
+                    }
+                }
+            }
+        }
+
         private static ushort ReadUInt16(byte[] b, int off)
         {
             if (b == null || off + 2 > b.Length) return 0;
