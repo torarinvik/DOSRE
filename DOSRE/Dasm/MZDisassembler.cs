@@ -1147,6 +1147,11 @@ namespace DOSRE.Dasm
                 if (b[1] == 0xC1) { lastCxImm = lastAxImm; return; } // mov cx, ax
                 if (b[1] == 0xC2) { lastDxImm = lastAxImm; return; } // mov dx, ax
                 if (b[1] == 0xC5) { lastBpImm = lastAxImm; return; } // mov bp, ax
+                if (b[1] == 0xDD) { lastBpImm = lastBxImm; return; } // mov bp, bx
+                if (b[1] == 0xCD) { lastBpImm = lastCxImm; return; } // mov bp, cx
+                if (b[1] == 0xD5) { lastBpImm = lastDxImm; return; } // mov bp, dx
+                if (b[1] == 0xF5) { lastBpImm = lastSiImm; return; } // mov bp, si
+                if (b[1] == 0xFD) { lastBpImm = lastDiImm; return; } // mov bp, di
             }
             if (b.Length >= 2 && b[0] == 0x8B) // mov r, r/m
             {
@@ -1155,6 +1160,11 @@ namespace DOSRE.Dasm
                 if (b[1] == 0xD0) { lastDxImm = lastAxImm; return; } // mov dx, ax
                 if (b[1] == 0xC3) { lastAxImm = lastBxImm; lastAh = lastAxImm.HasValue ? (byte?)(lastAxImm >> 8) : null; lastAl = lastAxImm.HasValue ? (byte?)(lastAxImm & 0xFF) : null; return; } // mov ax, bx
                 if (b[1] == 0xE8) { lastBpImm = lastAxImm; return; } // mov bp, ax
+                if (b[1] == 0xEB) { lastBpImm = lastBxImm; return; } // mov bp, bx
+                if (b[1] == 0xE9) { lastBpImm = lastCxImm; return; } // mov bp, cx
+                if (b[1] == 0xEA) { lastBpImm = lastDxImm; return; } // mov bp, dx
+                if (b[1] == 0xEE) { lastBpImm = lastSiImm; return; } // mov bp, si
+                if (b[1] == 0xEF) { lastBpImm = lastDiImm; return; } // mov bp, di
             }
 
             // Segments
@@ -1632,11 +1642,32 @@ namespace DOSRE.Dasm
                                 var cmdOff = (ushort)(cmdPtr & 0xFFFF);
                                 var cmdSeg = (ushort)(cmdPtr >> 16);
 
-                                dbDesc += $" ; PB env=0x{envSeg:X4} cmd={cmdSeg:X4}:{cmdOff:X4}";
+                                var fcb1Ptr = ReadUInt32(module, pbOff + 6);
+                                var fcb1Off = (ushort)(fcb1Ptr & 0xFFFF);
+                                var fcb1Seg = (ushort)(fcb1Ptr >> 16);
+
+                                var fcb2Ptr = ReadUInt32(module, pbOff + 10);
+                                var fcb2Off = (ushort)(fcb2Ptr & 0xFFFF);
+                                var fcb2Seg = (ushort)(fcb2Ptr >> 16);
+
+                                dbDesc += $" ; PB env=0x{envSeg:X4} cmd={cmdSeg:X4}:{cmdOff:X4} fcb1={fcb1Seg:X4}:{fcb1Off:X4} fcb2={fcb2Seg:X4}:{fcb2Off:X4}";
 
                                 var cmdLinear = (uint)((cmdSeg << 4) + cmdOff);
                                 var cmd = TryReadDosCommandTail(module, cmdLinear, 126);
                                 if (!string.IsNullOrEmpty(cmd)) dbDesc += $" \"{cmd}\"";
+
+                                if (fcb1Ptr != 0)
+                                {
+                                    var fcb1Linear = (uint)((fcb1Seg << 4) + fcb1Off);
+                                    var fcb1 = TryFormatFcbDetail(fcb1Linear, module);
+                                    if (!string.IsNullOrEmpty(fcb1)) dbDesc += $" ; {fcb1}";
+                                }
+                                if (fcb2Ptr != 0)
+                                {
+                                    var fcb2Linear = (uint)((fcb2Seg << 4) + fcb2Off);
+                                    var fcb2 = TryFormatFcbDetail(fcb2Linear, module);
+                                    if (!string.IsNullOrEmpty(fcb2)) dbDesc += $" ; {fcb2}";
+                                }
                             }
                         }
                         dbDesc += " ; AL: 0=Exec 1=Debug 3=Overlay DS:DX=path ES:BX=params";
