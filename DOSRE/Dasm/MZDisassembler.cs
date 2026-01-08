@@ -1660,6 +1660,22 @@ namespace DOSRE.Dasm
                 return $"CALL FAR {seg:X4}:{off:X4}";
             }
 
+            // Indirect CALL (often a function pointer / callback)
+            // FF /2 = CALL r/m16 (near), FF /3 = CALL m16:16 (far)
+            if (b[0] == 0xFF && b.Length >= 2)
+            {
+                var modrm = b[1];
+                var reg = (modrm >> 3) & 0x07;
+                if (reg == 2 || reg == 3)
+                {
+                    var idx = text.IndexOf("call", StringComparison.OrdinalIgnoreCase);
+                    var op = idx >= 0 ? text[(idx + 4)..].Trim() : text;
+                    if (string.IsNullOrEmpty(op))
+                        op = "?";
+                    return reg == 3 ? $"INDIRECT FAR CALL via {op}" : $"INDIRECT CALL via {op}";
+                }
+            }
+
             // Far JMP to segment:offset
             if (b[0] == 0xEA && b.Length >= 5)
             {
@@ -2307,16 +2323,12 @@ namespace DOSRE.Dasm
 
                         if (al.HasValue)
                         {
-                            var sub = al.Value switch
-                            {
-                                0x30 => "Get Font Info",
-                                _ => $"sub=0x{al.Value:X2}"
-                            };
-                            dbDesc += $" ; Font services: {sub}";
+                            var sub = DescribeInt10CharacterGeneratorSubfunction(al.Value);
+                            dbDesc += $" ; Character generator: {sub}";
                         }
                         else
                         {
-                            dbDesc += " ; Font services";
+                            dbDesc += " ; Character generator";
                         }
 
                         dbDesc += " ; AL=sub";
@@ -2556,16 +2568,12 @@ namespace DOSRE.Dasm
 
                     if (al.HasValue)
                     {
-                        var sub = al.Value switch
-                        {
-                            0x30 => "Get Font Info",
-                            _ => $"sub=0x{al.Value:X2}"
-                        };
-                        desc += $" ; Font services: {sub}";
+                        var sub = DescribeInt10CharacterGeneratorSubfunction(al.Value);
+                        desc += $" ; Character generator: {sub}";
                     }
                     else
                     {
-                        desc += " ; Font services";
+                        desc += " ; Character generator";
                     }
 
                     desc += " ; AL=sub";
@@ -2791,5 +2799,29 @@ namespace DOSRE.Dasm
 
             return $"{regName}=0x{val:X}";
         }
+
+        private static string DescribeInt10CharacterGeneratorSubfunction(byte al)
+        {
+            return al switch
+            {
+                0x00 => "User character load",
+                0x01 => "Load ROM BIOS 8x14 monochrome set",
+                0x02 => "Load ROM BIOS 8x8 double-dot set",
+                0x03 => "Set displayed definition table",
+                0x04 => "Load ROM BIOS 8x16 character set",
+                0x10 => "User-specified character definition table",
+                0x11 => "Load ROM BIOS 8x14 monochrome character set",
+                0x12 => "Load ROM 8x8 double-dot character definitions",
+                0x14 => "Load ROM 8x16 double-dot character definitions",
+                0x20 => "Get pointer to graphics character table for INT 1F (8x8)",
+                0x21 => "Set user graphics character pointer at INT 43",
+                0x22 => "Load ROM 8x14 character set",
+                0x23 => "Load ROM 8x8 double-dot character set",
+                0x24 => "Load ROM 8x16 character set",
+                0x30 => "Get current character generator information",
+                _ => $"sub=0x{al:X2}"
+            };
+        }
+
     }
 }
