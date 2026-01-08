@@ -587,6 +587,10 @@ namespace DOSRE.Dasm
                     if (!string.IsNullOrEmpty(indirectCallHint))
                         insText += $" ; {indirectCallHint}";
 
+                    var packedHint = TryGetPackedNibbleShiftHint(instructions, i);
+                    if (!string.IsNullOrEmpty(packedHint))
+                        insText += $" ; {packedHint}";
+
                     var higherHint = TryGetHigherLevelHint(ins, i > 0 ? instructions[i - 1] : null, lastAh, lastAl, lastAxImm, lastBxImm, lastCxImm, lastDxImm, lastSiImm, lastDiImm, lastDsImm, lastEsImm);
                     if (!string.IsNullOrEmpty(higherHint))
                         insText += $" ; {higherHint}";
@@ -1643,6 +1647,50 @@ namespace DOSRE.Dasm
             return count;
         }
 
+        private static string TryGetPackedNibbleShiftHint(IReadOnlyList<Instruction> instructions, int index)
+        {
+            // Pattern (seen in PERFORM):
+            //   xor bx,bx
+            //   mov bl,ah
+            //   mov cl,4
+            //   shr bx,cl
+            //   shl ax,cl
+            // Interpretable as splitting a packed 4:12 value:
+            //   BX = (AH >> 4)
+            //   AX = (AX << 4)
+            if (instructions == null || index < 4)
+                return null;
+
+            static bool BytesEq(byte[] b, params byte[] pat)
+            {
+                if (b == null || b.Length != pat.Length)
+                    return false;
+                for (var i = 0; i < pat.Length; i++)
+                {
+                    if (b[i] != pat[i])
+                        return false;
+                }
+                return true;
+            }
+
+            var b0 = instructions[index - 4].Bytes;
+            var b1 = instructions[index - 3].Bytes;
+            var b2 = instructions[index - 2].Bytes;
+            var b3 = instructions[index - 1].Bytes;
+            var b4 = instructions[index].Bytes;
+
+            if (BytesEq(b0, 0x33, 0xDB) &&       // xor bx,bx
+                BytesEq(b1, 0x8A, 0xDC) &&       // mov bl,ah
+                BytesEq(b2, 0xB1, 0x04) &&       // mov cl,4
+                BytesEq(b3, 0xD3, 0xEB) &&       // shr bx,cl
+                BytesEq(b4, 0xD3, 0xE0))         // shl ax,cl
+            {
+                return "PACKED SPLIT: BX = AH>>4; AX <<= 4 (4:12 split)";
+            }
+
+            return null;
+        }
+
         private static string TryGetHigherLevelHint(
             Instruction ins,
             Instruction prev,
@@ -1654,6 +1702,86 @@ namespace DOSRE.Dasm
             var b = ins.Bytes;
             if (b == null || b.Length == 0) return null;
             var text = ins.ToString();
+
+            // Shift-by-CL (helps make bit-twiddling less opaque)
+            if (b[0] == 0xD3 && b.Length >= 2 && cx.HasValue)
+            {
+                var cl = (byte)(cx.Value & 0xFF);
+                var modrm = b[1];
+                var mod = (modrm >> 6) & 0x03;
+                var reg = (modrm >> 3) & 0x07;
+                var rm = modrm & 0x07;
+                if (mod == 0x03) // register operand
+                {
+                    var regName = rm switch
+                    {
+                        0 => "AX",
+                        1 => "CX",
+                        2 => "DX",
+                        3 => "BX",
+                        4 => "SP",
+                        5 => "BP",
+                        6 => "SI",
+                        7 => "DI",
+                        _ => null
+                    };
+
+                    if (!string.IsNullOrEmpty(regName) && (reg == 4 || reg == 5 || reg == 7))
+                    {
+                        var op = reg switch
+                        {
+                            4 => "<<=",
+                            5 => ">>=",
+                            7 => ">>= (arith)",
+                            _ => "?"
+                        };
+                        var mult = cl == 4 && reg == 4 ? " (x16)" : string.Empty;
+                        var div = cl == 4 && (reg == 5 || reg == 7) ? " (/16)" : string.Empty;
+                        return $"SHIFT: {regName} {op} {cl}{mult}{div}";
+                    }
+                }
+            }
+
+            // Detect writing a FAR pointer at DS:0000 via consecutive stores to [0] and [2]
+            //   mov [0000], bx
+            //   mov [0002], cx
+            if (b.Length >= 4 && b[0] == 0x89)
+            {
+                var modrm = b[1];
+                var mod = (modrm >> 6) & 0x03;
+                var reg = (modrm >> 3) & 0x07;
+                var rm = modrm & 0x07;
+                if (mod == 0x00 && rm == 0x06)
+                {
+                    var disp = (ushort)(b[2] | (b[3] << 8));
+
+                    // current: mov [0002], cx
+                    if (disp == 0x0002 && reg == 0x01 && prev?.Bytes != null && prev.Bytes.Length >= 4)
+                    {
+                        var pb = prev.Bytes;
+                        if (pb[0] == 0x89)
+                        {
+                            var pmodrm = pb[1];
+                            var pmod = (pmodrm >> 6) & 0x03;
+                            var preg = (pmodrm >> 3) & 0x07;
+                            var prm = pmodrm & 0x07;
+                            if (pmod == 0x00 && prm == 0x06)
+                            {
+                                var pdisp = (ushort)(pb[2] | (pb[3] << 8));
+                                // prev: mov [0000], bx
+                                if (pdisp == 0x0000 && preg == 0x03)
+                                {
+                                    if (ds.HasValue && ds.Value == 0x0000)
+                                        return "WRITE IVT INT 00h vector = CX:BX";
+                                    if (ds.HasValue)
+                                        return $"STORE FAR PTR [DS:0000] = CX:BX (DS=0x{ds.Value:X4})";
+                                    return "STORE FAR PTR [DS:0000] = CX:BX";
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // Stack switch: mov sp, reg after mov ss, reg
             if (ins.Mnemonic == ud_mnemonic_code.UD_Imov && text.Contains("sp") && prev != null && prev.Mnemonic == ud_mnemonic_code.UD_Imov && prev.ToString().Contains("ss"))
