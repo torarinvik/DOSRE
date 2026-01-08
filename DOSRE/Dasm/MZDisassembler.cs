@@ -1138,10 +1138,24 @@ namespace DOSRE.Dasm
                 return;
             }
 
+            // mov ds, dx: 8E DA
+            if (b[0] == 0x8E && b.Length >= 2 && b[1] == 0xDA)
+            {
+                lastDsImm = lastDxImm;
+                return;
+            }
+
             // mov es, ax: 8E C0
             if (b[0] == 0x8E && b.Length >= 2 && b[1] == 0xC0)
             {
                 lastEsImm = lastAxImm;
+                return;
+            }
+
+            // mov es, dx: 8E C2
+            if (b[0] == 0x8E && b.Length >= 2 && b[1] == 0xC2)
+            {
+                lastEsImm = lastDxImm;
                 return;
             }
         }
@@ -1175,6 +1189,10 @@ namespace DOSRE.Dasm
                 if (Regex.IsMatch(text, @"\bss\b,\s*ax\b")) return $"SET SS=0x{ax.Value:X4}";
             }
 
+            // Direction flag
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Icld) return "Direction: Forward";
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Istd) return "Direction: Backward";
+
             // ES = DS
             if (ins.Mnemonic == ud_mnemonic_code.UD_Ipop && text.Contains("es") && prev != null && prev.Mnemonic == ud_mnemonic_code.UD_Ipush && prev.ToString().Contains("ds"))
             {
@@ -1186,7 +1204,7 @@ namespace DOSRE.Dasm
             if (b[0] == 0xF3 && b.Length >= 2 && b[1] == 0xAA)
             {
                 string detail = "memset";
-                if (es.HasValue && di.HasValue) detail += $"(ES:0x{di.Value:X4}";
+                if (es.HasValue && di.HasValue) detail += $"(ES:0x{di.Value:X4} [seg=0x{es.Value:X4}]";
                 else if (di.HasValue) detail += $"(DI=0x{di.Value:X4}";
                 else detail += "(";
 
@@ -1201,7 +1219,7 @@ namespace DOSRE.Dasm
             if (b[0] == 0xF3 && b.Length >= 2 && b[1] == 0xAB)
             {
                 string detail = "memsetw";
-                if (es.HasValue && di.HasValue) detail += $"(ES:0x{di.Value:X4}";
+                if (es.HasValue && di.HasValue) detail += $"(ES:0x{di.Value:X4} [seg=0x{es.Value:X4}]";
                 else if (di.HasValue) detail += $"(DI=0x{di.Value:X4}";
                 else detail += "(";
 
@@ -1217,11 +1235,11 @@ namespace DOSRE.Dasm
             {
                 bool isWord = b[1] == 0xA5;
                 string detail = isWord ? "memmovew" : "memmoveb";
-                if (ds.HasValue && si.HasValue) detail += $"(from DS:0x{si.Value:X4}";
+                if (ds.HasValue && si.HasValue) detail += $"(from DS:0x{si.Value:X4} [seg=0x{ds.Value:X4}]";
                 else if (si.HasValue) detail += $"(from SI=0x{si.Value:X4}";
                 else detail += "(from ?";
 
-                if (es.HasValue && di.HasValue) detail += $", to ES:0x{di.Value:X4}";
+                if (es.HasValue && di.HasValue) detail += $", to ES:0x{di.Value:X4} [seg=0x{es.Value:X4}]";
                 else if (di.HasValue) detail += $", to DI=0x{di.Value:X4}";
                 else detail += ", to ?";
 
@@ -1276,10 +1294,19 @@ namespace DOSRE.Dasm
 
             var intNo = b[1];
 
-            if (intNo == 0x20) return "terminate (CP/M style)";
-            if (intNo == 0x27) return "terminate and stay resident (TSR)";
-            if (intNo == 0x24) return "critical error handler service (internal)";
-            if (intNo == 0x29) return "fast console output (internal)";
+            if (intNo == 0x11) return "BIOS: Get Equipment List ; returns AX bits: 0=diskette, 1=8087, 4-5=video(01=40x25C 10=80x25C 11=80x25M), 6-7=drives";
+            if (intNo == 0x12) return "BIOS: Get Conventional Memory Size ; returns AX=KB (max 640)";
+            if (intNo == 0x18) return "BIOS: ROM BASIC";
+            if (intNo == 0x19) return "BIOS: Reboot";
+            if (intNo == 0x1B) return "BIOS: Ctrl-Break handler";
+            if (intNo == 0x1C) return "BIOS: User Timer Tick";
+
+            if (intNo == 0x20) return "DOS: terminate (CP/M style)";
+            if (intNo == 0x25) return "DOS: absolute disk read";
+            if (intNo == 0x26) return "DOS: absolute disk write";
+            if (intNo == 0x27) return "DOS: terminate and stay resident (TSR)";
+            if (intNo == 0x24) return "DOS: critical error handler service (internal)";
+            if (intNo == 0x29) return "DOS: fast console output (internal)";
 
             // Prefer database-driven descriptions.
             string dbDesc;
@@ -1289,6 +1316,12 @@ namespace DOSRE.Dasm
                 if (intNo == 0x21 && lastAh.HasValue)
                 {
                     var ah = lastAh.Value;
+
+                    // AH=01, 02, 05, 06, 07, 08: Basic I/O
+                    if (ah == 0x01) dbDesc += " ; (returns AL=char)";
+                    if (ah == 0x02) { if (lastDxImm.HasValue) dbDesc += $" ; DL='{(char)(lastDxImm.Value & 0xFF)}'"; dbDesc += " ; DL=char"; }
+                    if (ah == 0x05) { if (lastDxImm.HasValue) dbDesc += $" ; DL='{(char)(lastDxImm.Value & 0xFF)}'"; dbDesc += " ; DL=char"; }
+                    if (ah == 0x06) { if (lastDxImm.HasValue && (lastDxImm.Value & 0xFF) != 0xFF) dbDesc += $" ; DL='{(char)(lastDxImm.Value & 0xFF)}'"; dbDesc += " ; DL: FF=input, else=output char"; }
 
                     // Extra detail: DOS file attribute bit meanings (AH=43h).
                     // AL=00h Get Attributes returns CX, AL=01h Set Attributes takes CX.
@@ -1459,6 +1492,19 @@ namespace DOSRE.Dasm
                         dbDesc += " ; AL=int# (returns ES:BX=vector)";
                     }
 
+                    // AH=30h: Get DOS version
+                    if (ah == 0x30)
+                    {
+                        dbDesc += " ; (returns AL=major AH=minor)";
+                    }
+
+                    // AH=4Ch: Terminate with code
+                    if (ah == 0x4C)
+                    {
+                        if (lastAl.HasValue) dbDesc += $" ; exit code {lastAl.Value}";
+                        dbDesc += " ; AL=exit code";
+                    }
+
                     // AH=39h, 0x3Ah, 0x3Bh: Mkdir/Rmdir/Chdir
                     if (ah == 0x39 || ah == 0x3A || ah == 0x3B)
                     {
@@ -1522,6 +1568,18 @@ namespace DOSRE.Dasm
                     if (ah == 0x62)
                     {
                         dbDesc += " ; (returns BX=PSP segment)";
+                    }
+
+                    // AH=34h: Get In-DOS Flag
+                    if (ah == 0x34)
+                    {
+                        dbDesc += " ; (returns ES:BX -> In-DOS flag)";
+                    }
+
+                    // AH=52h: Get List of Lists
+                    if (ah == 0x52)
+                    {
+                        dbDesc += " ; (returns ES:BX -> LoL)";
                     }
 
                     // AH=6Ch: Extended Open/Create
