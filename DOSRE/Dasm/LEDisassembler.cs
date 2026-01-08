@@ -770,7 +770,7 @@ namespace DOSRE.Dasm
             return $"args~{pushes} ret={(retUsed ? "eax" : "(unused?)")}";
         }
 
-        private static string TryAnnotateInterrupt(List<Instruction> instructions, int idx, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> stringPreview)
+        private static string TryAnnotateInterrupt(List<Instruction> instructions, int idx, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> stringPreview, List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex)
         {
             if (instructions == null || idx < 0 || idx >= instructions.Count)
                 return string.Empty;
@@ -785,8 +785,6 @@ namespace DOSRE.Dasm
 
             var edxOperand = TryResolveEdxBefore(instructions, idx);
             var esiOperand = TryResolveEsiBefore(instructions, idx);
-            var edxDetail = TryFormatPointerDetail("EDX", edxOperand, stringSymbols, stringPreview);
-            var esiDetail = TryFormatPointerDetail("ESI", esiOperand, stringSymbols, stringPreview);
 
             string db;
             if (DosInterruptDatabase.Instance.TryDescribe(intNo, dbAh, dbAx, out db) && !string.IsNullOrEmpty(db))
@@ -798,21 +796,34 @@ namespace DOSRE.Dasm
                     if (dbAh.HasValue)
                     {
                         var ah = dbAh.Value;
-                        // DX/EDX based
-                        if (ah == 0x09 || ah == 0x0A || ah == 0x0F || ah == 0x10 || ah == 0x11 || ah == 0x12 || ah == 0x13 || 
-                            ah == 0x16 || ah == 0x17 || ah == 0x1A || ah == 0x21 || ah == 0x22 || ah == 0x23 || ah == 0x24 || 
-                            ah == 0x27 || ah == 0x28 || ah == 0x39 || ah == 0x3A || ah == 0x3B || ah == 0x3C || 
-                            ah == 0x3D || ah == 0x3F || ah == 0x40 || ah == 0x41 || ah == 0x43 || ah == 0x4B || 
-                            ah == 0x4E || ah == 0x56 || ah == 0x5A || ah == 0x5B)
+                        // FCB functions
+                        if (ah == 0x0F || ah == 0x10 || ah == 0x11 || ah == 0x12 || ah == 0x13 || ah == 0x16 || ah == 0x17 || 
+                            ah == 0x21 || ah == 0x22 || ah == 0x23 || ah == 0x24 || ah == 0x27 || ah == 0x28)
                         {
-                             if (!string.IsNullOrEmpty(edxDetail))
-                                 extra = " ; " + edxDetail;
+                            var fcb = TryAnnotateFcb(edxOperand, stringSymbols, objects, objBytesByIndex);
+                            if (!string.IsNullOrEmpty(fcb))
+                                extra = " ; " + fcb;
                         }
-                        // SI/ESI based
-                        if (ah == 0x47 || ah == 0x6C || ah == 0x71)
+
+                        if (string.IsNullOrEmpty(extra))
                         {
-                             if (!string.IsNullOrEmpty(esiDetail))
-                                 extra = " ; " + esiDetail;
+                            var edxDetail = TryFormatPointerDetail("EDX", edxOperand, stringSymbols, stringPreview);
+                            var esiDetail = TryFormatPointerDetail("ESI", esiOperand, stringSymbols, stringPreview);
+
+                            // DX/EDX based
+                            if (ah == 0x09 || ah == 0x0A || ah == 0x1A || ah == 0x39 || ah == 0x3A || ah == 0x3B || ah == 0x3C || 
+                                ah == 0x3D || ah == 0x3F || ah == 0x40 || ah == 0x41 || ah == 0x43 || ah == 0x4B || 
+                                ah == 0x4E || ah == 0x56 || ah == 0x5A || ah == 0x5B)
+                            {
+                                 if (!string.IsNullOrEmpty(edxDetail))
+                                     extra = " ; " + edxDetail;
+                            }
+                            // SI/ESI based
+                            if (ah == 0x47 || ah == 0x6C || ah == 0x71)
+                            {
+                                 if (!string.IsNullOrEmpty(esiDetail))
+                                     extra = " ; " + esiDetail;
+                            }
                         }
                     }
                     return "INT21: " + db + extra;
@@ -1932,7 +1943,7 @@ namespace DOSRE.Dasm
                     }
 
                     // Interrupt annotation is useful even without the heavier LE insights pass.
-                    var intHint = TryAnnotateInterrupt(instructions, insLoopIndex, stringSymbols, stringPreview);
+                    var intHint = TryAnnotateInterrupt(instructions, insLoopIndex, stringSymbols, stringPreview, objects, objBytesByIndex);
                     if (!string.IsNullOrEmpty(intHint))
                         insText += $" ; {intHint}";
 
@@ -4506,6 +4517,29 @@ namespace DOSRE.Dasm
             }
 
             return false;
+        }
+
+        private static string TryAnnotateFcb(uint? linearAddr, Dictionary<uint, string> stringSymbols, List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex)
+        {
+            if (!linearAddr.HasValue) return string.Empty;
+
+            foreach (var obj in objects)
+            {
+                if (linearAddr >= obj.RelocBaseAddr && linearAddr < obj.RelocBaseAddr + obj.VirtualSize)
+                {
+                    if (objBytesByIndex.TryGetValue(obj.ObjectNumber, out var bytes))
+                    {
+                        uint relativeOffset = linearAddr.Value - obj.RelocBaseAddr;
+                        if (relativeOffset + 12 <= bytes.Length)
+                        {
+                            return MZDisassembler.TryFormatFcbDetail(relativeOffset, bytes);
+                        }
+                    }
+                    break;
+                }
+            }
+
+            return string.Empty;
         }
     }
 }

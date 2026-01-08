@@ -407,7 +407,7 @@ namespace DOSRE.Dasm
 
                 if (mzInsights)
                 {
-                    var hint = TryDecodeInterruptHint(ins, lastAh, lastAxImm, lastDxImm, lastSiImm, stringSyms, stringPrev);
+                    var hint = TryDecodeInterruptHint(ins, lastAh, lastAxImm, lastDxImm, lastSiImm, stringSyms, stringPrev, module);
                     if (!string.IsNullOrEmpty(hint))
                         insText += $" ; {hint}";
                 }
@@ -814,7 +814,8 @@ namespace DOSRE.Dasm
             ushort? lastDxImm,
             ushort? lastSiImm,
             Dictionary<uint, string> stringSyms,
-            Dictionary<uint, string> stringPrev)
+            Dictionary<uint, string> stringPrev,
+            byte[] module)
         {
             var b = ins.Bytes;
             if (b == null || b.Length < 2)
@@ -834,10 +835,17 @@ namespace DOSRE.Dasm
                 if (intNo == 0x21 && lastAh.HasValue)
                 {
                     var ah = lastAh.Value;
-                    // DX-based: $ print, FCBs, Path functions, Handle I/O
-                    if (ah == 0x09 || ah == 0x0A || ah == 0x0F || ah == 0x10 || ah == 0x11 || ah == 0x12 || ah == 0x13 || 
-                        ah == 0x16 || ah == 0x17 || ah == 0x1A || ah == 0x21 || ah == 0x22 || ah == 0x23 || ah == 0x24 || 
-                        ah == 0x27 || ah == 0x28 || ah == 0x39 || ah == 0x3A || ah == 0x3B || ah == 0x3C || 
+                    // FCB-based: 0x0F, 0x10, 0x11, 0x12, 0x13, 0x16, 0x17, 0x21, 0x22, 0x23, 0x24, 0x27, 0x28
+                    if (ah == 0x0F || ah == 0x10 || ah == 0x11 || ah == 0x12 || ah == 0x13 || ah == 0x16 || ah == 0x17 || 
+                        ah == 0x21 || ah == 0x22 || ah == 0x23 || ah == 0x24 || ah == 0x27 || ah == 0x28)
+                    {
+                        var fcDetail = TryFormatFcbDetail(lastDxImm, module);
+                        if (!string.IsNullOrEmpty(fcDetail))
+                            return dbDesc + " ; " + fcDetail;
+                    }
+
+                    // DX-based: $ print, path functions, handle I/O, etc.
+                    if (ah == 0x09 || ah == 0x0A || ah == 0x1A || ah == 0x39 || ah == 0x3A || ah == 0x3B || ah == 0x3C || 
                         ah == 0x3D || ah == 0x3F || ah == 0x40 || ah == 0x41 || ah == 0x43 || ah == 0x4B || 
                         ah == 0x4E || ah == 0x56 || ah == 0x5A || ah == 0x5B)
                     {
@@ -912,6 +920,43 @@ namespace DOSRE.Dasm
             }
 
             return $"INT 0x{intNo:X2}";
+        }
+
+        internal static string TryFormatFcbDetail(uint? lastImm, byte[] module)
+        {
+            if (!lastImm.HasValue || module == null)
+                return string.Empty;
+
+            var addr = lastImm.Value;
+            if (addr + 12 > module.Length)
+                return string.Empty;
+
+            // Offset 0: Drive (0=default, 1=A, 2=B, 3=C)
+            var drive = module[addr];
+            var name = Encoding.ASCII.GetString(module, (int)addr + 1, 8).TrimEnd();
+            var ext = Encoding.ASCII.GetString(module, (int)addr + 9, 3).TrimEnd();
+
+            if (string.IsNullOrEmpty(name))
+                return string.Empty;
+
+            // Check if it looks like a valid filename (all printable)
+            if (name.Any(c => c < 0x20 || c > 0x7E) || ext.Any(c => c < 0x20 || c > 0x7E))
+                return string.Empty;
+
+            var driveStr = drive switch
+            {
+                0 => "",
+                1 => "A:",
+                2 => "B:",
+                3 => "C:",
+                _ => $"{(char)('A' + drive - 1)}:"
+            };
+
+            var filename = name;
+            if (!string.IsNullOrEmpty(ext))
+                filename += "." + ext;
+
+            return $"FCB=0x{addr:X} [{driveStr}{filename}]";
         }
 
         private static string TryFormatPointerDetail(ushort? lastImm, string regName, Dictionary<uint, string> stringSyms, Dictionary<uint, string> stringPrev)
