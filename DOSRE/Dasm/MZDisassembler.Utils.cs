@@ -52,7 +52,7 @@ namespace DOSRE.Dasm
                 yield return t;
         }
 
-        private static void AppendWrappedDisasmLine(StringBuilder sb, string prefix, string insText, int commentColumn, int maxWidth)
+        private static void AppendWrappedDisasmLine(StringBuilder sb, string prefix, string insText, int commentColumn, int maxWidth, int minGapAfterInstruction = 14)
         {
             if (sb == null)
                 return;
@@ -66,20 +66,24 @@ namespace DOSRE.Dasm
                 return;
             }
 
-            var commentIndent = new string(' ', Math.Max(0, commentColumn));
+            var startCol = Math.Max(0, commentColumn);
+            if (!string.IsNullOrEmpty(baseLine) && baseLine.Length >= startCol)
+                startCol = baseLine.Length + Math.Max(1, minGapAfterInstruction);
+
+            var commentIndent = new string(' ', startCol);
             var first = true;
 
             foreach (var c in comments)
             {
-                foreach (var wrapped in WrapText(c, Math.Max(16, maxWidth - (commentColumn + 2))))
+                foreach (var wrapped in WrapText(c, Math.Max(16, maxWidth - (startCol + 2))))
                 {
                     if (first)
                     {
                         var line = baseLine;
-                        if (line.Length < commentColumn)
-                            line += new string(' ', commentColumn - line.Length);
+                        if (line.Length < startCol)
+                            line += new string(' ', startCol - line.Length);
                         else if (!string.IsNullOrEmpty(line))
-                            line += " ";
+                            line += new string(' ', Math.Max(1, minGapAfterInstruction));
 
                         line += $"; {wrapped}";
                         sb.AppendLine(line);

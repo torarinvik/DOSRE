@@ -76,6 +76,26 @@ namespace DOSRE.Dasm
             @"(?<size>byte|word|dword)\s+\[(?<base>e[a-z]{2})(?:\+0x(?<disp>[0-9A-Fa-f]+))?\]",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+        private static readonly Regex MovDxImm16Regex = new Regex(
+            @"^mov\s+dx,\s*(?<imm>0x[0-9A-Fa-f]+)$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex MovEdxImmRegex = new Regex(
+            @"^mov\s+edx,\s*(?<imm>0x[0-9A-Fa-f]+)$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex OutDxAlRegex = new Regex(
+            @"^out\s+dx,\s*al$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex OutDxAxRegex = new Regex(
+            @"^out\s+dx,\s*ax$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex InAlDxRegex = new Regex(
+            @"^in\s+al,\s*dx$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
         private static void SplitInstructionAndComments(string insText, out string instruction, out List<string> comments)
         {
             instruction = insText ?? string.Empty;
@@ -120,7 +140,7 @@ namespace DOSRE.Dasm
                 yield return t;
         }
 
-        private static void AppendWrappedDisasmLine(StringBuilder sb, string prefix, string insText, int commentColumn, int maxWidth)
+        private static void AppendWrappedDisasmLine(StringBuilder sb, string prefix, string insText, int commentColumn, int maxWidth, int minGapAfterInstruction = 14)
         {
             if (sb == null)
                 return;
@@ -133,20 +153,24 @@ namespace DOSRE.Dasm
                 return;
             }
 
-            var commentIndent = new string(' ', Math.Max(0, commentColumn));
+            var startCol = Math.Max(0, commentColumn);
+            if (!string.IsNullOrEmpty(baseLine) && baseLine.Length >= startCol)
+                startCol = baseLine.Length + Math.Max(1, minGapAfterInstruction);
+
+            var commentIndent = new string(' ', startCol);
             var first = true;
 
             foreach (var c in comments)
             {
-                foreach (var wrapped in WrapText(c, Math.Max(16, maxWidth - (commentColumn + 2))))
+                foreach (var wrapped in WrapText(c, Math.Max(16, maxWidth - (startCol + 2))))
                 {
                     if (first)
                     {
                         var line = baseLine;
-                        if (line.Length < commentColumn)
-                            line += new string(' ', commentColumn - line.Length);
+                        if (line.Length < startCol)
+                            line += new string(' ', startCol - line.Length);
                         else if (!string.IsNullOrEmpty(line))
-                            line += " ";
+                            line += new string(' ', Math.Max(1, minGapAfterInstruction));
                         line += $"; {wrapped}";
                         sb.AppendLine(line);
                         first = false;
@@ -963,6 +987,204 @@ namespace DOSRE.Dasm
             }
 
             return $"INT: 0x{intNo:X2}";
+        }
+
+        private sealed class IoPortStats
+        {
+            public int Reads;
+            public int Writes;
+        }
+
+        private static readonly Dictionary<ushort, string> KnownIoPorts = new Dictionary<ushort, string>
+        {
+            // VGA / EGA ports (common in DOS games and demos)
+            [0x03C0] = "VGA Attribute Controller",
+            [0x03C1] = "VGA Attribute Data",
+            [0x03C2] = "VGA Misc Output",
+            [0x03C4] = "VGA Sequencer Index",
+            [0x03C5] = "VGA Sequencer Data",
+            [0x03C7] = "VGA DAC state/address",
+            [0x03C8] = "VGA DAC index",
+            [0x03C9] = "VGA DAC data",
+            [0x03CC] = "VGA Misc Output (read)",
+            [0x03CE] = "VGA Graphics Ctrl Index",
+            [0x03CF] = "VGA Graphics Ctrl Data",
+            [0x03D4] = "VGA CRTC Index",
+            [0x03D5] = "VGA CRTC Data",
+            [0x03DA] = "VGA Input Status 1",
+        };
+
+        private static bool TryParseMovDxImmediate(string insText, out ushort dxImm)
+        {
+            dxImm = 0;
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            // Typical output: "mov dx, 03C8h" or "mov dx, 0x3c8".
+            var m = Regex.Match(insText, @"^\s*mov\s+dx\s*,\s*(?<imm>(?:0x)?[0-9A-Fa-f]+)h?\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            var token = m.Groups["imm"].Value;
+            if (!TryParseImmUShort(token, out dxImm))
+                return false;
+            return true;
+        }
+
+        private static bool TryParseImmUShort(string token, out ushort value)
+        {
+            value = 0;
+            if (string.IsNullOrWhiteSpace(token))
+                return false;
+
+            token = token.Trim();
+
+            // Prefer hex when it looks like hex.
+            var isHex = token.StartsWith("0x", StringComparison.OrdinalIgnoreCase) || token.Any(c => (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'));
+            if (token.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                token = token.Substring(2);
+
+            if (isHex)
+            {
+                if (!uint.TryParse(token, System.Globalization.NumberStyles.HexNumber, null, out var hex))
+                    return false;
+                if (hex > 0xFFFF)
+                    return false;
+                value = (ushort)hex;
+                return true;
+            }
+
+            if (!uint.TryParse(token, out var dec))
+                return false;
+            if (dec > 0xFFFF)
+                return false;
+            value = (ushort)dec;
+            return true;
+        }
+
+        private static bool TryParseIoAccess(string insText, ushort? lastDxImm16, out ushort port, out bool isWrite, out string dataReg)
+        {
+            port = 0;
+            isWrite = false;
+            dataReg = null;
+
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            // out dx, al|ax|eax  OR out imm, al|ax|eax
+            var mout = Regex.Match(insText, @"^\s*out\s+(?<port>dx|(?:0x)?[0-9A-Fa-f]+h?)\s*,\s*(?<reg>al|ax|eax)\s*$", RegexOptions.IgnoreCase);
+            if (mout.Success)
+            {
+                isWrite = true;
+                dataReg = mout.Groups["reg"].Value.ToLowerInvariant();
+
+                var p = mout.Groups["port"].Value.Trim();
+                if (p.Equals("dx", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!lastDxImm16.HasValue)
+                        return false;
+                    port = lastDxImm16.Value;
+                    return true;
+                }
+
+                p = p.TrimEnd('h', 'H');
+                return TryParseImmUShort(p, out port);
+            }
+
+            // in al|ax|eax, dx  OR in al|ax|eax, imm
+            var min = Regex.Match(insText, @"^\s*in\s+(?<reg>al|ax|eax)\s*,\s*(?<port>dx|(?:0x)?[0-9A-Fa-f]+h?)\s*$", RegexOptions.IgnoreCase);
+            if (min.Success)
+            {
+                isWrite = false;
+                dataReg = min.Groups["reg"].Value.ToLowerInvariant();
+
+                var p = min.Groups["port"].Value.Trim();
+                if (p.Equals("dx", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!lastDxImm16.HasValue)
+                        return false;
+                    port = lastDxImm16.Value;
+                    return true;
+                }
+
+                p = p.TrimEnd('h', 'H');
+                return TryParseImmUShort(p, out port);
+            }
+
+            return false;
+        }
+
+        private static string TryAnnotateIoPortAccess(List<Instruction> instructions, int idx, ushort? lastDxImm16)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            var insText = instructions[idx].ToString();
+            if (!TryParseIoAccess(insText, lastDxImm16, out var port, out var isWrite, out var dataReg))
+                return string.Empty;
+
+            KnownIoPorts.TryGetValue(port, out var name);
+
+            var dir = isWrite ? "<-" : "->";
+            if (!string.IsNullOrEmpty(name))
+                return $"IO: {(isWrite ? "OUT" : "IN")} {name} (0x{port:X4}) {dir} {dataReg}";
+
+            return $"IO: {(isWrite ? "OUT" : "IN")} 0x{port:X4} {dir} {dataReg}";
+        }
+
+        private static void CollectIoPortsForFunction(List<Instruction> instructions, int startIdx, int endIdx, out Dictionary<ushort, IoPortStats> ports)
+        {
+            ports = new Dictionary<ushort, IoPortStats>();
+            if (instructions == null || startIdx < 0 || endIdx > instructions.Count || startIdx >= endIdx)
+                return;
+
+            ushort? lastDxImm16 = null;
+
+            for (var i = startIdx; i < endIdx; i++)
+            {
+                var text = instructions[i].ToString();
+
+                if (TryParseMovDxImmediate(text, out var dxImm))
+                    lastDxImm16 = dxImm;
+
+                if (!TryParseIoAccess(text, lastDxImm16, out var port, out var isWrite, out _))
+                    continue;
+
+                if (!ports.TryGetValue(port, out var st))
+                    ports[port] = st = new IoPortStats();
+
+                if (isWrite)
+                    st.Writes++;
+                else
+                    st.Reads++;
+            }
+        }
+
+        private static string FormatIoPortSummary(Dictionary<ushort, IoPortStats> ports)
+        {
+            if (ports == null || ports.Count == 0)
+                return string.Empty;
+
+            var parts = new List<string>();
+
+            foreach (var kvp in ports.OrderByDescending(k => k.Value.Reads + k.Value.Writes).ThenBy(k => k.Key).Take(8))
+            {
+                var port = kvp.Key;
+                var st = kvp.Value;
+
+                KnownIoPorts.TryGetValue(port, out var name);
+                var counts = new List<string>();
+                if (st.Reads > 0) counts.Add($"R{st.Reads}");
+                if (st.Writes > 0) counts.Add($"W{st.Writes}");
+                var countText = counts.Count > 0 ? $" ({string.Join(" ", counts)})" : string.Empty;
+
+                if (!string.IsNullOrEmpty(name))
+                    parts.Add($"0x{port:X4} {name}{countText}");
+                else
+                    parts.Add($"0x{port:X4}{countText}");
+            }
+
+            return string.Join(", ", parts);
         }
 
         private static bool TryGetIntNumber(Instruction ins, out byte intNo)
@@ -1912,11 +2134,36 @@ namespace DOSRE.Dasm
                     }
                 }
 
+                // Per-function I/O summaries (insights)
+                Dictionary<uint, string> funcIoSummaries = null;
+                if (leInsights && functionStarts != null && functionStarts.Count > 0)
+                {
+                    funcIoSummaries = new Dictionary<uint, string>();
+                    var sortedStarts = functionStarts.OrderBy(x => x).ToList();
+                    for (var si = 0; si < sortedStarts.Count; si++)
+                    {
+                        var startAddr = sortedStarts[si];
+                        if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                            continue;
+
+                        var endIdx = instructions.Count;
+                        if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                            endIdx = nextIdx;
+
+                        CollectIoPortsForFunction(instructions, startIdx, endIdx, out var ports);
+                        var summary = FormatIoPortSummary(ports);
+                        if (!string.IsNullOrEmpty(summary))
+                            funcIoSummaries[startAddr] = summary;
+                    }
+                }
+
                 // Live alias tracking for operand rewriting during rendering.
                 var liveAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                 {
                     ["ecx"] = "this"
                 };
+
+                ushort? lastDxImm16 = null;
 
                 for (var insLoopIndex = 0; insLoopIndex < instructions.Count; insLoopIndex++)
                 {
@@ -1936,12 +2183,18 @@ namespace DOSRE.Dasm
                         if (leInsights && funcSummaries != null && funcSummaries.TryGetValue(addr, out var summary))
                             AppendWrappedDisasmLine(sb, string.Empty, $" {summary.ToComment()}", commentColumn: 0, maxWidth: 160);
 
+                        if (leInsights && funcIoSummaries != null && funcIoSummaries.TryGetValue(addr, out var ioSum))
+                            AppendWrappedDisasmLine(sb, string.Empty, $" ; IO: {ioSum}", commentColumn: 0, maxWidth: 160);
+
                         if (leInsights && funcFieldSummaries != null && funcFieldSummaries.TryGetValue(addr, out var fsum))
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; {fsum}", commentColumn: 0, maxWidth: 160);
 
                         // Reset aliases at function boundary.
                         liveAliases.Clear();
                         liveAliases["ecx"] = "this";
+
+                        // Reset per-function port tracking to avoid stale DX.
+                        lastDxImm16 = null;
                     }
                     else if (labelTargets.Contains(addr))
                     {
@@ -1958,6 +2211,10 @@ namespace DOSRE.Dasm
 
                     var bytes = BitConverter.ToString(ins.Bytes).Replace("-", string.Empty);
                     var insText = ins.ToString();
+
+                    // Update DX immediate tracking before appending any '; ...' annotations.
+                    if (TryParseMovDxImmediate(insText, out var dxImm))
+                        lastDxImm16 = dxImm;
 
                     if (leInsights)
                     {
@@ -2042,6 +2299,10 @@ namespace DOSRE.Dasm
                     var intHint = TryAnnotateInterrupt(instructions, insLoopIndex, stringSymbols, stringPreview, objects, objBytesByIndex);
                     if (!string.IsNullOrEmpty(intHint))
                         insText += $" ; {intHint}";
+
+                    var ioHint = TryAnnotateIoPortAccess(instructions, insLoopIndex, lastDxImm16);
+                    if (!string.IsNullOrEmpty(ioHint))
+                        insText += $" ; {ioHint}";
 
                     if (haveFixups && fixupsHere.Count > 0)
                     {
