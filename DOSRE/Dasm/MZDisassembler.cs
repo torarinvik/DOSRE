@@ -1044,13 +1044,17 @@ namespace DOSRE.Dasm
             if (b == null || b.Length == 0)
                 return;
 
-            // xor ax, ax: 33 C0
-            if (b.Length >= 2 && b[0] == 0x33 && b[1] == 0xC0)
+            string text = ins.ToString().ToLower();
+
+            // xor reg, reg or sub reg, reg
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Ixor || ins.Mnemonic == ud_mnemonic_code.UD_Isub)
             {
-                lastAxImm = 0;
-                lastAh = 0;
-                lastAl = 0;
-                return;
+                if (text.Contains("ax, ax")) { lastAxImm = 0; lastAh = 0; lastAl = 0; return; }
+                if (text.Contains("bx, bx")) { lastBxImm = 0; return; }
+                if (text.Contains("cx, cx")) { lastCxImm = 0; return; }
+                if (text.Contains("dx, dx")) { lastDxImm = 0; return; }
+                if (text.Contains("si, si")) { lastSiImm = 0; return; }
+                if (text.Contains("di, di")) { lastDiImm = 0; return; }
             }
 
             // xor al, al: 30 C0
@@ -1068,11 +1072,8 @@ namespace DOSRE.Dasm
             if (b[0] == 0xB4 && b.Length >= 2)
             {
                 lastAh = b[1];
-                // Preserve AL if known; many codebases build AX via mov ah,imm + mov/xor al,...
-                if (lastAl.HasValue)
-                    lastAxImm = (ushort)((lastAh.Value << 8) | lastAl.Value);
-                else
-                    lastAxImm = null; // partial clobber
+                if (lastAl.HasValue) lastAxImm = (ushort)((lastAh.Value << 8) | lastAl.Value);
+                else lastAxImm = null;
                 return;
             }
 
@@ -1080,10 +1081,8 @@ namespace DOSRE.Dasm
             if (b[0] == 0xB0 && b.Length >= 2)
             {
                 lastAl = b[1];
-                if (lastAh.HasValue)
-                    lastAxImm = (ushort)((lastAh.Value << 8) | lastAl.Value);
-                else if (lastAxImm.HasValue)
-                    lastAxImm = (ushort)((lastAxImm.Value & 0xFF00) | lastAl.Value);
+                if (lastAh.HasValue) lastAxImm = (ushort)((lastAh.Value << 8) | lastAl.Value);
+                else if (lastAxImm.HasValue) lastAxImm = (ushort)((lastAxImm.Value & 0xFF00) | lastAl.Value);
                 return;
             }
 
@@ -1131,32 +1130,42 @@ namespace DOSRE.Dasm
                 return;
             }
 
-            // mov ds, ax: 8E D8
-            if (b[0] == 0x8E && b.Length >= 2 && b[1] == 0xD8)
+            // Segments
+            if (b[0] == 0x8E && b.Length >= 2)
             {
-                lastDsImm = lastAxImm;
-                return;
+                if (b[1] == 0xD8) { lastDsImm = lastAxImm; return; } // mov ds, ax
+                if (b[1] == 0xDA) { lastDsImm = lastDxImm; return; } // mov ds, dx
+                if (b[1] == 0xC0) { lastEsImm = lastAxImm; return; } // mov es, ax
+                if (b[1] == 0xC2) { lastEsImm = lastDxImm; return; } // mov es, dx
             }
 
-            // mov ds, dx: 8E DA
-            if (b[0] == 0x8E && b.Length >= 2 && b[1] == 0xDA)
-            {
-                lastDsImm = lastDxImm;
-                return;
-            }
+            // Clobber logic for instructions that modify registers in ways we don't track as constants
+            var firstComma = text.IndexOf(',');
+            var dest = firstComma != -1 ? text.Substring(0, firstComma) : text;
 
-            // mov es, ax: 8E C0
-            if (b[0] == 0x8E && b.Length >= 2 && b[1] == 0xC0)
-            {
-                lastEsImm = lastAxImm;
-                return;
-            }
+            if (dest.Contains("ax") || dest.Contains("ah") || dest.Contains("al")) { lastAxImm = null; lastAh = null; lastAl = null; }
+            else if (dest.Contains("bx")) lastBxImm = null;
+            else if (dest.Contains("cx")) lastCxImm = null;
+            else if (dest.Contains("dx")) lastDxImm = null;
+            else if (dest.Contains("si")) lastSiImm = null;
+            else if (dest.Contains("di")) lastDiImm = null;
+            else if (dest.Contains("ds")) lastDsImm = null;
+            else if (dest.Contains("es")) lastEsImm = null;
 
-            // mov es, dx: 8E C2
-            if (b[0] == 0x8E && b.Length >= 2 && b[1] == 0xC2)
+            // Special case: pop, call, mul, div, etc. clobber implicit registers
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Ipop || ins.Mnemonic == ud_mnemonic_code.UD_Icall || 
+                ins.Mnemonic == ud_mnemonic_code.UD_Imul || ins.Mnemonic == ud_mnemonic_code.UD_Idiv ||
+                ins.Mnemonic == ud_mnemonic_code.UD_Iloop || ins.Mnemonic == ud_mnemonic_code.UD_Iloope || ins.Mnemonic == ud_mnemonic_code.UD_Iloopne)
             {
-                lastEsImm = lastDxImm;
-                return;
+                if (ins.Mnemonic == ud_mnemonic_code.UD_Icall || ins.Mnemonic == ud_mnemonic_code.UD_Imul || ins.Mnemonic == ud_mnemonic_code.UD_Idiv)
+                {
+                    lastAxImm = null; lastAh = null; lastAl = null;
+                    lastDxImm = null; 
+                }
+                if (ins.Mnemonic == ud_mnemonic_code.UD_Iloop || ins.Mnemonic == ud_mnemonic_code.UD_Iloope || ins.Mnemonic == ud_mnemonic_code.UD_Iloopne)
+                {
+                    lastCxImm = null;
+                }
             }
         }
 
@@ -1249,6 +1258,18 @@ namespace DOSRE.Dasm
                 return detail;
             }
 
+            // REPNE SCASB: strlen
+            if (b[0] == 0xF2 && b.Length >= 2 && b[1] == 0xAE)
+            {
+                return "strlen (find AL in ES:DI)";
+            }
+
+            // REPE CMPSB/W: memcmp
+            if (b[0] == 0xF3 && b.Length >= 2 && (b[1] == 0xA6 || b[1] == 0xA7))
+            {
+                return $"memcmp { (b[1] == 0xA7 ? "word" : "byte") } (DS:SI vs ES:DI)";
+            }
+
             // Far CALL to segment:offset
             if (b[0] == 0x9A && b.Length >= 5)
             {
@@ -1264,6 +1285,23 @@ namespace DOSRE.Dasm
                 ushort seg = (ushort)(b[3] | (b[4] << 8));
                 return $"JMP FAR {seg:X4}:{off:X4}";
             }
+
+            // Function markers
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Imov && text.Contains("bp, sp") && prev != null && prev.Mnemonic == ud_mnemonic_code.UD_Ipush && prev.ToString().Contains("bp"))
+            {
+                return "FUNC PROLOGUE";
+            }
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Ipop && text.Contains("bp") && prev != null && prev.Mnemonic == ud_mnemonic_code.UD_Imov && prev.ToString().Contains("sp, bp"))
+            {
+                return "FUNC EPILOGUE (LEAVE)";
+            }
+
+            // Segment pointer loads
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Ilds) return "LDS: load DS:reg with far pointer";
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Iles) return "LES: load ES:reg with far pointer";
+
+            // INT 3: Debug break
+            if (b[0] == 0xCC) return "DEBUG BREAK";
 
             return null;
         }
@@ -1294,10 +1332,35 @@ namespace DOSRE.Dasm
 
             var intNo = b[1];
 
-            if (intNo == 0x11) return "BIOS: Get Equipment List ; returns AX bits: 0=diskette, 1=8087, 4-5=video(01=40x25C 10=80x25C 11=80x25M), 6-7=drives";
-            if (intNo == 0x12) return "BIOS: Get Conventional Memory Size ; returns AX=KB (max 640)";
+            if (intNo == 0x00) return "CPU: Divide By Zero";
+            if (intNo == 0x01) return "CPU: Single Step / Trace";
+            if (intNo == 0x02) return "CPU: Non-Maskable Interrupt (NMI)";
+            if (intNo == 0x03) return "CPU: Breakpoint (INT 3)";
+            if (intNo == 0x04) return "CPU: Overflow (INTO)";
+            if (intNo == 0x05) return "CPU: Bounds Check / Print Screen";
+            if (intNo == 0x06) return "CPU: Invalid Opcode";
+            if (intNo == 0x07) return "CPU: Coprocessor Not Available";
+            if (intNo == 0x08) return "IRQ0: System Timer Tick";
+            if (intNo == 0x09) return "IRQ1: Keyboard String / IRQ9: Redirected IRQ2";
+
+            if (intNo == 0x10) return "BIOS: VIDEO SERVICES (AH=mode/pos/char/scroll/VBE)";
+            if (intNo == 0x11) return "BIOS: Get Equipment List ; AX bits: 0=diskette, 1=8087, 4-5=video, 6-7=drives";
+            if (intNo == 0x12) return "BIOS: Get Memory Size ; AX=KB (max 640)";
+            if (intNo == 0x13) return "BIOS: DISK I/O (CH/CL=cyl/sec, DH/DL=head/drive, ES:BX=buffer)";
+            if (intNo == 0x14) return "BIOS: SERIAL I/O (DX=port)";
+            if (intNo == 0x15) return "BIOS: SYSTEM SERVICES (Wait/Copy/A20/E820/Joystick)";
+            if (intNo == 0x16) return "BIOS: KEYBOARD I/O";
+            if (intNo == 0x17) return "BIOS: PRINTER I/O";
+
+            if (intNo == 0x2F) return "MULTIPLEX INTERRUPT (Print/Eject/DPMI/XMS/Cache)";
+            if (intNo == 0x31) return "DPMI: DOS Protected Mode Interface";
+            if (intNo == 0x33) return "MOUSE DRIVER API";
+            if (intNo >= 0x34 && intNo <= 0x3E) return $"Borland Floating Point Emulator (INT {intNo:X2}h)";
+            if (intNo >= 0x60 && intNo <= 0x66) return $"Perhaps Game Hook? (User Interrupt INT {intNo:X2}h)";
+            if (intNo == 0x67) return "EMS: Expanded Memory (or Perhaps Game Hook?)";
             if (intNo == 0x18) return "BIOS: ROM BASIC";
             if (intNo == 0x19) return "BIOS: Reboot";
+            if (intNo == 0x1A) return "BIOS: TIMER & PCI SERVICES (Get Ticks/Set Time/PCI Check)";
             if (intNo == 0x1B) return "BIOS: Ctrl-Break handler";
             if (intNo == 0x1C) return "BIOS: User Timer Tick";
 
@@ -1443,6 +1506,19 @@ namespace DOSRE.Dasm
                     {
                         if (lastBxImm.HasValue) dbDesc += $" ; BX={lastBxImm.Value} paragraphs ({lastBxImm.Value * 16} bytes)";
                         dbDesc += " ; BX=paras (returns AX=seg)";
+                    }
+
+                    // AH=4Bh: EXEC
+                    if (ah == 0x4B)
+                    {
+                        byte? al = lastAl;
+                        if (!al.HasValue && lastAxImm.HasValue) al = (byte)(lastAxImm.Value & 0xFF);
+                        if (al.HasValue)
+                        {
+                            var sub = al.Value switch { 0 => "LoadExec", 1 => "LoadDebug", 3 => "LoadOverlay", 5 => "SetExecState", _ => $"sub=0x{al.Value:X2}" };
+                            dbDesc += $" ; {sub}";
+                        }
+                        dbDesc += " ; AL: 0=Exec 1=Debug 3=Overlay DS:DX=path ES:BX=params";
                     }
 
                     // AH=4Ah: Resize Memory Block
@@ -1769,6 +1845,10 @@ namespace DOSRE.Dasm
                     if (ah == 0x86) dbDesc += " ; Wait (CX:DX=microseconds)";
                     else if (ah == 0x87) dbDesc += " ; Move Extended Block (CX=words ES:SI=GDT)";
                     else if (ah == 0x88) dbDesc += " ; Get Extended Memory Size";
+                    else if (ah == 0xC0) dbDesc += " ; Get System Config (returns ES:BX -> table)";
+                    else if (lastAxImm == 0xE801) dbDesc += " ; Get Ext Memory (AX=1-16MB BX=>16MB)";
+                    else if (lastAxImm == 0xE820) dbDesc += " ; Get Memory Map (EAX=E820 EDX=SMAP ES:DI=buf)";
+                    else if (lastAxImm == 0x5300) dbDesc += " ; APM: Check Presence";
                 }
 
                 // BIOS Keyboard/Timer/System
@@ -1808,82 +1888,19 @@ namespace DOSRE.Dasm
                     }
                 }
 
-                // DPMI
+                // DPMI extra
                 if (intNo == 0x31 && lastAxImm.HasValue)
                 {
                     var ax = lastAxImm.Value;
-                    var name = ax switch
-                    {
-                        0x0000 => "Alloc Desc",
-                        0x0001 => "Free Desc",
-                        0x0002 => "Seg to Desc",
-                        0x0003 => "Get Next Desc",
-                        0x0006 => "Get Base",
-                        0x0007 => "Set Base",
-                        0x0008 => "Set Limit",
-                        0x0009 => "Set Access Rights",
-                        0x0100 => "Alloc DOS Mem",
-                        0x0101 => "Free DOS Mem",
-                        0x0200 => "Get Real Int",
-                        0x0201 => "Set Real Int",
-                        0x0204 => "Get Exc Vector",
-                        0x0205 => "Set Exc Vector",
-                        0x0300 => "Sim Real Int",
-                        0x0301 => "Call Real Far",
-                        0x0500 => "Get Info",
-                        0x0501 => "Alloc Block",
-                        0x0502 => "Free Block",
-                        0x0503 => "Resize Block",
-                        0x0600 => "Lock Region",
-                        0x0800 => "Map Physical",
-                        0x0900 => "Get State",
-                        _ => $"sub=0x{ax:X4}"
-                    };
-                    dbDesc += $" ; DPMI: {name}";
-                    if (ax == 0x0000) dbDesc += " ; CX=count";
-                    if (ax == 0x0100) dbDesc += " ; BX=paras";
-                    if (ax == 0x0501) dbDesc += " ; BX:CX=size";
+                    if (ax == 0x0100) dbDesc += $" ; BX={lastBxImm}p ({lastBxImm * 16}b)";
+                    if (ax == 0x0501) dbDesc += $" ; size={((uint)(lastBxImm ?? 0) << 16) | (lastCxImm ?? 0)}b";
                 }
 
-                // Mouse
+                // Mouse extra
                 if (intNo == 0x33 && lastAxImm.HasValue)
                 {
                     var ax = lastAxImm.Value;
-                    var name = ax switch
-                    {
-                        0x0000 => "Reset",
-                        0x0001 => "Show",
-                        0x0002 => "Hide",
-                        0x0003 => "Get Pos/Btns",
-                        0x0004 => "Set Pos",
-                        0x0007 => "Set X Range",
-                        0x0008 => "Set Y Range",
-                        0x000C => "Set Handler",
-                        _ => $"sub=0x{ax:X4}"
-                    };
-                    dbDesc += $" ; Mouse: {name}";
-                }
-
-                // EMS
-                if (intNo == 0x67 && lastAh.HasValue)
-                {
-                    var ah = lastAh.Value;
-                    var name = ah switch
-                    {
-                        0x40 => "Get Status",
-                        0x41 => "Get Page Frame",
-                        0x42 => "Get Page Count",
-                        0x43 => "Alloc Pages",
-                        0x44 => "Map Page",
-                        0x45 => "Dealloc Pages",
-                        0x46 => "Get Version",
-                        0x47 => "Save Context",
-                        0x48 => "Restore Context",
-                        _ => $"sub=0x{ah:X2}"
-                    };
-                    dbDesc += $" ; EMS: {name}";
-                    if (ah == 0x43) dbDesc += " ; BX=pages";
-                    if (ah == 0x44) dbDesc += " ; AL=phys BX=log DX=handle";
+                    if (ax == 0x0004) dbDesc += $" ; X={lastCxImm} Y={lastDxImm}";
                 }
 
                 return dbDesc;
