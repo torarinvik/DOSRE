@@ -332,6 +332,10 @@ namespace DOSRE.Dasm
             ushort? lastSiImm = null;
             ushort? lastDiImm = null;
             ushort? lastBpImm = null;
+            sbyte? lastBxBpDisp8 = null;
+            var bpFrameWords = new Dictionary<sbyte, ushort>();
+            var esIsSs = false;
+            var esSavedAsSsDepth = 0;
             ushort? lastDsImm = null;
             ushort? lastEsImm = null;
             FunctionInfo currentFunc = null;
@@ -358,6 +362,10 @@ namespace DOSRE.Dasm
                     lastSiImm = null;
                     lastDiImm = null;
                     lastBpImm = null;
+                    lastBxBpDisp8 = null;
+                    bpFrameWords.Clear();
+                    esIsSs = false;
+                    esSavedAsSsDepth = 0;
                     lastDsImm = null;
                     lastEsImm = null;
 
@@ -399,6 +407,114 @@ namespace DOSRE.Dasm
 
                 if (mzInsights)
                 {
+                    // Track a tiny amount of stack-frame state for richer INT 21h decoding (best-effort).
+                    // - `lea bx, [bp+disp8]` is commonly used for EXEC parameter blocks.
+                    // - `mov [bp+disp8], imm16` / `mov [bp+disp8], reg` often populates those blocks.
+                    var b = ins.Bytes;
+                    if (b != null && b.Length > 0)
+                    {
+                        // Track ES==SS via push/pop patterns (approximate, but works well for common prologues).
+                        if (b.Length >= 1 && b[0] == 0x16) // push ss
+                        {
+                            // push ss; pop es is the canonical way to set ES=SS
+                        }
+                        else if (b.Length >= 1 && b[0] == 0x06) // push es
+                        {
+                            if (esIsSs)
+                                esSavedAsSsDepth++;
+                        }
+                        else if (b.Length >= 1 && b[0] == 0x07) // pop es
+                        {
+                            if (esSavedAsSsDepth > 0)
+                            {
+                                esSavedAsSsDepth--;
+                                esIsSs = true;
+                            }
+                        }
+
+                        // mov sreg, r/m16 (0x8E /r): only ES assignments break ES==SS assumption.
+                        if (b.Length >= 2 && b[0] == 0x8E)
+                        {
+                            var reg = (b[1] >> 3) & 0x07;
+                            if (reg == 0) // ES
+                                esIsSs = false;
+                        }
+
+                        // push ss; pop es => ES=SS
+                        if (b.Length >= 1 && b[0] == 0x07 && i > 0)
+                        {
+                            var pb = instructions[i - 1].Bytes;
+                            if (pb != null && pb.Length >= 1 && pb[0] == 0x16)
+                                esIsSs = true;
+                        }
+
+                        // lea bx, [bp+disp8] : 8D 5E ib
+                        if (b.Length >= 3 && b[0] == 0x8D && b[1] == 0x5E)
+                        {
+                            lastBxBpDisp8 = unchecked((sbyte)b[2]);
+                        }
+
+                        // If BX is assigned directly, stop treating it as BP-relative.
+                        if (b.Length >= 1 && (b[0] == 0xBB || (b[0] == 0x89 && b.Length >= 2 && b[1] == 0xC3) || (b[0] == 0x8B && b.Length >= 2 && b[1] == 0xD8)))
+                        {
+                            // mov bx, imm16 OR mov bx, ax (common encodings)
+                            if (!(b.Length >= 3 && b[0] == 0x8D && b[1] == 0x5E))
+                                lastBxBpDisp8 = null;
+                        }
+
+                        // mov word [bp+disp8], imm16 : C7 46 ib iw
+                        if (b.Length >= 5 && b[0] == 0xC7 && b[1] == 0x46)
+                        {
+                            var disp = unchecked((sbyte)b[2]);
+                            var imm = (ushort)(b[3] | (b[4] << 8));
+                            bpFrameWords[disp] = imm;
+                        }
+
+                        // mov [bp+disp8], reg16 : 89 46 ib   (reg determined by ModRM reg field)
+                        if (b.Length >= 3 && b[0] == 0x89 && b[1] >= 0x46 && b[1] <= 0x7E)
+                        {
+                            var modrm = b[1];
+                            var mod = (modrm >> 6) & 0x03;
+                            var reg = (modrm >> 3) & 0x07;
+                            var rm = modrm & 0x07;
+                            if (mod == 0x01 && rm == 0x06) // [bp+disp8]
+                            {
+                                var disp = unchecked((sbyte)b[2]);
+                                ushort? src = reg switch
+                                {
+                                    0 => lastAxImm,
+                                    1 => lastCxImm,
+                                    2 => lastDxImm,
+                                    3 => lastBxImm,
+                                    6 => lastSiImm,
+                                    7 => lastDiImm,
+                                    _ => null
+                                };
+                                if (src.HasValue)
+                                    bpFrameWords[disp] = src.Value;
+                            }
+                        }
+
+                        // mov [bp+disp8], ds/es : 8C 5E ib (ds), 8C 46 ib (es)
+                        if (b.Length >= 3 && b[0] == 0x8C)
+                        {
+                            if (b[1] == 0x5E) // ds
+                            {
+                                var disp = unchecked((sbyte)b[2]);
+                                if (lastDsImm.HasValue)
+                                    bpFrameWords[disp] = lastDsImm.Value;
+                            }
+                            else if (b[1] == 0x46) // es
+                            {
+                                var disp = unchecked((sbyte)b[2]);
+                                if (lastEsImm.HasValue)
+                                    bpFrameWords[disp] = lastEsImm.Value;
+                                else if (esIsSs)
+                                    bpFrameWords[disp] = 0; // unknown SS; still marks it as set
+                            }
+                        }
+                    }
+
                     // Track a tiny amount of state for DOS interrupt hints.
                     UpdateSimpleDosState(ins, ref lastAh, ref lastAl, ref lastAxImm, ref lastBxImm, ref lastCxImm, ref lastDxImm, ref lastSiImm, ref lastDiImm, ref lastBpImm, ref lastDsImm, ref lastEsImm);
 
@@ -435,6 +551,14 @@ namespace DOSRE.Dasm
                     var hint = TryDecodeInterruptHint(ins, lastAh, lastAl, lastAxImm, lastBxImm, lastCxImm, lastDxImm, lastSiImm, lastDiImm, lastBpImm, lastDsImm, lastEsImm, stringSyms, stringPrev, module);
                     if (!string.IsNullOrEmpty(hint))
                         insText += $" ; {hint}";
+
+                    // Extra: if this is an EXEC call using a stack-local parameter block, reconstruct what we can.
+                    if (ins.Bytes != null && ins.Bytes.Length >= 2 && ins.Bytes[0] == 0xCD && ins.Bytes[1] == 0x21 && lastAh == 0x4B)
+                    {
+                        var pbHint = TryDecodeExecParamBlockFromStack(lastBxBpDisp8, esIsSs, bpFrameWords, module);
+                        if (!string.IsNullOrEmpty(pbHint))
+                            insText += $" ; {pbHint}";
+                    }
                 }
 
                 sb.AppendLine($"{addr:X5}h {bytes.PadRight(16, ' ')} {insText}");
@@ -442,6 +566,78 @@ namespace DOSRE.Dasm
 
             output = sb.ToString();
             return true;
+        }
+
+        private static string TryDecodeExecParamBlockFromStack(sbyte? bxBpDisp8, bool esIsSs, Dictionary<sbyte, ushort> bpFrameWords, byte[] module)
+        {
+            if (!bxBpDisp8.HasValue || !esIsSs || bpFrameWords == null)
+                return string.Empty;
+
+            // EXEC parameter block is 14 bytes. If BX = BP + baseDisp, fields are:
+            //  +0 envSeg
+            //  +2 cmdOff
+            //  +4 cmdSeg
+            //  +6 fcb1Off
+            //  +8 fcb1Seg
+            // +10 fcb2Off
+            // +12 fcb2Seg
+            var baseDisp = bxBpDisp8.Value;
+
+            static bool TryGetWord(Dictionary<sbyte, ushort> words, sbyte disp, out ushort v)
+            {
+                if (words != null && words.TryGetValue(disp, out v))
+                    return true;
+                v = 0;
+                return false;
+            }
+
+            var haveCmdOff = TryGetWord(bpFrameWords, (sbyte)(baseDisp + 2), out var cmdOff);
+            var haveCmdSeg = TryGetWord(bpFrameWords, (sbyte)(baseDisp + 4), out var cmdSeg);
+            var haveFcb1Off = TryGetWord(bpFrameWords, (sbyte)(baseDisp + 6), out var fcb1Off);
+            var haveFcb1Seg = TryGetWord(bpFrameWords, (sbyte)(baseDisp + 8), out var fcb1Seg);
+            var haveFcb2Off = TryGetWord(bpFrameWords, (sbyte)(baseDisp + 10), out var fcb2Off);
+            var haveFcb2Seg = TryGetWord(bpFrameWords, (sbyte)(baseDisp + 12), out var fcb2Seg);
+
+            var sb = new StringBuilder();
+            sb.Append($"PB(stack @BP{(baseDisp >= 0 ? "+" : "")}{baseDisp})");
+
+            if (haveCmdOff && haveCmdSeg)
+            {
+                sb.Append($" cmd={cmdSeg:X4}:{cmdOff:X4}");
+                var cmdLinear = (uint)((cmdSeg << 4) + cmdOff);
+                var cmd = TryReadDosCommandTail(module, cmdLinear, 126);
+                if (!string.IsNullOrEmpty(cmd)) sb.Append($" \"{cmd}\"");
+            }
+            else
+            {
+                sb.Append(" cmd=[BP+2..BP+4]");
+            }
+
+            if (haveFcb1Off && haveFcb1Seg)
+            {
+                sb.Append($" fcb1={fcb1Seg:X4}:{fcb1Off:X4}");
+                var linear = (uint)((fcb1Seg << 4) + fcb1Off);
+                var f = TryFormatFcbDetail(linear, module);
+                if (!string.IsNullOrEmpty(f)) sb.Append($" {f}");
+            }
+            else
+            {
+                sb.Append(" fcb1=[BP+6..BP+8]");
+            }
+
+            if (haveFcb2Off && haveFcb2Seg)
+            {
+                sb.Append($" fcb2={fcb2Seg:X4}:{fcb2Off:X4}");
+                var linear = (uint)((fcb2Seg << 4) + fcb2Off);
+                var f = TryFormatFcbDetail(linear, module);
+                if (!string.IsNullOrEmpty(f)) sb.Append($" {f}");
+            }
+            else
+            {
+                sb.Append(" fcb2=[BP+10..BP+12]");
+            }
+
+            return sb.ToString();
         }
 
         private readonly struct ToolchainMarker
