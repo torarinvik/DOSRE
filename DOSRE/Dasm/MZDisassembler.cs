@@ -1130,6 +1130,21 @@ namespace DOSRE.Dasm
                 return;
             }
 
+            // Register-to-register moves (subset of common ones)
+            if (b.Length >= 2 && b[0] == 0x89) // mov r/m, r
+            {
+                if (b[1] == 0xC3) { lastBxImm = lastAxImm; return; } // mov bx, ax
+                if (b[1] == 0xC1) { lastCxImm = lastAxImm; return; } // mov cx, ax
+                if (b[1] == 0xC2) { lastDxImm = lastAxImm; return; } // mov dx, ax
+            }
+            if (b.Length >= 2 && b[0] == 0x8B) // mov r, r/m
+            {
+                if (b[1] == 0xD8) { lastBxImm = lastAxImm; return; } // mov bx, ax
+                if (b[1] == 0xC8) { lastCxImm = lastAxImm; return; } // mov cx, ax
+                if (b[1] == 0xD0) { lastDxImm = lastAxImm; return; } // mov dx, ax
+                if (b[1] == 0xC3) { lastAxImm = lastBxImm; lastAh = lastAxImm.HasValue ? (byte?)(lastAxImm >> 8) : null; lastAl = lastAxImm.HasValue ? (byte?)(lastAxImm & 0xFF) : null; return; } // mov ax, bx
+            }
+
             // Segments
             if (b[0] == 0x8E && b.Length >= 2)
             {
@@ -1137,6 +1152,24 @@ namespace DOSRE.Dasm
                 if (b[1] == 0xDA) { lastDsImm = lastDxImm; return; } // mov ds, dx
                 if (b[1] == 0xC0) { lastEsImm = lastAxImm; return; } // mov es, ax
                 if (b[1] == 0xC2) { lastEsImm = lastDxImm; return; } // mov es, dx
+                if (b[1] == 0xD1) { lastDsImm = null; return; }     // mov ds, ss (clobber)
+                if (b[1] == 0xC8) { lastEsImm = lastCxImm; return; } // mov es, cx
+            }
+
+            // Basic Arithmetic (Constant Propagation)
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Iinc)
+            {
+                if (text.Contains("ax") && lastAxImm.HasValue) { lastAxImm++; lastAh = (byte?)(lastAxImm >> 8); lastAl = (byte?)(lastAxImm & 0xFF); return; }
+                if (text.Contains("bx") && lastBxImm.HasValue) { lastBxImm++; return; }
+                if (text.Contains("cx") && lastCxImm.HasValue) { lastCxImm++; return; }
+                if (text.Contains("dx") && lastDxImm.HasValue) { lastDxImm++; return; }
+            }
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Idec)
+            {
+                if (text.Contains("ax") && lastAxImm.HasValue) { lastAxImm--; lastAh = (byte?)(lastAxImm >> 8); lastAl = (byte?)(lastAxImm & 0xFF); return; }
+                if (text.Contains("bx") && lastBxImm.HasValue) { lastBxImm--; return; }
+                if (text.Contains("cx") && lastCxImm.HasValue) { lastCxImm--; return; }
+                if (text.Contains("dx") && lastDxImm.HasValue) { lastDxImm--; return; }
             }
 
             // Clobber logic for instructions that modify registers in ways we don't track as constants
@@ -1155,7 +1188,8 @@ namespace DOSRE.Dasm
             // Special case: pop, call, mul, div, etc. clobber implicit registers
             if (ins.Mnemonic == ud_mnemonic_code.UD_Ipop || ins.Mnemonic == ud_mnemonic_code.UD_Icall || 
                 ins.Mnemonic == ud_mnemonic_code.UD_Imul || ins.Mnemonic == ud_mnemonic_code.UD_Idiv ||
-                ins.Mnemonic == ud_mnemonic_code.UD_Iloop || ins.Mnemonic == ud_mnemonic_code.UD_Iloope || ins.Mnemonic == ud_mnemonic_code.UD_Iloopne)
+                ins.Mnemonic == ud_mnemonic_code.UD_Iloop || ins.Mnemonic == ud_mnemonic_code.UD_Iloope || ins.Mnemonic == ud_mnemonic_code.UD_Iloopne ||
+                ins.Mnemonic == ud_mnemonic_code.UD_Imovsb || ins.Mnemonic == ud_mnemonic_code.UD_Imovsw || ins.Mnemonic == ud_mnemonic_code.UD_Istosb || ins.Mnemonic == ud_mnemonic_code.UD_Istosw)
             {
                 if (ins.Mnemonic == ud_mnemonic_code.UD_Icall || ins.Mnemonic == ud_mnemonic_code.UD_Imul || ins.Mnemonic == ud_mnemonic_code.UD_Idiv)
                 {
@@ -1165,6 +1199,11 @@ namespace DOSRE.Dasm
                 if (ins.Mnemonic == ud_mnemonic_code.UD_Iloop || ins.Mnemonic == ud_mnemonic_code.UD_Iloope || ins.Mnemonic == ud_mnemonic_code.UD_Iloopne)
                 {
                     lastCxImm = null;
+                }
+                if (ins.Mnemonic == ud_mnemonic_code.UD_Imovsb || ins.Mnemonic == ud_mnemonic_code.UD_Imovsw || ins.Mnemonic == ud_mnemonic_code.UD_Istosb || ins.Mnemonic == ud_mnemonic_code.UD_Istosw)
+                {
+                    lastSiImm = null; lastDiImm = null;
+                    if (text.Contains("rep")) lastCxImm = 0;
                 }
             }
         }
@@ -1445,12 +1484,25 @@ namespace DOSRE.Dasm
                             var acc = (al.Value & 0x03) switch { 0 => "R", 1 => "W", 2 => "RW", _ => "?" };
                             dbDesc += $" ; AL=0x{al.Value:X2} ({acc})";
                         }
+                        
+                        if (lastDxImm.HasValue)
+                        {
+                            var linear = lastDsImm.HasValue ? (uint)((lastDsImm.Value << 4) + lastDxImm.Value) : lastDxImm.Value;
+                            var fn = TryReadAsciiString(module, linear, 128);
+                            if (!string.IsNullOrEmpty(fn)) dbDesc += $" ; path=\"{fn}\"";
+                        }
                         dbDesc += " ; AL mode: 0=R 1=W 2=RW, bits 4-6: 0=Comp 1=DAll 2=DW 3=DR 4=DNone";
                     }
 
                     // AH=3Ch: Create file
                     if (ah == 0x3C)
                     {
+                        if (lastDxImm.HasValue)
+                        {
+                            var linear = lastDsImm.HasValue ? (uint)((lastDsImm.Value << 4) + lastDxImm.Value) : lastDxImm.Value;
+                            var fn = TryReadAsciiString(module, linear, 128);
+                            if (!string.IsNullOrEmpty(fn)) dbDesc += $" ; path=\"{fn}\"";
+                        }
                         if (lastCxImm.HasValue)
                         {
                             var attr = lastCxImm.Value;
@@ -1459,18 +1511,46 @@ namespace DOSRE.Dasm
                             if ((attr & 0x02) != 0) parts.Add("Hid");
                             if ((attr & 0x04) != 0) parts.Add("Sys");
                             if ((attr & 0x20) != 0) parts.Add("Arch");
-                            var attrStr = parts.Count > 0 ? string.Join("|", parts) : "Norm";
-                            dbDesc += $" ; CX=0x{attr:X} ({attrStr})";
+                            if (parts.Count > 0) dbDesc += $" ; attr=0x{attr:X} ({string.Join("|", parts)})";
                         }
-                        dbDesc += " ; CX attr: 1=RO 2=Hid 4=Sys 0x20=Arch";
                     }
 
-                    // AH=3Fh, 0x40h: Read/Write file
+                    // AH=3Fh/40h: Read/Write
                     if (ah == 0x3F || ah == 0x40)
                     {
-                        if (lastBxImm.HasValue) dbDesc += $" ; BX={lastBxImm.Value}";
-                        if (lastCxImm.HasValue) dbDesc += $" ; CX={lastCxImm.Value}";
-                        dbDesc += " ; BX=handle CX=count DS:DX=buffer";
+                        if (lastBxImm.HasValue)
+                        {
+                            var h = lastBxImm.Value;
+                            var hname = h switch { 0 => "stdin", 1 => "stdout", 2 => "stderr", 3 => "stdaux", 4 => "stdprn", _ => $"handle 0x{h:X}" };
+                            dbDesc += $" ; { (ah == 0x3F ? "read from" : "write to") } {hname}";
+                        }
+                        if (lastCxImm.HasValue) dbDesc += $" ; count={lastCxImm.Value}";
+                    }
+
+                    // AH=09h: Print $
+                    if (ah == 0x09)
+                    {
+                        if (lastDxImm.HasValue)
+                        {
+                            var linear = lastDsImm.HasValue ? (uint)((lastDsImm.Value << 4) + lastDxImm.Value) : lastDxImm.Value;
+                            var s = TryReadDollarString(module, linear, 256);
+                            if (!string.IsNullOrEmpty(s)) dbDesc += $" ; \"{s}\"";
+                        }
+                    }
+
+                    // AH=25h: Set Interrupt Vector
+                    if (ah == 0x25)
+                    {
+                        if (lastAl.HasValue) dbDesc += $" ; SET INT {lastAl.Value:X2}h HOOK";
+                        else if (lastAxImm.HasValue) dbDesc += $" ; SET INT {(byte)(lastAxImm.Value & 0xFF):X2}h HOOK";
+                        dbDesc += " ; DS:DX -> new handler";
+                    }
+                    
+                    // AH=35h: Get Interrupt Vector
+                    if (ah == 0x35)
+                    {
+                        if (lastAl.HasValue) dbDesc += $" ; GET INT {lastAl.Value:X2}h VECTOR";
+                        dbDesc += " ; (returns ES:BX -> current handler)";
                     }
 
                     // AH=42h: LSeek
@@ -1528,21 +1608,6 @@ namespace DOSRE.Dasm
                         dbDesc += " ; ES=seg BX=paras";
                     }
 
-                    // AH=4Bh: Exec
-                    if (ah == 0x4B)
-                    {
-                        byte? al = lastAl;
-                        if (!al.HasValue && lastAxImm.HasValue)
-                            al = (byte)(lastAxImm.Value & 0xFF);
-
-                        if (al.HasValue)
-                        {
-                            var mode = al.Value switch { 0 => "Exec", 1 => "Load", 3 => "Overlay", 5 => "State", _ => "?" };
-                            dbDesc += $" ; AL={al.Value} ({mode})";
-                        }
-                        dbDesc += " ; AL mode: 0=Exec 3=LoadOverlay ; DS:DX=path ES:BX=param block";
-                    }
-
                     // AH=1Ah: Set DTA
                     if (ah == 0x1A)
                     {
@@ -1554,18 +1619,6 @@ namespace DOSRE.Dasm
                     {
                         var mode = ah switch { 0x2A => "GetDate", 0x2B => "SetDate", 0x2C => "GetTime", 0x2D => "SetTime", _ => "" };
                         dbDesc += $" ; {mode}";
-                    }
-
-                    // AH=25h, 0x35h: Interrupt vectors
-                    if (ah == 0x25)
-                    {
-                        if (lastAl.HasValue) dbDesc += $" ; AL=0x{lastAl.Value:X2}";
-                        dbDesc += " ; AL=int# DS:DX=handler";
-                    }
-                    else if (ah == 0x35)
-                    {
-                        if (lastAl.HasValue) dbDesc += $" ; AL=0x{lastAl.Value:X2}";
-                        dbDesc += " ; AL=int# (returns ES:BX=vector)";
                     }
 
                     // AH=30h: Get DOS version
@@ -1962,6 +2015,71 @@ namespace DOSRE.Dasm
             }
 
             return $"INT 0x{intNo:X2}";
+        }
+
+        private static string TryReadAsciiString(byte[] module, uint linear, int maxLen)
+        {
+            if (module == null || maxLen <= 0)
+                return string.Empty;
+
+            if (linear >= (uint)module.Length)
+                return string.Empty;
+
+            var start = (int)linear;
+            var end = Math.Min(module.Length, start + maxLen);
+            var sb = new StringBuilder();
+
+            for (var i = start; i < end; i++)
+            {
+                var b = module[i];
+                if (b == 0x00)
+                    break;
+
+                // Keep this conservative to avoid random binary junk.
+                if (b < 0x20 || b > 0x7E)
+                    return string.Empty;
+
+                sb.Append((char)b);
+            }
+
+            var s = sb.ToString().Trim();
+            if (s.Length == 0)
+                return string.Empty;
+
+            return s.Replace("\"", "\\\"");
+        }
+
+        private static string TryReadDollarString(byte[] module, uint linear, int maxLen)
+        {
+            if (module == null || maxLen <= 0)
+                return string.Empty;
+
+            if (linear >= (uint)module.Length)
+                return string.Empty;
+
+            var start = (int)linear;
+            var end = Math.Min(module.Length, start + maxLen);
+            var sb = new StringBuilder();
+
+            for (var i = start; i < end; i++)
+            {
+                var b = module[i];
+                if (b == (byte)'$')
+                    break;
+                if (b == 0x00)
+                    return string.Empty;
+
+                if (b < 0x20 || b > 0x7E)
+                    return string.Empty;
+
+                sb.Append((char)b);
+            }
+
+            var s = sb.ToString();
+            if (s.Length == 0)
+                return string.Empty;
+
+            return s.Replace("\"", "\\\"");
         }
 
         internal static string TryFormatFcbDetail(uint? lastImm, byte[] module)
