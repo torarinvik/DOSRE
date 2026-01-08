@@ -786,6 +786,9 @@ namespace DOSRE.Dasm
             var edxOperand = TryResolveEdxBefore(instructions, idx);
             var esiOperand = TryResolveEsiBefore(instructions, idx);
 
+            var edxDetail = TryFormatPointerDetail("EDX", edxOperand, stringSymbols, stringPreview, objects, objBytesByIndex);
+            var esiDetail = TryFormatPointerDetail("ESI", esiOperand, stringSymbols, stringPreview, objects, objBytesByIndex);
+
             string db;
             if (DosInterruptDatabase.Instance.TryDescribe(intNo, dbAh, dbAx, out db) && !string.IsNullOrEmpty(db))
             {
@@ -800,16 +803,15 @@ namespace DOSRE.Dasm
                         if (ah == 0x0F || ah == 0x10 || ah == 0x11 || ah == 0x12 || ah == 0x13 || ah == 0x16 || ah == 0x17 || 
                             ah == 0x21 || ah == 0x22 || ah == 0x23 || ah == 0x24 || ah == 0x27 || ah == 0x28)
                         {
-                            var fcb = TryAnnotateFcb(edxOperand, stringSymbols, objects, objBytesByIndex);
+                            uint? edxVal = null;
+                            if (TryParseHexUInt(edxOperand, out var v)) edxVal = v;
+                            var fcb = TryAnnotateFcb(edxVal, stringSymbols, objects, objBytesByIndex);
                             if (!string.IsNullOrEmpty(fcb))
                                 extra = " ; " + fcb;
                         }
 
                         if (string.IsNullOrEmpty(extra))
                         {
-                            var edxDetail = TryFormatPointerDetail("EDX", edxOperand, stringSymbols, stringPreview);
-                            var esiDetail = TryFormatPointerDetail("ESI", esiOperand, stringSymbols, stringPreview);
-
                             // DX/EDX based
                             if (ah == 0x09 || ah == 0x0A || ah == 0x1A || ah == 0x39 || ah == 0x3A || ah == 0x3B || ah == 0x3C || 
                                 ah == 0x3D || ah == 0x3F || ah == 0x40 || ah == 0x41 || ah == 0x43 || ah == 0x4B || 
@@ -1243,6 +1245,9 @@ namespace DOSRE.Dasm
             public uint Flags;
             public uint PageMapIndex; // 1-based
             public uint PageCount;
+
+            public uint RelocBaseAddr => BaseAddress;
+            public int ObjectNumber => Index;
         }
 
         public static bool TryDumpFixupsToString(string inputFile, int? maxPages, int maxBytesPerPage, out string output, out string error)
@@ -2327,7 +2332,7 @@ namespace DOSRE.Dasm
             return string.Empty;
         }
 
-        private static string TryFormatPointerDetail(string reg, string operand, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> stringPreview)
+        private static string TryFormatPointerDetail(string reg, string operand, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> stringPreview, List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex)
         {
             if (string.IsNullOrWhiteSpace(operand))
                 return string.Empty;
@@ -2342,6 +2347,11 @@ namespace DOSRE.Dasm
                 if (TryParseHexUInt(hex, out var addr))
                 {
                     var prev = stringPreview != null && stringPreview.TryGetValue(addr, out var p) ? p : string.Empty;
+
+                    // FALLBACK: On-demand extraction if not in preview
+                    if (string.IsNullOrEmpty(prev))
+                        prev = TryExtractStringFromObjects(addr, objects, objBytesByIndex);
+
                     if (!string.IsNullOrEmpty(prev))
                         return $"{regU}={op} \"{prev}\"";
                     return $"{regU}={op}";
@@ -2352,22 +2362,80 @@ namespace DOSRE.Dasm
             // Immediate linear address.
             if (TryParseHexUInt(op, out var imm))
             {
-                if (stringSymbols != null && stringSymbols.TryGetValue(imm, out var sym))
+                string sym = null;
+                string prev = null;
+
+                if (stringSymbols != null && stringSymbols.TryGetValue(imm, out sym))
                 {
-                    var prev = stringPreview != null && stringPreview.TryGetValue(imm, out var p) ? p : string.Empty;
-                    if (!string.IsNullOrEmpty(prev))
-                        return $"{regU}={sym} \"{prev}\"";
-                    return $"{regU}={sym}";
+                    if (stringPreview != null) stringPreview.TryGetValue(imm, out prev);
+                }
+                else
+                {
+                    if (stringPreview != null) stringPreview.TryGetValue(imm, out prev);
                 }
 
-                var onlyPrev = stringPreview != null && stringPreview.TryGetValue(imm, out var p2) ? p2 : string.Empty;
-                if (!string.IsNullOrEmpty(onlyPrev))
-                    return $"{regU}=0x{imm:X8} \"{onlyPrev}\"";
+                // FALLBACK: On-demand extraction
+                if (string.IsNullOrEmpty(prev))
+                    prev = TryExtractStringFromObjects(imm, objects, objBytesByIndex);
+
+                if (!string.IsNullOrEmpty(prev))
+                {
+                    var label = sym ?? $"0x{imm:X8}";
+                    return $"{regU}={label} \"{prev}\"";
+                }
+
+                if (!string.IsNullOrEmpty(sym))
+                    return $"{regU}={sym}";
 
                 return $"{regU}=0x{imm:X8}";
             }
 
             return $"{regU}={op}";
+        }
+
+        private static string TryExtractStringFromObjects(uint linearAddr, List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex)
+        {
+            if (objects == null || objBytesByIndex == null) return null;
+
+            foreach (var obj in objects)
+            {
+                if (linearAddr >= obj.RelocBaseAddr && linearAddr < obj.RelocBaseAddr + obj.VirtualSize)
+                {
+                    if (objBytesByIndex.TryGetValue(obj.ObjectNumber, out var bytes))
+                    {
+                        uint relativeOffset = linearAddr - obj.RelocBaseAddr;
+                        return ExtractString(bytes, (int)relativeOffset);
+                    }
+                    break;
+                }
+            }
+            return null;
+        }
+
+        private static string ExtractString(byte[] bytes, int offset)
+        {
+            if (bytes == null || offset < 0 || offset >= bytes.Length) return null;
+
+            int len = 0;
+            while (offset + len < bytes.Length && len < 128)
+            {
+                byte b = bytes[offset + len];
+                if (b == 0) break;
+                if (b < 32 || b > 126) // Simple ASCII filter
+                {
+                    if (len > 0) break; // End string at first non-ascii if we have some content
+                    return null; // Don't start with non-ascii
+                }
+                len++;
+            }
+
+            if (len < 1) return null;
+
+            try
+               {
+                return Encoding.ASCII.GetString(bytes, offset, len);
+            }
+            catch { return null; }
         }
 
         private static bool TryReadDwordAtLinear(List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex, uint addr, out uint value)

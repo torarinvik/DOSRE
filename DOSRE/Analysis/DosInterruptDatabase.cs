@@ -184,15 +184,22 @@ namespace DOSRE.Analysis
                 return false;
 
             InterruptFunction bestFn = null;
-            if (entry.FunctionsByCode != null && ax.HasValue && entry.FunctionsByCode.TryGetValue(ax.Value, out var axList) && axList != null && axList.Count > 0)
+            
+            // Try to find the function. 
+            // 1. If we have a full AX and the entry uses AX selector, try that first.
+            // 2. Otherwise, use the selValue (could be AH or AX) to look up in the functions dictionary.
+            // 3. Special case: if selector is AH but we have a full AX, also try just the AH part if AX lookup fails.
+            
+            if (entry.FunctionsByCode != null)
             {
-                var chosen = ChooseBestFunction(axList, dosVersionInt ?? _currentDosVersionInt);
-                bestFn = chosen ?? axList[0];
-            }
-            else if (entry.FunctionsByCode != null && selValue.HasValue && entry.FunctionsByCode.TryGetValue(selValue.Value, out var selList) && selList != null && selList.Count > 0)
-            {
-                var chosen = ChooseBestFunction(selList, dosVersionInt ?? _currentDosVersionInt);
-                bestFn = chosen ?? selList[0];
+                if (selector == "AX" && ax.HasValue && entry.FunctionsByCode.TryGetValue(ax.Value, out var axList) && axList.Count > 0)
+                {
+                    bestFn = ChooseBestFunction(axList, dosVersionInt ?? _currentDosVersionInt) ?? axList[0];
+                }
+                else if (entry.FunctionsByCode.TryGetValue(selValue.Value, out var selList) && selList.Count > 0)
+                {
+                    bestFn = ChooseBestFunction(selList, dosVersionInt ?? _currentDosVersionInt) ?? selList[0];
+                }
             }
 
             if (bestFn != null)

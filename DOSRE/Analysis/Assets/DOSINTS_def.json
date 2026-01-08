@@ -27,9 +27,7 @@
         { "code": "0x0D", "name": "Read Graphics Pixel", "params": ["BH=page", "CX=x", "DX=y"], "returns": ["AL=color"] },
         { "code": "0x0E", "name": "Teletype Output", "params": ["AL=char", "BH=page", "BL=color (GFX)"], "returns": [] },
         { "code": "0x0F", "name": "Get Video Mode", "params": [], "returns": ["AL=mode", "AH=columns", "BH=page"] },
-        { "code": "0x1010", "name": "Set Individual DAC Register", "params": ["BX=register", "CH=green", "CL=blue", "DH=red"], "returns": [] },
-        { "code": "0x1012", "name": "Set Block of DAC Registers", "params": ["BX=start register", "CX=count", "ES:DX -> color table"], "returns": [] },
-        { "code": "0x1130", "name": "Get Font Information", "params": ["BH=type"], "returns": ["CX=bytes/char", "DL=max row", "ES:BP -> data"] },
+        { "code": "0x1130", "name": "Get Font Info", "params": ["BH=type"], "returns": ["CX=bytes/char", "DL=max row", "ES:BP -> data"] },
         { "code": "0x13", "name": "Write String", "params": ["AL=mode", "BH=page", "BL=attr", "CX=len", "DH=row", "DL=col", "ES:BP -> string"], "returns": [] },
         { "code": "0x4F00", "name": "VBE: Get Controller Info", "params": ["ES:DI -> buffer"], "returns": ["AX=status"] },
         { "code": "0x4F01", "name": "VBE: Get Mode Info", "params": ["CX=mode", "ES:DI -> buffer"], "returns": ["AX=status"] },
@@ -37,28 +35,13 @@
       ]
     },
     {
-      "int": "0x11",
-      "name": "BIOS Equipment List",
-      "selector": "",
-      "functions": []
-    },
-    {
-      "int": "0x12",
-      "name": "BIOS Memory Size",
-      "selector": "",
-      "functions": []
-    },
-    {
       "int": "0x13",
-      "name": "BIOS Disk Services",
+      "name": "BIOS Disk",
       "selector": "AH",
       "functions": [
-        { "code": "0x00", "name": "Reset Disk", "params": ["DL=drive"], "returns": ["AH=status", "CF=fail"] },
-        { "code": "0x02", "name": "Read CHS", "params": ["AL=count", "CH=cyl", "CL=sec", "DH=head", "DL=drive", "ES:BX -> buffer"], "returns": ["AH=status", "AL=count", "CF=fail"] },
-        { "code": "0x08", "name": "Get Geometry", "params": ["DL=drive"], "returns": ["CH=max cyl", "CL=max sec", "DH=max head", "DL=num drives"] },
-        { "code": "0x41", "name": "Check Extensions", "params": ["BX=0x55AA", "DL=drive"], "returns": ["BX=0xAA55", "CF=no EDD"] },
-        { "code": "0x42", "name": "Read LBA", "params": ["DL=drive", "DS:SI -> DAP"], "returns": ["AH=status", "CF=fail"] },
-        { "code": "0x48", "name": "Get Disk Params", "params": ["DL=drive", "DS:SI -> buffer"], "returns": ["AH=status", "CF=fail"] }
+        { "code": "0x00", "name": "Reset", "params": ["DL=drive"], "returns": ["CF=fail"] },
+        { "code": "0x02", "name": "Read Sectors", "params": ["AL=count", "CH=cyl", "CL=sec", "DH=head", "DL=drive", "ES:BX -> buf"], "returns": ["CF=fail"] },
+        { "code": "0x42", "name": "Ext Read", "params": ["DL=drive", "DS:SI -> DAP"], "returns": ["CF=fail"] }
       ]
     },
     {
@@ -66,12 +49,9 @@
       "name": "BIOS System",
       "selector": "AH",
       "functions": [
-        { "code": "0x2401", "name": "A20: Enable", "params": [], "returns": ["CF=fail"] },
-        { "code": "0x86", "name": "Wait (us)", "params": ["CX:DX=us"], "returns": ["CF=fail"] },
-        { "code": "0x87", "name": "Copy Block", "params": ["CX=words", "ES:SI -> GDT"], "returns": ["AH=status", "CF=fail"] },
-        { "code": "0x88", "name": "Get Mem >1MB", "params": [], "returns": ["AX=KB"] },
-        { "code": "0xE801", "name": "Get Mem Phoenix", "params": [], "returns": ["AX=1-16MB", "BX=>16MB"] },
-        { "code": "0xE820", "name": "Query Map", "params": ["EAX=0xE820", "EBX=cont", "EDX=0x534D4150", "ES:DI -> buffer"], "returns": ["CF=fail", "EBX=next"] }
+        { "code": "0x86", "name": "Wait (Microseconds)", "params": ["CX:DX=interval"], "returns": ["CF=fail"] },
+        { "code": "0x87", "name": "Move Extended Block", "params": ["CX=length", "ES:SI -> GDT"], "returns": ["CF=fail"] },
+        { "code": "0x88", "name": "Get Extended Memory Size", "params": [], "returns": ["AX=KB"] }
       ]
     },
     {
@@ -79,8 +59,9 @@
       "name": "BIOS Keyboard",
       "selector": "AH",
       "functions": [
-        { "code": "0x00", "name": "Read Key", "params": [], "returns": ["AL=ASCII", "AH=Scan"] },
-        { "code": "0x01", "name": "Peek Key", "params": [], "returns": ["ZF=0 if key available"] }
+        { "code": "0x00", "name": "Read Char", "params": [], "returns": ["AL=char", "AH=scan"] },
+        { "code": "0x01", "name": "Peek Char", "params": [], "returns": ["ZF=none", "AL=char", "AH=scan"] },
+        { "code": "0x02", "name": "Get Flags", "params": [], "returns": ["AL=flags"] }
       ]
     },
     {
@@ -89,7 +70,8 @@
       "selector": "AH",
       "functions": [
         { "code": "0x00", "name": "Get Ticks", "params": [], "returns": ["CX:DX=ticks", "AL=midnight"] },
-        { "code": "0xB101", "name": "PCI Check", "params": [], "returns": ["AL=status"] }
+        { "code": "0x01", "name": "Set Ticks", "params": ["CX:DX=ticks"], "returns": [] },
+        { "code": "0x02", "name": "Get Real-Time Clock Time", "params": [], "returns": ["CH=hour", "CL=min", "DH=sec", "CF=fail"] }
       ]
     },
     {
@@ -97,28 +79,56 @@
       "name": "DOS API",
       "selector": "AH",
       "functions": [
+        { "code": "0x01", "name": "Read Char (Echo)", "params": [], "returns": ["AL=char"] },
+        { "code": "0x02", "name": "Write Char", "params": ["DL=char"], "returns": [] },
+        { "code": "0x06", "name": "Direct Console I/O", "params": ["DL=char/FF"], "returns": ["AL=char"] },
         { "code": "0x09", "name": "Print Str", "params": ["DS:DX -> str$"], "returns": [] },
+        { "code": "0x0A", "name": "Buffered Input", "params": ["DS:DX -> buf"], "returns": [] },
+        { "code": "0x0B", "name": "Get Input Status", "params": [], "returns": ["AL=status"] },
+        { "code": "0x0E", "name": "Select Default Drive", "params": ["DL=drive"], "returns": ["AL=total"] },
         { "code": "0x0F", "name": "Open FCB", "params": ["DS:DX -> FCB"], "returns": ["AL=status"] },
         { "code": "0x10", "name": "Close FCB", "params": ["DS:DX -> FCB"], "returns": ["AL=status"] },
+        { "code": "0x19", "name": "Get Default Drive", "params": [], "returns": ["AL=drive"] },
         { "code": "0x1A", "name": "Set DTA", "params": ["DS:DX -> buf"], "returns": [] },
         { "code": "0x25", "name": "Set Int", "params": ["AL=int", "DS:DX -> fn"], "returns": [] },
+        { "code": "0x2A", "name": "Get Date", "params": [], "returns": ["CX=year", "DH=month", "DL=day"] },
+        { "code": "0x2C", "name": "Get Time", "params": [], "returns": ["CH=hour", "CL=min", "DH=sec", "DL=cent"] },
         { "code": "0x30", "name": "Get Version", "params": [], "returns": ["AL=maj", "AH=min"] },
+        { "code": "0x33", "name": "Get/Set Ctrl-Break", "params": ["AL=mode", "DL=state"], "returns": ["DL=state"] },
         { "code": "0x35", "name": "Get Int", "params": ["AL=int"], "returns": ["ES:BX -> fn"] },
+        { "code": "0x36", "name": "Get Free Space", "params": ["DL=drive"], "returns": ["AX=sec/clust", "BX=avail", "CX=byte/sec", "DX=total"] },
         { "code": "0x39", "name": "mkdir", "params": ["DS:DX -> path"], "returns": ["CF=fail"] },
+        { "code": "0x3A", "name": "rmdir", "params": ["DS:DX -> path"], "returns": ["CF=fail"] },
         { "code": "0x3B", "name": "chdir", "params": ["DS:DX -> path"], "returns": ["CF=fail"] },
         { "code": "0x3C", "name": "Create", "params": ["CX=attr", "DS:DX -> path"], "returns": ["AX=handle", "CF=fail"] },
         { "code": "0x3D", "name": "Open", "params": ["AL=mode", "DS:DX -> path"], "returns": ["AX=handle", "CF=fail"] },
         { "code": "0x3E", "name": "Close", "params": ["BX=handle"], "returns": ["CF=fail"] },
         { "code": "0x3F", "name": "Read", "params": ["BX=handle", "CX=len", "DS:DX -> buf"], "returns": ["AX=len", "CF=fail"] },
         { "code": "0x40", "name": "Write", "params": ["BX=handle", "CX=len", "DS:DX -> buf"], "returns": ["AX=len", "CF=fail"] },
+        { "code": "0x41", "name": "Unlink", "params": ["DS:DX -> path"], "returns": ["CF=fail"] },
         { "code": "0x42", "name": "Seek", "params": ["AL=origin", "BX=handle", "CX:DX=offset"], "returns": ["DX:AX=new", "CF=fail"] },
+        { "code": "0x43", "name": "Get/Set Attr", "params": ["AL=mode", "DS:DX -> path", "CX=attr"], "returns": ["CX=attr", "CF=fail"] },
+        { "code": "0x44", "name": "IOCTL", "params": ["AL=sub", "BX=handle"], "returns": ["CF=fail"] },
+        { "code": "0x47", "name": "Get CWD", "params": ["DL=drive", "DS:SI -> buf"], "returns": ["CF=fail"] },
         { "code": "0x48", "name": "Alloc PARA", "params": ["BX=para"], "returns": ["AX=seg", "CF=fail"] },
         { "code": "0x49", "name": "Free PARA", "params": ["ES=seg"], "returns": ["CF=fail"] },
+        { "code": "0x4A", "name": "Resize Block", "params": ["ES=seg", "BX=new_para"], "returns": ["CF=fail"] },
+        { "code": "0x4B", "name": "Exec", "params": ["AL=mode", "DS:DX -> path", "ES:BX -> params"], "returns": ["CF=fail"] },
         { "code": "0x4C", "name": "Exit", "params": ["AL=code"], "returns": [] },
-        { "code": "0x52", "name": "Get LoL", "params": [], "returns": ["ES:BX -> LoL"] },
+        { "code": "0x4D", "name": "Get Exit Code", "params": [], "returns": ["AX=code"] },
+        { "code": "0x4E", "name": "FindFirst", "params": ["CX=attr", "DS:DX -> mask"], "returns": ["CF=fail"] },
+        { "code": "0x4F", "name": "FindNext", "params": [], "returns": ["CF=fail"] },
+        { "code": "0x56", "name": "Rename/Move", "params": ["DS:DX -> old", "ES:DI -> new"], "returns": ["CF=fail"] },
+        { "code": "0x57", "name": "Get/Set File Time", "params": ["AL=mode", "BX=handle", "CX=time", "DX=date"], "returns": ["CF=fail"] },
+        { "code": "0x58", "name": "Get/Set Alloc Strategy", "params": ["AL=sub"], "returns": ["AX=strat", "CF=fail"] },
+        { "code": "0x59", "name": "Get Ext Error", "params": [], "returns": ["AX=err", "BH=class", "BL=action", "CH=locus"] },
+        { "code": "0x5A", "name": "Create Temp", "params": ["CX=attr", "DS:DX -> path"], "returns": ["AX=handle", "CF=fail"] },
+        { "code": "0x5B", "name": "Create New", "params": ["CX=attr", "DS:DX -> path"], "returns": ["AX=handle", "CF=fail"] },
+        { "code": "0x5C", "name": "Lock/Unlock File", "params": ["AL=sub", "BX=handle", "CX:DX=off", "SI:DI=len"], "returns": ["CF=fail"] },
         { "code": "0x62", "name": "Get PSP", "params": [], "returns": ["BX=PSP"] },
+        { "code": "0x67", "name": "Set Handle Count", "params": ["BX=count"], "returns": ["CF=fail"] },
         { "code": "0x6C", "name": "Ext Open", "params": ["BX=mode", "CX=attr", "DX=act", "DS:SI -> path"], "returns": ["AX=handle", "CF=fail"] },
-        { "code": "0x714E", "name": "LFN Seek First", "params": ["CH=attr", "DS:DX -> pat", "ES:DI -> data"], "returns": ["AX=handle", "CF=fail"] }
+        { "code": "0x714E", "name": "LFN FindFirst", "params": ["CH=attr", "DS:DX -> pat", "ES:DI -> data"], "returns": ["AX=handle", "CF=fail"] }
       ]
     },
     {
@@ -137,11 +147,21 @@
       "selector": "AX",
       "functions": [
         { "code": "0x0000", "name": "Alloc Desc", "params": ["CX=count"], "returns": ["AX=sel"] },
+        { "code": "0x0001", "name": "Free Desc", "params": ["BX=sel"], "returns": ["CF=fail"] },
+        { "code": "0x0002", "name": "Seg to Desc", "params": ["AX=real_seg"], "returns": ["AX=sel"] },
+        { "code": "0x0003", "name": "Get Next Desc", "params": ["BX=sel"], "returns": ["AX=sel"] },
+        { "code": "0x0006", "name": "Get Base", "params": ["BX=sel"], "returns": ["CX:DX=base"] },
         { "code": "0x0007", "name": "Set Base", "params": ["BX=sel", "CX:DX=base"], "returns": ["CF=fail"] },
         { "code": "0x0008", "name": "Set Limit", "params": ["BX=sel", "CX:DX=lim"], "returns": ["CF=fail"] },
+        { "code": "0x0009", "name": "Set Access Rights", "params": ["BX=sel", "CX=rights"], "returns": ["CF=fail"] },
         { "code": "0x0100", "name": "Alloc DOS", "params": ["BX=para"], "returns": ["AX=seg", "DX=sel"] },
+        { "code": "0x0101", "name": "Free DOS", "params": ["DX=sel"], "returns": ["CF=fail"] },
+        { "code": "0x0200", "name": "Get Real Int", "params": ["BL=int"], "returns": ["CX:DX=fn"] },
+        { "code": "0x0201", "name": "Set Real Int", "params": ["BL=int", "CX:DX=fn"], "returns": ["CF=fail"] },
         { "code": "0x0300", "name": "Sim Real Int", "params": ["BL=int", "ES:DI -> regs"], "returns": ["CF=fail"] },
+        { "code": "0x0301", "name": "Call Real Proc (Far)", "params": ["ES:DI -> regs"], "returns": ["CF=fail"] },
         { "code": "0x0501", "name": "Alloc Block", "params": ["BX:CX=size"], "returns": ["SI:DI=handle", "BX:CX=addr"] },
+        { "code": "0x0502", "name": "Free Block", "params": ["SI:DI=handle"], "returns": ["CF=fail"] },
         { "code": "0x0800", "name": "Map Phys", "params": ["BX:CX=phys", "SI:DI=size"], "returns": ["BX:CX=addr"] }
       ]
     },
@@ -152,7 +172,9 @@
       "functions": [
         { "code": "0x0000", "name": "Reset", "params": [], "returns": ["AX=status"] },
         { "code": "0x0001", "name": "Show", "params": [], "returns": [] },
-        { "code": "0x0003", "name": "Get State", "params": [], "returns": ["BX=btns", "CX=x", "DX=y"] }
+        { "code": "0x0002", "name": "Hide", "params": [], "returns": [] },
+        { "code": "0x0003", "name": "Get State", "params": [], "returns": ["BX=btns", "CX=x", "DX=y"] },
+        { "code": "0x0004", "name": "Set Pos", "params": ["CX=x", "DX=y"], "returns": [] }
       ]
     }
   ]

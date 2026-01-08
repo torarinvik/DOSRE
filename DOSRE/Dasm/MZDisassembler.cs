@@ -326,6 +326,7 @@ namespace DOSRE.Dasm
             ushort? lastAxImm = null;
             ushort? lastDxImm = null;
             ushort? lastSiImm = null;
+            ushort? lastDsImm = null;
             FunctionInfo currentFunc = null;
             foreach (var ins in instructions)
             {
@@ -379,7 +380,7 @@ namespace DOSRE.Dasm
                 if (mzInsights)
                 {
                     // Track a tiny amount of state for DOS interrupt hints.
-                    UpdateSimpleDosState(ins, ref lastAh, ref lastAxImm, ref lastDxImm, ref lastSiImm);
+                    UpdateSimpleDosState(ins, ref lastAh, ref lastAxImm, ref lastDxImm, ref lastSiImm, ref lastDsImm);
                 }
 
                 if (mzInsights && TryGetRelativeBranchTarget16(ins, out var target2, out var isCall2))
@@ -407,7 +408,7 @@ namespace DOSRE.Dasm
 
                 if (mzInsights)
                 {
-                    var hint = TryDecodeInterruptHint(ins, lastAh, lastAxImm, lastDxImm, lastSiImm, stringSyms, stringPrev, module);
+                    var hint = TryDecodeInterruptHint(ins, lastAh, lastAxImm, lastDxImm, lastSiImm, lastDsImm, stringSyms, stringPrev, module);
                     if (!string.IsNullOrEmpty(hint))
                         insText += $" ; {hint}";
                 }
@@ -770,7 +771,7 @@ namespace DOSRE.Dasm
             return insText;
         }
 
-        private static void UpdateSimpleDosState(Instruction ins, ref byte? lastAh, ref ushort? lastAxImm, ref ushort? lastDxImm, ref ushort? lastSiImm)
+        private static void UpdateSimpleDosState(Instruction ins, ref byte? lastAh, ref ushort? lastAxImm, ref ushort? lastDxImm, ref ushort? lastSiImm, ref ushort? lastDsImm)
         {
             var b = ins.Bytes;
             if (b == null || b.Length == 0)
@@ -805,6 +806,13 @@ namespace DOSRE.Dasm
                 lastSiImm = (ushort)(b[1] | (b[2] << 8));
                 return;
             }
+
+            // mov ds, ax: 8E D8
+            if (b[0] == 0x8E && b.Length >= 2 && b[1] == 0xD8)
+            {
+                lastDsImm = lastAxImm;
+                return;
+            }
         }
 
         private static string TryDecodeInterruptHint(
@@ -813,6 +821,7 @@ namespace DOSRE.Dasm
             ushort? lastAxImm,
             ushort? lastDxImm,
             ushort? lastSiImm,
+            ushort? lastDsImm,
             Dictionary<uint, string> stringSyms,
             Dictionary<uint, string> stringPrev,
             byte[] module)
@@ -849,14 +858,14 @@ namespace DOSRE.Dasm
                         ah == 0x3D || ah == 0x3F || ah == 0x40 || ah == 0x41 || ah == 0x43 || ah == 0x4B || 
                         ah == 0x4E || ah == 0x56 || ah == 0x5A || ah == 0x5B)
                     {
-                        var dxDetail = TryFormatPointerDetail(lastDxImm, "DX", stringSyms, stringPrev);
+                        var dxDetail = TryFormatPointerDetail(lastDxImm, lastDsImm, "DX", stringSyms, stringPrev);
                         if (!string.IsNullOrEmpty(dxDetail))
                             return dbDesc + " ; " + dxDetail;
                     }
                     // SI-based: 0x47 (Get Cur Dir), 0x6C (Ext Open), 0x71xx (LFN)
                     if (ah == 0x47 || ah == 0x6C || ah == 0x71)
                     {
-                        var siDetail = TryFormatPointerDetail(lastSiImm, "SI", stringSyms, stringPrev);
+                        var siDetail = TryFormatPointerDetail(lastSiImm, lastDsImm, "SI", stringSyms, stringPrev);
                         if (!string.IsNullOrEmpty(siDetail))
                             return dbDesc + " ; " + siDetail;
                     }
@@ -882,14 +891,15 @@ namespace DOSRE.Dasm
                         if (lastDxImm.HasValue)
                         {
                             var dx = (uint)lastDxImm.Value;
-                            if (stringSyms != null && stringSyms.TryGetValue(dx, out var sym))
+                            var linear = lastDsImm.HasValue ? (uint)((lastDsImm.Value << 4) + dx) : dx;
+                            if (stringSyms != null && stringSyms.TryGetValue(linear, out var sym))
                             {
-                                var prev = stringPrev != null && stringPrev.TryGetValue(dx, out var p) ? p : string.Empty;
+                                var prev = stringPrev != null && stringPrev.TryGetValue(linear, out var p) ? p : string.Empty;
                                 if (!string.IsNullOrEmpty(prev))
                                     return $"DOS21h/09h print $ {sym} (DX=0x{dx:X}) \"{prev}\"";
                                 return $"DOS21h/09h print $ {sym} (DX=0x{dx:X})";
                             }
-                            return $"DOS21h/09h print $ at DS:DX (DX=0x{dx:X})";
+                            return $"DOS21h/09h print $ at DS:DX (DX=0x{dx:X}, linear=0x{linear:X})";
                         }
                         return "DOS21h/09h print $ at DS:DX";
                     }
@@ -959,23 +969,31 @@ namespace DOSRE.Dasm
             return $"FCB=0x{addr:X} [{driveStr}{filename}]";
         }
 
-        private static string TryFormatPointerDetail(ushort? lastImm, string regName, Dictionary<uint, string> stringSyms, Dictionary<uint, string> stringPrev)
+        private static string TryFormatPointerDetail(ushort? lastImm, ushort? lastDsImm, string regName, Dictionary<uint, string> stringSyms, Dictionary<uint, string> stringPrev)
         {
             if (!lastImm.HasValue)
                 return string.Empty;
 
             var val = (uint)lastImm.Value;
+            var linear = lastDsImm.HasValue ? (uint)((lastDsImm.Value << 4) + val) : val;
 
-            if (stringSyms != null && stringSyms.TryGetValue(val, out var sym))
+            if (stringSyms != null && stringSyms.TryGetValue(linear, out var sym))
             {
-                var prev = stringPrev != null && stringPrev.TryGetValue(val, out var p) ? p : string.Empty;
+                var prev = stringPrev != null && stringPrev.TryGetValue(linear, out var p) ? p : string.Empty;
+                var detail = lastDsImm.HasValue ? $"{regName}=0x{val:X} (lin 0x{linear:X}) -> {sym}" : $"{regName}={sym}";
                 if (!string.IsNullOrEmpty(prev))
-                    return $"{regName}={sym} \"{prev}\"";
-                return $"{regName}={sym}";
+                    return $"{detail} \"{prev}\"";
+                return detail;
             }
 
-            if (stringPrev != null && stringPrev.TryGetValue(val, out var onlyPrev) && !string.IsNullOrEmpty(onlyPrev))
-                return $"{regName}=0x{val:X} \"{onlyPrev}\"";
+            if (stringPrev != null && stringPrev.TryGetValue(linear, out var onlyPrev) && !string.IsNullOrEmpty(onlyPrev))
+            {
+                var detail = lastDsImm.HasValue ? $"{regName}=0x{val:X} (lin 0x{linear:X})" : $"{regName}=0x{val:X}";
+                return $"{detail} \"{onlyPrev}\"";
+            }
+
+            if (lastDsImm.HasValue)
+                return $"{regName}=0x{val:X} (lin 0x{linear:X})";
 
             return $"{regName}=0x{val:X}";
         }
