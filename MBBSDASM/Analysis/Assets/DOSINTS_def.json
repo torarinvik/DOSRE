@@ -15,7 +15,11 @@
       { "code": "0x03", "name": "Get cursor position", "params": ["BH=page"], "returns": ["DH=row", "DL=col"] },
       { "code": "0x06", "name": "Scroll up window", "params": ["AL=lines", "BH=attribute"], "returns": [] },
       { "code": "0x09", "name": "Write character/attribute", "params": ["AL=char", "BH=page", "BL=attr", "CX=count"], "returns": [] },
-      { "code": "0x0E", "name": "Teletype output", "params": ["AL=character", "BH=page"], "returns": [] }
+      { "code": "0x0E", "name": "Teletype output", "params": ["AL=character", "BH=page"], "returns": [] },
+      { "code": "0x0F", "name": "Get current video mode", "params": [], "returns": ["AL=mode", "AH=columns", "BH=page"] },
+      { "code": "0x13", "name": "Write string", "params": ["AL=mode", "BH=page", "BL=attr", "CX=len", "DH=row", "DL=col", "ES:BP -> string"], "returns": [] },
+      { "code": "0x1A", "name": "Display combination / video info (varies)", "params": ["AL=subfn"], "returns": [] },
+      { "code": "0x4F", "name": "VESA VBE (subfunctions)", "params": ["AL=subfn"], "returns": ["AX=status"] }
     ]},
 
     { "int": "0x11", "name": "BIOS equipment list", "selector": "", "functions": [] },
@@ -25,7 +29,11 @@
       { "code": "0x00", "name": "Reset disk system", "params": [], "returns": ["AH=status", "CF=error"] },
       { "code": "0x02", "name": "Read sectors (CHS)", "params": ["AL=count"], "returns": ["AH=status", "CF=error"] },
       { "code": "0x03", "name": "Write sectors (CHS)", "params": ["AL=count"], "returns": ["AH=status", "CF=error"] },
-      { "code": "0x08", "name": "Get drive parameters", "params": [], "returns": ["CF=error"] }
+      { "code": "0x08", "name": "Get drive parameters", "params": [], "returns": ["CF=error"] },
+      { "code": "0x15", "name": "Get drive type (varies)", "params": [], "returns": ["AH=status", "CF=error"] },
+      { "code": "0x41", "name": "Check extensions present (EDD)", "params": ["BX=0x55AA"], "returns": ["BX=0xAA55", "CX=features", "CF=error"] },
+      { "code": "0x42", "name": "Extended read (LBA, EDD)", "params": ["DL=drive", "DS:SI -> DAP"], "returns": ["AH=status", "CF=error"] },
+      { "code": "0x43", "name": "Extended write (LBA, EDD)", "params": ["DL=drive", "DS:SI -> DAP"], "returns": ["AH=status", "CF=error"] }
     ]},
 
     { "int": "0x14", "name": "BIOS serial", "selector": "AH", "functions": [
@@ -35,13 +43,18 @@
     ]},
 
     { "int": "0x15", "name": "BIOS misc", "selector": "AH", "functions": [
-      { "code": "0x86", "name": "Wait (microseconds)", "params": ["CX:DX=usec"], "returns": ["CF=error"] }
+      { "code": "0x86", "name": "Wait (microseconds)", "params": ["CX:DX=usec"], "returns": ["CF=error"] },
+      { "code": "0x88", "name": "Get extended memory size (KB above 1MB)", "params": [], "returns": ["AX=kilobytes"] },
+      { "code": "0xC0", "name": "Get system configuration table", "params": [], "returns": ["ES:BX -> table", "CF=error"] }
     ]},
 
     { "int": "0x16", "name": "BIOS keyboard", "selector": "AH", "functions": [
       { "code": "0x00", "name": "Read keystroke", "params": [], "returns": ["AL=ASCII", "AH=scan code"] },
       { "code": "0x01", "name": "Check keystroke (ZF set if none)", "params": [], "returns": ["AL=ASCII (if available)", "AH=scan code (if available)"] },
-      { "code": "0x02", "name": "Get shift flags", "params": [], "returns": ["AL=shift flags"] }
+      { "code": "0x02", "name": "Get shift flags", "params": [], "returns": ["AL=shift flags"] },
+      { "code": "0x10", "name": "Read keystroke (extended)", "params": [], "returns": ["AL=ASCII", "AH=scan code"] },
+      { "code": "0x11", "name": "Check keystroke (extended)", "params": [], "returns": ["AL=ASCII (if available)", "AH=scan code (if available)"] },
+      { "code": "0x12", "name": "Get extended shift flags", "params": [], "returns": ["AX=flags"] }
     ]},
 
     { "int": "0x17", "name": "BIOS printer", "selector": "AH", "functions": [
@@ -52,8 +65,11 @@
 
     { "int": "0x1A", "name": "BIOS time", "selector": "AH", "functions": [
       { "code": "0x00", "name": "Get system time", "params": [], "returns": ["CX:DX=ticks", "AL=midnight flag"] },
+      { "code": "0x01", "name": "Set system time", "params": ["CX:DX=ticks"], "returns": [] },
       { "code": "0x02", "name": "Get RTC time", "params": [], "returns": ["CH=hour", "CL=min", "DH=sec"] },
-      { "code": "0x04", "name": "Get RTC date", "params": [], "returns": ["CH=century", "CL=year", "DH=month", "DL=day"] }
+      { "code": "0x03", "name": "Set RTC time", "params": ["CH=hour", "CL=min", "DH=sec"], "returns": [] },
+      { "code": "0x04", "name": "Get RTC date", "params": [], "returns": ["CH=century", "CL=year", "DH=month", "DL=day"] },
+      { "code": "0x05", "name": "Set RTC date", "params": ["CH=century", "CL=year", "DH=month", "DL=day"], "returns": [] }
     ]},
 
     { "int": "0x1C", "name": "BIOS timer tick (user hook)", "selector": "", "functions": [] },
@@ -118,22 +134,40 @@
 
     { "int": "0x2F", "name": "DOS multiplex", "selector": "AH", "functions": [
       { "code": "0x16", "name": "Windows/Win386 present (varies)", "params": [], "returns": [] },
-      { "code": "0x43", "name": "XMS driver callout (varies)", "params": [], "returns": [] }
+      { "code": "0x43", "name": "XMS driver callout (varies)", "params": [], "returns": [] },
+      { "code": "0x10", "name": "SHARE / file sharing (varies)", "params": [], "returns": [] },
+      { "code": "0x12", "name": "Network redirector (varies)", "params": [], "returns": [] },
+      { "code": "0x13", "name": "MSCDEX / CD-ROM (varies)", "params": [], "returns": [] }
     ]},
 
     { "int": "0x31", "name": "DPMI", "selector": "AX", "functions": [
-      { "code": "0x0300", "name": "Simulate real-mode interrupt", "params": [], "returns": [] },
-      { "code": "0x0400", "name": "Get DPMI version", "params": [], "returns": [] }
+      { "code": "0x0000", "name": "Allocate LDT descriptors", "params": ["CX=count"], "returns": ["AX=first selector", "CF=error"] },
+      { "code": "0x0001", "name": "Free LDT descriptor", "params": ["BX=selector"], "returns": ["CF=error"] },
+      { "code": "0x0007", "name": "Set segment base", "params": ["BX=selector", "CX:DX=base"], "returns": ["CF=error"] },
+      { "code": "0x0008", "name": "Set segment limit", "params": ["BX=selector", "CX:DX=limit"], "returns": ["CF=error"] },
+      { "code": "0x0100", "name": "Allocate DOS memory block", "params": ["BX=paragraphs"], "returns": ["AX=segment", "DX=selector", "CF=error"] },
+      { "code": "0x0101", "name": "Free DOS memory block", "params": ["DX=selector"], "returns": ["CF=error"] },
+      { "code": "0x0300", "name": "Simulate real-mode interrupt", "params": ["BL=int", "ES:DI -> RMCS"], "returns": ["CF=error"] },
+      { "code": "0x0400", "name": "Get DPMI version", "params": [], "returns": ["AX=version", "BX=flags"] }
     ]},
 
     { "int": "0x33", "name": "Mouse", "selector": "AX", "functions": [
       { "code": "0x0000", "name": "Reset driver", "params": [], "returns": [] },
-      { "code": "0x0003", "name": "Get position/buttons", "params": [], "returns": [] }
+      { "code": "0x0001", "name": "Show cursor", "params": [], "returns": [] },
+      { "code": "0x0002", "name": "Hide cursor", "params": [], "returns": [] },
+      { "code": "0x0003", "name": "Get position/buttons", "params": [], "returns": [] },
+      { "code": "0x0004", "name": "Set cursor position", "params": ["CX=x", "DX=y"], "returns": [] },
+      { "code": "0x0007", "name": "Set horizontal range", "params": ["CX=min", "DX=max"], "returns": [] },
+      { "code": "0x0008", "name": "Set vertical range", "params": ["CX=min", "DX=max"], "returns": [] }
     ]},
 
     { "int": "0x67", "name": "EMS (LIM/EMM386)", "selector": "AH", "functions": [
       { "code": "0x40", "name": "Get EMS status", "params": [], "returns": ["AH=status"] },
       { "code": "0x41", "name": "Get page frame segment", "params": [], "returns": ["BX=segment", "AH=status"] },
+      { "code": "0x42", "name": "Get number of pages", "params": [], "returns": ["BX=total", "DX=free", "AH=status"] },
+      { "code": "0x43", "name": "Allocate pages", "params": ["BX=pages"], "returns": ["DX=handle", "AH=status"] },
+      { "code": "0x44", "name": "Map pages (varies)", "params": [], "returns": ["AH=status"] },
+      { "code": "0x45", "name": "Map page", "params": ["AL=phys page", "BX=logical page", "DX=handle"], "returns": ["AH=status"] },
       { "code": "0x4D", "name": "Get EMM version", "params": [], "returns": ["AL=major", "AH=minor"] }
     ]}
   ]
