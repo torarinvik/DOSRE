@@ -124,6 +124,24 @@ namespace MBBSDASM.UI.impl
         private int? _leFixDumpMaxPages;
 
         /// <summary>
+        ///     DOS MZ full disassembly
+        ///     Specified with the -mzfull argument
+        /// </summary>
+        private bool _bMzFull;
+
+        /// <summary>
+        ///     DOS MZ byte limit
+        ///     Specified with the -mzbytes <n> argument
+        /// </summary>
+        private int? _mzBytesLimit;
+
+        /// <summary>
+        ///     DOS MZ insights
+        ///     Specified with the -mzinsights argument
+        /// </summary>
+        private bool _bMzInsights;
+
+        /// <summary>
         ///     Default Constructor
         /// </summary>
         /// <param name="args">string - Command Line Arguments</param>
@@ -190,6 +208,20 @@ namespace MBBSDASM.UI.impl
                                 i++;
                             }
                             break;
+                        case "-MZFULL":
+                            _bMzFull = true;
+                            break;
+                        case "-MZBYTES":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -MZBYTES requires a value");
+                            if (!int.TryParse(_args[i + 1], out var mzBytesLimit) || mzBytesLimit <= 0)
+                                throw new Exception("Error: -MZBYTES must be a positive integer");
+                            _mzBytesLimit = mzBytesLimit;
+                            i++;
+                            break;
+                        case "-MZINSIGHTS":
+                            _bMzInsights = true;
+                            break;
                         case "-SPLITKB":
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -SPLITKB requires a value");
@@ -221,6 +253,12 @@ namespace MBBSDASM.UI.impl
                                 "-LEINSIGHTS -- (LE inputs) Best-effort function/CFG/xref/stack-var/string analysis (more LLM-friendly)");
                             Console.WriteLine(
                                 "-LEFIXDUMP [maxPages] -- (LE inputs) Dump raw fixup pages + decoding hints (writes <out>.fixups.txt if -O is used)");
+                            Console.WriteLine(
+                                "-MZFULL -- (MZ inputs) Disassemble from entrypoint to end of load module");
+                            Console.WriteLine(
+                                "-MZBYTES <n> -- (MZ inputs) Limit disassembly to n bytes from entrypoint");
+                            Console.WriteLine(
+                                "-MZINSIGHTS -- (MZ inputs) Best-effort labels/xrefs/strings for 16-bit MZ binaries");
                             Console.WriteLine(
                                 "-SPLITKB <n> -- (with -O) Split output into ~n KB chunks (out.001.asm, out.002.asm, ...)");
                             Console.WriteLine(
@@ -304,6 +342,52 @@ namespace MBBSDASM.UI.impl
                 else if (!string.IsNullOrEmpty(leError) && leError != "LE header not found")
                 {
                     throw new Exception(leError);
+                }
+
+                // DOS MZ support (best-effort): for plain MZ executables without an extended header.
+                // Note: we also treat -lefull/-lebytes/-leinsights as convenient aliases for MZ mode
+                // so existing command lines keep working when switching targets.
+                var mzFull = _bMzFull || _bLeFull;
+                var mzBytes = _mzBytesLimit ?? _leBytesLimit;
+                var mzInsights = _bMzInsights || _bLeInsights;
+                if (MZDisassembler.TryDisassembleToString(_sInputFile, mzFull, mzBytes, mzInsights, out var mzOutput, out var mzError))
+                {
+                    if (_bAnalysis)
+                        _logger.Warn("Warning: -analysis is not supported for MZ inputs, ignoring");
+                    if (_bStrings)
+                        _logger.Warn("Warning: -strings is not supported for MZ inputs (use -mzinsights for string scan), ignoring");
+                    if (_bMinimal)
+                        _logger.Warn("Warning: -minimal has no effect for MZ inputs (MZ output is always minimal)");
+
+                    if (string.IsNullOrEmpty(_sOutputFile))
+                    {
+                        if (_splitKb.HasValue)
+                            _logger.Warn("Warning: -splitkb requires -o, ignoring");
+                        if (_bMacros)
+                            mzOutput = MacroDeduper.Apply(mzOutput);
+                        _logger.Info(mzOutput);
+                    }
+                    else
+                    {
+                        if (_bMacros)
+                            mzOutput = MacroDeduper.Apply(mzOutput);
+                        if (_splitKb.HasValue)
+                        {
+                            WriteSplitFiles(_sOutputFile, mzOutput, _splitKb.Value);
+                        }
+                        else
+                        {
+                            _logger.Info($"{DateTime.Now} Writing Disassembly to {_sOutputFile}");
+                            File.WriteAllText(_sOutputFile, mzOutput);
+                        }
+                    }
+
+                    _logger.Info($"{DateTime.Now} Done!");
+                    return;
+                }
+                else if (!string.IsNullOrEmpty(mzError) && mzError != "MZ header not found" && mzError != "Has extended header (NE/LE/PE)")
+                {
+                    throw new Exception(mzError);
                 }
 
                 //Warn of Analysis not being available with minimal output
