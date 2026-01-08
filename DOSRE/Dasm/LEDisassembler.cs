@@ -675,6 +675,108 @@ namespace DOSRE.Dasm
             return $"BBHINT: critical section (cli..sti) around I/O: {string.Join(", ", top)}";
         }
 
+        private static bool TryParseCmpReg8Imm8(string insText, out string reg8, out byte imm8)
+        {
+            reg8 = null;
+            imm8 = 0;
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            // Examples: "cmp al, 0x72" / "cmp al, 72h" / "cmp dl, 0"
+            var m = Regex.Match(insText.Trim(), @"^cmp\s+(?<reg>[a-d][lh]|[sd]l|[sb]h)\s*,\s*(?<imm>(?:0x)?[0-9A-Fa-f]+)h?\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            reg8 = m.Groups["reg"].Value.ToLowerInvariant();
+            var tok = m.Groups["imm"].Value.Trim();
+
+            if (!TryParseHexOrDecUInt32(tok, out var u) || u > 0xFF)
+                return false;
+
+            imm8 = (byte)u;
+            return true;
+        }
+
+        private static bool IsEqualityJumpMnemonic(string insText)
+        {
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            var t = insText.Trim();
+            var sp = t.IndexOf(' ');
+            var mnemonic = (sp > 0 ? t.Substring(0, sp) : t).Trim();
+
+            return mnemonic.Equals("jz", StringComparison.OrdinalIgnoreCase)
+                || mnemonic.Equals("je", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string FormatImm8AsChar(byte b)
+        {
+            if (b >= 0x20 && b <= 0x7E)
+            {
+                var c = (char)b;
+                if (c == '\\' || c == '\'' )
+                    return $"'{c}'"; // keep it simple
+                return $"'{c}'";
+            }
+            return string.Empty;
+        }
+
+        private static string TryAnnotateByteSwitchDecisionTree(List<Instruction> instructions, int startIdx)
+        {
+            // Recognize compiler-generated decision trees for switch/case on a byte register.
+            // Typical shape: cmp al, imm ; jz loc_case ; ... ; unconditional jmp loc_default
+            if (instructions == null || startIdx < 0 || startIdx >= instructions.Count)
+                return string.Empty;
+
+            var maxScan = Math.Min(instructions.Count, startIdx + 48);
+
+            // Collect equality tests for a single reg8.
+            string reg = null;
+            var cases = new Dictionary<byte, uint>();
+
+            for (var i = startIdx; i + 1 < maxScan; i++)
+            {
+                var a = instructions[i].ToString();
+                if (!TryParseCmpReg8Imm8(a, out var r8, out var imm8))
+                    continue;
+
+                if (reg == null)
+                    reg = r8;
+                else if (!reg.Equals(r8, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var b = instructions[i + 1];
+                var bText = b.ToString();
+                if (!IsEqualityJumpMnemonic(bText))
+                    continue;
+
+                if (TryGetRelativeBranchTarget(b, out var target, out var isCall) && !isCall)
+                {
+                    // Prefer the first-seen target for a given imm.
+                    if (!cases.ContainsKey(imm8))
+                        cases[imm8] = (uint)target;
+                }
+            }
+
+            if (string.IsNullOrEmpty(reg) || cases.Count < 4)
+                return string.Empty;
+
+            var parts = cases
+                .OrderBy(k => k.Key)
+                .Take(10)
+                .Select(k =>
+                {
+                    var ch = FormatImm8AsChar(k.Key);
+                    var imm = !string.IsNullOrEmpty(ch) ? $"{ch} (0x{k.Key:X2})" : $"0x{k.Key:X2}";
+                    return $"{imm}->loc_{k.Value:X8}";
+                })
+                .ToList();
+
+            var more = cases.Count > 10 ? $", ... (+{cases.Count - 10})" : string.Empty;
+            return $"BBHINT: switch({reg}) decision tree: {string.Join(", ", parts)}{more}";
+        }
+
         private static string RewriteStackFrameOperands(string insText)
         {
             if (string.IsNullOrEmpty(insText))
@@ -3121,6 +3223,13 @@ namespace DOSRE.Dasm
                         sb.AppendLine($"loc_{addr:X8}:");
                         if (jumpXrefs.TryGetValue(addr, out var sources) && sources.Count > 0)
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; XREF: jumped from {string.Join(", ", sources.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}", commentColumn: 0, maxWidth: 160);
+
+                        if (leInsights)
+                        {
+                            var sw = TryAnnotateByteSwitchDecisionTree(instructions, insLoopIndex);
+                            if (!string.IsNullOrEmpty(sw))
+                                AppendWrappedDisasmLine(sb, string.Empty, $" ; {sw}", commentColumn: 0, maxWidth: 160);
+                        }
                     }
                     else if (leInsights && blockStarts != null && blockStarts.Contains(addr))
                     {
@@ -3131,6 +3240,10 @@ namespace DOSRE.Dasm
                         var bbHint = TryAnnotateBasicBlockSummary(instructions, insLoopIndex);
                         if (!string.IsNullOrEmpty(bbHint))
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; {bbHint}", commentColumn: 0, maxWidth: 160);
+
+                        var sw = TryAnnotateByteSwitchDecisionTree(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(sw))
+                            AppendWrappedDisasmLine(sb, string.Empty, $" ; {sw}", commentColumn: 0, maxWidth: 160);
                     }
 
                     var bytes = BitConverter.ToString(ins.Bytes).Replace("-", string.Empty);
