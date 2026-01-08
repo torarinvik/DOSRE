@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using DOSRE.Dasm;
+using DOSRE.Analysis;
 using DOSRE.Renderer.impl;
 using Terminal.Gui;
 
