@@ -2,16 +2,14 @@
 ![](http://forthebadge.com/images/badges/made-with-c-sharp.svg)
 ![](http://forthebadge.com/images/badges/60-percent-of-the-time-works-every-time.svg)
 
-![Disassembler Preview](./mbbsdasm_ui.png)
+![Disassembler Preview](./dosre_ui.png)
 
-**DOSRE** is a disassembler for classic DOS/Windows-era binaries. It started as a 16-bit Segmented Executable File Format ("New Executable", or just NE) disassembler, and now also includes best-effort support for:
+**DOSRE** is an x86 Disassembler, Decompiler, and Reconstruction tool for classic DOS/Windows-era binaries. It focuses on 16-bit Segmented Executable File Format ("New Executable", or just NE), and also includes support for:
 
 * DOS MZ EXE ("old" EXE header)
 * DOS4GW LE (32-bit linear executables)
 
-The disassembler itself is written in C#.
-
-This project is intended to help with reverse engineering classic DOS games and other DOS/Windows-era binaries (especially 16-bit NE executables), with best-effort support for a few related formats.
+This project is intended to help with reverse engineering and reconstructing classic DOS games and applications from their original binaries.
 
 # Text UI
 

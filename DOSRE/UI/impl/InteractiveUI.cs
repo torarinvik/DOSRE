@@ -27,20 +27,39 @@ namespace DOSRE.UI.impl
             Application.Init();
 
             //Define Main Window
-            _mainWindow = new Window(new Rect(0, 1, Application.Top.Frame.Width, Application.Top.Frame.Height - 1), null);
-            _mainWindow.Add(new Label(0, 0, $"--=[About {Constants.ProgramName}]=--"));
-            _mainWindow.Add(new Label(0, 1, $"{Constants.ProgramName} is a disassembler for classic DOS/Windows-era binaries with optional analysis"));
-            _mainWindow.Add(new Label(0, 3, $"--=[Credits]=--"));
-            _mainWindow.Add(new Label(0, 4, $"{Constants.ProgramName} is Copyright (c) 2019 Eric Nusbaum and is distributed under the 2-clause \"Simplified BSD License\". "));
-            _mainWindow.Add(new Label(0, 5, "SharpDisam is Copyright (c) 2015 Justin Stenning and is distributed under the 2-clause \"Simplified BSD License\". "));
-            _mainWindow.Add(new Label(0, 6, "Terminal.Gui is Copyright (c) 2017 Microsoft Corp and is distributed under the MIT License"));
-            _mainWindow.Add(new Label(0, 8, $"--=[Code]=--"));
-            _mainWindow.Add(new Label(0, 9, $"{Constants.ProgramName}"));
-            _progressBar =
-                new ProgressBar(new Rect(1, Application.Top.Frame.Height - 5, Application.Top.Frame.Width - 4, 1));
-            _mainWindow.Add(_progressBar);
-            _statusLabel = new Label(1, Application.Top.Frame.Height - 7, "Ready!");
+            _mainWindow = new Window ("DOSRE") {
+                X = 0,
+                Y = 1,
+                Width = Dim.Fill (),
+                Height = Dim.Fill ()
+            };
+
+            _mainWindow.Add(
+                new Label(0, 0, $"--=[About {Constants.ProgramName}]=--"),
+                new Label(0, 1, $"{Constants.ProgramName} is an x86 disassembler/decompiler/reconstruction tool for classic DOS/Windows-era binaries"),
+                new Label(0, 3, "--=[Credits]=--"),
+                new Label(0, 4, "Based on MBBSDASM (c) 2019 Eric Nusbaum, distributed under the 2-clause \"Simplified BSD License\"."),
+                new Label(0, 5, "DOSRE fork and enhancements: see LICENSE and git history."),
+                new Label(0, 6, "SharpDisam (c) 2015 Justin Stenning (2-clause \"Simplified BSD License\"); Terminal.Gui (c) 2017 Microsoft (MIT)."),
+                new Label(0, 8, "--=[Code]=--"),
+                new Label(0, 9, $"{Constants.ProgramName} v{Constants.ProgramVersion}")
+            );
+
+            _statusLabel = new Label("Ready!")
+            {
+                X = 1,
+                Y = Pos.Percent(80) 
+            };
             _mainWindow.Add(_statusLabel);
+
+            _progressBar = new ProgressBar()
+            {
+                X = 1,
+                Y = Pos.Percent(90),
+                Width = Dim.Fill(1)
+            };
+            _mainWindow.Add(_progressBar);
+
             Application.Top.Add(_mainWindow);
 
             //Draw Menu Items
