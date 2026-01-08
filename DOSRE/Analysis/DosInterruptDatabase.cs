@@ -196,6 +196,12 @@ namespace DOSRE.Analysis
                 {
                     bestFn = ChooseBestFunction(axList, dosVersionInt ?? _currentDosVersionInt) ?? axList[0];
                 }
+                else if (selector == "AH" && ax.HasValue && entry.FunctionsByCode.TryGetValue(ax.Value, out var fullAxList) && fullAxList.Count > 0)
+                {
+                    // Some databases (and many BIOS APIs) are effectively AX-selected even when AH is the nominal selector.
+                    // Allow AX lookup as a higher-specificity match when available.
+                    bestFn = ChooseBestFunction(fullAxList, dosVersionInt ?? _currentDosVersionInt) ?? fullAxList[0];
+                }
                 else if (entry.FunctionsByCode.TryGetValue(selValue.Value, out var selList) && selList.Count > 0)
                 {
                     bestFn = ChooseBestFunction(selList, dosVersionInt ?? _currentDosVersionInt) ?? selList[0];

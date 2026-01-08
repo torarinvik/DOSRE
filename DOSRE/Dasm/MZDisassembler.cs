@@ -613,7 +613,11 @@ namespace DOSRE.Dasm
 
                 if (mzInsights)
                 {
-                    var hint = TryDecodeInterruptHint(ins, lastAh, lastAl, lastAxImm, lastBxImm, lastCxImm, lastDxImm, lastSiImm, lastDiImm, lastBpImm, lastDsImm, lastEsImm, stringSyms, stringPrev, module);
+                    var axForHint = lastAxImm;
+                    if (!axForHint.HasValue && lastAh.HasValue && lastAl.HasValue)
+                        axForHint = (ushort)((lastAh.Value << 8) | lastAl.Value);
+
+                    var hint = TryDecodeInterruptHint(ins, lastAh, lastAl, axForHint, lastBxImm, lastCxImm, lastDxImm, lastSiImm, lastDiImm, lastBpImm, lastDsImm, lastEsImm, stringSyms, stringPrev, module);
                     if (!string.IsNullOrEmpty(hint))
                         insText += $" ; {hint}";
 
@@ -1385,6 +1389,22 @@ namespace DOSRE.Dasm
             if (b[0] == 0xBB && b.Length >= 3)
             {
                 lastBxImm = (ushort)(b[1] | (b[2] << 8));
+                return;
+            }
+
+            // mov bl, imm8: B3 ib
+            if (b[0] == 0xB3 && b.Length >= 2)
+            {
+                var imm = b[1];
+                lastBxImm = lastBxImm.HasValue ? (ushort)((lastBxImm.Value & 0xFF00) | imm) : imm;
+                return;
+            }
+
+            // mov bh, imm8: B7 ib
+            if (b[0] == 0xB7 && b.Length >= 2)
+            {
+                var imm = b[1];
+                lastBxImm = lastBxImm.HasValue ? (ushort)((lastBxImm.Value & 0x00FF) | (imm << 8)) : (ushort)(imm << 8);
                 return;
             }
 
@@ -2280,6 +2300,45 @@ namespace DOSRE.Dasm
                         }
                         dbDesc += " ; AL=mode BH=page BL=attr CX=len DX=row/col ES:BP=string";
                     }
+                    else if (ah == 0x11) // Font/Character Generator Services
+                    {
+                        byte? al = lastAl;
+                        if (!al.HasValue && lastAxImm.HasValue) al = (byte)(lastAxImm.Value & 0xFF);
+
+                        if (al.HasValue)
+                        {
+                            var sub = al.Value switch
+                            {
+                                0x30 => "Get Font Info",
+                                _ => $"sub=0x{al.Value:X2}"
+                            };
+                            dbDesc += $" ; Font services: {sub}";
+                        }
+                        else
+                        {
+                            dbDesc += " ; Font services";
+                        }
+
+                        dbDesc += " ; AL=sub";
+                    }
+                    else if (ah == 0x1A) // Display Combination Code
+                    {
+                        byte? al = lastAl;
+                        if (!al.HasValue && lastAxImm.HasValue) al = (byte)(lastAxImm.Value & 0xFF);
+
+                        if (al == 0x00) dbDesc += " ; Get Display Combination Code";
+                        else if (al == 0x01) dbDesc += " ; Set Display Combination Code";
+                        else if (al.HasValue) dbDesc += $" ; sub=0x{al.Value:X2}";
+
+                        dbDesc += " ; AL=sub (returns BL=active display, BH=alternate?)";
+                    }
+                    else if (ah == 0x12) // EGA/VGA services (subfunction in BL)
+                    {
+                        byte? bl = lastBxImm.HasValue ? (byte?)(lastBxImm.Value & 0xFF) : null;
+                        if (bl == 0x10) dbDesc += " ; EGA/VGA: Get Configuration";
+                        else if (bl.HasValue) dbDesc += $" ; EGA/VGA: sub=0x{bl.Value:X2}";
+                        dbDesc += " ; BL=sub";
+                    }
                 }
 
                 // BIOS Disk
@@ -2489,6 +2548,45 @@ namespace DOSRE.Dasm
                             desc += $" ; \"{s}\"";
                     }
                     desc += " ; AL=mode BH=page BL=attr CX=len DX=row/col ES:BP=string";
+                }
+                else if (ah == 0x11) // Font/Character Generator Services
+                {
+                    byte? al = lastAl;
+                    if (!al.HasValue && lastAxImm.HasValue) al = (byte)(lastAxImm.Value & 0xFF);
+
+                    if (al.HasValue)
+                    {
+                        var sub = al.Value switch
+                        {
+                            0x30 => "Get Font Info",
+                            _ => $"sub=0x{al.Value:X2}"
+                        };
+                        desc += $" ; Font services: {sub}";
+                    }
+                    else
+                    {
+                        desc += " ; Font services";
+                    }
+
+                    desc += " ; AL=sub";
+                }
+                else if (ah == 0x1A) // Display Combination Code
+                {
+                    byte? al = lastAl;
+                    if (!al.HasValue && lastAxImm.HasValue) al = (byte)(lastAxImm.Value & 0xFF);
+
+                    if (al == 0x00) desc += " ; Get Display Combination Code";
+                    else if (al == 0x01) desc += " ; Set Display Combination Code";
+                    else if (al.HasValue) desc += $" ; sub=0x{al.Value:X2}";
+
+                    desc += " ; AL=sub (returns BL=active display, BH=alternate?)";
+                }
+                else if (ah == 0x12) // EGA/VGA services (subfunction in BL)
+                {
+                    byte? bl = lastBxImm.HasValue ? (byte?)(lastBxImm.Value & 0xFF) : null;
+                    if (bl == 0x10) desc += " ; EGA/VGA: Get Configuration";
+                    else if (bl.HasValue) desc += $" ; EGA/VGA: sub=0x{bl.Value:X2}";
+                    desc += " ; BL=sub";
                 }
 
                 return desc;
