@@ -722,7 +722,139 @@ namespace DOSRE.Dasm
             return string.Empty;
         }
 
-        private static string TryAnnotateByteSwitchDecisionTree(List<Instruction> instructions, int startIdx, out string signature)
+        private static string ShortenInterruptHintForCase(string hint)
+        {
+            if (string.IsNullOrWhiteSpace(hint))
+                return string.Empty;
+
+            var t = hint.Trim();
+            if (t.StartsWith("INT21: ", StringComparison.OrdinalIgnoreCase))
+                t = t.Substring("INT21: ".Length);
+            else if (t.StartsWith("INT31: ", StringComparison.OrdinalIgnoreCase))
+                t = t.Substring("INT31: ".Length);
+            else if (t.StartsWith("INT: ", StringComparison.OrdinalIgnoreCase))
+                t = t.Substring("INT: ".Length);
+
+            if (t.StartsWith("DOS API:", StringComparison.OrdinalIgnoreCase))
+                t = t.Substring("DOS API:".Length).Trim();
+
+            // Drop extra pointer details.
+            var semi = t.IndexOf(';');
+            if (semi >= 0)
+                t = t.Substring(0, semi).Trim();
+
+            // Keep it compact.
+            if (t.Length > 42)
+                t = t.Substring(0, 42) + "...";
+
+            return t;
+        }
+
+        private static string ShortenIoHintForCase(string hint)
+        {
+            if (string.IsNullOrWhiteSpace(hint))
+                return string.Empty;
+
+            var t = hint.Trim();
+            if (t.StartsWith("IO: ", StringComparison.OrdinalIgnoreCase))
+                t = t.Substring("IO: ".Length);
+
+            var paren = t.IndexOf('(');
+            if (paren >= 0)
+                t = t.Substring(0, paren).Trim();
+
+            if (t.Length > 42)
+                t = t.Substring(0, 42) + "...";
+
+            return t;
+        }
+
+        private static string TrySummarizeCaseTargetRole(
+            List<Instruction> instructions,
+            Dictionary<uint, int> insIndexByAddr,
+            uint targetAddr,
+            Dictionary<uint, string> stringSymbols,
+            Dictionary<uint, string> stringPreview,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex)
+        {
+            if (instructions == null || insIndexByAddr == null)
+                return string.Empty;
+            if (!insIndexByAddr.TryGetValue(targetAddr, out var idx))
+                return string.Empty;
+
+            ushort? localDxImm16 = null;
+            var localNotes = new List<string>();
+
+            var max = Math.Min(instructions.Count, idx + 28);
+            for (var i = idx; i < max; i++)
+            {
+                var raw = instructions[i].ToString();
+                var cooked = RewriteStackFrameOperands(raw);
+
+                // Lightweight local/flag setup detection (common in switch case handlers).
+                if (localNotes.Count < 2 && (i - idx) <= 8)
+                {
+                    var mMov = Regex.Match(cooked, @"^\s*mov\s+(?:byte|word|dword)\s+\[(?<mem>local_[0-9A-Fa-f]+|g_[0-9A-Fa-f]{8})\]\s*,\s*(?<imm>(?:0x)?[0-9A-Fa-f]+)h?\s*$", RegexOptions.IgnoreCase);
+                    if (mMov.Success)
+                    {
+                        var mem = mMov.Groups["mem"].Value;
+                        var imm = mMov.Groups["imm"].Value;
+                        if (TryParseHexOrDecUInt32(imm, out var v))
+                            localNotes.Add($"set {mem}=0x{v:X}");
+                    }
+
+                    if (localNotes.Count < 2)
+                    {
+                        var mLea = Regex.Match(cooked, @"^\s*lea\s+(?<reg>e[a-z]{2})\s*,\s*\[(?<mem>local_[0-9A-Fa-f]+)\]\s*$", RegexOptions.IgnoreCase);
+                        if (mLea.Success)
+                        {
+                            var reg = mLea.Groups["reg"].Value.ToLowerInvariant();
+                            var mem = mLea.Groups["mem"].Value;
+                            localNotes.Add($"{reg}=&{mem}");
+                        }
+                    }
+                }
+
+                // Prefer "strong" actions first.
+                var intHint = TryAnnotateInterrupt(instructions, i, stringSymbols, stringPreview, objects, objBytesByIndex);
+                if (!string.IsNullOrEmpty(intHint))
+                {
+                    var shortInt = ShortenInterruptHintForCase(intHint);
+                    return string.IsNullOrEmpty(shortInt) ? string.Empty : $"INT {shortInt}";
+                }
+
+                if (TryParseMovDxImmediate(cooked, out var dxImm))
+                    localDxImm16 = dxImm;
+
+                var ioHint = TryAnnotateIoPortAccess(instructions, i, localDxImm16);
+                if (!string.IsNullOrEmpty(ioHint))
+                {
+                    var shortIo = ShortenIoHintForCase(ioHint);
+                    return string.IsNullOrEmpty(shortIo) ? string.Empty : $"IO {shortIo}";
+                }
+
+                // Don't scan past an obvious terminal for this tiny summary.
+                var t = cooked.TrimStart();
+                if (t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) || t.StartsWith("jmp ", StringComparison.OrdinalIgnoreCase))
+                    break;
+            }
+
+            if (localNotes.Count > 0)
+                return string.Join(", ", localNotes);
+
+            return string.Empty;
+        }
+
+        private static string TryAnnotateByteSwitchDecisionTree(
+            List<Instruction> instructions,
+            Dictionary<uint, int> insIndexByAddr,
+            int startIdx,
+            Dictionary<uint, string> stringSymbols,
+            Dictionary<uint, string> stringPreview,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
+            out string signature)
         {
             // Recognize compiler-generated decision trees for switch/case on a byte register.
             // Typical shape: cmp al, imm ; jz loc_case ; ... ; unconditional jmp loc_default
@@ -810,6 +942,9 @@ namespace DOSRE.Dasm
                 {
                     var ch = FormatImm8AsChar(k.Key);
                     var imm = !string.IsNullOrEmpty(ch) ? $"{ch} (0x{k.Key:X2})" : $"0x{k.Key:X2}";
+                    var role = TrySummarizeCaseTargetRole(instructions, insIndexByAddr, k.Value, stringSymbols, stringPreview, objects, objBytesByIndex);
+                    if (!string.IsNullOrEmpty(role))
+                        return $"{imm}->loc_{k.Value:X8} ({role})";
                     return $"{imm}->loc_{k.Value:X8}";
                 })
                 .ToList();
@@ -3279,7 +3414,7 @@ namespace DOSRE.Dasm
 
                         if (leInsights)
                         {
-                            var sw = TryAnnotateByteSwitchDecisionTree(instructions, insLoopIndex, out var swSig);
+                            var sw = TryAnnotateByteSwitchDecisionTree(instructions, insIndexByAddr, insLoopIndex, stringSymbols, stringPreview, objects, objBytesByIndex, out var swSig);
                             if (!string.IsNullOrEmpty(sw) && !string.IsNullOrEmpty(swSig))
                             {
                                 if (!(swSig == lastSwitchSig && (insLoopIndex - lastSwitchIdx) <= 64) && !emittedSwitchSigs.Contains(swSig))
@@ -3302,7 +3437,7 @@ namespace DOSRE.Dasm
                         if (!string.IsNullOrEmpty(bbHint))
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; {bbHint}", commentColumn: 0, maxWidth: 160);
 
-                        var sw = TryAnnotateByteSwitchDecisionTree(instructions, insLoopIndex, out var swSig);
+                        var sw = TryAnnotateByteSwitchDecisionTree(instructions, insIndexByAddr, insLoopIndex, stringSymbols, stringPreview, objects, objBytesByIndex, out var swSig);
                         if (!string.IsNullOrEmpty(sw) && !string.IsNullOrEmpty(swSig))
                         {
                             if (!(swSig == lastSwitchSig && (insLoopIndex - lastSwitchIdx) <= 64) && !emittedSwitchSigs.Contains(swSig))
