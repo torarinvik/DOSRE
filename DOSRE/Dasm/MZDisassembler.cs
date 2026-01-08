@@ -239,10 +239,81 @@ namespace DOSRE.Dasm
                     {
                         if (currentFunc.HasFrame)
                         {
+                            static string FormatArgs(SortedSet<int> argOffsets)
+                            {
+                                if (argOffsets == null || argOffsets.Count == 0)
+                                    return string.Empty;
+
+                                var groups = argOffsets
+                                    .Where(o => o >= 4)
+                                    .GroupBy(o => (o - 4) / 2)
+                                    .OrderBy(g => g.Key);
+
+                                var parts = new List<string>();
+                                foreach (var g in groups)
+                                {
+                                    var offs = g.Distinct().OrderBy(x => x).ToArray();
+                                    var even = offs.FirstOrDefault(x => (x & 1) == 0);
+                                    var hasEven = offs.Any(x => (x & 1) == 0);
+                                    var hasOdd = offs.Any(x => (x & 1) == 1);
+
+                                    if (hasEven && hasOdd)
+                                        parts.Add($"arg{g.Key}@+0x{even:X} (word)");
+                                    else if (hasEven)
+                                        parts.Add($"arg{g.Key}@+0x{even:X}");
+                                    else
+                                        parts.Add($"arg{g.Key}_hi@+0x{offs[0]:X}");
+                                }
+
+                                return string.Join(", ", parts);
+                            }
+
+                            static string FormatLocals(SortedSet<int> localOffsets, int maxToShow)
+                            {
+                                if (localOffsets == null || localOffsets.Count == 0)
+                                    return string.Empty;
+
+                                // Group local byte offsets into word-ish labels when both bytes appear.
+                                var groups = localOffsets
+                                    .Where(o => o >= 2)
+                                    .GroupBy(o => o / 2)
+                                    .OrderBy(g => g.Key)
+                                    .ToList();
+
+                                var parts = new List<string>();
+                                foreach (var g in groups)
+                                {
+                                    var offs = g.Distinct().OrderBy(x => x).ToArray();
+                                    var even = offs.FirstOrDefault(x => (x & 1) == 0);
+                                    var hasEven = offs.Any(x => (x & 1) == 0);
+                                    var hasOdd = offs.Any(x => (x & 1) == 1);
+
+                                    if (hasEven && hasOdd)
+                                        parts.Add($"local_0x{even:X} (word)");
+                                    else
+                                        parts.Add($"local_0x{offs[0]:X}");
+                                }
+
+                                if (parts.Count <= maxToShow)
+                                    return string.Join(", ", parts);
+
+                                var head = string.Join(", ", parts.Take(maxToShow));
+                                return $"{head}, ... (+{parts.Count - maxToShow} more)";
+                            }
+
                             if (currentFunc.ArgOffsets.Count > 0)
-                                sb.AppendLine($"; ARGS: {string.Join(", ", currentFunc.ArgOffsets.Select(o => $"arg{(o - 4) / 2}@+0x{o:X}"))}");
+                            {
+                                var args = FormatArgs(currentFunc.ArgOffsets);
+                                if (!string.IsNullOrEmpty(args))
+                                    sb.AppendLine($"; ARGS: {args}");
+                            }
+
                             if (currentFunc.LocalOffsets.Count > 0)
-                                sb.AppendLine($"; LOCALS: {string.Join(", ", currentFunc.LocalOffsets.Select(o => $"local_0x{o:X}"))}");
+                            {
+                                var locals = FormatLocals(currentFunc.LocalOffsets, maxToShow: 40);
+                                if (!string.IsNullOrEmpty(locals))
+                                    sb.AppendLine($"; LOCALS: {locals}");
+                            }
                         }
                         if (currentFunc.RetPopBytes > 0)
                             sb.AppendLine($"; PROTO?: callee pops {currentFunc.RetPopBytes} bytes (~{currentFunc.RetPopBytes / 2} args)");

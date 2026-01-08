@@ -310,11 +310,11 @@ namespace DOSRE.Dasm
 
             // Segment setup
 
-            var bdaHint = TryGetBiosDataAreaHint(text, ds, es);
+            var bdaHint = TryGetBiosDataAreaHint(text, ds, es, bx, si, di);
             if (!string.IsNullOrEmpty(bdaHint))
                 return bdaHint;
 
-            var pspHint = TryGetPspHint(text, ds, es, index);
+            var pspHint = TryGetPspHint(text, ds, es, bx, si, di, index);
             if (!string.IsNullOrEmpty(pspHint))
                 return pspHint;
             if (ins.Mnemonic == ud_mnemonic_code.UD_Imov && ax.HasValue && text.Contains("ax"))
@@ -432,7 +432,92 @@ namespace DOSRE.Dasm
             return null;
         }
 
-        private static string TryGetBiosDataAreaHint(string insText, ushort? ds, ushort? es)
+        private static bool TryGetSimpleMemOffset(string insText, ushort? bx, ushort? si, ushort? di, out string seg, out ushort off)
+        {
+            seg = null;
+            off = 0;
+
+            if (string.IsNullOrEmpty(insText))
+                return false;
+
+            // Direct memory operands like: [0x6c], [es:0x6c]
+            var m = Regex.Match(insText, @"\[(?:(?<seg>cs|ds|es|ss):)?0x(?<hex>[0-9a-fA-F]+)\]");
+            if (m.Success)
+            {
+                seg = m.Groups["seg"].Success ? m.Groups["seg"].Value : null;
+                if (int.TryParse(m.Groups["hex"].Value, System.Globalization.NumberStyles.HexNumber, null, out var disp) && disp >= 0 && disp <= 0xFFFF)
+                {
+                    off = (ushort)disp;
+                    return true;
+                }
+            }
+
+            // Simple base register forms: [bx], [si+0x80], [di-0x2], optionally with a segment prefix.
+            m = Regex.Match(insText, @"\[(?:(?<seg>cs|ds|es|ss):)?(?<base>bx|si|di)\s*(?:(?<sign>[+-])\s*0x(?<hex>[0-9a-fA-F]+))?\]");
+            if (m.Success)
+            {
+                seg = m.Groups["seg"].Success ? m.Groups["seg"].Value : null;
+                var baseName = m.Groups["base"].Value;
+                ushort? baseVal = baseName switch
+                {
+                    "bx" => bx,
+                    "si" => si,
+                    "di" => di,
+                    _ => null
+                };
+
+                if (!baseVal.HasValue)
+                    return false;
+
+                var total = (int)baseVal.Value;
+                if (m.Groups["hex"].Success)
+                {
+                    if (!int.TryParse(m.Groups["hex"].Value, System.Globalization.NumberStyles.HexNumber, null, out var disp))
+                        return false;
+
+                    var sign = m.Groups["sign"].Success ? m.Groups["sign"].Value : "+";
+                    total = sign == "-" ? total - disp : total + disp;
+                }
+
+                if (total < 0 || total > 0xFFFF)
+                    return false;
+
+                off = (ushort)total;
+                return true;
+            }
+
+            // Variant: [0x80+bx]
+            m = Regex.Match(insText, @"\[(?:(?<seg>cs|ds|es|ss):)?0x(?<hex>[0-9a-fA-F]+)\s*\+\s*(?<base>bx|si|di)\]");
+            if (m.Success)
+            {
+                seg = m.Groups["seg"].Success ? m.Groups["seg"].Value : null;
+                var baseName = m.Groups["base"].Value;
+                ushort? baseVal = baseName switch
+                {
+                    "bx" => bx,
+                    "si" => si,
+                    "di" => di,
+                    _ => null
+                };
+
+                if (!baseVal.HasValue)
+                    return false;
+
+                if (!int.TryParse(m.Groups["hex"].Value, System.Globalization.NumberStyles.HexNumber, null, out var disp))
+                    return false;
+
+                var total = (int)baseVal.Value + disp;
+                if (total < 0 || total > 0xFFFF)
+                    return false;
+
+                off = (ushort)total;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static string TryGetBiosDataAreaHint(string insText, ushort? ds, ushort? es, ushort? bx, ushort? si, ushort? di)
         {
             if (string.IsNullOrEmpty(insText))
                 return null;
@@ -442,19 +527,17 @@ namespace DOSRE.Dasm
             if (ds != bdaSeg && es != bdaSeg)
                 return null;
 
-            // Match direct memory operands like: [0x6c], [es:0x6c], [ds:0x10]
-            var m = Regex.Match(insText, @"\[(?:(?<seg>cs|ds|es|ss):)?0x(?<hex>[0-9a-fA-F]+)\]");
-            if (!m.Success)
+            if (!TryGetSimpleMemOffset(insText, bx, si, di, out var seg, out var offU16))
                 return null;
 
-            var seg = m.Groups["seg"].Success ? m.Groups["seg"].Value : null;
-            if (!int.TryParse(m.Groups["hex"].Value, System.Globalization.NumberStyles.HexNumber, null, out var off))
-                return null;
+            var off = (int)offU16;
 
             ushort? effectiveSeg = seg switch
             {
                 "ds" => ds,
                 "es" => es,
+                "ss" => null,
+                "cs" => null,
                 _ => ds // default for [disp16] is DS
             };
 
@@ -489,7 +572,7 @@ namespace DOSRE.Dasm
             return $"BDA 0040:{off:X4}h ; {desc}";
         }
 
-        private static string TryGetPspHint(string insText, ushort? ds, ushort? es, int index)
+        private static string TryGetPspHint(string insText, ushort? ds, ushort? es, ushort? bx, ushort? si, ushort? di, int index)
         {
             if (string.IsNullOrEmpty(insText))
                 return null;
@@ -503,12 +586,13 @@ namespace DOSRE.Dasm
             if (ds == 0x0040 || es == 0x0040)
                 return null;
 
-            var m = Regex.Match(insText, @"\[(?:(?<seg>cs|ds|es|ss):)?0x(?<hex>[0-9a-fA-F]+)\]");
-            if (!m.Success)
+            if (!TryGetSimpleMemOffset(insText, bx, si, di, out var seg, out var offU16))
                 return null;
 
-            if (!int.TryParse(m.Groups["hex"].Value, System.Globalization.NumberStyles.HexNumber, null, out var off))
+            if (seg is "cs" or "ss")
                 return null;
+
+            var off = (int)offU16;
 
             // Only very low offsets are plausible PSP references.
             if (off > 0x00FF)
