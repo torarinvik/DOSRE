@@ -780,15 +780,13 @@ namespace DOSRE.Dasm
                 return string.Empty;
 
             // Database-driven descriptions first.
-            byte? dbAh = null;
-            ushort? dbAx = null;
-            if (intNo == 0x21 || intNo == 0x10 || intNo == 0x16)
-                dbAh = TryResolveAhBefore(instructions, idx);
-            if (intNo == 0x31 || intNo == 0x33)
-                dbAx = TryResolveAxBefore(instructions, idx);
+            byte? dbAh = TryResolveAhBefore(instructions, idx);
+            ushort? dbAx = TryResolveAxBefore(instructions, idx);
 
             var edxOperand = TryResolveEdxBefore(instructions, idx);
-            var edxDetail = TryFormatEdxStringDetail(edxOperand, stringSymbols, stringPreview);
+            var esiOperand = TryResolveEsiBefore(instructions, idx);
+            var edxDetail = TryFormatPointerDetail("EDX", edxOperand, stringSymbols, stringPreview);
+            var esiDetail = TryFormatPointerDetail("ESI", esiOperand, stringSymbols, stringPreview);
 
             string db;
             if (DosInterruptDatabase.Instance.TryDescribe(intNo, dbAh, dbAx, out db) && !string.IsNullOrEmpty(db))
@@ -799,11 +797,23 @@ namespace DOSRE.Dasm
                     var extra = string.Empty;
                     if (dbAh.HasValue)
                     {
-                        // Common DS:DX/DS:EDX pointer arguments.
-                        // (Exec/open/create/delete/findfirst/set DTA/print string)
                         var ah = dbAh.Value;
-                        if ((ah == 0x09 || ah == 0x1A || ah == 0x3C || ah == 0x3D || ah == 0x41 || ah == 0x43 || ah == 0x4B || ah == 0x4E) && !string.IsNullOrEmpty(edxDetail))
-                            extra = " ; " + edxDetail;
+                        // DX/EDX based
+                        if (ah == 0x09 || ah == 0x0A || ah == 0x0F || ah == 0x10 || ah == 0x11 || ah == 0x12 || ah == 0x13 || 
+                            ah == 0x16 || ah == 0x17 || ah == 0x1A || ah == 0x21 || ah == 0x22 || ah == 0x23 || ah == 0x24 || 
+                            ah == 0x27 || ah == 0x28 || ah == 0x39 || ah == 0x3A || ah == 0x3B || ah == 0x3C || 
+                            ah == 0x3D || ah == 0x3F || ah == 0x40 || ah == 0x41 || ah == 0x43 || ah == 0x4B || 
+                            ah == 0x4E || ah == 0x56 || ah == 0x5A || ah == 0x5B)
+                        {
+                             if (!string.IsNullOrEmpty(edxDetail))
+                                 extra = " ; " + edxDetail;
+                        }
+                        // SI/ESI based
+                        if (ah == 0x47 || ah == 0x6C || ah == 0x71)
+                        {
+                             if (!string.IsNullOrEmpty(esiDetail))
+                                 extra = " ; " + esiDetail;
+                        }
                     }
                     return "INT21: " + db + extra;
                 }
@@ -833,8 +843,15 @@ namespace DOSRE.Dasm
                 var baseText = string.IsNullOrEmpty(name) ? $"INT21: AH=0x{ah.Value:X2}" : $"INT21: {name} (AH=0x{ah.Value:X2})";
 
                 // Add DS:EDX best-effort pointer detail for common calls.
-                if ((ah.Value == 0x09 || ah.Value == 0x1A || ah.Value == 0x3C || ah.Value == 0x3D || ah.Value == 0x41 || ah.Value == 0x43 || ah.Value == 0x4B || ah.Value == 0x4E) && !string.IsNullOrEmpty(edxDetail))
-                    baseText += " ; " + edxDetail;
+                var val = ah.Value;
+                if (val == 0x09 || val == 0x11 || val == 0x12 || val == 0x13 || val == 0x17 || val == 0x1A || 
+                    val == 0x27 || val == 0x28 || val == 0x39 || val == 0x3A || val == 0x3B || val == 0x3C || 
+                    val == 0x3D || val == 0x3F || val == 0x40 || val == 0x41 || val == 0x43 || val == 0x47 || 
+                    val == 0x4B || val == 0x4E || val == 0x56 || val == 0x5A || val == 0x5B || val == 0x6C)
+                {
+                    if (!string.IsNullOrEmpty(edxDetail))
+                        baseText += " ; " + edxDetail;
+                }
 
                 return baseText;
             }
@@ -2264,32 +2281,34 @@ namespace DOSRE.Dasm
 
         private static string TryResolveEdxBefore(List<Instruction> instructions, int idx)
         {
+            return TryResolveRegBefore("edx", instructions, idx);
+        }
+
+        private static string TryResolveEsiBefore(List<Instruction> instructions, int idx)
+        {
+            return TryResolveRegBefore("esi", instructions, idx);
+        }
+
+        private static string TryResolveRegBefore(string reg, List<Instruction> instructions, int idx)
+        {
             if (instructions == null)
                 return string.Empty;
 
-            for (var i = idx - 1; i >= 0 && i >= idx - 10; i--)
+            var movPrefix = "mov " + reg + ",";
+            var leaPrefix = "lea " + reg + ",";
+
+            for (var i = idx - 1; i >= 0 && i >= idx - 12; i--)
             {
                 var t = instructions[i].ToString().Trim();
-                if (t.Length == 0)
-                    continue;
+                if (t.Length == 0) continue;
 
-                // mov edx, imm32 / symbol / reg
-                if (t.StartsWith("mov edx,", StringComparison.OrdinalIgnoreCase))
+                if (t.StartsWith(movPrefix, StringComparison.OrdinalIgnoreCase) || t.StartsWith(leaPrefix, StringComparison.OrdinalIgnoreCase))
                 {
                     var p = t.IndexOf(',');
                     if (p >= 0 && p + 1 < t.Length)
                         return t.Substring(p + 1).Trim();
                 }
 
-                // lea edx, [mem]
-                if (t.StartsWith("lea edx,", StringComparison.OrdinalIgnoreCase))
-                {
-                    var p = t.IndexOf(',');
-                    if (p >= 0 && p + 1 < t.Length)
-                        return t.Substring(p + 1).Trim();
-                }
-
-                // Stop if we hit another interrupt or a call (heuristic: value likely changed in another basic block).
                 if (t.StartsWith("int ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
                     break;
             }
@@ -2297,14 +2316,15 @@ namespace DOSRE.Dasm
             return string.Empty;
         }
 
-        private static string TryFormatEdxStringDetail(string edxOperand, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> stringPreview)
+        private static string TryFormatPointerDetail(string reg, string operand, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> stringPreview)
         {
-            if (string.IsNullOrWhiteSpace(edxOperand))
+            if (string.IsNullOrWhiteSpace(operand))
                 return string.Empty;
 
-            var op = edxOperand.Trim();
+            var op = operand.Trim();
+            var regU = reg.ToUpperInvariant();
 
-            // If EDX is a known string symbol, show preview.
+            // If it is a known string symbol, show preview.
             if (StringSymRegex.IsMatch(op))
             {
                 var hex = op.Substring(2);
@@ -2312,10 +2332,10 @@ namespace DOSRE.Dasm
                 {
                     var prev = stringPreview != null && stringPreview.TryGetValue(addr, out var p) ? p : string.Empty;
                     if (!string.IsNullOrEmpty(prev))
-                        return $"EDX={op} \"{prev}\"";
-                    return $"EDX={op}";
+                        return $"{regU}={op} \"{prev}\"";
+                    return $"{regU}={op}";
                 }
-                return $"EDX={op}";
+                return $"{regU}={op}";
             }
 
             // Immediate linear address.
@@ -2325,19 +2345,18 @@ namespace DOSRE.Dasm
                 {
                     var prev = stringPreview != null && stringPreview.TryGetValue(imm, out var p) ? p : string.Empty;
                     if (!string.IsNullOrEmpty(prev))
-                        return $"EDX={sym} \"{prev}\"";
-                    return $"EDX={sym}";
+                        return $"{regU}={sym} \"{prev}\"";
+                    return $"{regU}={sym}";
                 }
 
                 var onlyPrev = stringPreview != null && stringPreview.TryGetValue(imm, out var p2) ? p2 : string.Empty;
                 if (!string.IsNullOrEmpty(onlyPrev))
-                    return $"EDX=0x{imm:X8} \"{onlyPrev}\"";
+                    return $"{regU}=0x{imm:X8} \"{onlyPrev}\"";
 
-                return $"EDX=0x{imm:X8}";
+                return $"{regU}=0x{imm:X8}";
             }
 
-            // Stack/local pointer etc.
-            return $"EDX={op}";
+            return $"{regU}={op}";
         }
 
         private static bool TryReadDwordAtLinear(List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex, uint addr, out uint value)

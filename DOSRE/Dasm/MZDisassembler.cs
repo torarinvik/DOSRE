@@ -323,7 +323,9 @@ namespace DOSRE.Dasm
             sb.AppendLine(";-------------------------------------------");
 
             byte? lastAh = null;
+            ushort? lastAxImm = null;
             ushort? lastDxImm = null;
+            ushort? lastSiImm = null;
             FunctionInfo currentFunc = null;
             foreach (var ins in instructions)
             {
@@ -338,7 +340,9 @@ namespace DOSRE.Dasm
 
                     currentFunc = funcInfos.TryGetValue(addr, out var fi) ? fi : null;
                     lastAh = null;
+                    lastAxImm = null;
                     lastDxImm = null;
+                    lastSiImm = null;
 
                     if (mzInsights && currentFunc != null)
                     {
@@ -375,7 +379,7 @@ namespace DOSRE.Dasm
                 if (mzInsights)
                 {
                     // Track a tiny amount of state for DOS interrupt hints.
-                    UpdateSimpleDosState(ins, ref lastAh, ref lastDxImm);
+                    UpdateSimpleDosState(ins, ref lastAh, ref lastAxImm, ref lastDxImm, ref lastSiImm);
                 }
 
                 if (mzInsights && TryGetRelativeBranchTarget16(ins, out var target2, out var isCall2))
@@ -403,7 +407,7 @@ namespace DOSRE.Dasm
 
                 if (mzInsights)
                 {
-                    var hint = TryDecodeInterruptHint(ins, lastAh, lastDxImm, stringSyms, stringPrev);
+                    var hint = TryDecodeInterruptHint(ins, lastAh, lastAxImm, lastDxImm, lastSiImm, stringSyms, stringPrev);
                     if (!string.IsNullOrEmpty(hint))
                         insText += $" ; {hint}";
                 }
@@ -766,7 +770,7 @@ namespace DOSRE.Dasm
             return insText;
         }
 
-        private static void UpdateSimpleDosState(Instruction ins, ref byte? lastAh, ref ushort? lastDxImm)
+        private static void UpdateSimpleDosState(Instruction ins, ref byte? lastAh, ref ushort? lastAxImm, ref ushort? lastDxImm, ref ushort? lastSiImm)
         {
             var b = ins.Bytes;
             if (b == null || b.Length == 0)
@@ -776,6 +780,15 @@ namespace DOSRE.Dasm
             if (b[0] == 0xB4 && b.Length >= 2)
             {
                 lastAh = b[1];
+                lastAxImm = null; // partial clobber
+                return;
+            }
+
+            // mov ax, imm16: B8 iw
+            if (b[0] == 0xB8 && b.Length >= 3)
+            {
+                lastAxImm = (ushort)(b[1] | (b[2] << 8));
+                lastAh = (byte)(lastAxImm >> 8);
                 return;
             }
 
@@ -785,12 +798,21 @@ namespace DOSRE.Dasm
                 lastDxImm = (ushort)(b[1] | (b[2] << 8));
                 return;
             }
+
+            // mov si, imm16: BE iw
+            if (b[0] == 0xBE && b.Length >= 3)
+            {
+                lastSiImm = (ushort)(b[1] | (b[2] << 8));
+                return;
+            }
         }
 
         private static string TryDecodeInterruptHint(
             Instruction ins,
             byte? lastAh,
+            ushort? lastAxImm,
             ushort? lastDxImm,
+            ushort? lastSiImm,
             Dictionary<uint, string> stringSyms,
             Dictionary<uint, string> stringPrev)
         {
@@ -805,36 +827,30 @@ namespace DOSRE.Dasm
             var intNo = b[1];
 
             // Prefer database-driven descriptions.
-            // For MZ we only track AH (8-bit) today; AX is unknown in this quick tracker.
             string dbDesc;
-            if (DosInterruptDatabase.Instance.TryDescribe(intNo, lastAh, null, out dbDesc) && !string.IsNullOrEmpty(dbDesc))
+            if (DosInterruptDatabase.Instance.TryDescribe(intNo, lastAh, lastAxImm, out dbDesc) && !string.IsNullOrEmpty(dbDesc))
             {
-                // Preserve the richer inline-string detail for DOS print-$.
-                if (intNo == 0x21 && lastAh.HasValue && lastAh.Value == 0x09)
-                {
-                    if (lastDxImm.HasValue)
-                    {
-                        var dx = (uint)lastDxImm.Value;
-                        if (stringSyms != null && stringSyms.TryGetValue(dx, out var sym))
-                        {
-                            var prev = stringPrev != null && stringPrev.TryGetValue(dx, out var p) ? p : string.Empty;
-                            if (!string.IsNullOrEmpty(prev))
-                                return dbDesc + $" ; DX={sym} \"{prev}\"";
-                            return dbDesc + $" ; DX={sym}";
-                        }
-                        return dbDesc + $" ; DX=0x{dx:X}";
-                    }
-                }
-
-                // Best-effort inline detail for common DS:DX filename/string APIs.
+                // Best-effort inline detail for common DS:DX or DS:SI filename/string/buffer APIs.
                 if (intNo == 0x21 && lastAh.HasValue)
                 {
                     var ah = lastAh.Value;
-                    if (ah == 0x3D || ah == 0x3C || ah == 0x41 || ah == 0x43 || ah == 0x4B || ah == 0x4E)
+                    // DX-based: $ print, FCBs, Path functions, Handle I/O
+                    if (ah == 0x09 || ah == 0x0A || ah == 0x0F || ah == 0x10 || ah == 0x11 || ah == 0x12 || ah == 0x13 || 
+                        ah == 0x16 || ah == 0x17 || ah == 0x1A || ah == 0x21 || ah == 0x22 || ah == 0x23 || ah == 0x24 || 
+                        ah == 0x27 || ah == 0x28 || ah == 0x39 || ah == 0x3A || ah == 0x3B || ah == 0x3C || 
+                        ah == 0x3D || ah == 0x3F || ah == 0x40 || ah == 0x41 || ah == 0x43 || ah == 0x4B || 
+                        ah == 0x4E || ah == 0x56 || ah == 0x5A || ah == 0x5B)
                     {
-                        var dxDetail = TryFormatDxStringDetail(lastDxImm, stringSyms, stringPrev);
+                        var dxDetail = TryFormatPointerDetail(lastDxImm, "DX", stringSyms, stringPrev);
                         if (!string.IsNullOrEmpty(dxDetail))
                             return dbDesc + " ; " + dxDetail;
+                    }
+                    // SI-based: 0x47 (Get Cur Dir), 0x6C (Ext Open), 0x71xx (LFN)
+                    if (ah == 0x47 || ah == 0x6C || ah == 0x71)
+                    {
+                        var siDetail = TryFormatPointerDetail(lastSiImm, "SI", stringSyms, stringPrev);
+                        if (!string.IsNullOrEmpty(siDetail))
+                            return dbDesc + " ; " + siDetail;
                     }
                 }
 
@@ -898,25 +914,25 @@ namespace DOSRE.Dasm
             return $"INT 0x{intNo:X2}";
         }
 
-        private static string TryFormatDxStringDetail(ushort? lastDxImm, Dictionary<uint, string> stringSyms, Dictionary<uint, string> stringPrev)
+        private static string TryFormatPointerDetail(ushort? lastImm, string regName, Dictionary<uint, string> stringSyms, Dictionary<uint, string> stringPrev)
         {
-            if (!lastDxImm.HasValue)
+            if (!lastImm.HasValue)
                 return string.Empty;
 
-            var dx = (uint)lastDxImm.Value;
+            var val = (uint)lastImm.Value;
 
-            if (stringSyms != null && stringSyms.TryGetValue(dx, out var sym))
+            if (stringSyms != null && stringSyms.TryGetValue(val, out var sym))
             {
-                var prev = stringPrev != null && stringPrev.TryGetValue(dx, out var p) ? p : string.Empty;
+                var prev = stringPrev != null && stringPrev.TryGetValue(val, out var p) ? p : string.Empty;
                 if (!string.IsNullOrEmpty(prev))
-                    return $"DX={sym} \"{prev}\"";
-                return $"DX={sym}";
+                    return $"{regName}={sym} \"{prev}\"";
+                return $"{regName}={sym}";
             }
 
-            if (stringPrev != null && stringPrev.TryGetValue(dx, out var onlyPrev) && !string.IsNullOrEmpty(onlyPrev))
-                return $"DX=0x{dx:X} \"{onlyPrev}\"";
+            if (stringPrev != null && stringPrev.TryGetValue(val, out var onlyPrev) && !string.IsNullOrEmpty(onlyPrev))
+                return $"{regName}=0x{val:X} \"{onlyPrev}\"";
 
-            return $"DX=0x{dx:X}";
+            return $"{regName}=0x{val:X}";
         }
     }
 }

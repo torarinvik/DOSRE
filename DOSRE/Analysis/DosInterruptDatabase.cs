@@ -183,15 +183,23 @@ namespace DOSRE.Analysis
             if (!selValue.HasValue)
                 return false;
 
-            List<InterruptFunction> fnList;
-            if (entry.FunctionsByCode != null && entry.FunctionsByCode.TryGetValue(selValue.Value, out fnList) && fnList != null && fnList.Count > 0)
+            InterruptFunction bestFn = null;
+            if (entry.FunctionsByCode != null && ax.HasValue && entry.FunctionsByCode.TryGetValue(ax.Value, out var axList) && axList != null && axList.Count > 0)
             {
-                var chosen = ChooseBestFunction(fnList, dosVersionInt ?? _currentDosVersionInt);
-                var fn = chosen ?? fnList[0];
+                var chosen = ChooseBestFunction(axList, dosVersionInt ?? _currentDosVersionInt);
+                bestFn = chosen ?? axList[0];
+            }
+            else if (entry.FunctionsByCode != null && selValue.HasValue && entry.FunctionsByCode.TryGetValue(selValue.Value, out var selList) && selList != null && selList.Count > 0)
+            {
+                var chosen = ChooseBestFunction(selList, dosVersionInt ?? _currentDosVersionInt);
+                bestFn = chosen ?? selList[0];
+            }
 
+            if (bestFn != null)
+            {
                 // Keep it concise in output; include param hint in parentheses if it fits.
                 var baseName = string.IsNullOrEmpty(entry.Name) ? $"INT 0x{intNo:X2}" : entry.Name;
-                var fnName = fn.Name ?? string.Empty;
+                var fnName = bestFn.Name ?? string.Empty;
                 if (string.IsNullOrEmpty(fnName))
                 {
                     description = baseName;
@@ -199,10 +207,10 @@ namespace DOSRE.Analysis
                 }
 
                 var paramHint = string.Empty;
-                if (fn.Params != null && fn.Params.Length > 0)
+                if (bestFn.Params != null && bestFn.Params.Length > 0)
                 {
                     // Take first param hint only to reduce noise.
-                    paramHint = fn.Params[0];
+                    paramHint = bestFn.Params[0];
                 }
 
                 if (!string.IsNullOrEmpty(paramHint))
