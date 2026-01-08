@@ -323,6 +323,7 @@ namespace DOSRE.Dasm
             sb.AppendLine(";-------------------------------------------");
 
             byte? lastAh = null;
+            byte? lastAl = null;
             ushort? lastAxImm = null;
             ushort? lastDxImm = null;
             ushort? lastSiImm = null;
@@ -341,6 +342,7 @@ namespace DOSRE.Dasm
 
                     currentFunc = funcInfos.TryGetValue(addr, out var fi) ? fi : null;
                     lastAh = null;
+                    lastAl = null;
                     lastAxImm = null;
                     lastDxImm = null;
                     lastSiImm = null;
@@ -365,6 +367,10 @@ namespace DOSRE.Dasm
                             var argc = currentFunc.RetPopBytes.Value / 2;
                             sb.AppendLine($"; PROTO?: callee pops {currentFunc.RetPopBytes.Value} bytes (~{argc} args)");
                         }
+
+                        var summary = TrySummarizeFunction(currentFunc, instructions);
+                        if (!string.IsNullOrEmpty(summary))
+                            sb.AppendLine($"; SUMMARY: {summary}");
                     }
                 }
                 else if (mzInsights && labelTargets.Contains(addr))
@@ -380,7 +386,7 @@ namespace DOSRE.Dasm
                 if (mzInsights)
                 {
                     // Track a tiny amount of state for DOS interrupt hints.
-                    UpdateSimpleDosState(ins, ref lastAh, ref lastAxImm, ref lastDxImm, ref lastSiImm, ref lastDsImm);
+                    UpdateSimpleDosState(ins, ref lastAh, ref lastAl, ref lastAxImm, ref lastDxImm, ref lastSiImm, ref lastDsImm);
                 }
 
                 if (mzInsights && TryGetRelativeBranchTarget16(ins, out var target2, out var isCall2))
@@ -408,7 +414,7 @@ namespace DOSRE.Dasm
 
                 if (mzInsights)
                 {
-                    var hint = TryDecodeInterruptHint(ins, lastAh, lastAxImm, lastDxImm, lastSiImm, lastDsImm, stringSyms, stringPrev, module);
+                    var hint = TryDecodeInterruptHint(ins, lastAh, lastAl, lastAxImm, lastDxImm, lastSiImm, lastDsImm, stringSyms, stringPrev, module);
                     if (!string.IsNullOrEmpty(hint))
                         insText += $" ; {hint}";
                 }
@@ -771,17 +777,286 @@ namespace DOSRE.Dasm
             return insText;
         }
 
-        private static void UpdateSimpleDosState(Instruction ins, ref byte? lastAh, ref ushort? lastAxImm, ref ushort? lastDxImm, ref ushort? lastSiImm, ref ushort? lastDsImm)
+        private static string TrySummarizeFunction(FunctionInfo func, List<Instruction> instructions)
+        {
+            if (func == null || instructions == null)
+                return string.Empty;
+            if (func.StartIndex < 0 || func.StartIndex >= instructions.Count)
+                return string.Empty;
+
+            var endIdx = Math.Min(func.EndIndex, instructions.Count);
+            if (endIdx <= func.StartIndex)
+                return string.Empty;
+
+            // Recognize simple helper wrappers around common INT 21h services.
+            // Keep this intentionally conservative: only emit summaries when we're highly confident.
+            //
+            // Pattern: DOS Get File Attributes wrapper
+            //   AH=43h, AL=00h
+            //   lds dx, [argX]   (far filename pointer)
+            //   int 21h
+            //   jb/jc fail
+            //   les bx, [argY]   (far out-pointer)
+            //   mov [es:bx], cx  (store attr)
+            //   xor ax, ax       (return 0)
+            //   (fail path returns 1)
+
+            const int scanLimit = 80;
+            var scanEnd = Math.Min(endIdx, func.StartIndex + scanLimit);
+
+            int? int21Idx = null;
+            for (var i = func.StartIndex; i < scanEnd; i++)
+            {
+                var b = instructions[i].Bytes;
+                if (b != null && b.Length >= 2 && b[0] == 0xCD && b[1] == 0x21)
+                {
+                    int21Idx = i;
+                    break;
+                }
+            }
+
+            if (!int21Idx.HasValue)
+                return string.Empty;
+
+            var idx = int21Idx.Value;
+
+            byte? ah = null;
+            byte? al = null;
+            int? filenameArgOff = null;
+
+            for (var i = Math.Max(func.StartIndex, idx - 8); i < idx; i++)
+            {
+                var b = instructions[i].Bytes;
+                if (b == null || b.Length == 0)
+                    continue;
+
+                // mov ah, imm8
+                if (b.Length >= 2 && b[0] == 0xB4)
+                    ah = b[1];
+
+                // mov al, imm8
+                if (b.Length >= 2 && b[0] == 0xB0)
+                    al = b[1];
+
+                // xor al, al
+                if (b.Length >= 2 && b[0] == 0x30 && b[1] == 0xC0)
+                    al = 0;
+
+                if (!filenameArgOff.HasValue && TryDecodeLdsDxFromBp(b, out var bpOff))
+                    filenameArgOff = bpOff;
+            }
+
+            if (ah != 0x43 || al != 0x00)
+                return string.Empty;
+            if (!filenameArgOff.HasValue)
+                return string.Empty;
+
+            // Find the first carry-based conditional branch following int 21h.
+            int? jccIdx = null;
+            for (var i = idx + 1; i < Math.Min(scanEnd, idx + 8); i++)
+            {
+                var b = instructions[i].Bytes;
+                if (b == null || b.Length < 1)
+                    continue;
+
+                // 72 = JC/JB (carry set), 73 = JNC/JAE (carry clear)
+                if (b[0] == 0x72 || b[0] == 0x73)
+                {
+                    jccIdx = i;
+                    break;
+                }
+            }
+
+            if (!jccIdx.HasValue)
+                return string.Empty;
+
+            int? outArgOff = null;
+            var sawStoreCx = false;
+            var sawXorAxAx = false;
+            for (var i = jccIdx.Value + 1; i < Math.Min(scanEnd, jccIdx.Value + 20); i++)
+            {
+                var b = instructions[i].Bytes;
+                if (b == null || b.Length == 0)
+                    continue;
+
+                if (!outArgOff.HasValue && TryDecodeLesBxFromBp(b, out var bpOff))
+                    outArgOff = bpOff;
+
+                if (IsMovWordPtrEsBxFromCx(b))
+                    sawStoreCx = true;
+
+                if (b.Length >= 2 && b[0] == 0x33 && b[1] == 0xC0)
+                    sawXorAxAx = true;
+            }
+
+            if (!outArgOff.HasValue || !sawStoreCx || !sawXorAxAx)
+                return string.Empty;
+
+            // Best-effort: look for a very nearby "return 1" on failure.
+            var failureReturnsOne = false;
+            for (var i = idx + 1; i < scanEnd; i++)
+            {
+                var b = instructions[i].Bytes;
+                if (b == null || b.Length == 0)
+                    continue;
+
+                // mov ax, 1 : B8 01 00
+                if (b.Length >= 3 && b[0] == 0xB8 && b[1] == 0x01 && b[2] == 0x00)
+                {
+                    failureReturnsOne = true;
+                    break;
+                }
+            }
+
+            var inArgName = FormatArgNameFromBpOffset(filenameArgOff.Value);
+            var outArgName = FormatArgNameFromBpOffset(outArgOff.Value);
+
+            var retText = failureReturnsOne ? "returns 0 on success, 1 on failure" : "returns 0 on success, nonzero on failure";
+            return $"Gets DOS file attributes for filename at {inArgName} (far ptr), stores CX to *{outArgName} (far ptr), {retText}.";
+        }
+
+        private static string FormatArgNameFromBpOffset(int bpOff)
+        {
+            if (bpOff < 4)
+                return $"bp+0x{bpOff:X}";
+            var argN = (bpOff - 4) / 2;
+            return $"arg{argN}@+0x{bpOff:X}";
+        }
+
+        private static bool TryDecodeLdsDxFromBp(byte[] b, out int bpOff)
+        {
+            bpOff = 0;
+            if (b == null || b.Length < 3)
+                return false;
+            if (b[0] != 0xC5)
+                return false;
+
+            var modrm = b[1];
+            var mod = (modrm >> 6) & 0x3;
+            var reg = (modrm >> 3) & 0x7;
+            var rm = modrm & 0x7;
+
+            // reg=010 is DX
+            if (reg != 0x2)
+                return false;
+
+            // We only accept [bp+disp] addressing forms.
+            if (rm != 0x6)
+                return false;
+
+            if (mod == 0x1 && b.Length >= 3)
+            {
+                bpOff = unchecked((sbyte)b[2]);
+                if (bpOff < 0)
+                    return false;
+                return true;
+            }
+            if (mod == 0x2 && b.Length >= 4)
+            {
+                bpOff = b[2] | (b[3] << 8);
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryDecodeLesBxFromBp(byte[] b, out int bpOff)
+        {
+            bpOff = 0;
+            if (b == null || b.Length < 3)
+                return false;
+            if (b[0] != 0xC4)
+                return false;
+
+            var modrm = b[1];
+            var mod = (modrm >> 6) & 0x3;
+            var reg = (modrm >> 3) & 0x7;
+            var rm = modrm & 0x7;
+
+            // reg=011 is BX
+            if (reg != 0x3)
+                return false;
+            if (rm != 0x6)
+                return false;
+
+            if (mod == 0x1 && b.Length >= 3)
+            {
+                bpOff = unchecked((sbyte)b[2]);
+                if (bpOff < 0)
+                    return false;
+                return true;
+            }
+            if (mod == 0x2 && b.Length >= 4)
+            {
+                bpOff = b[2] | (b[3] << 8);
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsMovWordPtrEsBxFromCx(byte[] b)
+        {
+            if (b == null || b.Length == 0)
+                return false;
+
+            // Accept:
+            //   26 89 0F   mov [es:bx], cx
+            //   89 0F      mov [bx], cx  (rare, but allow)
+            if (b.Length >= 3 && b[0] == 0x26 && b[1] == 0x89 && b[2] == 0x0F)
+                return true;
+            if (b.Length >= 2 && b[0] == 0x89 && b[1] == 0x0F)
+                return true;
+
+            return false;
+        }
+
+        private static void UpdateSimpleDosState(Instruction ins, ref byte? lastAh, ref byte? lastAl, ref ushort? lastAxImm, ref ushort? lastDxImm, ref ushort? lastSiImm, ref ushort? lastDsImm)
         {
             var b = ins.Bytes;
             if (b == null || b.Length == 0)
                 return;
 
+            // xor ax, ax: 33 C0
+            if (b.Length >= 2 && b[0] == 0x33 && b[1] == 0xC0)
+            {
+                lastAxImm = 0;
+                lastAh = 0;
+                lastAl = 0;
+                return;
+            }
+
+            // xor al, al: 30 C0
+            if (b.Length >= 2 && b[0] == 0x30 && b[1] == 0xC0)
+            {
+                lastAl = 0;
+                if (lastAh.HasValue)
+                    lastAxImm = (ushort)(lastAh.Value << 8);
+                else if (lastAxImm.HasValue)
+                    lastAxImm = (ushort)(lastAxImm.Value & 0xFF00);
+                return;
+            }
+
             // mov ah, imm8: B4 ib
             if (b[0] == 0xB4 && b.Length >= 2)
             {
                 lastAh = b[1];
-                lastAxImm = null; // partial clobber
+                // Preserve AL if known; many codebases build AX via mov ah,imm + mov/xor al,...
+                if (lastAl.HasValue)
+                    lastAxImm = (ushort)((lastAh.Value << 8) | lastAl.Value);
+                else
+                    lastAxImm = null; // partial clobber
+                return;
+            }
+
+            // mov al, imm8: B0 ib
+            if (b[0] == 0xB0 && b.Length >= 2)
+            {
+                lastAl = b[1];
+                if (lastAh.HasValue)
+                    lastAxImm = (ushort)((lastAh.Value << 8) | lastAl.Value);
+                else if (lastAxImm.HasValue)
+                    lastAxImm = (ushort)((lastAxImm.Value & 0xFF00) | lastAl.Value);
                 return;
             }
 
@@ -790,6 +1065,7 @@ namespace DOSRE.Dasm
             {
                 lastAxImm = (ushort)(b[1] | (b[2] << 8));
                 lastAh = (byte)(lastAxImm >> 8);
+                lastAl = (byte)(lastAxImm & 0xFF);
                 return;
             }
 
@@ -818,6 +1094,7 @@ namespace DOSRE.Dasm
         private static string TryDecodeInterruptHint(
             Instruction ins,
             byte? lastAh,
+            byte? lastAl,
             ushort? lastAxImm,
             ushort? lastDxImm,
             ushort? lastSiImm,
@@ -844,6 +1121,21 @@ namespace DOSRE.Dasm
                 if (intNo == 0x21 && lastAh.HasValue)
                 {
                     var ah = lastAh.Value;
+
+                    // Extra detail: DOS file attribute bit meanings (AH=43h).
+                    // AL=00h Get Attributes returns CX, AL=01h Set Attributes takes CX.
+                    if (ah == 0x43)
+                    {
+                        byte? al = lastAl;
+                        if (!al.HasValue && lastAxImm.HasValue)
+                            al = (byte)(lastAxImm.Value & 0xFF);
+
+                        if (al == 0x00)
+                            dbDesc += " ; returns CX bits: 0x01=RO 0x02=Hidden 0x04=System 0x08=VolLabel 0x10=Dir 0x20=Archive";
+                        else if (al == 0x01)
+                            dbDesc += " ; CX bits: 0x01=RO 0x02=Hidden 0x04=System 0x08=VolLabel 0x10=Dir 0x20=Archive";
+                    }
+
                     // FCB-based: 0x0F, 0x10, 0x11, 0x12, 0x13, 0x16, 0x17, 0x21, 0x22, 0x23, 0x24, 0x27, 0x28
                     if (ah == 0x0F || ah == 0x10 || ah == 0x11 || ah == 0x12 || ah == 0x13 || ah == 0x16 || ah == 0x17 || 
                         ah == 0x21 || ah == 0x22 || ah == 0x23 || ah == 0x24 || ah == 0x27 || ah == 0x28)
