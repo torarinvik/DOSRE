@@ -874,7 +874,72 @@ namespace DOSRE.Dasm
                     retUsed = true;
             }
 
-            return $"args~{pushes} ret={(retUsed ? "eax" : "(unused?)")}";
+            // Best-effort register-arg note (common in Watcom/DOS4GW style code)
+            // This doesn't assume a calling convention; it simply records obvious setup like "movzx edx, word [0x....]" right before call.
+            var regArgNotes = new List<string>();
+            for (var i = idx - 1; i >= 0 && i >= idx - 6; i--)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (TryParseSimpleRegSetup(t, "edx", out var rhsEdx))
+                {
+                    regArgNotes.Add($"edx={rhsEdx}");
+                    break;
+                }
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
+                    break;
+            }
+            for (var i = idx - 1; i >= 0 && i >= idx - 6; i--)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (TryParseSimpleRegSetup(t, "eax", out var rhsEax))
+                {
+                    regArgNotes.Add($"eax={rhsEax}");
+                    break;
+                }
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
+                    break;
+            }
+            for (var i = idx - 1; i >= 0 && i >= idx - 6; i--)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (TryParseSimpleRegSetup(t, "ecx", out var rhsEcx))
+                {
+                    regArgNotes.Add($"ecx={rhsEcx}");
+                    break;
+                }
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
+                    break;
+            }
+
+            var regText = regArgNotes.Count > 0 ? $" reg~{string.Join(",", regArgNotes)}" : string.Empty;
+            return $"args~{pushes} ret={(retUsed ? "eax" : "(unused?)")}{regText}";
+        }
+
+        private static bool TryParseSimpleRegSetup(string insText, string reg, out string rhs)
+        {
+            rhs = null;
+            if (string.IsNullOrWhiteSpace(insText) || string.IsNullOrWhiteSpace(reg))
+                return false;
+
+            // mov reg, rhs
+            var m1 = Regex.Match(insText, $@"^\s*mov\s+{Regex.Escape(reg)}\s*,\s*(?<rhs>.+?)\s*$", RegexOptions.IgnoreCase);
+            if (m1.Success)
+            {
+                rhs = m1.Groups["rhs"].Value.Trim();
+                rhs = rhs.Length > 48 ? rhs.Substring(0, 48) + "..." : rhs;
+                return true;
+            }
+
+            // movzx reg, word [mem]
+            var m2 = Regex.Match(insText, $@"^\s*movzx\s+{Regex.Escape(reg)}\s*,\s*(?<rhs>.+?)\s*$", RegexOptions.IgnoreCase);
+            if (m2.Success)
+            {
+                rhs = m2.Groups["rhs"].Value.Trim();
+                rhs = rhs.Length > 48 ? rhs.Substring(0, 48) + "..." : rhs;
+                return true;
+            }
+
+            return false;
         }
 
         private static string TryAnnotateInterrupt(List<Instruction> instructions, int idx, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> stringPreview, List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex)
@@ -1130,6 +1195,110 @@ namespace DOSRE.Dasm
                 return $"IO: {(isWrite ? "OUT" : "IN")} {name} (0x{port:X4}) {dir} {dataReg}";
 
             return $"IO: {(isWrite ? "OUT" : "IN")} 0x{port:X4} {dir} {dataReg}";
+        }
+
+        private static string TryAnnotateBasicBlockSummary(List<Instruction> instructions, int startIdx)
+        {
+            if (instructions == null || startIdx < 0 || startIdx >= instructions.Count)
+                return string.Empty;
+
+            // Detect repeated pattern:
+            //   mov r32, [esi+disp]
+            //   mov [abs32], r32
+            // repeated several times to "cache" fields from a struct pointed by ESI.
+            var pairs = new List<(int disp, uint abs)>();
+            var scanLimit = Math.Min(instructions.Count, startIdx + 20);
+
+            for (var i = startIdx; i + 1 < scanLimit; i++)
+            {
+                var a = instructions[i].ToString().Trim();
+                var b = instructions[i + 1].ToString().Trim();
+
+                if (!TryParseMovRegFromEsiDisp(a, out var reg, out var disp))
+                    continue;
+                if (!TryParseMovAbsFromReg(b, reg, out var abs))
+                    continue;
+
+                pairs.Add((disp, abs));
+                i++; // consume the store
+            }
+
+            if (pairs.Count < 3)
+                return string.Empty;
+
+            // Prefer an explicit mapping list (more useful than a min/max range since globals may not be monotonic).
+            var mappingParts = pairs
+                .Take(6)
+                .Select(p => $"+0x{p.disp:X}->0x{p.abs:X}")
+                .ToList();
+
+            var mappingText = string.Join(", ", mappingParts);
+            if (pairs.Count > 6)
+                mappingText += ", ...";
+
+            return $"BBHINT: cache [esi+disp] to globals: {mappingText} ({pairs.Count} stores)";
+        }
+
+        private static bool TryParseMovRegFromEsiDisp(string insText, out string reg, out int disp)
+        {
+            reg = null;
+            disp = 0;
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            // e.g. "mov eax, [esi+0x30]" or "mov edx, [esi+0x30]"
+            var m = Regex.Match(insText, @"^\s*mov\s+(?<reg>e[a-d]x|e[sdi]i|e[bp]p)\s*,\s*\[esi\+(?<disp>0x[0-9A-Fa-f]+|[0-9]+)\]\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            reg = m.Groups["reg"].Value.ToLowerInvariant();
+            var d = m.Groups["disp"].Value;
+
+            if (d.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!int.TryParse(d.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out disp))
+                    return false;
+            }
+            else
+            {
+                if (!int.TryParse(d, out disp))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool TryParseMovAbsFromReg(string insText, string reg, out uint abs)
+        {
+            abs = 0;
+            if (string.IsNullOrWhiteSpace(insText) || string.IsNullOrWhiteSpace(reg))
+                return false;
+
+            // e.g. "mov [0xc25c0], eax"
+            var m = Regex.Match(insText, $@"^\s*mov\s+\[(?<abs>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\]\s*,\s*{Regex.Escape(reg)}\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            var token = m.Groups["abs"].Value.Trim();
+            token = token.TrimEnd('h', 'H');
+            if (token.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!uint.TryParse(token.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out abs))
+                    return false;
+                return true;
+            }
+
+            // If it contains A-F treat as hex.
+            var isHex = token.Any(c => (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'));
+            if (isHex)
+            {
+                if (!uint.TryParse(token, System.Globalization.NumberStyles.HexNumber, null, out abs))
+                    return false;
+                return true;
+            }
+            if (!uint.TryParse(token, out abs))
+                return false;
+            return true;
         }
 
         private static void CollectIoPortsForFunction(List<Instruction> instructions, int startIdx, int endIdx, out Dictionary<ushort, IoPortStats> ports)
@@ -2207,6 +2376,10 @@ namespace DOSRE.Dasm
                         sb.AppendLine($"bb_{addr:X8}:");
                         if (blockPreds != null && blockPreds.TryGetValue(addr, out var preds) && preds.Count > 0)
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; CFG: preds {string.Join(", ", preds.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}", commentColumn: 0, maxWidth: 160);
+
+                        var bbHint = TryAnnotateBasicBlockSummary(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(bbHint))
+                            AppendWrappedDisasmLine(sb, string.Empty, $" ; {bbHint}", commentColumn: 0, maxWidth: 160);
                     }
 
                     var bytes = BitConverter.ToString(ins.Bytes).Replace("-", string.Empty);
