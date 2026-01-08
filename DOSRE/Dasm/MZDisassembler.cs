@@ -583,6 +583,10 @@ namespace DOSRE.Dasm
                     // Track a tiny amount of state for DOS interrupt hints.
                     UpdateSimpleDosState(ins, ref lastAh, ref lastAl, ref lastAxImm, ref lastBxImm, ref lastCxImm, ref lastDxImm, ref lastSiImm, ref lastDiImm, ref lastBpImm, ref lastDsImm, ref lastEsImm);
 
+                    var indirectCallHint = TryGetIndirectCallHint(ins, instructions, i);
+                    if (!string.IsNullOrEmpty(indirectCallHint))
+                        insText += $" ; {indirectCallHint}";
+
                     var higherHint = TryGetHigherLevelHint(ins, i > 0 ? instructions[i - 1] : null, lastAh, lastAl, lastAxImm, lastBxImm, lastCxImm, lastDxImm, lastSiImm, lastDiImm, lastDsImm, lastEsImm);
                     if (!string.IsNullOrEmpty(higherHint))
                         insText += $" ; {higherHint}";
@@ -1400,11 +1404,43 @@ namespace DOSRE.Dasm
                 return;
             }
 
+            // mov cl, imm8: B1 ib
+            if (b[0] == 0xB1 && b.Length >= 2)
+            {
+                var imm = b[1];
+                lastCxImm = lastCxImm.HasValue ? (ushort)((lastCxImm.Value & 0xFF00) | imm) : imm;
+                return;
+            }
+
+            // mov dl, imm8: B2 ib
+            if (b[0] == 0xB2 && b.Length >= 2)
+            {
+                var imm = b[1];
+                lastDxImm = lastDxImm.HasValue ? (ushort)((lastDxImm.Value & 0xFF00) | imm) : imm;
+                return;
+            }
+
             // mov bh, imm8: B7 ib
             if (b[0] == 0xB7 && b.Length >= 2)
             {
                 var imm = b[1];
                 lastBxImm = lastBxImm.HasValue ? (ushort)((lastBxImm.Value & 0x00FF) | (imm << 8)) : (ushort)(imm << 8);
+                return;
+            }
+
+            // mov ch, imm8: B5 ib
+            if (b[0] == 0xB5 && b.Length >= 2)
+            {
+                var imm = b[1];
+                lastCxImm = lastCxImm.HasValue ? (ushort)((lastCxImm.Value & 0x00FF) | (imm << 8)) : (ushort)(imm << 8);
+                return;
+            }
+
+            // mov dh, imm8: B6 ib
+            if (b[0] == 0xB6 && b.Length >= 2)
+            {
+                var imm = b[1];
+                lastDxImm = lastDxImm.HasValue ? (ushort)((lastDxImm.Value & 0x00FF) | (imm << 8)) : (ushort)(imm << 8);
                 return;
             }
 
@@ -1551,6 +1587,62 @@ namespace DOSRE.Dasm
             }
         }
 
+        private static string TryGetIndirectCallHint(Instruction ins, IReadOnlyList<Instruction> instructions, int index)
+        {
+            var b = ins.Bytes;
+            if (b == null || b.Length < 2)
+                return null;
+
+            // Indirect CALL (often a function pointer / callback)
+            // FF /2 = CALL r/m16 (near), FF /3 = CALL m16:16 (far)
+            if (b[0] != 0xFF)
+                return null;
+
+            var modrm = b[1];
+            var reg = (modrm >> 3) & 0x07;
+            if (reg != 2 && reg != 3)
+                return null;
+
+            var text = ins.ToString();
+            var callIdx = text.IndexOf("call", StringComparison.OrdinalIgnoreCase);
+            var op = callIdx >= 0 ? text[(callIdx + 4)..].Trim() : text;
+            if (string.IsNullOrEmpty(op))
+                op = "?";
+
+            var pushes = CountImmediatelyPrecedingPushes(instructions, index, max: 6);
+            var argsSuffix = pushes > 0 ? $" (args~{pushes})" : string.Empty;
+
+            return reg == 3
+                ? $"INDIRECT FAR CALL via {op}{argsSuffix}"
+                : $"INDIRECT CALL via {op}{argsSuffix}";
+        }
+
+        private static int CountImmediatelyPrecedingPushes(IReadOnlyList<Instruction> instructions, int index, int max)
+        {
+            if (instructions == null || index <= 0 || max <= 0)
+                return 0;
+
+            var count = 0;
+            for (var i = index - 1; i >= 0 && count < max; i--)
+            {
+                var prior = instructions[i];
+                if (prior == null)
+                    break;
+
+                // Treat any PUSH as an argument push (best-effort).
+                // Stop at the first non-push to keep this conservative.
+                if (prior.Mnemonic == ud_mnemonic_code.UD_Ipush)
+                {
+                    count++;
+                    continue;
+                }
+
+                break;
+            }
+
+            return count;
+        }
+
         private static string TryGetHigherLevelHint(
             Instruction ins,
             Instruction prev,
@@ -1658,22 +1750,6 @@ namespace DOSRE.Dasm
                 ushort off = (ushort)(b[1] | (b[2] << 8));
                 ushort seg = (ushort)(b[3] | (b[4] << 8));
                 return $"CALL FAR {seg:X4}:{off:X4}";
-            }
-
-            // Indirect CALL (often a function pointer / callback)
-            // FF /2 = CALL r/m16 (near), FF /3 = CALL m16:16 (far)
-            if (b[0] == 0xFF && b.Length >= 2)
-            {
-                var modrm = b[1];
-                var reg = (modrm >> 3) & 0x07;
-                if (reg == 2 || reg == 3)
-                {
-                    var idx = text.IndexOf("call", StringComparison.OrdinalIgnoreCase);
-                    var op = idx >= 0 ? text[(idx + 4)..].Trim() : text;
-                    if (string.IsNullOrEmpty(op))
-                        op = "?";
-                    return reg == 3 ? $"INDIRECT FAR CALL via {op}" : $"INDIRECT CALL via {op}";
-                }
             }
 
             // Far JMP to segment:offset
