@@ -325,9 +325,13 @@ namespace DOSRE.Dasm
             byte? lastAh = null;
             byte? lastAl = null;
             ushort? lastAxImm = null;
+            ushort? lastBxImm = null;
+            ushort? lastCxImm = null;
             ushort? lastDxImm = null;
             ushort? lastSiImm = null;
+            ushort? lastDiImm = null;
             ushort? lastDsImm = null;
+            ushort? lastEsImm = null;
             FunctionInfo currentFunc = null;
             foreach (var ins in instructions)
             {
@@ -344,8 +348,13 @@ namespace DOSRE.Dasm
                     lastAh = null;
                     lastAl = null;
                     lastAxImm = null;
+                    lastBxImm = null;
+                    lastCxImm = null;
                     lastDxImm = null;
                     lastSiImm = null;
+                    lastDiImm = null;
+                    lastDsImm = null;
+                    lastEsImm = null;
 
                     if (mzInsights && currentFunc != null)
                     {
@@ -386,7 +395,7 @@ namespace DOSRE.Dasm
                 if (mzInsights)
                 {
                     // Track a tiny amount of state for DOS interrupt hints.
-                    UpdateSimpleDosState(ins, ref lastAh, ref lastAl, ref lastAxImm, ref lastDxImm, ref lastSiImm, ref lastDsImm);
+                    UpdateSimpleDosState(ins, ref lastAh, ref lastAl, ref lastAxImm, ref lastBxImm, ref lastCxImm, ref lastDxImm, ref lastSiImm, ref lastDiImm, ref lastDsImm, ref lastEsImm);
                 }
 
                 if (mzInsights && TryGetRelativeBranchTarget16(ins, out var target2, out var isCall2))
@@ -414,7 +423,7 @@ namespace DOSRE.Dasm
 
                 if (mzInsights)
                 {
-                    var hint = TryDecodeInterruptHint(ins, lastAh, lastAl, lastAxImm, lastDxImm, lastSiImm, lastDsImm, stringSyms, stringPrev, module);
+                    var hint = TryDecodeInterruptHint(ins, lastAh, lastAl, lastAxImm, lastBxImm, lastCxImm, lastDxImm, lastSiImm, lastDiImm, lastDsImm, lastEsImm, stringSyms, stringPrev, module);
                     if (!string.IsNullOrEmpty(hint))
                         insText += $" ; {hint}";
                 }
@@ -1011,7 +1020,18 @@ namespace DOSRE.Dasm
             return false;
         }
 
-        private static void UpdateSimpleDosState(Instruction ins, ref byte? lastAh, ref byte? lastAl, ref ushort? lastAxImm, ref ushort? lastDxImm, ref ushort? lastSiImm, ref ushort? lastDsImm)
+        private static void UpdateSimpleDosState(
+            Instruction ins,
+            ref byte? lastAh,
+            ref byte? lastAl,
+            ref ushort? lastAxImm,
+            ref ushort? lastBxImm,
+            ref ushort? lastCxImm,
+            ref ushort? lastDxImm,
+            ref ushort? lastSiImm,
+            ref ushort? lastDiImm,
+            ref ushort? lastDsImm,
+            ref ushort? lastEsImm)
         {
             var b = ins.Bytes;
             if (b == null || b.Length == 0)
@@ -1069,6 +1089,20 @@ namespace DOSRE.Dasm
                 return;
             }
 
+            // mov bx, imm16: BB iw
+            if (b[0] == 0xBB && b.Length >= 3)
+            {
+                lastBxImm = (ushort)(b[1] | (b[2] << 8));
+                return;
+            }
+
+            // mov cx, imm16: B9 iw
+            if (b[0] == 0xB9 && b.Length >= 3)
+            {
+                lastCxImm = (ushort)(b[1] | (b[2] << 8));
+                return;
+            }
+
             // mov dx, imm16: BA iw
             if (b[0] == 0xBA && b.Length >= 3)
             {
@@ -1083,10 +1117,24 @@ namespace DOSRE.Dasm
                 return;
             }
 
+            // mov di, imm16: BF iw
+            if (b[0] == 0xBF && b.Length >= 3)
+            {
+                lastDiImm = (ushort)(b[1] | (b[2] << 8));
+                return;
+            }
+
             // mov ds, ax: 8E D8
             if (b[0] == 0x8E && b.Length >= 2 && b[1] == 0xD8)
             {
                 lastDsImm = lastAxImm;
+                return;
+            }
+
+            // mov es, ax: 8E C0
+            if (b[0] == 0x8E && b.Length >= 2 && b[1] == 0xC0)
+            {
+                lastEsImm = lastAxImm;
                 return;
             }
         }
@@ -1096,9 +1144,13 @@ namespace DOSRE.Dasm
             byte? lastAh,
             byte? lastAl,
             ushort? lastAxImm,
+            ushort? lastBxImm,
+            ushort? lastCxImm,
             ushort? lastDxImm,
             ushort? lastSiImm,
+            ushort? lastDiImm,
             ushort? lastDsImm,
+            ushort? lastEsImm,
             Dictionary<uint, string> stringSyms,
             Dictionary<uint, string> stringPrev,
             byte[] module)
@@ -1136,6 +1188,178 @@ namespace DOSRE.Dasm
                             dbDesc += " ; CX bits: 0x01=RO 0x02=Hidden 0x04=System 0x08=VolLabel 0x10=Dir 0x20=Archive";
                     }
 
+                    // AH=3Dh: Open file
+                    if (ah == 0x3D)
+                    {
+                        byte? al = lastAl;
+                        if (!al.HasValue && lastAxImm.HasValue)
+                            al = (byte)(lastAxImm.Value & 0xFF);
+
+                        if (al.HasValue)
+                        {
+                            var acc = (al.Value & 0x03) switch { 0 => "R", 1 => "W", 2 => "RW", _ => "?" };
+                            dbDesc += $" ; AL=0x{al.Value:X2} ({acc})";
+                        }
+                        dbDesc += " ; AL mode: 0=R 1=W 2=RW, bits 4-6: 0=Comp 1=DAll 2=DW 3=DR 4=DNone";
+                    }
+
+                    // AH=3Ch: Create file
+                    if (ah == 0x3C)
+                    {
+                        if (lastCxImm.HasValue)
+                        {
+                            var attr = lastCxImm.Value;
+                            var parts = new List<string>();
+                            if ((attr & 0x01) != 0) parts.Add("RO");
+                            if ((attr & 0x02) != 0) parts.Add("Hid");
+                            if ((attr & 0x04) != 0) parts.Add("Sys");
+                            if ((attr & 0x20) != 0) parts.Add("Arch");
+                            var attrStr = parts.Count > 0 ? string.Join("|", parts) : "Norm";
+                            dbDesc += $" ; CX=0x{attr:X} ({attrStr})";
+                        }
+                        dbDesc += " ; CX attr: 1=RO 2=Hid 4=Sys 0x20=Arch";
+                    }
+
+                    // AH=3Fh, 0x40h: Read/Write file
+                    if (ah == 0x3F || ah == 0x40)
+                    {
+                        if (lastBxImm.HasValue) dbDesc += $" ; BX={lastBxImm.Value}";
+                        if (lastCxImm.HasValue) dbDesc += $" ; CX={lastCxImm.Value}";
+                        dbDesc += " ; BX=handle CX=count DS:DX=buffer";
+                    }
+
+                    // AH=42h: LSeek
+                    if (ah == 0x42)
+                    {
+                        byte? al = lastAl;
+                        if (!al.HasValue && lastAxImm.HasValue)
+                            al = (byte)(lastAxImm.Value & 0xFF);
+
+                        if (al.HasValue)
+                        {
+                            var orig = al.Value switch { 0 => "Start", 1 => "Cur", 2 => "End", _ => "?" };
+                            dbDesc += $" ; AL={al.Value} ({orig})";
+                        }
+                        if (lastBxImm.HasValue) dbDesc += $" ; BX={lastBxImm.Value}";
+                        if (lastCxImm.HasValue && lastDxImm.HasValue)
+                        {
+                            long off = ((long)lastCxImm.Value << 16) | lastDxImm.Value;
+                            dbDesc += $" ; offset={off} (0x{off:X})";
+                        }
+                        dbDesc += " ; AL origin: 0=Start 1=Cur 2=End ; BX=handle CX:DX=offset";
+                    }
+
+                    // AH=47h: Get Cur Dir
+                    if (ah == 0x47)
+                    {
+                        if (lastDxImm.HasValue) dbDesc += $" ; DL={lastDxImm.Value & 0xFF}";
+                        dbDesc += " ; DL=drive(0=def 1=A 2=B) DS:SI=64b buffer";
+                    }
+
+                    // AH=4Bh: Exec
+                    if (ah == 0x4B)
+                    {
+                        byte? al = lastAl;
+                        if (!al.HasValue && lastAxImm.HasValue)
+                            al = (byte)(lastAxImm.Value & 0xFF);
+
+                        if (al.HasValue)
+                        {
+                            var mode = al.Value switch { 0 => "Exec", 1 => "Load", 3 => "Overlay", 5 => "State", _ => "?" };
+                            dbDesc += $" ; AL={al.Value} ({mode})";
+                        }
+                        dbDesc += " ; AL mode: 0=Exec 3=LoadOverlay ; DS:DX=path ES:BX=param block";
+                    }
+
+                    // AH=1Ah: Set DTA
+                    if (ah == 0x1A)
+                    {
+                        dbDesc += " ; DS:DX=DTA buffer";
+                    }
+
+                    // AH=25h, 0x35h: Interrupt vectors
+                    if (ah == 0x25)
+                    {
+                        if (lastAl.HasValue) dbDesc += $" ; AL=0x{lastAl.Value:X2}";
+                        dbDesc += " ; AL=int# DS:DX=handler";
+                    }
+                    else if (ah == 0x35)
+                    {
+                        if (lastAl.HasValue) dbDesc += $" ; AL=0x{lastAl.Value:X2}";
+                        dbDesc += " ; AL=int# (returns ES:BX=vector)";
+                    }
+
+                    // AH=39h, 0x3Ah, 0x3Bh: Mkdir/Rmdir/Chdir
+                    if (ah == 0x39 || ah == 0x3A || ah == 0x3B)
+                    {
+                        dbDesc += " ; DS:DX=path";
+                    }
+
+                    // AH=4Eh: Find First
+                    if (ah == 0x4E)
+                    {
+                        if (lastCxImm.HasValue)
+                        {
+                            var attr = lastCxImm.Value;
+                            var parts = new List<string>();
+                            if ((attr & 0x01) != 0) parts.Add("RO");
+                            if ((attr & 0x02) != 0) parts.Add("Hid");
+                            if ((attr & 0x04) != 0) parts.Add("Sys");
+                            if ((attr & 0x08) != 0) parts.Add("Vol");
+                            if ((attr & 0x10) != 0) parts.Add("Dir");
+                            if ((attr & 0x20) != 0) parts.Add("Arch");
+                            var attrStr = parts.Count > 0 ? string.Join("|", parts) : "Norm";
+                            dbDesc += $" ; CX=0x{attr:X} ({attrStr})";
+                        }
+                        dbDesc += " ; CX attr: 1=RO 2=Hid 4=Sys 0x10=Dir 0x20=Arch ; DS:DX=path";
+                    }
+
+                    // AH=4Fh: Find Next
+                    if (ah == 0x4F)
+                    {
+                        dbDesc += " ; (uses current DTA)";
+                    }
+
+                    // AH=56h: Rename
+                    if (ah == 0x56)
+                    {
+                        dbDesc += " ; DS:DX=oldpath ES:DI=newpath";
+                    }
+
+                    // AH=6Ch: Extended Open/Create
+                    if (ah == 0x6C)
+                    {
+                        if (lastBxImm.HasValue) dbDesc += $" ; BX=0x{lastBxImm.Value:X} (mode)";
+                        if (lastCxImm.HasValue) dbDesc += $" ; CX=0x{lastCxImm.Value:X} (attr)";
+                        if (lastDxImm.HasValue) dbDesc += $" ; DX=0x{lastDxImm.Value:X} (action)";
+                        dbDesc += " ; BX=mode CX=attr DX=action DS:SI=path";
+                    }
+
+                    // AH=44h: IOCTL
+                    if (ah == 0x44)
+                    {
+                        byte? al = lastAl;
+                        if (!al.HasValue && lastAxImm.HasValue)
+                            al = (byte)(lastAxImm.Value & 0xFF);
+                        
+                        if (al.HasValue)
+                        {
+                            var sub = al.Value switch
+                            {
+                                0 => "GetDeviceInfo",
+                                1 => "SetDeviceInfo",
+                                2 => "Receive(Char)",
+                                3 => "Send(Char)",
+                                6 => "GetInputStat",
+                                7 => "GetOutputStat",
+                                8 => "IsRemovable",
+                                _ => $"sub=0x{al.Value:X2}"
+                            };
+                            dbDesc += $" ; {sub}";
+                        }
+                        dbDesc += " ; AL: 0=Get 1=Set 2=Rd 3=Wr 6=InStat 7=OutStat 8=Remov";
+                    }
+
                     // FCB-based: 0x0F, 0x10, 0x11, 0x12, 0x13, 0x16, 0x17, 0x21, 0x22, 0x23, 0x24, 0x27, 0x28
                     if (ah == 0x0F || ah == 0x10 || ah == 0x11 || ah == 0x12 || ah == 0x13 || ah == 0x16 || ah == 0x17 || 
                         ah == 0x21 || ah == 0x22 || ah == 0x23 || ah == 0x24 || ah == 0x27 || ah == 0x28)
@@ -1161,6 +1385,108 @@ namespace DOSRE.Dasm
                         if (!string.IsNullOrEmpty(siDetail))
                             return dbDesc + " ; " + siDetail;
                     }
+                }
+
+                // BIOS Video
+                if (intNo == 0x10 && lastAh.HasValue)
+                {
+                    var ah = lastAh.Value;
+                    if (ah == 0x00) // Set Mode
+                    {
+                        var al = lastAl ?? (byte)(lastAxImm ?? 0);
+                        var mode = al switch
+                        {
+                            0x03 => "80x25 Text",
+                            0x04 => "320x200 4-color",
+                            0x06 => "640x200 BW",
+                            0x0D => "320x200 16-color (EGA)",
+                            0x0E => "640x200 16-color (EGA)",
+                            0x10 => "640x350 16-color (EGA)",
+                            0x12 => "640x480 16-color (VGA)",
+                            0x13 => "320x200 256-color (VGA)",
+                            _ => $"mode 0x{al:X2}"
+                        };
+                        dbDesc += $" ; {mode}";
+                    }
+                    else if (ah == 0x02) // Set Cursor
+                    {
+                        if (lastDxImm.HasValue) dbDesc += $" ; row={lastDxImm.Value >> 8} col={lastDxImm.Value & 0xFF}";
+                        dbDesc += " ; BH=page DH=row DL=col";
+                    }
+                    else if (ah == 0x09 || ah == 0x0A) // Write Char/Attr
+                    {
+                        if (lastAxImm.HasValue) dbDesc += $" ; char='{(char)(lastAxImm.Value & 0xFF)}'";
+                        dbDesc += " ; AL=char BH=page BL=attr CX=count";
+                    }
+                    else if (ah == 0x13) // Write String
+                    {
+                        dbDesc += " ; AL=mode BH=page BL=attr CX=len DX=row/col ES:BP=string";
+                    }
+                }
+
+                // BIOS Disk
+                if (intNo == 0x13 && lastAh.HasValue)
+                {
+                    var ah = lastAh.Value;
+                    if (ah == 0x02 || ah == 0x03) // Read/Write sectors
+                    {
+                        if (lastAl.HasValue) dbDesc += $" ; count={lastAl.Value}";
+                        if (lastDxImm.HasValue) dbDesc += $" ; drive=0x{(lastDxImm.Value & 0xFF):X} head={lastDxImm.Value >> 8}";
+                        dbDesc += " ; AL=count CH=cyl CL=sec DH=head DL=drive ES:BX=buffer";
+                    }
+                }
+
+                // BIOS System
+                if (intNo == 0x15 && lastAh.HasValue)
+                {
+                    var ah = lastAh.Value;
+                    if (ah == 0x86) dbDesc += " ; Wait (CX:DX=microseconds)";
+                    else if (ah == 0x87) dbDesc += " ; Move Extended Block (CX=words ES:SI=GDT)";
+                    else if (ah == 0x88) dbDesc += " ; Get Extended Memory Size";
+                }
+
+                // BIOS Keyboard/Timer/System
+                if (intNo == 0x16) dbDesc += " ; AH=0:Get AH=1:Peek AH=2:ShiftFlags";
+                if (intNo == 0x1A) dbDesc += " ; AH=0:GetTicks AH=1:SetTicks AH=2:GetTime AH=4:GetDate";
+
+                // Multiplex
+                if (intNo == 0x2F && lastAxImm.HasValue)
+                {
+                    var ax = lastAxImm.Value;
+                    if (ax == 0x1680) dbDesc += " ; DPMI: release time slice";
+                    else if (ax == 0x1687) dbDesc += " ; DPMI: get entry point";
+                    else if (ax == 0x4300) dbDesc += " ; XMS: check presence";
+                    else if (ax == 0x4310) dbDesc += " ; XMS: get entry point";
+                }
+
+                // DPMI
+                if (intNo == 0x31 && lastAxImm.HasValue)
+                {
+                    var ax = lastAxImm.Value;
+                    if (ax == 0x0000) dbDesc += " ; DPMI: alloc LDT descriptor (CX=count)";
+                    else if (ax == 0x0100) dbDesc += " ; DPMI: alloc DOS memory (BX=paras)";
+                    else if (ax == 0x0200) dbDesc += " ; DPMI: get real mode vector (BL=int)";
+                    else if (ax == 0x0300) dbDesc += " ; DPMI: simulate real mode int (BL=int ES:DI=regs)";
+                    else if (ax == 0x0501) dbDesc += " ; DPMI: alloc memory block (BX:CX=size)";
+                }
+
+                // Mouse
+                if (intNo == 0x33 && lastAxImm.HasValue)
+                {
+                    var ax = lastAxImm.Value;
+                    var name = ax switch
+                    {
+                        0x0000 => "Reset",
+                        0x0001 => "Show",
+                        0x0002 => "Hide",
+                        0x0003 => "Get Pos/Btns",
+                        0x0004 => "Set Pos",
+                        0x0007 => "Set X Range",
+                        0x0008 => "Set Y Range",
+                        0x000C => "Set Handler",
+                        _ => $"sub=0x{ax:X4}"
+                    };
+                    dbDesc += $" ; Mouse: {name}";
                 }
 
                 return dbDesc;
