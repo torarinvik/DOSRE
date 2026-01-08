@@ -1077,6 +1077,12 @@ namespace DOSRE.Dasm
             [0x03D4] = "VGA CRTC Index",
             [0x03D5] = "VGA CRTC Data",
             [0x03DA] = "VGA Input Status 1",
+
+            // PIC / PIT (IRQ/timers)
+            [0x0020] = "PIC1 Command",
+            [0x0021] = "PIC1 Data",
+            [0x0040] = "PIT Channel 0 Data",
+            [0x0043] = "PIT Mode/Command",
         };
 
         private static bool TryParseMovDxImmediate(string insText, out ushort dxImm)
@@ -1202,6 +1208,10 @@ namespace DOSRE.Dasm
             if (instructions == null || startIdx < 0 || startIdx >= instructions.Count)
                 return string.Empty;
 
+            var restoreHint = TryAnnotateRestoreCachedGlobalsToEsi(instructions, startIdx);
+            if (!string.IsNullOrEmpty(restoreHint))
+                return restoreHint;
+
             // Detect repeated pattern:
             //   mov r32, [esi+disp]
             //   mov [abs32], r32
@@ -1239,6 +1249,44 @@ namespace DOSRE.Dasm
             return $"BBHINT: cache [esi+disp] to globals: {mappingText} ({pairs.Count} stores)";
         }
 
+        private static string TryAnnotateRestoreCachedGlobalsToEsi(List<Instruction> instructions, int startIdx)
+        {
+            // Detect repeated pattern:
+            //   mov reg, [abs]
+            //   mov [esi+disp], reg
+            // which commonly restores a cached struct state.
+            var pairs = new List<(uint abs, int disp)>();
+            var scanLimit = Math.Min(instructions.Count, startIdx + 24);
+
+            for (var i = startIdx; i + 1 < scanLimit; i++)
+            {
+                var a = instructions[i].ToString().Trim();
+                var b = instructions[i + 1].ToString().Trim();
+
+                if (!TryParseMovRegFromAbs(a, out var reg, out var abs))
+                    continue;
+                if (!TryParseMovEsiDispFromReg(b, reg, out var disp))
+                    continue;
+
+                pairs.Add((abs, disp));
+                i++; // consume store
+            }
+
+            if (pairs.Count < 3)
+                return string.Empty;
+
+            var mappingParts = pairs
+                .Take(6)
+                .Select(p => $"0x{p.abs:X}->+0x{p.disp:X}")
+                .ToList();
+
+            var mappingText = string.Join(", ", mappingParts);
+            if (pairs.Count > 6)
+                mappingText += ", ...";
+
+            return $"BBHINT: restore globals to [esi+disp]: {mappingText} ({pairs.Count} stores)";
+        }
+
         private static bool TryParseMovRegFromEsiDisp(string insText, out string reg, out int disp)
         {
             reg = null;
@@ -1247,7 +1295,7 @@ namespace DOSRE.Dasm
                 return false;
 
             // e.g. "mov eax, [esi+0x30]" or "mov edx, [esi+0x30]"
-            var m = Regex.Match(insText, @"^\s*mov\s+(?<reg>e[a-d]x|e[sdi]i|e[bp]p)\s*,\s*\[esi\+(?<disp>0x[0-9A-Fa-f]+|[0-9]+)\]\s*$", RegexOptions.IgnoreCase);
+            var m = Regex.Match(insText, @"^\s*mov\s+(?<reg>e[a-d]x|e[sdi]i|e[bp]p|[a-d]x|[sb]p|[sd]i|[a-d][lh])\s*,\s*\[esi\+(?<disp>0x[0-9A-Fa-f]+|[0-9]+)\]\s*$", RegexOptions.IgnoreCase);
             if (!m.Success)
                 return false;
 
@@ -1266,6 +1314,114 @@ namespace DOSRE.Dasm
             }
 
             return true;
+        }
+
+        private static bool TryParseMovRegFromAbs(string insText, out string reg, out uint abs)
+        {
+            reg = null;
+            abs = 0;
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            // e.g. "mov eax, [0xc25c0]"
+            var m = Regex.Match(insText, @"^\s*mov\s+(?<reg>e[a-d]x|e[sdi]i|e[bp]p|[a-d]x|[sb]p|[sd]i|[a-d][lh])\s*,\s*\[(?<abs>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\]\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            reg = m.Groups["reg"].Value.ToLowerInvariant();
+            var token = m.Groups["abs"].Value.Trim().TrimEnd('h', 'H');
+
+            if (token.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                return uint.TryParse(token.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out abs);
+
+            var isHex = token.Any(c => (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'));
+            return isHex
+                ? uint.TryParse(token, System.Globalization.NumberStyles.HexNumber, null, out abs)
+                : uint.TryParse(token, out abs);
+        }
+
+        private static bool TryParseMovEsiDispFromReg(string insText, string reg, out int disp)
+        {
+            disp = 0;
+            if (string.IsNullOrWhiteSpace(insText) || string.IsNullOrWhiteSpace(reg))
+                return false;
+
+            // e.g. "mov [esi+0x30], eax" or "mov [esi+0x29], dl"
+            var m = Regex.Match(insText, $@"^\s*mov\s+\[esi\+(?<disp>0x[0-9A-Fa-f]+|[0-9]+)\]\s*,\s*{Regex.Escape(reg)}\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            var d = m.Groups["disp"].Value;
+            if (d.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                return int.TryParse(d.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out disp);
+            return int.TryParse(d, out disp);
+        }
+
+        private static string TryAnnotateGenericInstruction(string rawInsText)
+        {
+            if (string.IsNullOrWhiteSpace(rawInsText))
+                return string.Empty;
+
+            var t = rawInsText.Trim();
+            if (t.Equals("cli", StringComparison.OrdinalIgnoreCase))
+                return "IRQ: disable interrupts";
+            if (t.Equals("sti", StringComparison.OrdinalIgnoreCase))
+                return "IRQ: enable interrupts";
+            if (t.StartsWith("retf", StringComparison.OrdinalIgnoreCase))
+                return "RET: far return";
+            if (t.Equals("clc", StringComparison.OrdinalIgnoreCase))
+                return "FLAGS: CF=0 (success?)";
+            if (t.Equals("stc", StringComparison.OrdinalIgnoreCase))
+                return "FLAGS: CF=1 (failure?)";
+
+            // Flag-bit tests like: test dword [0xBAB6C], 0x4
+            var m = Regex.Match(t, @"^test\s+(?:byte|word|dword)\s+\[(?<abs>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\]\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?|\d+)\s*$", RegexOptions.IgnoreCase);
+            if (m.Success)
+            {
+                var absTok = m.Groups["abs"].Value.Trim().TrimEnd('h', 'H');
+                var immTok = m.Groups["imm"].Value.Trim().TrimEnd('h', 'H');
+
+                if (TryParseHexOrDecUInt32(immTok, out var imm) && imm != 0 && (imm & (imm - 1)) == 0)
+                {
+                    var bit = 0;
+                    var x = imm;
+                    while (x > 1) { x >>= 1; bit++; }
+                    return $"FLAGS: test bit {bit} (mask 0x{imm:X}) of [{NormalizeAbsToken(absTok)}]";
+                }
+            }
+
+            if (t.StartsWith("lgs ", StringComparison.OrdinalIgnoreCase))
+                return "PTR: load far pointer + selector (protected mode)";
+
+            return string.Empty;
+        }
+
+        private static bool TryParseHexOrDecUInt32(string token, out uint value)
+        {
+            value = 0;
+            if (string.IsNullOrWhiteSpace(token))
+                return false;
+
+            token = token.Trim();
+            if (token.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                return uint.TryParse(token.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out value);
+
+            var isHex = token.Any(c => (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'));
+            return isHex
+                ? uint.TryParse(token, System.Globalization.NumberStyles.HexNumber, null, out value)
+                : uint.TryParse(token, out value);
+        }
+
+        private static string NormalizeAbsToken(string token)
+        {
+            if (string.IsNullOrWhiteSpace(token))
+                return token;
+            token = token.Trim();
+            if (token.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                return "0x" + token.Substring(2).ToUpperInvariant();
+            // If it looks hex, normalize into 0x....
+            var isHex = token.Any(c => (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'));
+            return isHex ? "0x" + token.ToUpperInvariant() : token;
         }
 
         private static bool TryParseMovAbsFromReg(string insText, string reg, out uint abs)
@@ -2383,10 +2539,11 @@ namespace DOSRE.Dasm
                     }
 
                     var bytes = BitConverter.ToString(ins.Bytes).Replace("-", string.Empty);
-                    var insText = ins.ToString();
+                    var rawInsText = ins.ToString();
+                    var insText = rawInsText;
 
                     // Update DX immediate tracking before appending any '; ...' annotations.
-                    if (TryParseMovDxImmediate(insText, out var dxImm))
+                    if (TryParseMovDxImmediate(rawInsText, out var dxImm))
                         lastDxImm16 = dxImm;
 
                     if (leInsights)
@@ -2476,6 +2633,10 @@ namespace DOSRE.Dasm
                     var ioHint = TryAnnotateIoPortAccess(instructions, insLoopIndex, lastDxImm16);
                     if (!string.IsNullOrEmpty(ioHint))
                         insText += $" ; {ioHint}";
+
+                    var genHint = TryAnnotateGenericInstruction(rawInsText);
+                    if (!string.IsNullOrEmpty(genHint))
+                        insText += $" ; {genHint}";
 
                     if (haveFixups && fixupsHere.Count > 0)
                     {
