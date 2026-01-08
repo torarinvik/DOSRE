@@ -424,16 +424,9 @@ namespace DOSRE.UI.impl
                 // so existing command lines keep working when switching targets.
                 var mzFull = _bMzFull || _bLeFull;
                 var mzBytes = _mzBytesLimit ?? _leBytesLimit;
-                var mzInsights = _bMzInsights || _bLeInsights;
+                var mzInsights = _bMzInsights || _bLeInsights || _bAnalysis;
                 if (MZDisassembler.TryDisassembleToString(_sInputFile, mzFull, mzBytes, mzInsights, _toolchainHint, out var mzOutput, out var mzError))
                 {
-                    if (_bAnalysis)
-                        _logger.Warn("Warning: -analysis is not supported for MZ inputs, ignoring");
-                    if (_bStrings)
-                        _logger.Warn("Warning: -strings is not supported for MZ inputs (use -mzinsights for string scan), ignoring");
-                    if (_bMinimal)
-                        _logger.Warn("Warning: -minimal has no effect for MZ inputs (MZ output is always minimal)");
-
                     if (_toolchainHint != EnumToolchainHint.None)
                         _logger.Info($"Toolchain hint enabled: {_toolchainHint}");
 
