@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using MBBSDASM.Analysis;
 using MBBSDASM.Logging;
 using NLog;
 using SharpDisasm;
@@ -776,6 +777,25 @@ namespace MBBSDASM.Dasm
             var ins = instructions[idx];
             if (!TryGetIntNumber(ins, out var intNo))
                 return string.Empty;
+
+            // Database-driven descriptions first.
+            byte? dbAh = null;
+            ushort? dbAx = null;
+            if (intNo == 0x21 || intNo == 0x10 || intNo == 0x16)
+                dbAh = TryResolveAhBefore(instructions, idx);
+            if (intNo == 0x31 || intNo == 0x33)
+                dbAx = TryResolveAxBefore(instructions, idx);
+
+            string db;
+            if (DosInterruptDatabase.Instance.TryDescribe(intNo, dbAh, dbAx, out db) && !string.IsNullOrEmpty(db))
+            {
+                // Preserve existing prefixing style for readability in LE output.
+                if (intNo == 0x21)
+                    return "INT21: " + db;
+                if (intNo == 0x31)
+                    return "INT31: " + db;
+                return "INT: " + db;
+            }
 
             // BIOS/DOS/high-level tags
             if (intNo == 0x10)

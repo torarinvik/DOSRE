@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using MBBSDASM.Analysis;
 using SharpDisasm;
 
 namespace MBBSDASM.Dasm
@@ -684,6 +685,32 @@ namespace MBBSDASM.Dasm
                 return string.Empty;
 
             var intNo = b[1];
+
+            // Prefer database-driven descriptions.
+            // For MZ we only track AH (8-bit) today; AX is unknown in this quick tracker.
+            string dbDesc;
+            if (DosInterruptDatabase.Instance.TryDescribe(intNo, lastAh, null, out dbDesc) && !string.IsNullOrEmpty(dbDesc))
+            {
+                // Preserve the richer inline-string detail for DOS print-$.
+                if (intNo == 0x21 && lastAh.HasValue && lastAh.Value == 0x09)
+                {
+                    if (lastDxImm.HasValue)
+                    {
+                        var dx = (uint)lastDxImm.Value;
+                        if (stringSyms != null && stringSyms.TryGetValue(dx, out var sym))
+                        {
+                            var prev = stringPrev != null && stringPrev.TryGetValue(dx, out var p) ? p : string.Empty;
+                            if (!string.IsNullOrEmpty(prev))
+                                return dbDesc + $" ; DX={sym} \"{prev}\"";
+                            return dbDesc + $" ; DX={sym}";
+                        }
+                        return dbDesc + $" ; DX=0x{dx:X}";
+                    }
+                }
+
+                return dbDesc;
+            }
+
             if (intNo == 0x21)
             {
                 if (!lastAh.HasValue)

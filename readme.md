@@ -4,7 +4,12 @@
 
 ![MajorBBS Disassembler (MBBSDASM) Preview](./mbbsdasm_ui.png)
 
-**MBBSDASM** is a Disassembler for 16-bit Segmented Executable File Format ("New Executable", or just NE) files. The Disassembler itself is written in C# using .Net Core.
+**MBBSDASM** is a disassembler for classic DOS/Windows-era binaries. It started as a 16-bit Segmented Executable File Format ("New Executable", or just NE) disassembler, and now also includes best-effort support for:
+
+* DOS MZ EXE ("old" EXE header)
+* DOS4GW LE (32-bit linear executables)
+
+The disassembler itself is written in C#.
 
 It was created to assist in my own personal education of The MajorBBS (MBBS) Bulletin Board System by GALACTICOMM, which was one of the first multi-line, multi-user commercial BBS systems available at the time of its hayday. MBBS loaded modules that were an early version of DLL's files built with Borland Turbo C++.
 
@@ -23,6 +28,18 @@ While **MBBSDASM** targets Major BBS/Worldgroup files for analysis, any 16-bit N
 An example command line to disassemble a DLL and perform enhanced MajorBBS/Worldgroup Analysis:
 ```
 -i c:\bbsv6\example.dll -o c:\bbsv6\output.txt -strings -analysis
+```
+
+Examples for DOS binaries:
+
+* DOS MZ EXE (best-effort insights, limit output):
+```
+-i perform.EXE -o perform.disasm.txt -mzinsights -mzbytes 131072
+```
+
+* DOS4GW LE (insights + fixups/globals, limit output):
+```
+-i EUROBLST.EXE -o EUROBLST.disasm.txt -leinsights -lefixups -leglobals -lebytes 131072
 ```
 
 # Current Features
@@ -100,11 +117,15 @@ The Enhanced Analysis mode can be extended through pull requests by adding Modul
 * Enhance MBBS Analysis
     * Enhanced Variable Labeling and Tracking
     * Enhanced Auto-Documentation of GALGSBL and MAJORBBS imported function
-* Add support for DOS MZ EXE files
-	* This would allow disassembly of the MajorBBS/WG EXE files
+* Expand DOS-focused analysis
+    * Improve INT 21h decoding, compiler/runtime pattern recognition (Borland/Watcom), and higher-level pseudo-C summaries
 * Add support for Worldgroup 3.0+
     * Requires additional support for disassembly of 32-bit PE format EXE/DLL files
 	* The best tool for this is probably IDA Freeware, which disassembles PE files with ease
+
+# Reference Docs
+
+This repo includes a `DosDocs/` folder with PDFs covering DOS assembly/interrupts and Borland/Watcom documentation. These are reference materials intended to inform disassembly annotations and reverse engineering notes.
 
 # Using Hex-Rays IDA for Disassembly?
 Check out [MBBSDASM.IDA](https://github.com/enusbaum/MBBSDASM.IDA), which is a collection of IDS/IDT files that allow Hex-Rays IDA to properly identify/comment imports for both MAJORBBS and GALGSBL.

@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using MBBSDASM.Analysis;
 using MBBSDASM.Dasm;
 using MBBSDASM.Enums;
 using MBBSDASM.Logging;
@@ -61,6 +62,13 @@ namespace MBBSDASM.UI.impl
         ///     Includes all strings discovered in DATA segments at the end of the disassembly output
         /// </summary>
         private bool _bStrings;
+
+        /// <summary>
+        ///     Target DOS version for interrupt/service annotations
+        ///     Specified with the -dosver <major.minor> argument
+        ///     Example: -dosver 6.22
+        /// </summary>
+        private string _dosVersion = "6.22";
 
         /// <summary>
         ///     LE (DOS4GW) full disassembly
@@ -180,6 +188,12 @@ namespace MBBSDASM.UI.impl
                         case "-STRINGS":
                             _bStrings = true;
                             break;
+                        case "-DOSVER":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -DOSVER requires a value (example: 6.22)");
+                            _dosVersion = _args[i + 1];
+                            i++;
+                            break;
                         case "-LEFULL":
                             _bLeFull = true;
                             break;
@@ -242,6 +256,8 @@ namespace MBBSDASM.UI.impl
                             Console.WriteLine(
                                 "-STRINGS -- Output all strings found in DATA segments at end of Disassembly");
                             Console.WriteLine(
+                                "-DOSVER <v> -- Target DOS version for interrupt annotations (example: 6.22, 7.10)");
+                            Console.WriteLine(
                                 "-LEFULL -- (LE inputs) Disassemble executable objects from the start (can be very large)");
                             Console.WriteLine(
                                 "-LEBYTES <n> -- (LE inputs) Limit disassembly to n bytes from start offset");
@@ -270,6 +286,9 @@ namespace MBBSDASM.UI.impl
                 //Verify Input File is Valid
                 if (string.IsNullOrEmpty(_sInputFile) || !File.Exists(_sInputFile))
                     throw new Exception("Error: Please specify a valid input file");
+
+                // Apply DOS version selection globally for interrupt DB lookups.
+                DosInterruptDatabase.SetCurrentDosVersionGlobal(_dosVersion);
 
                 //LE/DOS4GW support (minimal): bypass NE-specific pipeline
                 //NOTE: This tool was originally NE-only; LE support does not include relocations/import analysis.
