@@ -353,6 +353,7 @@ namespace DOSRE.Dasm
                         lastAh, lastAl,
                         lastAxImm, lastBxImm, lastCxImm, lastDxImm,
                         lastSiImm, lastDiImm,
+                        lastBpImm,
                         lastDsImm, lastEsImm);
                     if (!string.IsNullOrEmpty(hHigh)) insText += $" ; {hHigh}";
 

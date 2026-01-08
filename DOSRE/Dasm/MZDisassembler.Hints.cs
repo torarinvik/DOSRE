@@ -116,6 +116,7 @@ namespace DOSRE.Dasm
             byte? ah, byte? al,
             ushort? ax, ushort? bx, ushort? cx, ushort? dx,
             ushort? si, ushort? di,
+            ushort? bp,
             ushort? ds, ushort? es)
         {
             var ins = instructions[index];
@@ -310,11 +311,11 @@ namespace DOSRE.Dasm
 
             // Segment setup
 
-            var bdaHint = TryGetBiosDataAreaHint(text, ds, es, bx, si, di);
+            var bdaHint = TryGetBiosDataAreaHint(text, b, ds, es, bx, bp, si, di);
             if (!string.IsNullOrEmpty(bdaHint))
                 return bdaHint;
 
-            var pspHint = TryGetPspHint(text, ds, es, bx, si, di, index);
+            var pspHint = TryGetPspHint(text, b, ds, es, bx, bp, si, di, index);
             if (!string.IsNullOrEmpty(pspHint))
                 return pspHint;
             if (ins.Mnemonic == ud_mnemonic_code.UD_Imov && ax.HasValue && text.Contains("ax"))
@@ -432,7 +433,7 @@ namespace DOSRE.Dasm
             return null;
         }
 
-        private static bool TryGetSimpleMemOffset(string insText, ushort? bx, ushort? si, ushort? di, out string seg, out ushort off)
+        private static bool TryGetSimpleMemOffset(string insText, ushort? bx, ushort? bp, ushort? si, ushort? di, out string seg, out ushort off)
         {
             seg = null;
             off = 0;
@@ -461,6 +462,7 @@ namespace DOSRE.Dasm
                 ushort? baseVal = baseName switch
                 {
                     "bx" => bx,
+                    "bp" => bp,
                     "si" => si,
                     "di" => di,
                     _ => null
@@ -482,6 +484,53 @@ namespace DOSRE.Dasm
                 if (total < 0 || total > 0xFFFF)
                     return false;
 
+                // Default segment for BP-based addressing is SS.
+                if (seg == null && baseName == "bp")
+                    seg = "ss";
+
+                off = (ushort)total;
+                return true;
+            }
+
+            // Combined base+index: [bx+si+disp], [bx+di+disp], [bp+si+disp], [bp+di+disp]
+            m = Regex.Match(insText, @"\[(?:(?<seg>cs|ds|es|ss):)?(?<b>bx|bp)\s*\+\s*(?<i>si|di)\s*(?:(?<sign>[+-])\s*0x(?<hex>[0-9a-fA-F]+))?\]");
+            if (m.Success)
+            {
+                seg = m.Groups["seg"].Success ? m.Groups["seg"].Value : null;
+                var bName = m.Groups["b"].Value;
+                var iName = m.Groups["i"].Value;
+
+                ushort? bVal = bName switch
+                {
+                    "bx" => bx,
+                    "bp" => bp,
+                    _ => null
+                };
+                ushort? iVal = iName switch
+                {
+                    "si" => si,
+                    "di" => di,
+                    _ => null
+                };
+
+                if (!bVal.HasValue || !iVal.HasValue)
+                    return false;
+
+                var total = (int)bVal.Value + (int)iVal.Value;
+                if (m.Groups["hex"].Success)
+                {
+                    if (!int.TryParse(m.Groups["hex"].Value, System.Globalization.NumberStyles.HexNumber, null, out var disp))
+                        return false;
+                    var sign = m.Groups["sign"].Success ? m.Groups["sign"].Value : "+";
+                    total = sign == "-" ? total - disp : total + disp;
+                }
+
+                if (total < 0 || total > 0xFFFF)
+                    return false;
+
+                if (seg == null && bName == "bp")
+                    seg = "ss";
+
                 off = (ushort)total;
                 return true;
             }
@@ -495,6 +544,7 @@ namespace DOSRE.Dasm
                 ushort? baseVal = baseName switch
                 {
                     "bx" => bx,
+                    "bp" => bp,
                     "si" => si,
                     "di" => di,
                     _ => null
@@ -510,6 +560,46 @@ namespace DOSRE.Dasm
                 if (total < 0 || total > 0xFFFF)
                     return false;
 
+                if (seg == null && baseName == "bp")
+                    seg = "ss";
+
+                off = (ushort)total;
+                return true;
+            }
+
+            // Variant: [0x10+bx+si]
+            m = Regex.Match(insText, @"\[(?:(?<seg>cs|ds|es|ss):)?0x(?<hex>[0-9a-fA-F]+)\s*\+\s*(?<b>bx|bp)\s*\+\s*(?<i>si|di)\]");
+            if (m.Success)
+            {
+                seg = m.Groups["seg"].Success ? m.Groups["seg"].Value : null;
+                if (!int.TryParse(m.Groups["hex"].Value, System.Globalization.NumberStyles.HexNumber, null, out var disp))
+                    return false;
+
+                var bName = m.Groups["b"].Value;
+                var iName = m.Groups["i"].Value;
+                ushort? bVal = bName switch
+                {
+                    "bx" => bx,
+                    "bp" => bp,
+                    _ => null
+                };
+                ushort? iVal = iName switch
+                {
+                    "si" => si,
+                    "di" => di,
+                    _ => null
+                };
+
+                if (!bVal.HasValue || !iVal.HasValue)
+                    return false;
+
+                var total = disp + (int)bVal.Value + (int)iVal.Value;
+                if (total < 0 || total > 0xFFFF)
+                    return false;
+
+                if (seg == null && bName == "bp")
+                    seg = "ss";
+
                 off = (ushort)total;
                 return true;
             }
@@ -517,7 +607,156 @@ namespace DOSRE.Dasm
             return false;
         }
 
-        private static string TryGetBiosDataAreaHint(string insText, ushort? ds, ushort? es, ushort? bx, ushort? si, ushort? di)
+        private static bool TryDecodeMemRef16FromBytes(byte[] bytes, ushort? bx, ushort? bp, ushort? si, ushort? di, out string seg, out ushort off)
+        {
+            seg = null;
+            off = 0;
+
+            if (bytes == null || bytes.Length == 0)
+                return false;
+
+            var i = 0;
+            var addressSizeOverride = false;
+            string segOverride = null;
+
+            // Prefix scan (best-effort)
+            while (i < bytes.Length)
+            {
+                var p = bytes[i];
+                if (p == 0x26) { segOverride = "es"; i++; continue; }
+                if (p == 0x2E) { segOverride = "cs"; i++; continue; }
+                if (p == 0x36) { segOverride = "ss"; i++; continue; }
+                if (p == 0x3E) { segOverride = "ds"; i++; continue; }
+                if (p == 0xF0 || p == 0xF2 || p == 0xF3) { i++; continue; } // lock/rep
+                if (p == 0x66) { i++; continue; } // operand-size override
+                if (p == 0x67) { addressSizeOverride = true; i++; continue; }
+                break;
+            }
+
+            if (addressSizeOverride)
+                return false; // 32-bit addressing; ignore here
+
+            if (i >= bytes.Length)
+                return false;
+
+            var op = bytes[i++];
+
+            // moffs16 forms (direct offset, no ModRM)
+            if (op == 0xA0 || op == 0xA1 || op == 0xA2 || op == 0xA3)
+            {
+                if (i + 1 >= bytes.Length)
+                    return false;
+                off = (ushort)(bytes[i] | (bytes[i + 1] << 8));
+                seg = segOverride; // null means default DS
+                return true;
+            }
+
+            // Some common ModRM-using opcodes. If not in this set, bail and let text parsing handle it.
+            var usesModRm = op is 0x88 or 0x89 or 0x8A or 0x8B or 0x8C or 0x8E or 0xC6 or 0xC7 or 0x80 or 0x81 or 0x83 or 0x8F or 0xFF or 0xFE or 0xF6 or 0xF7;
+            if (!usesModRm)
+                return false;
+
+            if (i >= bytes.Length)
+                return false;
+
+            var modrm = bytes[i++];
+            var mod = (modrm >> 6) & 0x03;
+            var rm = modrm & 0x07;
+
+            if (mod == 0x03)
+                return false; // register operand, not memory
+
+            int disp = 0;
+            if (mod == 0x01)
+            {
+                if (i >= bytes.Length) return false;
+                disp = unchecked((sbyte)bytes[i++]);
+            }
+            else if (mod == 0x02)
+            {
+                if (i + 1 >= bytes.Length) return false;
+                disp = bytes[i] | (bytes[i + 1] << 8);
+                i += 2;
+            }
+
+            // mod==00 rm==110 is disp16 direct
+            if (mod == 0x00 && rm == 0x06)
+            {
+                if (i + 1 >= bytes.Length) return false;
+                off = (ushort)(bytes[i] | (bytes[i + 1] << 8));
+                seg = segOverride; // null means default DS
+                return true;
+            }
+
+            int baseSum;
+            bool baseUsesBp;
+            switch (rm)
+            {
+                case 0x00: // [bx+si]
+                    if (!bx.HasValue || !si.HasValue) return false;
+                    baseSum = bx.Value + si.Value;
+                    baseUsesBp = false;
+                    break;
+                case 0x01: // [bx+di]
+                    if (!bx.HasValue || !di.HasValue) return false;
+                    baseSum = bx.Value + di.Value;
+                    baseUsesBp = false;
+                    break;
+                case 0x02: // [bp+si]
+                    if (!bp.HasValue || !si.HasValue) return false;
+                    baseSum = bp.Value + si.Value;
+                    baseUsesBp = true;
+                    break;
+                case 0x03: // [bp+di]
+                    if (!bp.HasValue || !di.HasValue) return false;
+                    baseSum = bp.Value + di.Value;
+                    baseUsesBp = true;
+                    break;
+                case 0x04: // [si]
+                    if (!si.HasValue) return false;
+                    baseSum = si.Value;
+                    baseUsesBp = false;
+                    break;
+                case 0x05: // [di]
+                    if (!di.HasValue) return false;
+                    baseSum = di.Value;
+                    baseUsesBp = false;
+                    break;
+                case 0x06: // [bp] (mod != 00)
+                    if (!bp.HasValue) return false;
+                    baseSum = bp.Value;
+                    baseUsesBp = true;
+                    break;
+                case 0x07: // [bx]
+                    if (!bx.HasValue) return false;
+                    baseSum = bx.Value;
+                    baseUsesBp = false;
+                    break;
+                default:
+                    return false;
+            }
+
+            var total = baseSum + disp;
+            off = (ushort)(total & 0xFFFF);
+
+            // Segment selection: segment override wins; otherwise BP-based uses SS, others use DS
+            if (segOverride != null)
+                seg = segOverride;
+            else
+                seg = baseUsesBp ? "ss" : null;
+
+            return true;
+        }
+
+        private static bool TryGetMemOffset(string insText, byte[] insBytes, ushort? bx, ushort? bp, ushort? si, ushort? di, out string seg, out ushort off)
+        {
+            if (TryDecodeMemRef16FromBytes(insBytes, bx, bp, si, di, out seg, out off))
+                return true;
+
+            return TryGetSimpleMemOffset(insText, bx, bp, si, di, out seg, out off);
+        }
+
+        private static string TryGetBiosDataAreaHint(string insText, byte[] insBytes, ushort? ds, ushort? es, ushort? bx, ushort? bp, ushort? si, ushort? di)
         {
             if (string.IsNullOrEmpty(insText))
                 return null;
@@ -527,7 +766,7 @@ namespace DOSRE.Dasm
             if (ds != bdaSeg && es != bdaSeg)
                 return null;
 
-            if (!TryGetSimpleMemOffset(insText, bx, si, di, out var seg, out var offU16))
+            if (!TryGetMemOffset(insText, insBytes, bx, bp, si, di, out var seg, out var offU16))
                 return null;
 
             var off = (int)offU16;
@@ -572,7 +811,7 @@ namespace DOSRE.Dasm
             return $"BDA 0040:{off:X4}h ; {desc}";
         }
 
-        private static string TryGetPspHint(string insText, ushort? ds, ushort? es, ushort? bx, ushort? si, ushort? di, int index)
+        private static string TryGetPspHint(string insText, byte[] insBytes, ushort? ds, ushort? es, ushort? bx, ushort? bp, ushort? si, ushort? di, int index)
         {
             if (string.IsNullOrEmpty(insText))
                 return null;
@@ -586,7 +825,7 @@ namespace DOSRE.Dasm
             if (ds == 0x0040 || es == 0x0040)
                 return null;
 
-            if (!TryGetSimpleMemOffset(insText, bx, si, di, out var seg, out var offU16))
+            if (!TryGetMemOffset(insText, insBytes, bx, bp, si, di, out var seg, out var offU16))
                 return null;
 
             if (seg is "cs" or "ss")
