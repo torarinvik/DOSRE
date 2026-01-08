@@ -580,9 +580,6 @@ namespace DOSRE.Dasm
                         }
                     }
 
-                    // Track a tiny amount of state for DOS interrupt hints.
-                    UpdateSimpleDosState(ins, ref lastAh, ref lastAl, ref lastAxImm, ref lastBxImm, ref lastCxImm, ref lastDxImm, ref lastSiImm, ref lastDiImm, ref lastBpImm, ref lastDsImm, ref lastEsImm);
-
                     var indirectCallHint = TryGetIndirectCallHint(ins, instructions, i);
                     if (!string.IsNullOrEmpty(indirectCallHint))
                         insText += $" ; {indirectCallHint}";
@@ -591,9 +588,12 @@ namespace DOSRE.Dasm
                     if (!string.IsNullOrEmpty(packedHint))
                         insText += $" ; {packedHint}";
 
-                    var higherHint = TryGetHigherLevelHint(ins, i > 0 ? instructions[i - 1] : null, lastAh, lastAl, lastAxImm, lastBxImm, lastCxImm, lastDxImm, lastSiImm, lastDiImm, lastDsImm, lastEsImm);
+                    var higherHint = TryGetHigherLevelHint(instructions, i, lastAh, lastAl, lastAxImm, lastBxImm, lastCxImm, lastDxImm, lastSiImm, lastDiImm, lastDsImm, lastEsImm);
                     if (!string.IsNullOrEmpty(higherHint))
                         insText += $" ; {higherHint}";
+
+                    // Track state for the NEXT instruction.
+                    UpdateSimpleDosState(ins, ref lastAh, ref lastAl, ref lastAxImm, ref lastBxImm, ref lastCxImm, ref lastDxImm, ref lastSiImm, ref lastDiImm, ref lastBpImm, ref lastDsImm, ref lastEsImm);
                 }
 
                 if (mzInsights && TryGetRelativeBranchTarget16(ins, out var target2, out var isCall2))
@@ -1483,19 +1483,49 @@ namespace DOSRE.Dasm
                 return;
             }
 
-            // Register-to-register moves (subset of common ones)
+            // Register-to-register moves (expanded)
             if (b.Length >= 2 && b[0] == 0x89) // mov r/m, r
             {
                 if (b[1] == 0xC3) { lastBxImm = lastAxImm; return; } // mov bx, ax
                 if (b[1] == 0xC1) { lastCxImm = lastAxImm; return; } // mov cx, ax
                 if (b[1] == 0xC2) { lastDxImm = lastAxImm; return; } // mov dx, ax
+                if (b[1] == 0xC6) { lastSiImm = lastAxImm; return; } // mov si, ax
+                if (b[1] == 0xC7) { lastDiImm = lastAxImm; return; } // mov di, ax
                 if (b[1] == 0xC5) { lastBpImm = lastAxImm; return; } // mov bp, ax
+                
+                if (b[1] == 0xD8) { lastAxImm = lastBxImm; return; } // mov ax, bx
+                if (b[1] == 0xD1) { lastCxImm = lastBxImm; return; } // mov cx, bx
+                if (b[1] == 0xD2) { lastDxImm = lastBxImm; return; } // mov dx, bx
                 if (b[1] == 0xDD) { lastBpImm = lastBxImm; return; } // mov bp, bx
+                
+                if (b[1] == 0xE0) { lastAxImm = lastCxImm; return; } // mov ax, cx
+                if (b[1] == 0xEB) { lastBxImm = lastCxImm; return; } // mov bx, cx
+                if (b[1] == 0xEA) { lastDxImm = lastCxImm; return; } // mov dx, cx
                 if (b[1] == 0xCD) { lastBpImm = lastCxImm; return; } // mov bp, cx
+                
+                if (b[1] == 0xF0) { lastAxImm = lastDxImm; return; } // mov ax, dx
+                if (b[1] == 0xFB) { lastBxImm = lastDxImm; return; } // mov bx, dx
+                if (b[1] == 0xF9) { lastCxImm = lastDxImm; return; } // mov cx, dx
                 if (b[1] == 0xD5) { lastBpImm = lastDxImm; return; } // mov bp, dx
+                
                 if (b[1] == 0xF5) { lastBpImm = lastSiImm; return; } // mov bp, si
                 if (b[1] == 0xFD) { lastBpImm = lastDiImm; return; } // mov bp, di
             }
+
+            // mov Sreg, r/m (subset for DS/ES from common registers)
+            if (b.Length >= 2 && b[0] == 0x8E)
+            {
+                if (b[1] == 0xD8) { lastDsImm = lastAxImm; return; } // mov ds, ax
+                if (b[1] == 0xDA) { lastDsImm = lastDxImm; return; } // mov ds, dx
+                if (b[1] == 0xDB) { lastDsImm = lastBxImm; return; } // mov ds, bx
+                if (b[1] == 0xD9) { lastDsImm = lastCxImm; return; } // mov ds, cx
+
+                if (b[1] == 0xC0) { lastEsImm = lastAxImm; return; } // mov es, ax
+                if (b[1] == 0xC2) { lastEsImm = lastDxImm; return; } // mov es, dx
+                if (b[1] == 0xC3) { lastEsImm = lastBxImm; return; } // mov es, bx
+                if (b[1] == 0xC1) { lastEsImm = lastCxImm; return; } // mov es, cx
+            }
+
             if (b.Length >= 2 && b[0] == 0x8B) // mov r, r/m
             {
                 if (b[1] == 0xD8) { lastBxImm = lastAxImm; return; } // mov bx, ax
@@ -1560,8 +1590,38 @@ namespace DOSRE.Dasm
                 lastAxImm = null;
             }
             else if (dest.Contains("bx")) lastBxImm = null;
+            else if (dest.Contains("bl"))
+            {
+                if (lastBxImm.HasValue) lastBxImm = (ushort)(lastBxImm.Value & 0xFF00);
+                else lastBxImm = null;
+            }
+            else if (dest.Contains("bh"))
+            {
+                if (lastBxImm.HasValue) lastBxImm = (ushort)(lastBxImm.Value & 0x00FF);
+                else lastBxImm = null;
+            }
             else if (dest.Contains("cx")) lastCxImm = null;
+            else if (dest.Contains("cl"))
+            {
+                if (lastCxImm.HasValue) lastCxImm = (ushort)(lastCxImm.Value & 0xFF00);
+                else lastCxImm = null;
+            }
+            else if (dest.Contains("ch"))
+            {
+                if (lastCxImm.HasValue) lastCxImm = (ushort)(lastCxImm.Value & 0x00FF);
+                else lastCxImm = null;
+            }
             else if (dest.Contains("dx")) lastDxImm = null;
+            else if (dest.Contains("dl"))
+            {
+                if (lastDxImm.HasValue) lastDxImm = (ushort)(lastDxImm.Value & 0xFF00);
+                else lastDxImm = null;
+            }
+            else if (dest.Contains("dh"))
+            {
+                if (lastDxImm.HasValue) lastDxImm = (ushort)(lastDxImm.Value & 0x00FF);
+                else lastDxImm = null;
+            }
             else if (dest.Contains("si")) lastSiImm = null;
             else if (dest.Contains("di")) lastDiImm = null;
             else if (dest.Contains("bp")) lastBpImm = null;
@@ -1572,7 +1632,8 @@ namespace DOSRE.Dasm
             if (ins.Mnemonic == ud_mnemonic_code.UD_Ipop || ins.Mnemonic == ud_mnemonic_code.UD_Icall || 
                 ins.Mnemonic == ud_mnemonic_code.UD_Imul || ins.Mnemonic == ud_mnemonic_code.UD_Idiv ||
                 ins.Mnemonic == ud_mnemonic_code.UD_Iloop || ins.Mnemonic == ud_mnemonic_code.UD_Iloope || ins.Mnemonic == ud_mnemonic_code.UD_Iloopne ||
-                ins.Mnemonic == ud_mnemonic_code.UD_Imovsb || ins.Mnemonic == ud_mnemonic_code.UD_Imovsw || ins.Mnemonic == ud_mnemonic_code.UD_Istosb || ins.Mnemonic == ud_mnemonic_code.UD_Istosw)
+                ins.Mnemonic == ud_mnemonic_code.UD_Imovsb || ins.Mnemonic == ud_mnemonic_code.UD_Imovsw || ins.Mnemonic == ud_mnemonic_code.UD_Istosb || ins.Mnemonic == ud_mnemonic_code.UD_Istosw ||
+                ins.Mnemonic == ud_mnemonic_code.UD_Icmpsb || ins.Mnemonic == ud_mnemonic_code.UD_Icmpsw || ins.Mnemonic == ud_mnemonic_code.UD_Iscasb || ins.Mnemonic == ud_mnemonic_code.UD_Iscasw)
             {
                 if (ins.Mnemonic == ud_mnemonic_code.UD_Icall || ins.Mnemonic == ud_mnemonic_code.UD_Imul || ins.Mnemonic == ud_mnemonic_code.UD_Idiv)
                 {
@@ -1583,7 +1644,8 @@ namespace DOSRE.Dasm
                 {
                     lastCxImm = null;
                 }
-                if (ins.Mnemonic == ud_mnemonic_code.UD_Imovsb || ins.Mnemonic == ud_mnemonic_code.UD_Imovsw || ins.Mnemonic == ud_mnemonic_code.UD_Istosb || ins.Mnemonic == ud_mnemonic_code.UD_Istosw)
+                if (ins.Mnemonic == ud_mnemonic_code.UD_Imovsb || ins.Mnemonic == ud_mnemonic_code.UD_Imovsw || ins.Mnemonic == ud_mnemonic_code.UD_Istosb || ins.Mnemonic == ud_mnemonic_code.UD_Istosw ||
+                    ins.Mnemonic == ud_mnemonic_code.UD_Icmpsb || ins.Mnemonic == ud_mnemonic_code.UD_Icmpsw || ins.Mnemonic == ud_mnemonic_code.UD_Iscasb || ins.Mnemonic == ud_mnemonic_code.UD_Iscasw)
                 {
                     lastSiImm = null; lastDiImm = null;
                     if (text.Contains("rep")) lastCxImm = 0;
@@ -1692,16 +1754,106 @@ namespace DOSRE.Dasm
         }
 
         private static string TryGetHigherLevelHint(
-            Instruction ins,
-            Instruction prev,
+            List<Instruction> instructions,
+            int index,
             byte? ah, byte? al,
             ushort? ax, ushort? bx, ushort? cx, ushort? dx,
             ushort? si, ushort? di,
             ushort? ds, ushort? es)
         {
+            var ins = instructions[index];
+            var prev = index > 0 ? instructions[index - 1] : null;
             var b = ins.Bytes;
             if (b == null || b.Length == 0) return null;
             var text = ins.ToString();
+
+            // LDS/LES/LFS/LGS/LSS far pointer loads
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Ilds || ins.Mnemonic == ud_mnemonic_code.UD_Iles ||
+                ins.Mnemonic == ud_mnemonic_code.UD_Ilfs || ins.Mnemonic == ud_mnemonic_code.UD_Ilgs || ins.Mnemonic == ud_mnemonic_code.UD_Ilss)
+            {
+                var sreg = ins.Mnemonic switch {
+                    ud_mnemonic_code.UD_Ilds => "DS",
+                    ud_mnemonic_code.UD_Iles => "ES",
+                    ud_mnemonic_code.UD_Ilfs => "FS",
+                    ud_mnemonic_code.UD_Ilgs => "GS",
+                    ud_mnemonic_code.UD_Ilss => "SS",
+                    _ => "?"
+                };
+                
+                // Try to find the register being loaded
+                var modrm = b[b.Length > 2 && (b[0] == 0x0F || b[0] == 0x2E || b[0] == 0x3E) ? 2 : 1];
+                var reg = (modrm >> 3) & 0x07;
+                var regName = GetRegName16(reg);
+                return $"LOAD FAR PTR {sreg}:{regName}";
+            }
+
+            // REP string operations
+            if (text.Contains("rep") || text.Contains("repne"))
+            {
+                var count = cx.HasValue ? $"0x{cx.Value:X4}" : "CX";
+                if (ins.Mnemonic == ud_mnemonic_code.UD_Imovsb || ins.Mnemonic == ud_mnemonic_code.UD_Imovsw)
+                {
+                    var unit = ins.Mnemonic == ud_mnemonic_code.UD_Imovsw ? "words" : "bytes";
+                    return $"MEMCPY: {count} {unit} from DS:SI to ES:DI";
+                }
+                if (ins.Mnemonic == ud_mnemonic_code.UD_Istosb || ins.Mnemonic == ud_mnemonic_code.UD_Istosw)
+                {
+                    var val = (ins.Mnemonic == ud_mnemonic_code.UD_Istosw) ? (ax.HasValue ? $"0x{ax.Value:X4}" : "AX") : (al.HasValue ? $"0x{al.Value:X2}" : "AL");
+                    return $"MEMSET: fill {count} with {val} at ES:DI";
+                }
+                if (ins.Mnemonic == ud_mnemonic_code.UD_Icmpsb || ins.Mnemonic == ud_mnemonic_code.UD_Icmpsw)
+                    return $"MEMCMP: compare {count} units at DS:SI and ES:DI";
+                if (ins.Mnemonic == ud_mnemonic_code.UD_Iscasb || ins.Mnemonic == ud_mnemonic_code.UD_Iscasw)
+                {
+                    var val = (ins.Mnemonic == ud_mnemonic_code.UD_Iscasw) ? (ax.HasValue ? $"0x{ax.Value:X4}" : "AX") : (al.HasValue ? $"0x{al.Value:X2}" : "AL");
+                    return $"MEMSCAN: find {val} in {count} units at ES:DI";
+                }
+            }
+
+            // DOS INT 21h Sub-functions
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Iint && b.Length >= 2 && b[0] == 0xCD && b[1] == 0x21)
+            {
+                if (ah == 0x25) {
+                    var alHex = al.HasValue ? $"{al.Value:X2}h" : "AL";
+                    return $"DOS: Set Vector for INT {alHex} to DS:DX";
+                }
+                if (ah == 0x35) {
+                    var alHex = al.HasValue ? $"{al.Value:X2}h" : "AL";
+                    return $"DOS: Get Vector for INT {alHex} (returns ES:BX)";
+                }
+                if (ah == 0x48) {
+                    var bxStr = bx.HasValue ? $"{bx.Value} paragraphs (0x{bx.Value:X4})" : "BX paragraphs";
+                    return $"DOS: Allocate Memory ({bxStr})";
+                }
+                if (ah == 0x49) {
+                    var esStr = es.HasValue ? $"0x{es.Value:X4}" : "ES";
+                    return $"DOS: Free Memory at 0x{esStr}";
+                }
+                if (ah == 0x3D) {
+                    var access = (al.HasValue) ? (al.Value & 0x03) switch { 0 => "Read", 1 => "Write", 2 => "R/W", _ => "?" } : "AL";
+                    return $"DOS: Open File (Access: {access}) DS:DX -> filename";
+                }
+                if (ah == 0x3E) return $"DOS: Close File (Handle: BX)";
+                if (ah == 0x3F) return $"DOS: Read File (Handle: BX, CX bytes to DS:DX)";
+                if (ah == 0x40) return $"DOS: Write File (Handle: BX, CX bytes from DS:DX)";
+            }
+
+            // BIOS INT 10h (Video) Sub-functions
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Iint && b.Length >= 2 && b[0] == 0xCD && b[1] == 0x10)
+            {
+                if (ah == 0x02) {
+                    var dhStr = dx.HasValue ? $"R:{(dx.Value >> 8)}" : "DH";
+                    var dlStr = dx.HasValue ? $"C:{(dx.Value & 0xFF)}" : "DL";
+                    var bhStr = bx.HasValue ? $"Pg:{(bx.Value >> 8)}" : "BH";
+                    return $"BIOS Video: Set Cursor {dhStr},{dlStr} {bhStr}";
+                }
+                if (ah == 0x09) {
+                    var alStr = ax.HasValue ? $"Char:{(char)(ax.Value & 0xFF)}" : "AL";
+                    var blStr = bx.HasValue ? $"Attr:0x{(bx.Value & 0xFF):X2}" : "BL";
+                    var cxStr = cx.HasValue ? $"Count:{cx.Value}" : "CX";
+                    return $"BIOS Video: Write Char/Attr {alStr} {blStr} {cxStr}";
+                }
+            }
 
             // Shift-by-CL (helps make bit-twiddling less opaque)
             if (b[0] == 0xD3 && b.Length >= 2 && cx.HasValue)
@@ -1713,18 +1865,7 @@ namespace DOSRE.Dasm
                 var rm = modrm & 0x07;
                 if (mod == 0x03) // register operand
                 {
-                    var regName = rm switch
-                    {
-                        0 => "AX",
-                        1 => "CX",
-                        2 => "DX",
-                        3 => "BX",
-                        4 => "SP",
-                        5 => "BP",
-                        6 => "SI",
-                        7 => "DI",
-                        _ => null
-                    };
+                    var regName = GetRegName16(rm);
 
                     if (!string.IsNullOrEmpty(regName) && (reg == 4 || reg == 5 || reg == 7))
                     {
@@ -1742,9 +1883,7 @@ namespace DOSRE.Dasm
                 }
             }
 
-            // Detect writing a FAR pointer at DS:0000 via consecutive stores to [0] and [2]
-            //   mov [0000], bx
-            //   mov [0002], cx
+            // Detect writing a FAR pointer at [disp] via consecutive stores to [disp] and [disp+2]
             if (b.Length >= 4 && b[0] == 0x89)
             {
                 var modrm = b[1];
@@ -1755,8 +1894,8 @@ namespace DOSRE.Dasm
                 {
                     var disp = (ushort)(b[2] | (b[3] << 8));
 
-                    // current: mov [0002], cx
-                    if (disp == 0x0002 && reg == 0x01 && prev?.Bytes != null && prev.Bytes.Length >= 4)
+                    // current: mov [disp], reg (segment part)
+                    if (prev?.Bytes != null && prev.Bytes.Length >= 4)
                     {
                         var pb = prev.Bytes;
                         if (pb[0] == 0x89)
@@ -1768,14 +1907,29 @@ namespace DOSRE.Dasm
                             if (pmod == 0x00 && prm == 0x06)
                             {
                                 var pdisp = (ushort)(pb[2] | (pb[3] << 8));
-                                // prev: mov [0000], bx
-                                if (pdisp == 0x0000 && preg == 0x03)
+                                // We check for consecutive writes to [X] and [X+2] where X is 4-byte aligned (possible IVT vector)
+                                if (disp == pdisp + 2 && (pdisp % 4) == 0)
                                 {
+                                    string pVal = GetRegName16(preg);
+                                    string vVal = GetRegName16(reg);
+                                    int intNo = pdisp / 4;
+
                                     if (ds.HasValue && ds.Value == 0x0000)
-                                        return "WRITE IVT INT 00h vector = CX:BX";
+                                        return $"WRITE IVT INT {intNo:X2}h vector = {vVal}:{pVal}";
+                                    if (ds.HasValue && ds.Value < 0x0100) // Also likely IVT if DS is very low
+                                        return $"WRITE IVT? INT {intNo:X2}h vector = {vVal}:{pVal} (DS=0x{ds.Value:X4})";
+                                    
                                     if (ds.HasValue)
-                                        return $"STORE FAR PTR [DS:0000] = CX:BX (DS=0x{ds.Value:X4})";
-                                    return "STORE FAR PTR [DS:0000] = CX:BX";
+                                        return $"STORE FAR PTR [DS:{pdisp:X4}] = {vVal}:{pVal} (DS=0x{ds.Value:X4})";
+                                    
+                                    return $"STORE FAR PTR [DS:{pdisp:X4}] = {vVal}:{pVal}";
+                                }
+                                // Generic consecutive FAR-ptr-like store
+                                if (disp == pdisp + 2)
+                                {
+                                    string pVal = GetRegName16(preg);
+                                    string vVal = GetRegName16(reg);
+                                    return $"STORE FAR PTR [DS:{pdisp:X4}] = {vVal}:{pVal}";
                                 }
                             }
                         }
@@ -2036,7 +2190,18 @@ namespace DOSRE.Dasm
                         dbDesc += " ; DL=drive";
                     }
 
-                    // AH=3Dh: Open file
+                    // AH=39h-4Eh: Common path-based operations (mkdir, rmdir, chdir, create, open, unlink, chmod, findfirst)
+                    if (ah == 0x39 || ah == 0x3A || ah == 0x3B || ah == 0x3C || ah == 0x3D || ah == 0x41 || ah == 0x43 || ah == 0x4E)
+                    {
+                        if (lastDxImm.HasValue)
+                        {
+                            var linear = lastDsImm.HasValue ? (uint)((lastDsImm.Value << 4) + lastDxImm.Value) : lastDxImm.Value;
+                            var fn = TryReadAsciiString(module, linear, 128);
+                            if (!string.IsNullOrEmpty(fn)) dbDesc += $" ; path=\"{fn}\"";
+                        }
+                    }
+
+                    // AH=3Dh: Open file (Extra detail)
                     if (ah == 0x3D)
                     {
                         byte? al = lastAl;
@@ -2048,25 +2213,12 @@ namespace DOSRE.Dasm
                             var acc = (al.Value & 0x03) switch { 0 => "R", 1 => "W", 2 => "RW", _ => "?" };
                             dbDesc += $" ; AL=0x{al.Value:X2} ({acc})";
                         }
-                        
-                        if (lastDxImm.HasValue)
-                        {
-                            var linear = lastDsImm.HasValue ? (uint)((lastDsImm.Value << 4) + lastDxImm.Value) : lastDxImm.Value;
-                            var fn = TryReadAsciiString(module, linear, 128);
-                            if (!string.IsNullOrEmpty(fn)) dbDesc += $" ; path=\"{fn}\"";
-                        }
                         dbDesc += " ; AL mode: 0=R 1=W 2=RW, bits 4-6: 0=Comp 1=DAll 2=DW 3=DR 4=DNone";
                     }
 
-                    // AH=3Ch: Create file
+                    // AH=3Ch: Create file (Extra detail)
                     if (ah == 0x3C)
                     {
-                        if (lastDxImm.HasValue)
-                        {
-                            var linear = lastDsImm.HasValue ? (uint)((lastDsImm.Value << 4) + lastDxImm.Value) : lastDxImm.Value;
-                            var fn = TryReadAsciiString(module, linear, 128);
-                            if (!string.IsNullOrEmpty(fn)) dbDesc += $" ; path=\"{fn}\"";
-                        }
                         if (lastCxImm.HasValue)
                         {
                             var attr = lastCxImm.Value;
@@ -2117,25 +2269,19 @@ namespace DOSRE.Dasm
                         dbDesc += " ; (returns ES:BX -> current handler)";
                     }
 
-                    // AH=42h: LSeek
+                    // AH=42h: LSeek (Better detail)
                     if (ah == 0x42)
                     {
                         byte? al = lastAl;
-                        if (!al.HasValue && lastAxImm.HasValue)
-                            al = (byte)(lastAxImm.Value & 0xFF);
-
-                        if (al.HasValue)
-                        {
-                            var orig = al.Value switch { 0 => "Start", 1 => "Cur", 2 => "End", _ => "?" };
-                            dbDesc += $" ; AL={al.Value} ({orig})";
-                        }
-                        if (lastBxImm.HasValue) dbDesc += $" ; BX={lastBxImm.Value}";
+                        if (!al.HasValue && lastAxImm.HasValue) al = (byte)(lastAxImm.Value & 0xFF);
+                        var origin = al.HasValue ? (al.Value switch { 0 => "START", 1 => "CURR", 2 => "END", _ => $"?({al.Value})" }) : "AL";
+                        if (lastBxImm.HasValue) dbDesc += $" ; handle 0x{lastBxImm.Value:X}";
                         if (lastCxImm.HasValue && lastDxImm.HasValue)
                         {
                             long off = ((long)lastCxImm.Value << 16) | lastDxImm.Value;
-                            dbDesc += $" ; offset={off} (0x{off:X})";
+                            dbDesc += $" ; offset {off} (0x{off:X})";
                         }
-                        dbDesc += " ; AL origin: 0=Start 1=Cur 2=End ; BX=handle CX:DX=offset";
+                        dbDesc += $" ; origin {origin} (AL={al})";
                     }
 
                     // AH=47h: Get Cur Dir
@@ -2563,10 +2709,32 @@ namespace DOSRE.Dasm
                     var ah = lastAh.Value;
                     if (ah == 0x02 || ah == 0x03) // Read/Write sectors
                     {
-                        if (lastAl.HasValue) dbDesc += $" ; count={lastAl.Value}";
-                        if (lastDxImm.HasValue) dbDesc += $" ; drive=0x{(lastDxImm.Value & 0xFF):X} head={lastDxImm.Value >> 8}";
-                        dbDesc += " ; AL=count CH=cyl CL=sec DH=head DL=drive ES:BX=buffer";
+                        var op = ah == 0x02 ? "Read" : "Write";
+                        byte? al = lastAl;
+                        if (!al.HasValue && lastAxImm.HasValue) al = (byte)(lastAxImm.Value & 0xFF);
+                        var count = al.HasValue ? al.Value.ToString() : "?";
+
+                        string chs = "";
+                        if (lastCxImm.HasValue)
+                        {
+                            var cx = lastCxImm.Value;
+                            var cyl = (cx >> 8) | ((cx & 0xC0) << 2);
+                            var sect = cx & 0x3F;
+                            chs += $" cyl:{cyl} sect:{sect}";
+                        }
+                        if (lastDxImm.HasValue)
+                        {
+                            var dx = lastDxImm.Value;
+                            var head = dx >> 8;
+                            var drive = dx & 0xFF;
+                            var driveStr = drive >= 0x80 ? $"HDD:{drive:X2}h" : $"FDD:{drive:X2}h";
+                            chs += $" head:{head} {driveStr}";
+                        }
+                        dbDesc += $" ; {op} {count} sect{chs}";
                     }
+                    else if (ah == 0x00) dbDesc += " ; Reset disk system";
+                    else if (ah == 0x01) dbDesc += " ; Get last disk status";
+                    else if (ah == 0x08) dbDesc += " ; Get drive parameters";
                 }
 
                 // BIOS Serial
@@ -2903,6 +3071,22 @@ namespace DOSRE.Dasm
                 return string.Empty;
 
             return s.Replace("\"", "\\\"");
+        }
+
+        private static string GetRegName16(int reg)
+        {
+            return reg switch
+            {
+                0 => "AX",
+                1 => "CX",
+                2 => "DX",
+                3 => "BX",
+                4 => "SP",
+                5 => "BP",
+                6 => "SI",
+                7 => "DI",
+                _ => $"R{reg}"
+            };
         }
 
         private static string TryReadDollarString(byte[] module, uint linear, int maxLen)
