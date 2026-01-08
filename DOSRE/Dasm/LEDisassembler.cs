@@ -854,11 +854,15 @@ namespace DOSRE.Dasm
             Dictionary<uint, string> stringPreview,
             List<LEObject> objects,
             Dictionary<int, byte[]> objBytesByIndex,
-            out string signature)
+            out string signature,
+            out Dictionary<string, string> inferredLocalAliases,
+            out List<string> localAliasHints)
         {
             // Recognize compiler-generated decision trees for switch/case on a byte register.
             // Typical shape: cmp al, imm ; jz loc_case ; ... ; unconditional jmp loc_default
             signature = null;
+            inferredLocalAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            localAliasHints = new List<string>();
             if (instructions == null || startIdx < 0 || startIdx >= instructions.Count)
                 return string.Empty;
 
@@ -935,6 +939,20 @@ namespace DOSRE.Dasm
                 ? "ASCII dispatch (likely token/command char)"
                 : (maybeAsciiDispatch ? "ASCII dispatch" : string.Empty);
 
+            // Compute per-case roles first, then infer local aliases, then render using the aliases.
+            var roleByCase = new Dictionary<byte, string>();
+            foreach (var kv in cases)
+            {
+                var role = TrySummarizeCaseTargetRole(instructions, insIndexByAddr, kv.Value, stringSymbols, stringPreview, objects, objBytesByIndex);
+                if (!string.IsNullOrEmpty(role))
+                    roleByCase[kv.Key] = role;
+            }
+
+            InferLocalAliasesFromSwitchCases(roleByCase, out inferredLocalAliases, out localAliasHints);
+
+            // Don't capture the out-parameter in lambdas.
+            var inferredAliases = inferredLocalAliases;
+
             var parts = cases
                 .OrderBy(k => k.Key)
                 .Take(10)
@@ -942,9 +960,12 @@ namespace DOSRE.Dasm
                 {
                     var ch = FormatImm8AsChar(k.Key);
                     var imm = !string.IsNullOrEmpty(ch) ? $"{ch} (0x{k.Key:X2})" : $"0x{k.Key:X2}";
-                    var role = TrySummarizeCaseTargetRole(instructions, insIndexByAddr, k.Value, stringSymbols, stringPreview, objects, objBytesByIndex);
+                    roleByCase.TryGetValue(k.Key, out var role);
                     if (!string.IsNullOrEmpty(role))
+                    {
+                        role = RewriteLocalAliasTokens(role, inferredAliases);
                         return $"{imm}->loc_{k.Value:X8} ({role})";
+                    }
                     return $"{imm}->loc_{k.Value:X8}";
                 })
                 .ToList();
@@ -983,6 +1004,175 @@ namespace DOSRE.Dasm
 
                 return m.Value;
             });
+        }
+
+        private static string RewriteLocalAliasTokens(string text, Dictionary<string, string> localAliases)
+        {
+            if (string.IsNullOrEmpty(text) || localAliases == null || localAliases.Count == 0)
+                return text;
+
+            return Regex.Replace(text, @"\blocal_[0-9A-Fa-f]+\b", m =>
+            {
+                var key = m.Value;
+                if (localAliases.TryGetValue(key, out var alias) && !string.IsNullOrWhiteSpace(alias))
+                    return alias;
+                return key;
+            });
+        }
+
+        private sealed class LocalAliasEvidence
+        {
+            public readonly HashSet<byte> Cases = new HashSet<byte>();
+            public readonly HashSet<uint> Values = new HashSet<uint>();
+            public bool AddressTaken;
+        }
+
+        private static bool TryParseRoleNoteSetLocal(string note, out string localName, out uint value)
+        {
+            localName = null;
+            value = 0;
+            if (string.IsNullOrWhiteSpace(note))
+                return false;
+
+            // Example: "set local_1C=0x1"
+            var m = Regex.Match(note.Trim(), @"^set\s+(?<local>local_[0-9A-Fa-f]+)\s*=\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            localName = m.Groups["local"].Value;
+            var imm = m.Groups["imm"].Value;
+            if (!TryParseHexOrDecUInt32(imm, out var v))
+                return false;
+            value = v;
+            return true;
+        }
+
+        private static bool TryParseRoleNoteAddrTaken(string note, out string localName)
+        {
+            localName = null;
+            if (string.IsNullOrWhiteSpace(note))
+                return false;
+
+            // Example: "edx=&local_14"
+            var m = Regex.Match(note.Trim(), @"^(?<reg>e[a-z]{2})\s*=\s*&(?<local>local_[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            localName = m.Groups["local"].Value;
+            return true;
+        }
+
+        private static bool IsSafeAliasIdent(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s))
+                return false;
+            return Regex.IsMatch(s, @"^[A-Za-z_][A-Za-z0-9_]*$");
+        }
+
+        private static string MakeOptAliasFromCase(byte caseVal)
+        {
+            if (caseVal >= (byte)'A' && caseVal <= (byte)'Z')
+                return $"opt_{(char)caseVal}";
+            if (caseVal >= (byte)'a' && caseVal <= (byte)'z')
+                return $"opt_{(char)caseVal}";
+            if (caseVal >= (byte)'0' && caseVal <= (byte)'9')
+                return $"opt_{(char)caseVal}";
+            return $"opt_0x{caseVal:X2}";
+        }
+
+        private static string MakeOutAliasFromCase(byte caseVal)
+        {
+            if (caseVal >= (byte)'A' && caseVal <= (byte)'Z')
+                return $"out_{(char)caseVal}";
+            if (caseVal >= (byte)'a' && caseVal <= (byte)'z')
+                return $"out_{(char)caseVal}";
+            if (caseVal >= (byte)'0' && caseVal <= (byte)'9')
+                return $"out_{(char)caseVal}";
+            return $"out_0x{caseVal:X2}";
+        }
+
+        private static void InferLocalAliasesFromSwitchCases(
+            Dictionary<byte, string> roleByCase,
+            out Dictionary<string, string> inferredAliases,
+            out List<string> aliasHints)
+        {
+            inferredAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            aliasHints = new List<string>();
+
+            if (roleByCase == null || roleByCase.Count == 0)
+                return;
+
+            var evidence = new Dictionary<string, LocalAliasEvidence>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var kv in roleByCase)
+            {
+                var caseVal = kv.Key;
+                var role = kv.Value;
+                if (string.IsNullOrWhiteSpace(role))
+                    continue;
+
+                foreach (var part in role.Split(new[] { ", " }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    if (TryParseRoleNoteSetLocal(part, out var local, out var v))
+                    {
+                        if (!evidence.TryGetValue(local, out var ev))
+                            evidence[local] = ev = new LocalAliasEvidence();
+                        ev.Cases.Add(caseVal);
+                        ev.Values.Add(v);
+                    }
+
+                    if (TryParseRoleNoteAddrTaken(part, out var local2))
+                    {
+                        if (!evidence.TryGetValue(local2, out var ev2))
+                            evidence[local2] = ev2 = new LocalAliasEvidence();
+                        ev2.Cases.Add(caseVal);
+                        ev2.AddressTaken = true;
+                    }
+                }
+            }
+
+            var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var kv in evidence.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                var local = kv.Key;
+                var ev = kv.Value;
+
+                // Only rename when we have a fairly safe interpretation.
+                // - boolean-ish options (only 0/1 writes, and at least one case sets to 1)
+                // - address-taken locals (likely out parameters)
+                var isBoolish = ev.Values.Count > 0 && ev.Values.All(v => v == 0 || v == 1) && ev.Values.Contains(1);
+
+                byte? chosenCase = ev.Cases.OrderBy(c => c).FirstOrDefault();
+                if (ev.Cases.Count > 0)
+                    chosenCase = ev.Cases.OrderBy(c => c).First();
+
+                string alias = null;
+                if (isBoolish && chosenCase.HasValue)
+                    alias = MakeOptAliasFromCase(chosenCase.Value);
+                else if (!isBoolish && ev.AddressTaken && chosenCase.HasValue)
+                    alias = MakeOutAliasFromCase(chosenCase.Value);
+
+                if (string.IsNullOrWhiteSpace(alias) || !IsSafeAliasIdent(alias))
+                    continue;
+
+                // Ensure uniqueness.
+                var baseAlias = alias;
+                var suffix = 2;
+                while (used.Contains(alias))
+                {
+                    alias = baseAlias + "_" + suffix;
+                    suffix++;
+                }
+                used.Add(alias);
+
+                inferredAliases[local] = alias;
+
+                var caseText = string.Join(",", ev.Cases.OrderBy(c => c).Take(8).Select(c => FormatImm8AsChar(c) + $"(0x{c:X2})"));
+                var valText = ev.Values.Count > 0 ? $" values={string.Join("/", ev.Values.OrderBy(v => v).Select(v => $"0x{v:X}"))}" : string.Empty;
+                var kind = isBoolish ? "bool" : (ev.AddressTaken ? "out" : "local");
+                aliasHints.Add($"VARALIAS: {local} -> {alias} ({kind}; cases {caseText}{valText})");
+            }
         }
 
         private static void ScanStrings(List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex, out Dictionary<uint, string> symbols, out Dictionary<uint, string> preview)
@@ -3349,6 +3539,9 @@ namespace DOSRE.Dasm
                     ["ecx"] = "this"
                 };
 
+                // Per-function local aliasing (best-effort). Keys are like "local_1C".
+                var localAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
                 ushort? lastDxImm16 = null;
 
                 // Suppress repeating switch/decision-tree hints on every bb_ label inside the same compare chain.
@@ -3370,6 +3563,9 @@ namespace DOSRE.Dasm
                         lastSwitchSig = null;
                         lastSwitchIdx = int.MinValue;
                         emittedSwitchSigs.Clear();
+
+                        // Reset per-function local aliasing.
+                        localAliases.Clear();
 
                         if (callXrefs.TryGetValue(addr, out var callers) && callers.Count > 0)
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; XREF: called from {string.Join(", ", callers.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}", commentColumn: 0, maxWidth: 160);
@@ -3414,12 +3610,26 @@ namespace DOSRE.Dasm
 
                         if (leInsights)
                         {
-                            var sw = TryAnnotateByteSwitchDecisionTree(instructions, insIndexByAddr, insLoopIndex, stringSymbols, stringPreview, objects, objBytesByIndex, out var swSig);
+                            var sw = TryAnnotateByteSwitchDecisionTree(instructions, insIndexByAddr, insLoopIndex, stringSymbols, stringPreview, objects, objBytesByIndex, out var swSig, out var inferredLocals, out var aliasHints);
                             if (!string.IsNullOrEmpty(sw) && !string.IsNullOrEmpty(swSig))
                             {
                                 if (!(swSig == lastSwitchSig && (insLoopIndex - lastSwitchIdx) <= 64) && !emittedSwitchSigs.Contains(swSig))
                                 {
+                                    // Merge inferred local aliases (only if not already set).
+                                    if (inferredLocals != null && inferredLocals.Count > 0)
+                                    {
+                                        foreach (var kv in inferredLocals)
+                                            if (!localAliases.ContainsKey(kv.Key))
+                                                localAliases[kv.Key] = kv.Value;
+                                    }
+
                                     AppendWrappedDisasmLine(sb, string.Empty, $" ; {sw}", commentColumn: 0, maxWidth: 160);
+
+                                    if (aliasHints != null && aliasHints.Count > 0)
+                                    {
+                                        foreach (var h in aliasHints.Take(8))
+                                            AppendWrappedDisasmLine(sb, string.Empty, $" ; {h}", commentColumn: 0, maxWidth: 160);
+                                    }
                                     lastSwitchSig = swSig;
                                     lastSwitchIdx = insLoopIndex;
                                     emittedSwitchSigs.Add(swSig);
@@ -3437,12 +3647,25 @@ namespace DOSRE.Dasm
                         if (!string.IsNullOrEmpty(bbHint))
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; {bbHint}", commentColumn: 0, maxWidth: 160);
 
-                        var sw = TryAnnotateByteSwitchDecisionTree(instructions, insIndexByAddr, insLoopIndex, stringSymbols, stringPreview, objects, objBytesByIndex, out var swSig);
+                        var sw = TryAnnotateByteSwitchDecisionTree(instructions, insIndexByAddr, insLoopIndex, stringSymbols, stringPreview, objects, objBytesByIndex, out var swSig, out var inferredLocals, out var aliasHints);
                         if (!string.IsNullOrEmpty(sw) && !string.IsNullOrEmpty(swSig))
                         {
                             if (!(swSig == lastSwitchSig && (insLoopIndex - lastSwitchIdx) <= 64) && !emittedSwitchSigs.Contains(swSig))
                             {
+                                if (inferredLocals != null && inferredLocals.Count > 0)
+                                {
+                                    foreach (var kv in inferredLocals)
+                                        if (!localAliases.ContainsKey(kv.Key))
+                                            localAliases[kv.Key] = kv.Value;
+                                }
+
                                 AppendWrappedDisasmLine(sb, string.Empty, $" ; {sw}", commentColumn: 0, maxWidth: 160);
+
+                                if (aliasHints != null && aliasHints.Count > 0)
+                                {
+                                    foreach (var h in aliasHints.Take(8))
+                                        AppendWrappedDisasmLine(sb, string.Empty, $" ; {h}", commentColumn: 0, maxWidth: 160);
+                                }
                                 lastSwitchSig = swSig;
                                 lastSwitchIdx = insLoopIndex;
                                 emittedSwitchSigs.Add(swSig);
@@ -3461,6 +3684,9 @@ namespace DOSRE.Dasm
                     if (leInsights)
                     {
                         insText = RewriteStackFrameOperands(insText);
+
+                        // Apply any inferred per-function local aliases after stack-frame normalization.
+                        insText = RewriteLocalAliasTokens(insText, localAliases);
 
                         // Update aliases based on the *current* instruction before rewriting.
                         UpdatePointerAliases(insText, liveAliases, inferredPtrSymbols);
