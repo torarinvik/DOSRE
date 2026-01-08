@@ -1,324 +1,140 @@
 {
+  "meta": {
+    "description": "Best-effort DOS/BIOS interrupt signature database for disassembly annotations. Not exhaustive.",
+    "defaultDosVersion": "6.22",
+    "notes": [
+      "Use -dosver <major.minor> to pick between version-variant entries (e.g. 3.30, 5.00, 6.22, 7.00, 7.10).",
+      "Many services are stable across DOS 3.x-6.x; some (like LFN) are 7.x+ only."
+    ]
+  },
   "interrupts": [
-    {
-      "int": "0x13",
-      "name": "BIOS disk",
-      "selector": "AH",
-      "functions": [
-        { "code": "0x00", "name": "Reset disk system", "params": [], "returns": ["AH=status", "CF=error"] },
-        { "code": "0x02", "name": "Read sectors (CHS)", "params": ["AL=count"], "returns": ["AH=status", "CF=error"] },
-        { "code": "0x03", "name": "Write sectors (CHS)", "params": ["AL=count"], "returns": ["AH=status", "CF=error"] },
-        { "code": "0x08", "name": "Get drive parameters", "params": [], "returns": ["CF=error"] }
-      ]
-    },
-    {
-      "int": "0x14",
-      "name": "BIOS serial",
-      "selector": "AH",
-      "functions": [
-        { "code": "0x00", "name": "Initialize port", "params": ["AL=line control"], "returns": ["AH=line status"] },
-        { "code": "0x01", "name": "Send character", "params": ["AL=char"], "returns": ["AH=line status"] },
-        { "code": "0x02", "name": "Receive character", "params": [], "returns": ["AL=char", "AH=line status"] }
-      ]
-    },
-    {
-      "int": "0x15",
-      "name": "BIOS misc",
-      "selector": "AH",
-      "functions": [
-        { "code": "0x86", "name": "Wait (microseconds)", "params": ["CX:DX=usec"], "returns": ["CF=error"] }
-      ]
-    },
-    {
-      "int": "0x10",
-      "name": "BIOS video",
-      "selector": "AH",
-      "functions": [
-        {
-          "code": "0x00",
-          "name": "Set video mode",
-          "params": ["AL=mode"],
-          "returns": []
-        },
-        {
-          "code": "0x0E",
-          "name": "Teletype output",
-          "params": ["AL=character", "BH=page", "BL=foreground color (graphics modes)"],
-          "returns": []
-        },
-        {
-          "code": "0x01",
-          "name": "Set text cursor shape",
-          "params": ["CH=start", "CL=end"],
-          "returns": []
-        },
-        {
-          "code": "0x02",
-          "name": "Set cursor position",
-          "params": ["BH=page", "DH=row", "DL=col"],
-          "returns": []
-        },
-        {
-          "code": "0x03",
-          "name": "Get cursor position",
-          "params": ["BH=page"],
-          "returns": ["DH=row", "DL=col"]
-        },
-        {
-          "code": "0x06",
-          "name": "Scroll up window",
-          "params": ["AL=lines", "BH=attribute"],
-          "returns": []
-        },
-        {
-          "code": "0x09",
-          "name": "Write character/attribute",
-          "params": ["AL=char", "BH=page", "BL=attr", "CX=count"],
-          "returns": []
-        }
-      ]
-    },
-    {
-      "int": "0x16",
-      "name": "BIOS keyboard",
-      "selector": "AH",
-      "functions": [
-        {
-          "code": "0x00",
-          "name": "Read keystroke",
-          "params": [],
-          "returns": ["AL=ASCII", "AH=scan code"]
-        },
-        {
-          "code": "0x01",
-          },
-          {
-            "code": "0x02",
-            "name": "Get shift flags",
-            "params": [],
-            "returns": ["AL=shift flags"]
-          "name": "Check keystroke (ZF set if none)",
-          "params": [],
-          "returns": ["AL=ASCII (if available)", "AH=scan code (if available)"]
-      {
-        "int": "0x17",
-        "name": "BIOS printer",
-        "selector": "AH",
-        "functions": [
-          { "code": "0x00", "name": "Print character", "params": ["AL=char"], "returns": ["AH=status"] },
-          { "code": "0x01", "name": "Initialize printer", "params": [], "returns": ["AH=status"] },
-          { "code": "0x02", "name": "Get printer status", "params": [], "returns": ["AH=status"] }
-        ]
-      },
-      {
-        "int": "0x1A",
-        "name": "BIOS time",
-        "selector": "AH",
-        "functions": [
-          { "code": "0x00", "name": "Get system time", "params": [], "returns": ["CX:DX=ticks", "AL=midnight flag"] },
-          { "code": "0x02", "name": "Get real-time clock time", "params": [], "returns": ["CH=hour", "CL=min", "DH=sec"] },
-          { "code": "0x04", "name": "Get real-time clock date", "params": [], "returns": ["CH=century", "CL=year", "DH=month", "DL=day"] }
-        ]
-      },
-        }
-      ]
-    },
-    {
-      "int": "0x21",
-          { "code": "0x01", "name": "Input character with echo", "params": [], "returns": ["AL=char"] },
-          { "code": "0x02", "name": "Display character", "params": ["DL=char"], "returns": [] },
-          { "code": "0x06", "name": "Direct console I/O", "params": ["DL=char or 0xFF"], "returns": ["AL=char"] },
-          { "code": "0x07", "name": "Direct character input (no echo)", "params": [], "returns": ["AL=char"] },
-          { "code": "0x08", "name": "Character input (no echo)", "params": [], "returns": ["AL=char"] },
-      "name": "DOS",
-      "selector": "AH",
-      "functions": [
-        {
-          "code": "0x09",
-          "name": "Display string ($-terminated)",
-          "params": ["DS:DX -> '$'-terminated string"],
-          "returns": []
-        },
-        {
-          "code": "0x0A",
-          "name": "Buffered keyboard input",
-          { "code": "0x19", "name": "Get current default drive", "params": [], "returns": ["AL=drive (0=A)"] },
-          "params": ["DS:DX -> input buffer"],
-          "returns": []
-        },
-        {
-          "code": "0x1A",
-          "name": "Set DTA",
-          { "code": "0x2A", "name": "Get date", "params": [], "returns": ["CX=year", "DH=month", "DL=day"] },
-          { "code": "0x2C", "name": "Get time", "params": [], "returns": ["CH=hour", "CL=min", "DH=sec", "DL=1/100s"] },
-          "params": ["DS:DX -> DTA"],
-          "returns": []
-        },
-        {
-          "code": "0x2F",
-          "name": "Get DTA",
-          "params": [],
-          "returns": ["ES:BX -> DTA"]
-        },
-        {
-          "code": "0x30",
-          "name": "Get DOS version",
-          "params": [],
-          "returns": ["AL=major", "AH=minor"]
-        },
-        {
-          "code": "0x25",
-          "name": "Set interrupt vector",
-          "params": ["AL=interrupt", "DS:DX -> handler"],
-          "returns": []
-        },
-        {
-          "code": "0x35",
-          "name": "Get interrupt vector",
-          { "code": "0x36", "name": "Get free disk space", "params": ["DL=drive (0=default)"], "returns": ["AX=sectors/cluster", "BX=free clusters", "CX=bytes/sector", "DX=total clusters"] },
-          "params": ["AL=interrupt"],
-          "returns": ["ES:BX -> handler"]
-        },
-        {
-          "code": "0x3C",
-          "name": "Create file",
-          "params": ["CX=attributes", "DS:DX -> ASCIIZ filename"],
-          "returns": ["AX=handle", "CF=error"]
-        },
-        {
-          "code": "0x3D",
-          "name": "Open file",
-          "params": ["AL=access mode", "DS:DX -> ASCIIZ filename"],
-          "returns": ["AX=handle", "CF=error"]
-        },
-        {
-          "code": "0x3E",
-          "name": "Close file",
-          "params": ["BX=handle"],
-          "returns": ["CF=error"]
-        },
-        {
-          "code": "0x3F",
-          "name": "Read file/handle",
-          "params": ["BX=handle", "CX=bytes", "DS:DX -> buffer"],
-          "returns": ["AX=bytes read", "CF=error"]
-        },
-        {
-          "code": "0x40",
-          "name": "Write file/handle",
-          { "code": "0x41", "name": "Delete file", "params": ["DS:DX -> ASCIIZ filename"], "returns": ["CF=error"] },
-          { "code": "0x42", "name": "Lseek", "params": ["AL=whence", "BX=handle"], "returns": ["DX:AX=new offset", "CF=error"] },
-          { "code": "0x43", "name": "Get/Set file attributes", "params": ["AL=subfn", "DS:DX -> ASCIIZ filename"], "returns": ["CX=attrs", "CF=error"] },
-          { "code": "0x44", "name": "IOCTL", "params": ["AL=subfn"], "returns": ["CF=error"] },
-          { "code": "0x45", "name": "Duplicate file handle", "params": ["BX=handle"], "returns": ["AX=new handle", "CF=error"] },
-          { "code": "0x46", "name": "Force duplicate handle", "params": ["BX=handle", "CX=target"], "returns": ["CF=error"] },
-          { "code": "0x47", "name": "Get current directory", "params": ["DL=drive (0=default)", "DS:SI -> buffer"], "returns": ["CF=error"] },
-          "params": ["BX=handle", "CX=bytes", "DS:DX -> buffer"],
-          "returns": ["AX=bytes written", "CF=error"]
-        },
-        {
-          "code": "0x41",
-          "name": "Delete file",
-          "params": ["DS:DX -> ASCIIZ filename"],
-          "returns": ["CF=error"]
-        },
-        {
-          "code": "0x42",
-          "name": "Lseek",
-          "params": ["AL=whence", "BX=handle", "CX:DX=offset"],
-          "returns": ["DX:AX=new offset", "CF=error"]
-        },
-        {
-          "code": "0x47",
-          "name": "Get current directory",
-          "params": ["DL=drive (0=default)", "DS:SI -> buffer"],
-          "returns": ["CF=error"]
-        },
-        {
-          "code": "0x48",
-          "name": "Allocate memory",
-          "params": ["BX=paragraphs"],
-          "returns": ["AX=segment", "BX=max paragraphs (if fail)", "CF=error"]
-        },
-        {
-          "code": "0x49",
-          "name": "Free memory",
-          { "code": "0x56", "name": "Rename file", "params": ["DS:DX -> old", "ES:DI -> new"], "returns": ["CF=error"] },
-          { "code": "0x57", "name": "Get/Set file date/time", "params": ["AL=subfn", "BX=handle"], "returns": ["CX:DX=date/time", "CF=error"] },
-          "params": ["ES=segment"],
-          "returns": ["CF=error"]
-        },
-        {
-          "code": "0x4A",
-          "name": "Resize memory block",
-          "params": ["ES=segment", "BX=paragraphs"],
-          "returns": ["BX=max paragraphs (if fail)", "CF=error"]
-        },
-        {
-          "code": "0x4B",
-          },
-          {
-            "code": "0x71",
-            "name": "Windows 9x/7+ LFN API (subfunctions)",
-            "since": "7.00",
-            "params": ["AL=subfunction"],
-            "returns": ["CF=error"]
-          "name": "Exec",
-          "params": ["AL=subfunction", "DS:DX -> program name", "ES:BX -> parameter block"],
-          "returns": ["CF=error"]
-      {
-        "int": "0x2F",
-        "name": "DOS multiplex",
-        "selector": "AH",
-        "functions": [
-          { "code": "0x16", "name": "Windows/Win386 present (varies)", "params": [], "returns": [] },
-          { "code": "0x43", "name": "XMS driver callout (varies)", "params": [], "returns": [] }
-        ]
-      },
-        },
-        {
-          "code": "0x4C",
-          "name": "Terminate process",
-          "params": ["AL=exit code"],
-          "returns": []
-        },
-        {
-          "code": "0x4E",
-          "name": "Find first",
-          "params": ["CX=attributes", "DS:DX -> ASCIIZ pattern"],
-          "returns": ["CF=error"]
-        },
-        {
-          "code": "0x4F",
-          "name": "Find next",
-          "params": [],
-          "returns": ["CF=error"]
-        }
-      ]
-    },
-    {
-      "int": "0x31",
-      "name": "DPMI",
-      "selector": "AX",
-      "functions": [
-        { "code": "0x0000", "name": "Allocate LDT descriptors", "params": [], "returns": [] },
-        { "code": "0x0001", "name": "Free LDT descriptor", "params": [], "returns": [] },
-        { "code": "0x0007", "name": "Set segment base", "params": [], "returns": [] },
-        { "code": "0x0008", "name": "Set segment limit", "params": [], "returns": [] },
-        { "code": "0x0100", "name": "Allocate DOS memory block", "params": [], "returns": [] },
-        { "code": "0x0101", "name": "Free DOS memory block", "params": [], "returns": [] },
-        { "code": "0x0300", "name": "Simulate real-mode interrupt", "params": [], "returns": [] },
-        { "code": "0x0400", "name": "Get DPMI version", "params": [], "returns": [] }
-      ]
-    },
-    {
-      "int": "0x33",
-      "name": "Mouse",
-      "selector": "AX",
-      "functions": [
-        { "code": "0x0000", "name": "Reset driver", "params": [], "returns": [] },
-        { "code": "0x0003", "name": "Get position/buttons", "params": [], "returns": [] }
-      ]
-    }
+    { "int": "0x10", "name": "BIOS video", "selector": "AH", "functions": [
+      { "code": "0x00", "name": "Set video mode", "params": ["AL=mode"], "returns": [] },
+      { "code": "0x01", "name": "Set text cursor shape", "params": ["CH=start", "CL=end"], "returns": [] },
+      { "code": "0x02", "name": "Set cursor position", "params": ["BH=page", "DH=row", "DL=col"], "returns": [] },
+      { "code": "0x03", "name": "Get cursor position", "params": ["BH=page"], "returns": ["DH=row", "DL=col"] },
+      { "code": "0x06", "name": "Scroll up window", "params": ["AL=lines", "BH=attribute"], "returns": [] },
+      { "code": "0x09", "name": "Write character/attribute", "params": ["AL=char", "BH=page", "BL=attr", "CX=count"], "returns": [] },
+      { "code": "0x0E", "name": "Teletype output", "params": ["AL=character", "BH=page"], "returns": [] }
+    ]},
+
+    { "int": "0x11", "name": "BIOS equipment list", "selector": "", "functions": [] },
+    { "int": "0x12", "name": "BIOS memory size", "selector": "", "functions": [] },
+
+    { "int": "0x13", "name": "BIOS disk", "selector": "AH", "functions": [
+      { "code": "0x00", "name": "Reset disk system", "params": [], "returns": ["AH=status", "CF=error"] },
+      { "code": "0x02", "name": "Read sectors (CHS)", "params": ["AL=count"], "returns": ["AH=status", "CF=error"] },
+      { "code": "0x03", "name": "Write sectors (CHS)", "params": ["AL=count"], "returns": ["AH=status", "CF=error"] },
+      { "code": "0x08", "name": "Get drive parameters", "params": [], "returns": ["CF=error"] }
+    ]},
+
+    { "int": "0x14", "name": "BIOS serial", "selector": "AH", "functions": [
+      { "code": "0x00", "name": "Initialize port", "params": ["AL=line control"], "returns": ["AH=line status"] },
+      { "code": "0x01", "name": "Send character", "params": ["AL=char"], "returns": ["AH=line status"] },
+      { "code": "0x02", "name": "Receive character", "params": [], "returns": ["AL=char", "AH=line status"] }
+    ]},
+
+    { "int": "0x15", "name": "BIOS misc", "selector": "AH", "functions": [
+      { "code": "0x86", "name": "Wait (microseconds)", "params": ["CX:DX=usec"], "returns": ["CF=error"] }
+    ]},
+
+    { "int": "0x16", "name": "BIOS keyboard", "selector": "AH", "functions": [
+      { "code": "0x00", "name": "Read keystroke", "params": [], "returns": ["AL=ASCII", "AH=scan code"] },
+      { "code": "0x01", "name": "Check keystroke (ZF set if none)", "params": [], "returns": ["AL=ASCII (if available)", "AH=scan code (if available)"] },
+      { "code": "0x02", "name": "Get shift flags", "params": [], "returns": ["AL=shift flags"] }
+    ]},
+
+    { "int": "0x17", "name": "BIOS printer", "selector": "AH", "functions": [
+      { "code": "0x00", "name": "Print character", "params": ["AL=char"], "returns": ["AH=status"] },
+      { "code": "0x01", "name": "Initialize printer", "params": [], "returns": ["AH=status"] },
+      { "code": "0x02", "name": "Get printer status", "params": [], "returns": ["AH=status"] }
+    ]},
+
+    { "int": "0x1A", "name": "BIOS time", "selector": "AH", "functions": [
+      { "code": "0x00", "name": "Get system time", "params": [], "returns": ["CX:DX=ticks", "AL=midnight flag"] },
+      { "code": "0x02", "name": "Get RTC time", "params": [], "returns": ["CH=hour", "CL=min", "DH=sec"] },
+      { "code": "0x04", "name": "Get RTC date", "params": [], "returns": ["CH=century", "CL=year", "DH=month", "DL=day"] }
+    ]},
+
+    { "int": "0x1C", "name": "BIOS timer tick (user hook)", "selector": "", "functions": [] },
+    { "int": "0x20", "name": "DOS terminate program (INT 20h)", "selector": "", "functions": [] },
+    { "int": "0x27", "name": "DOS TSR terminate and stay resident", "selector": "", "functions": [] },
+    { "int": "0x28", "name": "DOS idle interrupt (DOS busy loop)", "selector": "", "functions": [] },
+
+    { "int": "0x21", "name": "DOS", "selector": "AH", "functions": [
+      { "code": "0x01", "name": "Input character with echo", "params": [], "returns": ["AL=char"] },
+      { "code": "0x02", "name": "Display character", "params": ["DL=char"], "returns": [] },
+      { "code": "0x06", "name": "Direct console I/O", "params": ["DL=char or 0xFF"], "returns": ["AL=char"] },
+      { "code": "0x07", "name": "Direct character input (no echo)", "params": [], "returns": ["AL=char"] },
+      { "code": "0x08", "name": "Character input (no echo)", "params": [], "returns": ["AL=char"] },
+      { "code": "0x09", "name": "Display string ($-terminated)", "params": ["DS:DX -> '$'-terminated string"], "returns": [] },
+      { "code": "0x0A", "name": "Buffered keyboard input", "params": ["DS:DX -> input buffer"], "returns": [] },
+      { "code": "0x0B", "name": "Get input status", "params": [], "returns": ["AL=0x00 none, 0xFF available"] },
+      { "code": "0x0C", "name": "Flush buffer and read input", "params": ["AL=function"], "returns": [] },
+      { "code": "0x0D", "name": "Disk reset", "params": [], "returns": [] },
+      { "code": "0x0E", "name": "Select default drive", "params": ["DL=drive (0=A)"], "returns": ["AL=max drive"] },
+      { "code": "0x19", "name": "Get current default drive", "params": [], "returns": ["AL=drive (0=A)"] },
+      { "code": "0x1A", "name": "Set DTA", "params": ["DS:DX -> DTA"], "returns": [] },
+      { "code": "0x25", "name": "Set interrupt vector", "params": ["AL=interrupt", "DS:DX -> handler"], "returns": [] },
+      { "code": "0x2A", "name": "Get date", "params": [], "returns": ["CX=year", "DH=month", "DL=day"] },
+      { "code": "0x2B", "name": "Set date", "params": ["CX=year", "DH=month", "DL=day"], "returns": ["AL=status"] },
+      { "code": "0x2C", "name": "Get time", "params": [], "returns": ["CH=hour", "CL=min", "DH=sec", "DL=1/100s"] },
+      { "code": "0x2D", "name": "Set time", "params": ["CH=hour", "CL=min", "DH=sec", "DL=1/100s"], "returns": ["AL=status"] },
+      { "code": "0x2F", "name": "Get DTA", "params": [], "returns": ["ES:BX -> DTA"] },
+      { "code": "0x30", "name": "Get DOS version", "params": [], "returns": ["AL=major", "AH=minor"] },
+      { "code": "0x35", "name": "Get interrupt vector", "params": ["AL=interrupt"], "returns": ["ES:BX -> handler"] },
+      { "code": "0x36", "name": "Get free disk space", "params": ["DL=drive (0=default)"], "returns": ["AX=sectors/cluster", "BX=free clusters", "CX=bytes/sector", "DX=total clusters"] },
+      { "code": "0x39", "name": "Create directory", "params": ["DS:DX -> ASCIIZ path"], "returns": ["CF=error"] },
+      { "code": "0x3A", "name": "Remove directory", "params": ["DS:DX -> ASCIIZ path"], "returns": ["CF=error"] },
+      { "code": "0x3B", "name": "Change directory", "params": ["DS:DX -> ASCIIZ path"], "returns": ["CF=error"] },
+      { "code": "0x3C", "name": "Create file", "params": ["CX=attributes", "DS:DX -> ASCIIZ filename"], "returns": ["AX=handle", "CF=error"] },
+      { "code": "0x3D", "name": "Open file", "params": ["AL=access mode", "DS:DX -> ASCIIZ filename"], "returns": ["AX=handle", "CF=error"] },
+      { "code": "0x3E", "name": "Close file", "params": ["BX=handle"], "returns": ["CF=error"] },
+      { "code": "0x3F", "name": "Read file/handle", "params": ["BX=handle", "CX=bytes", "DS:DX -> buffer"], "returns": ["AX=bytes read", "CF=error"] },
+      { "code": "0x40", "name": "Write file/handle", "params": ["BX=handle", "CX=bytes", "DS:DX -> buffer"], "returns": ["AX=bytes written", "CF=error"] },
+      { "code": "0x41", "name": "Delete file", "params": ["DS:DX -> ASCIIZ filename"], "returns": ["CF=error"] },
+      { "code": "0x42", "name": "Lseek", "params": ["AL=whence", "BX=handle"], "returns": ["DX:AX=new offset", "CF=error"] },
+      { "code": "0x43", "name": "Get/Set file attributes", "params": ["AL=subfn", "DS:DX -> ASCIIZ filename"], "returns": ["CF=error"] },
+      { "code": "0x44", "name": "IOCTL (device/file control)", "params": ["AL=subfn"], "returns": ["CF=error"] },
+      { "code": "0x45", "name": "Duplicate file handle", "params": ["BX=handle"], "returns": ["AX=new handle", "CF=error"] },
+      { "code": "0x46", "name": "Force duplicate handle", "params": ["BX=handle", "CX=target"], "returns": ["CF=error"] },
+      { "code": "0x47", "name": "Get current directory", "params": ["DL=drive (0=default)"], "returns": ["DS:SI -> buffer", "CF=error"] },
+      { "code": "0x48", "name": "Allocate memory", "params": ["BX=paragraphs"], "returns": ["AX=segment", "BX=max paragraphs (if fail)", "CF=error"] },
+      { "code": "0x49", "name": "Free memory", "params": ["ES=segment"], "returns": ["CF=error"] },
+      { "code": "0x4A", "name": "Resize memory block", "params": ["ES=segment", "BX=paragraphs"], "returns": ["CF=error"] },
+      { "code": "0x4B", "name": "Exec", "params": ["AL=subfn", "DS:DX -> program"], "returns": ["CF=error"] },
+      { "code": "0x4C", "name": "Terminate process", "params": ["AL=exit code"], "returns": [] },
+      { "code": "0x4D", "name": "Get return code (child)", "params": [], "returns": ["AL=exit code", "AH=termination type"] },
+      { "code": "0x4E", "name": "Find first", "params": ["CX=attrs", "DS:DX -> pattern"], "returns": ["CF=error"] },
+      { "code": "0x4F", "name": "Find next", "params": [], "returns": ["CF=error"] },
+      { "code": "0x56", "name": "Rename file", "params": ["DS:DX -> old", "ES:DI -> new"], "returns": ["CF=error"] },
+      { "code": "0x57", "name": "Get/Set file date/time", "params": ["AL=subfn", "BX=handle"], "returns": ["CF=error"] },
+      { "code": "0x58", "name": "Get/Set memory allocation strategy (varies)", "params": ["AL=subfn"], "returns": ["CF=error"] },
+      { "code": "0x62", "name": "Get PSP address", "params": [], "returns": ["BX=PSP seg"] },
+      { "code": "0x68", "name": "Commit file", "params": ["BX=handle"], "returns": ["CF=error"] },
+      { "code": "0x6C", "name": "Extended open/create", "params": ["DS:SI -> filename"], "returns": ["AX=handle", "CF=error"] },
+      { "code": "0x71", "name": "LFN API (subfunctions)", "since": "7.00", "params": ["AL=subfn"], "returns": ["CF=error"] }
+    ]},
+
+    { "int": "0x2F", "name": "DOS multiplex", "selector": "AH", "functions": [
+      { "code": "0x16", "name": "Windows/Win386 present (varies)", "params": [], "returns": [] },
+      { "code": "0x43", "name": "XMS driver callout (varies)", "params": [], "returns": [] }
+    ]},
+
+    { "int": "0x31", "name": "DPMI", "selector": "AX", "functions": [
+      { "code": "0x0300", "name": "Simulate real-mode interrupt", "params": [], "returns": [] },
+      { "code": "0x0400", "name": "Get DPMI version", "params": [], "returns": [] }
+    ]},
+
+    { "int": "0x33", "name": "Mouse", "selector": "AX", "functions": [
+      { "code": "0x0000", "name": "Reset driver", "params": [], "returns": [] },
+      { "code": "0x0003", "name": "Get position/buttons", "params": [], "returns": [] }
+    ]},
+
+    { "int": "0x67", "name": "EMS (LIM/EMM386)", "selector": "AH", "functions": [
+      { "code": "0x40", "name": "Get EMS status", "params": [], "returns": ["AH=status"] },
+      { "code": "0x41", "name": "Get page frame segment", "params": [], "returns": ["BX=segment", "AH=status"] },
+      { "code": "0x4D", "name": "Get EMM version", "params": [], "returns": ["AL=major", "AH=minor"] }
+    ]}
   ]
 }

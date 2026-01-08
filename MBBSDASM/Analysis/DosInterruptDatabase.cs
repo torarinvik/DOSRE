@@ -53,7 +53,7 @@ namespace MBBSDASM.Analysis
 
         public bool TryDescribe(byte intNo, byte? ah, ushort? ax, out string description)
         {
-            return TryDescribe(intNo, ah, ax, null, out description);
+            return TryDescribe(intNo, ah, ax, (int?)null, out description);
         }
 
         public bool TryDescribe(byte intNo, byte? ah, ushort? ax, string dosVersion, out string description)
