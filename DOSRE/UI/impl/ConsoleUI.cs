@@ -343,6 +343,9 @@ namespace DOSRE.UI.impl
                 // Apply DOS version selection globally for interrupt DB lookups.
                 DosInterruptDatabase.SetCurrentDosVersionGlobal(_dosVersion);
 
+                // Apply toolchain hint globally so toolchain-specific interrupt overlays can be selected.
+                DosInterruptDatabase.SetCurrentToolchainHintGlobal(_toolchainHint);
+
                 //LE/DOS4GW support (minimal): bypass NE-specific pipeline
                 //NOTE: This tool was originally NE-only; LE support does not include relocations/import analysis.
                 if (LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out var leOutput, out var leError))

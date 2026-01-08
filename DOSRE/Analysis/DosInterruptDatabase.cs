@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using DOSRE.Enums;
 using Newtonsoft.Json.Linq;
 
 namespace DOSRE.Analysis
@@ -31,6 +32,20 @@ namespace DOSRE.Analysis
 
         private static readonly object _lock = new object();
         private static DosInterruptDatabase _instance;
+
+        private static EnumToolchainHint _currentToolchainHint = EnumToolchainHint.None;
+
+        public static void SetCurrentToolchainHintGlobal(EnumToolchainHint hint)
+        {
+            lock (_lock)
+            {
+                _currentToolchainHint = hint;
+
+                // Rebuild instance so toolchain-specific overlays take effect immediately.
+                // (Keep it best-effort: if something fails, fallback to previous instance behavior.)
+                _instance = null;
+            }
+        }
 
         public static DosInterruptDatabase Instance
         {
@@ -78,6 +93,11 @@ namespace DOSRE.Analysis
                 {
                     try
                     {
+                        // Toolchain filtering by filename (best-effort).
+                        // If the user specifies -watcom/-borland, load generic packs plus the matching toolchain packs.
+                        if (!ShouldLoadToolchainSpecificPath(path, _currentToolchainHint))
+                            continue;
+
                         var json = File.ReadAllText(path);
                         var db = Parse(json);
                         if (db == null)
@@ -252,6 +272,11 @@ namespace DOSRE.Analysis
                     .ToList();
 
                 // Ensure the primary DB is first if present.
+                // If a toolchain is selected, skip non-matching toolchain overlays.
+                names = names
+                    .Where(n => ShouldLoadToolchainSpecificResourceName(n, _currentToolchainHint))
+                    .ToList();
+
                 names.Sort((a, b) =>
                 {
                     if (string.Equals(a, PrimaryResourceName, StringComparison.OrdinalIgnoreCase)) return -1;
@@ -290,6 +315,50 @@ namespace DOSRE.Analysis
             {
                 return null;
             }
+        }
+
+        private static bool ShouldLoadToolchainSpecificResourceName(string resName, EnumToolchainHint hint)
+        {
+            if (string.IsNullOrEmpty(resName))
+                return true;
+
+            // Convention: toolchain overlays have BORLAND/WATCOM in their resource names.
+            var isBorland = resName.IndexOf("BORLAND", StringComparison.OrdinalIgnoreCase) >= 0;
+            var isWatcom = resName.IndexOf("WATCOM", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (!isBorland && !isWatcom)
+                return true;
+
+            if (hint == EnumToolchainHint.None)
+                return true;
+
+            if (hint == EnumToolchainHint.Borland)
+                return isBorland;
+            if (hint == EnumToolchainHint.Watcom)
+                return isWatcom;
+
+            return true;
+        }
+
+        private static bool ShouldLoadToolchainSpecificPath(string path, EnumToolchainHint hint)
+        {
+            if (string.IsNullOrEmpty(path))
+                return true;
+
+            var file = Path.GetFileName(path) ?? string.Empty;
+            var isBorland = file.IndexOf("borland", StringComparison.OrdinalIgnoreCase) >= 0;
+            var isWatcom = file.IndexOf("watcom", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (!isBorland && !isWatcom)
+                return true;
+
+            if (hint == EnumToolchainHint.None)
+                return true;
+
+            if (hint == EnumToolchainHint.Borland)
+                return isBorland;
+            if (hint == EnumToolchainHint.Watcom)
+                return isWatcom;
+
+            return true;
         }
 
         private static void MergeInto(Dictionary<byte, InterruptEntry> dest, Dictionary<byte, InterruptEntry> src)
