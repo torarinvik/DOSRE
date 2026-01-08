@@ -334,8 +334,10 @@ namespace DOSRE.Dasm
             ushort? lastBpImm = null;
             sbyte? lastBxBpDisp8 = null;
             var bpFrameWords = new Dictionary<sbyte, ushort>();
+            var bpFrameSyms = new Dictionary<sbyte, string>();
             var esIsSs = false;
             var esSavedAsSsDepth = 0;
+            string lastLdsSiBaseSym = null;
             ushort? lastDsImm = null;
             ushort? lastEsImm = null;
             FunctionInfo currentFunc = null;
@@ -364,8 +366,10 @@ namespace DOSRE.Dasm
                     lastBpImm = null;
                     lastBxBpDisp8 = null;
                     bpFrameWords.Clear();
+                    bpFrameSyms.Clear();
                     esIsSs = false;
                     esSavedAsSsDepth = 0;
+                    lastLdsSiBaseSym = null;
                     lastDsImm = null;
                     lastEsImm = null;
 
@@ -454,6 +458,28 @@ namespace DOSRE.Dasm
                             lastBxBpDisp8 = unchecked((sbyte)b[2]);
                         }
 
+                        // lds si, [bp+disp8] : C5 76 ib
+                        if (b.Length >= 3 && b[0] == 0xC5)
+                        {
+                            var modrm = b[1];
+                            var mod = (modrm >> 6) & 0x03;
+                            var reg = (modrm >> 3) & 0x07;
+                            var rm = modrm & 0x07;
+                            if (reg == 6 && rm == 6) // SI, [BP+disp]
+                            {
+                                if (mod == 0x01)
+                                {
+                                    var disp = unchecked((sbyte)b[2]);
+                                    lastLdsSiBaseSym = $"[BP{(disp >= 0 ? "+" : "")}{disp}]";
+                                }
+                                else if (mod == 0x02 && b.Length >= 4)
+                                {
+                                    var disp16 = (short)(b[2] | (b[3] << 8));
+                                    lastLdsSiBaseSym = $"[BP{(disp16 >= 0 ? "+" : "")}{disp16}]";
+                                }
+                            }
+                        }
+
                         // If BX is assigned directly, stop treating it as BP-relative.
                         if (b.Length >= 1 && (b[0] == 0xBB || (b[0] == 0x89 && b.Length >= 2 && b[1] == 0xC3) || (b[0] == 0x8B && b.Length >= 2 && b[1] == 0xD8)))
                         {
@@ -468,6 +494,7 @@ namespace DOSRE.Dasm
                             var disp = unchecked((sbyte)b[2]);
                             var imm = (ushort)(b[3] | (b[4] << 8));
                             bpFrameWords[disp] = imm;
+                            bpFrameSyms.Remove(disp);
                         }
 
                         // mov [bp+disp8], reg16 : 89 46 ib   (reg determined by ModRM reg field)
@@ -491,7 +518,29 @@ namespace DOSRE.Dasm
                                     _ => null
                                 };
                                 if (src.HasValue)
+                                {
                                     bpFrameWords[disp] = src.Value;
+                                    bpFrameSyms.Remove(disp);
+                                }
+                                else
+                                {
+                                    // Record a symbolic source when we can't resolve a constant.
+                                    var regName = reg switch
+                                    {
+                                        0 => "AX",
+                                        1 => "CX",
+                                        2 => "DX",
+                                        3 => "BX",
+                                        6 => "SI",
+                                        7 => "DI",
+                                        _ => "?"
+                                    };
+
+                                    if (reg == 6 && !string.IsNullOrEmpty(lastLdsSiBaseSym))
+                                        bpFrameSyms[disp] = $"off({lastLdsSiBaseSym})";
+                                    else
+                                        bpFrameSyms[disp] = regName;
+                                }
                             }
                         }
 
@@ -502,15 +551,31 @@ namespace DOSRE.Dasm
                             {
                                 var disp = unchecked((sbyte)b[2]);
                                 if (lastDsImm.HasValue)
+                                {
                                     bpFrameWords[disp] = lastDsImm.Value;
+                                    bpFrameSyms.Remove(disp);
+                                }
+                                else if (!string.IsNullOrEmpty(lastLdsSiBaseSym))
+                                {
+                                    bpFrameSyms[disp] = $"seg({lastLdsSiBaseSym})";
+                                }
+                                else
+                                {
+                                    bpFrameSyms[disp] = "DS";
+                                }
                             }
                             else if (b[1] == 0x46) // es
                             {
                                 var disp = unchecked((sbyte)b[2]);
                                 if (lastEsImm.HasValue)
+                                {
                                     bpFrameWords[disp] = lastEsImm.Value;
+                                    bpFrameSyms.Remove(disp);
+                                }
                                 else if (esIsSs)
-                                    bpFrameWords[disp] = 0; // unknown SS; still marks it as set
+                                    bpFrameSyms[disp] = "SS";
+                                else
+                                    bpFrameSyms[disp] = "ES";
                             }
                         }
                     }
@@ -555,7 +620,7 @@ namespace DOSRE.Dasm
                     // Extra: if this is an EXEC call using a stack-local parameter block, reconstruct what we can.
                     if (ins.Bytes != null && ins.Bytes.Length >= 2 && ins.Bytes[0] == 0xCD && ins.Bytes[1] == 0x21 && lastAh == 0x4B)
                     {
-                        var pbHint = TryDecodeExecParamBlockFromStack(lastBxBpDisp8, esIsSs, bpFrameWords, module);
+                        var pbHint = TryDecodeExecParamBlockFromStack(lastBxBpDisp8, esIsSs, bpFrameWords, bpFrameSyms, module);
                         if (!string.IsNullOrEmpty(pbHint))
                             insText += $" ; {pbHint}";
                     }
@@ -568,7 +633,7 @@ namespace DOSRE.Dasm
             return true;
         }
 
-        private static string TryDecodeExecParamBlockFromStack(sbyte? bxBpDisp8, bool esIsSs, Dictionary<sbyte, ushort> bpFrameWords, byte[] module)
+        private static string TryDecodeExecParamBlockFromStack(sbyte? bxBpDisp8, bool esIsSs, Dictionary<sbyte, ushort> bpFrameWords, Dictionary<sbyte, string> bpFrameSyms, byte[] module)
         {
             if (!bxBpDisp8.HasValue || !esIsSs || bpFrameWords == null)
                 return string.Empty;
@@ -598,6 +663,13 @@ namespace DOSRE.Dasm
             var haveFcb2Off = TryGetWord(bpFrameWords, (sbyte)(baseDisp + 10), out var fcb2Off);
             var haveFcb2Seg = TryGetWord(bpFrameWords, (sbyte)(baseDisp + 12), out var fcb2Seg);
 
+            string GetSym(sbyte disp)
+            {
+                if (bpFrameSyms != null && bpFrameSyms.TryGetValue(disp, out var s) && !string.IsNullOrEmpty(s))
+                    return s;
+                return null;
+            }
+
             var sb = new StringBuilder();
             sb.Append($"PB(stack @BP{(baseDisp >= 0 ? "+" : "")}{baseDisp})");
 
@@ -610,7 +682,12 @@ namespace DOSRE.Dasm
             }
             else
             {
-                sb.Append(" cmd=[BP+2..BP+4]");
+                var offSym = GetSym((sbyte)(baseDisp + 2));
+                var segSym = GetSym((sbyte)(baseDisp + 4));
+                if (!string.IsNullOrEmpty(offSym) || !string.IsNullOrEmpty(segSym))
+                    sb.Append($" cmd={(segSym ?? "?")}:{(offSym ?? "?")}");
+                else
+                    sb.Append(" cmd=[BP+2..BP+4]");
             }
 
             if (haveFcb1Off && haveFcb1Seg)
@@ -622,7 +699,12 @@ namespace DOSRE.Dasm
             }
             else
             {
-                sb.Append(" fcb1=[BP+6..BP+8]");
+                var offSym = GetSym((sbyte)(baseDisp + 6));
+                var segSym = GetSym((sbyte)(baseDisp + 8));
+                if (!string.IsNullOrEmpty(offSym) || !string.IsNullOrEmpty(segSym))
+                    sb.Append($" fcb1={(segSym ?? "?")}:{(offSym ?? "?")}");
+                else
+                    sb.Append(" fcb1=[BP+6..BP+8]");
             }
 
             if (haveFcb2Off && haveFcb2Seg)
@@ -634,7 +716,12 @@ namespace DOSRE.Dasm
             }
             else
             {
-                sb.Append(" fcb2=[BP+10..BP+12]");
+                var offSym = GetSym((sbyte)(baseDisp + 10));
+                var segSym = GetSym((sbyte)(baseDisp + 12));
+                if (!string.IsNullOrEmpty(offSym) || !string.IsNullOrEmpty(segSym))
+                    sb.Append($" fcb2={(segSym ?? "?")}:{(offSym ?? "?")}");
+                else
+                    sb.Append(" fcb2=[BP+10..BP+12]");
             }
 
             return sb.ToString();
@@ -1390,11 +1477,28 @@ namespace DOSRE.Dasm
                 if (text.Contains("dx") && lastDxImm.HasValue) { lastDxImm--; return; }
             }
 
-            // Clobber logic for instructions that modify registers in ways we don't track as constants
+            // Clobber logic for instructions that modify registers in ways we don't track as constants.
+            // Important: writing AL shouldn't wipe a known AH (and vice versa), because lots of DOS APIs
+            // set AH=function and later load AL/return-code/etc from memory.
             var firstComma = text.IndexOf(',');
             var dest = firstComma != -1 ? text.Substring(0, firstComma) : text;
 
-            if (dest.Contains("ax") || dest.Contains("ah") || dest.Contains("al")) { lastAxImm = null; lastAh = null; lastAl = null; }
+            if (dest.Contains("ax"))
+            {
+                lastAxImm = null;
+                lastAh = null;
+                lastAl = null;
+            }
+            else if (dest.Contains("ah"))
+            {
+                lastAh = null;
+                lastAxImm = null;
+            }
+            else if (dest.Contains("al"))
+            {
+                lastAl = null;
+                lastAxImm = null;
+            }
             else if (dest.Contains("bx")) lastBxImm = null;
             else if (dest.Contains("cx")) lastCxImm = null;
             else if (dest.Contains("dx")) lastDxImm = null;
