@@ -191,7 +191,7 @@
     {
       "name": "_BTUIRP",
       "ord": 23,
-      "Singnature": "int btuirp(int comno);",
+      "Signature": "int btuirp(int comno);",
       "Comments": [
         "Define alternate GSBL timing source using COM1/2/3/4"
       ]
