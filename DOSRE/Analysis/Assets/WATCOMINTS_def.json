@@ -1,0 +1,11 @@
+{
+  "meta": {
+    "description": "Watcom-specific interrupt and DOS extender annotation overlays for DOSRE.",
+    "notes": [
+      "This file is intended for Watcom C/C++ runtime patterns and DOS4GW/DPMI-specific conventions.",
+      "Schema matches DOSINTS_def.json: meta + interrupts[]."
+    ]
+  },
+  "interrupts": [
+  ]
+}

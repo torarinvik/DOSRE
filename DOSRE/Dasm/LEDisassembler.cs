@@ -5,6 +5,7 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using DOSRE.Analysis;
+using DOSRE.Enums;
 using DOSRE.Logging;
 using NLog;
 using SharpDisasm;
@@ -1385,6 +1386,11 @@ namespace DOSRE.Dasm
 
         public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, bool leFixups, bool leGlobals, bool leInsights, out string output, out string error)
         {
+            return TryDisassembleToString(inputFile, leFull, leBytesLimit, leFixups, leGlobals, leInsights, EnumToolchainHint.None, out output, out error);
+        }
+
+        public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, bool leFixups, bool leGlobals, bool leInsights, EnumToolchainHint toolchainHint, out string output, out string error)
+        {
             output = string.Empty;
             error = string.Empty;
 
@@ -1428,6 +1434,22 @@ namespace DOSRE.Dasm
             sb.AppendLine($"; Disassembly of {Path.GetFileName(inputFile)} (LE / DOS4GW)");
             sb.AppendLine($"; PageSize: {header.PageSize}  LastPageSize: {header.LastPageSize}  Pages: {header.NumberOfPages}");
             sb.AppendLine($"; Entry: Obj {header.EntryEipObject} + 0x{header.EntryEip:X} (Linear 0x{ComputeEntryLinear(header, objects):X})");
+            if (toolchainHint != EnumToolchainHint.None)
+            {
+                sb.AppendLine($"; Toolchain hint: {toolchainHint}");
+
+                var markers = FindToolchainMarkers(fileBytes, toolchainHint, 12);
+                if (markers.Count > 0)
+                {
+                    sb.AppendLine("; Toolchain markers (best-effort)");
+                    foreach (var m in markers.OrderBy(m => m.Offset))
+                        sb.AppendLine($"; 0x{m.Offset:X}  {m.Text}");
+                }
+                else
+                {
+                    sb.AppendLine("; Toolchain markers (best-effort): none found");
+                }
+            }
             if (leFixups)
                 sb.AppendLine($"; NOTE: LE fixup annotations enabled (best-effort)");
             else
@@ -1932,6 +1954,92 @@ namespace DOSRE.Dasm
 
             output = sb.ToString();
             return true;
+        }
+
+        private readonly struct ToolchainMarker
+        {
+            public readonly int Offset;
+            public readonly string Text;
+
+            public ToolchainMarker(int offset, string text)
+            {
+                Offset = offset;
+                Text = text;
+            }
+        }
+
+        private static List<ToolchainMarker> FindToolchainMarkers(byte[] data, EnumToolchainHint hint, int maxTotalHits)
+        {
+            var markers = new List<ToolchainMarker>();
+            if (data == null || data.Length == 0)
+                return markers;
+
+            string[] needles;
+            switch (hint)
+            {
+                case EnumToolchainHint.Borland:
+                    needles = new[] { "Borland", "Turbo C", "Turbo Pascal", "TC++", "TURBO" };
+                    break;
+                case EnumToolchainHint.Watcom:
+                    needles = new[] { "WATCOM", "Watcom" };
+                    break;
+                default:
+                    needles = new string[0];
+                    break;
+            }
+
+            foreach (var needle in needles)
+            {
+                if (markers.Count >= maxTotalHits)
+                    break;
+
+                foreach (var off in FindAsciiOccurrences(data, needle, Math.Max(1, maxTotalHits - markers.Count)))
+                {
+                    markers.Add(new ToolchainMarker(off, $"\"{needle}\""));
+                    if (markers.Count >= maxTotalHits)
+                        break;
+                }
+            }
+
+            return markers;
+        }
+
+        private static IEnumerable<int> FindAsciiOccurrences(byte[] data, string needle, int maxHits)
+        {
+            if (maxHits <= 0)
+                yield break;
+            if (data == null || data.Length == 0)
+                yield break;
+            if (string.IsNullOrEmpty(needle))
+                yield break;
+
+            var nb = Encoding.ASCII.GetBytes(needle);
+            if (nb.Length == 0 || nb.Length > data.Length)
+                yield break;
+
+            var hits = 0;
+            for (var i = 0; i <= data.Length - nb.Length; i++)
+            {
+                var ok = true;
+                for (var j = 0; j < nb.Length; j++)
+                {
+                    if (data[i + j] != nb[j])
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+
+                if (!ok)
+                    continue;
+
+                yield return i;
+                hits++;
+                if (hits >= maxHits)
+                    yield break;
+
+                i += nb.Length - 1;
+            }
         }
 
         private static Dictionary<uint, List<LEFixup>> BuildFixupLookupByInstruction(List<Instruction> instructions, List<LEFixup> sortedFixups)

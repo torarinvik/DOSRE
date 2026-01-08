@@ -1,0 +1,11 @@
+{
+  "meta": {
+    "description": "Borland/Turbo C/C++-specific interrupt annotation overlays for DOSRE.",
+    "notes": [
+      "This file is intended for Borland runtime/library conventions (e.g., Turbo C++) that use DOS/BIOS interrupts in recognizable ways.",
+      "Schema matches DOSINTS_def.json: meta + interrupts[]."
+    ]
+  },
+  "interrupts": [
+  ]
+}

@@ -9,7 +9,8 @@ namespace DOSRE.Analysis
 {
     public sealed class DosInterruptDatabase
     {
-        private const string ResourceName = "DOSRE.Analysis.Assets.DOSINTS_def.json";
+        private const string PrimaryResourceName = "DOSRE.Analysis.Assets.DOSINTS_def.json";
+        private const string ResourceSuffix = "INTS_def.json";
 
         private readonly Dictionary<byte, InterruptEntry> _intsByNo;
 
@@ -33,7 +34,7 @@ namespace DOSRE.Analysis
                 {
                     if (_instance != null)
                         return _instance;
-                    _instance = LoadFromEmbeddedResource() ?? new DosInterruptDatabase(new Dictionary<byte, InterruptEntry>());
+                    _instance = LoadFromEmbeddedResources() ?? new DosInterruptDatabase(new Dictionary<byte, InterruptEntry>());
                     return _instance;
                 }
             }
@@ -182,25 +183,113 @@ namespace DOSRE.Analysis
             return true;
         }
 
-        private static DosInterruptDatabase LoadFromEmbeddedResource()
+        private static DosInterruptDatabase LoadFromEmbeddedResources()
         {
             try
             {
                 var asm = Assembly.GetExecutingAssembly();
-                using (var s = asm.GetManifestResourceStream(ResourceName))
+
+                // Prefer loading all INTS_def.json resources (base DB + overlays).
+                // This enables adding compiler/SDK-specific overlays (e.g., Watcom/Borland) without code changes.
+                var names = asm.GetManifestResourceNames()
+                    .Where(n => n.EndsWith(ResourceSuffix, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                // Ensure the primary DB is first if present.
+                names.Sort((a, b) =>
                 {
-                    if (s == null)
-                        return null;
-                    using (var sr = new StreamReader(s))
+                    if (string.Equals(a, PrimaryResourceName, StringComparison.OrdinalIgnoreCase)) return -1;
+                    if (string.Equals(b, PrimaryResourceName, StringComparison.OrdinalIgnoreCase)) return 1;
+                    return string.Compare(a, b, StringComparison.OrdinalIgnoreCase);
+                });
+
+                if (names.Count == 0)
+                {
+                    // Backwards compatibility: try the original hard-coded name.
+                    names.Add(PrimaryResourceName);
+                }
+
+                var merged = new Dictionary<byte, InterruptEntry>();
+
+                foreach (var resName in names)
+                {
+                    using (var s = asm.GetManifestResourceStream(resName))
                     {
-                        var json = sr.ReadToEnd();
-                        return Parse(json);
+                        if (s == null)
+                            continue;
+                        using (var sr = new StreamReader(s))
+                        {
+                            var json = sr.ReadToEnd();
+                            var db = Parse(json);
+                            if (db == null)
+                                continue;
+                            MergeInto(merged, db._intsByNo);
+                        }
                     }
                 }
+
+                return new DosInterruptDatabase(merged);
             }
             catch
             {
                 return null;
+            }
+        }
+
+        private static void MergeInto(Dictionary<byte, InterruptEntry> dest, Dictionary<byte, InterruptEntry> src)
+        {
+            if (dest == null || src == null || src.Count == 0)
+                return;
+
+            foreach (var kv in src)
+            {
+                var intNo = kv.Key;
+                var srcEntry = kv.Value;
+                if (srcEntry == null)
+                    continue;
+
+                InterruptEntry destEntry;
+                if (!dest.TryGetValue(intNo, out destEntry) || destEntry == null)
+                {
+                    // Clone-ish: create a new entry instance so we don't accidentally share mutable dictionaries.
+                    dest[intNo] = new InterruptEntry
+                    {
+                        IntNo = srcEntry.IntNo,
+                        Name = srcEntry.Name,
+                        Selector = srcEntry.Selector,
+                        FunctionsByCode = srcEntry.FunctionsByCode != null
+                            ? srcEntry.FunctionsByCode.ToDictionary(p => p.Key, p => p.Value?.ToList() ?? new List<InterruptFunction>())
+                            : new Dictionary<ushort, List<InterruptFunction>>()
+                    };
+                    continue;
+                }
+
+                // Overlay name/selector if the base is empty.
+                if (string.IsNullOrEmpty(destEntry.Name) && !string.IsNullOrEmpty(srcEntry.Name))
+                    destEntry.Name = srcEntry.Name;
+                if (string.IsNullOrEmpty(destEntry.Selector) && !string.IsNullOrEmpty(srcEntry.Selector))
+                    destEntry.Selector = srcEntry.Selector;
+
+                if (srcEntry.FunctionsByCode == null)
+                    continue;
+                if (destEntry.FunctionsByCode == null)
+                    destEntry.FunctionsByCode = new Dictionary<ushort, List<InterruptFunction>>();
+
+                foreach (var fnKv in srcEntry.FunctionsByCode)
+                {
+                    List<InterruptFunction> destList;
+                    if (!destEntry.FunctionsByCode.TryGetValue(fnKv.Key, out destList) || destList == null)
+                    {
+                        destEntry.FunctionsByCode[fnKv.Key] = fnKv.Value?.ToList() ?? new List<InterruptFunction>();
+                        continue;
+                    }
+
+                    if (fnKv.Value == null || fnKv.Value.Count == 0)
+                        continue;
+
+                    // Append overlay functions (keeps multiple variants for version selection).
+                    destList.AddRange(fnKv.Value);
+                }
             }
         }
 

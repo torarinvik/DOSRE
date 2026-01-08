@@ -17,8 +17,14 @@
   </ItemGroup>
   <ItemGroup>
     <None Remove="Analysis\Assets\DOSCALLS_def.json" />
+    <None Remove="Analysis\Assets\DOSINTS_def.json" />
+    <None Remove="Analysis\Assets\WATCOMINTS_def.json" />
+    <None Remove="Analysis\Assets\BORLANDINTS_def.json" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Analysis\Assets\DOSCALLS_def.json" />
+    <EmbeddedResource Include="Analysis\Assets\DOSINTS_def.json" />
+    <EmbeddedResource Include="Analysis\Assets\WATCOMINTS_def.json" />
+    <EmbeddedResource Include="Analysis\Assets\BORLANDINTS_def.json" />
   </ItemGroup>
 </Project>

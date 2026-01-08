@@ -150,6 +150,12 @@ namespace DOSRE.UI.impl
         private bool _bMzInsights;
 
         /// <summary>
+        ///     Toolchain hint (best-effort heuristics)
+        ///     Specified with -borland or -watcom
+        /// </summary>
+        private EnumToolchainHint _toolchainHint = EnumToolchainHint.None;
+
+        /// <summary>
         ///     Default Constructor
         /// </summary>
         /// <param name="args">string - Command Line Arguments</param>
@@ -236,6 +242,16 @@ namespace DOSRE.UI.impl
                         case "-MZINSIGHTS":
                             _bMzInsights = true;
                             break;
+                        case "-BORLAND":
+                            if (_toolchainHint != EnumToolchainHint.None && _toolchainHint != EnumToolchainHint.Borland)
+                                throw new Exception("Error: -BORLAND and -WATCOM are mutually exclusive");
+                            _toolchainHint = EnumToolchainHint.Borland;
+                            break;
+                        case "-WATCOM":
+                            if (_toolchainHint != EnumToolchainHint.None && _toolchainHint != EnumToolchainHint.Watcom)
+                                throw new Exception("Error: -BORLAND and -WATCOM are mutually exclusive");
+                            _toolchainHint = EnumToolchainHint.Watcom;
+                            break;
                         case "-SPLITKB":
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -SPLITKB requires a value");
@@ -276,6 +292,10 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-MZINSIGHTS -- (MZ inputs) Best-effort labels/xrefs/strings for 16-bit MZ binaries");
                             Console.WriteLine(
+                                "-BORLAND -- Toolchain hint: use Borland/Turbo-era heuristics (best-effort; currently impacts MZ output)");
+                            Console.WriteLine(
+                                "-WATCOM -- Toolchain hint: use Watcom-era heuristics (best-effort; currently impacts MZ output)");
+                            Console.WriteLine(
                                 "-SPLITKB <n> -- (with -O) Split output into ~n KB chunks (out.001.asm, out.002.asm, ...)");
                             Console.WriteLine(
                                 "-MACROS -- Replace repeated straight-line chunks with macros (best-effort, readability)");
@@ -292,7 +312,7 @@ namespace DOSRE.UI.impl
 
                 //LE/DOS4GW support (minimal): bypass NE-specific pipeline
                 //NOTE: This tool was originally NE-only; LE support does not include relocations/import analysis.
-                if (LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, out var leOutput, out var leError))
+                if (LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out var leOutput, out var leError))
                 {
                     if (_bAnalysis)
                         _logger.Warn("Warning: -analysis is not supported for LE inputs, ignoring");
@@ -369,7 +389,7 @@ namespace DOSRE.UI.impl
                 var mzFull = _bMzFull || _bLeFull;
                 var mzBytes = _mzBytesLimit ?? _leBytesLimit;
                 var mzInsights = _bMzInsights || _bLeInsights;
-                if (MZDisassembler.TryDisassembleToString(_sInputFile, mzFull, mzBytes, mzInsights, out var mzOutput, out var mzError))
+                if (MZDisassembler.TryDisassembleToString(_sInputFile, mzFull, mzBytes, mzInsights, _toolchainHint, out var mzOutput, out var mzError))
                 {
                     if (_bAnalysis)
                         _logger.Warn("Warning: -analysis is not supported for MZ inputs, ignoring");
@@ -377,6 +397,9 @@ namespace DOSRE.UI.impl
                         _logger.Warn("Warning: -strings is not supported for MZ inputs (use -mzinsights for string scan), ignoring");
                     if (_bMinimal)
                         _logger.Warn("Warning: -minimal has no effect for MZ inputs (MZ output is always minimal)");
+
+                    if (_toolchainHint != EnumToolchainHint.None)
+                        _logger.Info($"Toolchain hint enabled: {_toolchainHint}");
 
                     if (string.IsNullOrEmpty(_sOutputFile))
                     {
@@ -434,6 +457,8 @@ namespace DOSRE.UI.impl
                 var output = new StringBuilder();
                 output.AppendLine($"; Disassembly of {inputFile.Path}{inputFile.FileName}");
                 output.AppendLine($"; Description: {inputFile.NonResidentNameTable[0].Name}");
+                if (_toolchainHint != EnumToolchainHint.None)
+                    output.AppendLine($"; Toolchain hint: {_toolchainHint}");
                 output.AppendLine(";");
 
                 //Render Segment Information to output

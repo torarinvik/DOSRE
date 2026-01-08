@@ -5,6 +5,7 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using DOSRE.Analysis;
+using DOSRE.Enums;
 using SharpDisasm;
 
 namespace DOSRE.Dasm
@@ -57,6 +58,18 @@ namespace DOSRE.Dasm
             bool mzFull,
             int? mzBytesLimit,
             bool mzInsights,
+            out string output,
+            out string error)
+        {
+            return TryDisassembleToString(inputFile, mzFull, mzBytesLimit, mzInsights, EnumToolchainHint.None, out output, out error);
+        }
+
+        public static bool TryDisassembleToString(
+            string inputFile,
+            bool mzFull,
+            int? mzBytesLimit,
+            bool mzInsights,
+            EnumToolchainHint toolchainHint,
             out string output,
             out string error)
         {
@@ -142,6 +155,23 @@ namespace DOSRE.Dasm
                 sb.AppendLine($"; MZ mode: LIMIT {codeLen} bytes");
             if (mzInsights)
                 sb.AppendLine("; NOTE: MZ insights enabled (best-effort labels/strings)");
+
+            if (toolchainHint != EnumToolchainHint.None)
+            {
+                sb.AppendLine($"; Toolchain hint: {toolchainHint}");
+
+                var markers = FindToolchainMarkers(module, toolchainHint, 12);
+                if (markers.Count > 0)
+                {
+                    sb.AppendLine("; Toolchain markers (best-effort)");
+                    foreach (var m in markers.OrderBy(m => m.Offset))
+                        sb.AppendLine($"; 0x{m.Offset:X}  {m.Text}");
+                }
+                else
+                {
+                    sb.AppendLine("; Toolchain markers (best-effort): none found");
+                }
+            }
             sb.AppendLine(";");
 
             Dictionary<uint, string> stringSyms = null;
@@ -383,6 +413,94 @@ namespace DOSRE.Dasm
 
             output = sb.ToString();
             return true;
+        }
+
+        private readonly struct ToolchainMarker
+        {
+            public readonly int Offset;
+            public readonly string Text;
+
+            public ToolchainMarker(int offset, string text)
+            {
+                Offset = offset;
+                Text = text;
+            }
+        }
+
+        private static List<ToolchainMarker> FindToolchainMarkers(byte[] module, EnumToolchainHint hint, int maxTotalHits)
+        {
+            var markers = new List<ToolchainMarker>();
+            if (module == null || module.Length == 0)
+                return markers;
+
+            // Keep this intentionally conservative; these strings are common and low-risk to detect.
+            string[] needles;
+            switch (hint)
+            {
+                case EnumToolchainHint.Borland:
+                    needles = new[] { "Borland", "Turbo C", "Turbo Pascal", "TC++", "TURBO" };
+                    break;
+                case EnumToolchainHint.Watcom:
+                    needles = new[] { "WATCOM", "Watcom" };
+                    break;
+                default:
+                    needles = new string[0];
+                    break;
+            }
+
+            foreach (var needle in needles)
+            {
+                if (markers.Count >= maxTotalHits)
+                    break;
+
+                foreach (var off in FindAsciiOccurrences(module, needle, maxHits: Math.Max(1, maxTotalHits - markers.Count)))
+                {
+                    markers.Add(new ToolchainMarker(off, $"\"{needle}\""));
+                    if (markers.Count >= maxTotalHits)
+                        break;
+                }
+            }
+
+            return markers;
+        }
+
+        private static IEnumerable<int> FindAsciiOccurrences(byte[] data, string needle, int maxHits)
+        {
+            if (maxHits <= 0)
+                yield break;
+            if (data == null || data.Length == 0)
+                yield break;
+            if (string.IsNullOrEmpty(needle))
+                yield break;
+
+            var nb = Encoding.ASCII.GetBytes(needle);
+            if (nb.Length == 0 || nb.Length > data.Length)
+                yield break;
+
+            var hits = 0;
+            for (var i = 0; i <= data.Length - nb.Length; i++)
+            {
+                var ok = true;
+                for (var j = 0; j < nb.Length; j++)
+                {
+                    if (data[i + j] != nb[j])
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+
+                if (!ok)
+                    continue;
+
+                yield return i;
+                hits++;
+                if (hits >= maxHits)
+                    yield break;
+
+                // Avoid pathological overlaps.
+                i += nb.Length - 1;
+            }
         }
 
         private static bool TryParseMZHeader(byte[] fileBytes, out MZHeader h)
