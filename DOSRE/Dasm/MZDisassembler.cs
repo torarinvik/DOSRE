@@ -7,6 +7,7 @@ using System.Text.RegularExpressions;
 using DOSRE.Analysis;
 using DOSRE.Enums;
 using SharpDisasm;
+using SharpDisasm.Udis86;
 
 namespace DOSRE.Dasm
 {
@@ -333,8 +334,10 @@ namespace DOSRE.Dasm
             ushort? lastDsImm = null;
             ushort? lastEsImm = null;
             FunctionInfo currentFunc = null;
-            foreach (var ins in instructions)
+
+            for (var i = 0; i < instructions.Count; i++)
             {
+                var ins = instructions[i];
                 var addr = (uint)ins.Offset;
 
                 if (mzInsights && functionStarts.Contains(addr))
@@ -396,6 +399,10 @@ namespace DOSRE.Dasm
                 {
                     // Track a tiny amount of state for DOS interrupt hints.
                     UpdateSimpleDosState(ins, ref lastAh, ref lastAl, ref lastAxImm, ref lastBxImm, ref lastCxImm, ref lastDxImm, ref lastSiImm, ref lastDiImm, ref lastDsImm, ref lastEsImm);
+
+                    var higherHint = TryGetHigherLevelHint(ins, i > 0 ? instructions[i - 1] : null, lastAh, lastAl, lastAxImm, lastBxImm, lastCxImm, lastDxImm, lastSiImm, lastDiImm, lastDsImm, lastEsImm);
+                    if (!string.IsNullOrEmpty(higherHint))
+                        insText += $" ; {higherHint}";
                 }
 
                 if (mzInsights && TryGetRelativeBranchTarget16(ins, out var target2, out var isCall2))
@@ -1139,6 +1146,110 @@ namespace DOSRE.Dasm
             }
         }
 
+        private static string TryGetHigherLevelHint(
+            Instruction ins,
+            Instruction prev,
+            byte? ah, byte? al,
+            ushort? ax, ushort? bx, ushort? cx, ushort? dx,
+            ushort? si, ushort? di,
+            ushort? ds, ushort? es)
+        {
+            var b = ins.Bytes;
+            if (b == null || b.Length == 0) return null;
+            var text = ins.ToString();
+
+            // Stack switch: mov sp, reg after mov ss, reg
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Imov && text.Contains("sp") && prev != null && prev.Mnemonic == ud_mnemonic_code.UD_Imov && prev.ToString().Contains("ss"))
+            {
+                if (Regex.IsMatch(text, @"\bsp\b") && Regex.IsMatch(prev.ToString(), @"\bss\b"))
+                {
+                    return "SETUP STACK";
+                }
+            }
+
+            // Segment setup
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Imov && ax.HasValue && text.Contains("ax"))
+            {
+                if (Regex.IsMatch(text, @"\bds\b,\s*ax\b")) return $"SET DS=0x{ax.Value:X4}";
+                if (Regex.IsMatch(text, @"\bes\b,\s*ax\b")) return $"SET ES=0x{ax.Value:X4}";
+                if (Regex.IsMatch(text, @"\bss\b,\s*ax\b")) return $"SET SS=0x{ax.Value:X4}";
+            }
+
+            // ES = DS
+            if (ins.Mnemonic == ud_mnemonic_code.UD_Ipop && text.Contains("es") && prev != null && prev.Mnemonic == ud_mnemonic_code.UD_Ipush && prev.ToString().Contains("ds"))
+            {
+                if (Regex.IsMatch(text, @"\bes\b") && Regex.IsMatch(prev.ToString(), @"\bds\b"))
+                    return "ES = DS";
+            }
+
+            // REP STOSB: memset
+            if (b[0] == 0xF3 && b.Length >= 2 && b[1] == 0xAA)
+            {
+                string detail = "memset";
+                if (es.HasValue && di.HasValue) detail += $"(ES:0x{di.Value:X4}";
+                else if (di.HasValue) detail += $"(DI=0x{di.Value:X4}";
+                else detail += "(";
+
+                if (al.HasValue) detail += $", val=0x{al.Value:X2}";
+                if (cx.HasValue) detail += $", count=0x{cx.Value:X4})";
+                else detail += ")";
+                
+                return detail;
+            }
+
+            // REP STOSW: memset (word)
+            if (b[0] == 0xF3 && b.Length >= 2 && b[1] == 0xAB)
+            {
+                string detail = "memsetw";
+                if (es.HasValue && di.HasValue) detail += $"(ES:0x{di.Value:X4}";
+                else if (di.HasValue) detail += $"(DI=0x{di.Value:X4}";
+                else detail += "(";
+
+                if (ax.HasValue) detail += $", val=0x{ax.Value:X4}";
+                if (cx.HasValue) detail += $", count=0x{cx.Value:X4})";
+                else detail += ")";
+
+                return detail;
+            }
+
+            // REP MOVSB/W: memcpy
+            if (b[0] == 0xF3 && b.Length >= 2 && (b[1] == 0xA4 || b[1] == 0xA5))
+            {
+                bool isWord = b[1] == 0xA5;
+                string detail = isWord ? "memmovew" : "memmoveb";
+                if (ds.HasValue && si.HasValue) detail += $"(from DS:0x{si.Value:X4}";
+                else if (si.HasValue) detail += $"(from SI=0x{si.Value:X4}";
+                else detail += "(from ?";
+
+                if (es.HasValue && di.HasValue) detail += $", to ES:0x{di.Value:X4}";
+                else if (di.HasValue) detail += $", to DI=0x{di.Value:X4}";
+                else detail += ", to ?";
+
+                if (cx.HasValue) detail += $", count=0x{cx.Value:X4})";
+                else detail += ")";
+
+                return detail;
+            }
+
+            // Far CALL to segment:offset
+            if (b[0] == 0x9A && b.Length >= 5)
+            {
+                ushort off = (ushort)(b[1] | (b[2] << 8));
+                ushort seg = (ushort)(b[3] | (b[4] << 8));
+                return $"CALL FAR {seg:X4}:{off:X4}";
+            }
+
+            // Far JMP to segment:offset
+            if (b[0] == 0xEA && b.Length >= 5)
+            {
+                ushort off = (ushort)(b[1] | (b[2] << 8));
+                ushort seg = (ushort)(b[3] | (b[4] << 8));
+                return $"JMP FAR {seg:X4}:{off:X4}";
+            }
+
+            return null;
+        }
+
         private static string TryDecodeInterruptHint(
             Instruction ins,
             byte? lastAh,
@@ -1292,6 +1403,20 @@ namespace DOSRE.Dasm
                     {
                         if (lastDxImm.HasValue) dbDesc += $" ; DL={lastDxImm.Value & 0xFF}";
                         dbDesc += " ; DL=drive(0=def 1=A 2=B) DS:SI=64b buffer";
+                    }
+
+                    // AH=48h: Allocate Memory
+                    if (ah == 0x48)
+                    {
+                        if (lastBxImm.HasValue) dbDesc += $" ; BX={lastBxImm.Value} paragraphs ({lastBxImm.Value * 16} bytes)";
+                        dbDesc += " ; BX=paras (returns AX=seg)";
+                    }
+
+                    // AH=4Ah: Resize Memory Block
+                    if (ah == 0x4A)
+                    {
+                        if (lastBxImm.HasValue) dbDesc += $" ; BX={lastBxImm.Value} paragraphs ({lastBxImm.Value * 16} bytes)";
+                        dbDesc += " ; ES=seg BX=paras";
                     }
 
                     // AH=4Bh: Exec
