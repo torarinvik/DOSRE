@@ -722,20 +722,53 @@ namespace DOSRE.Dasm
             return string.Empty;
         }
 
-        private static string TryAnnotateByteSwitchDecisionTree(List<Instruction> instructions, int startIdx)
+        private static string TryAnnotateByteSwitchDecisionTree(List<Instruction> instructions, int startIdx, out string signature)
         {
             // Recognize compiler-generated decision trees for switch/case on a byte register.
             // Typical shape: cmp al, imm ; jz loc_case ; ... ; unconditional jmp loc_default
+            signature = null;
             if (instructions == null || startIdx < 0 || startIdx >= instructions.Count)
                 return string.Empty;
 
-            var maxScan = Math.Min(instructions.Count, startIdx + 48);
+            // Guard: only annotate at decision-tree nodes that actually start with the canonical compare.
+            if (!TryParseCmpReg8Imm8(instructions[startIdx].ToString(), out _, out _))
+                return string.Empty;
+
+            // First, try to stabilize the "chain start" by scanning backwards for nearby cmp+je patterns.
+            // This keeps the signature consistent even if we emit at bb_ labels mid-chain.
+            const int backWindow = 256;
+            const int forwardWindow = 256;
+
+            var backLimit = Math.Max(0, startIdx - backWindow);
+            var chainStart = startIdx;
+            string chainReg = null;
+            for (var i = startIdx; i >= backLimit; i--)
+            {
+                if (i + 1 >= instructions.Count)
+                    continue;
+
+                var a = instructions[i].ToString();
+                if (!TryParseCmpReg8Imm8(a, out var r8, out _))
+                    continue;
+
+                if (!IsEqualityJumpMnemonic(instructions[i + 1].ToString()))
+                    continue;
+
+                if (chainReg == null)
+                    chainReg = r8;
+                else if (!chainReg.Equals(r8, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                chainStart = i;
+            }
+
+            var maxScan = Math.Min(instructions.Count, chainStart + forwardWindow);
 
             // Collect equality tests for a single reg8.
-            string reg = null;
+            var reg = chainReg;
             var cases = new Dictionary<byte, uint>();
 
-            for (var i = startIdx; i + 1 < maxScan; i++)
+            for (var i = chainStart; i + 1 < maxScan; i++)
             {
                 var a = instructions[i].ToString();
                 if (!TryParseCmpReg8Imm8(a, out var r8, out var imm8))
@@ -747,13 +780,11 @@ namespace DOSRE.Dasm
                     continue;
 
                 var b = instructions[i + 1];
-                var bText = b.ToString();
-                if (!IsEqualityJumpMnemonic(bText))
+                if (!IsEqualityJumpMnemonic(b.ToString()))
                     continue;
 
                 if (TryGetRelativeBranchTarget(b, out var target, out var isCall) && !isCall)
                 {
-                    // Prefer the first-seen target for a given imm.
                     if (!cases.ContainsKey(imm8))
                         cases[imm8] = (uint)target;
                 }
@@ -761,6 +792,16 @@ namespace DOSRE.Dasm
 
             if (string.IsNullOrEmpty(reg) || cases.Count < 4)
                 return string.Empty;
+
+            signature = reg + "|" + string.Join(",", cases.OrderBy(k => k.Key).Select(k => $"{k.Key:X2}->{k.Value:X8}"));
+
+            // Best-effort interpretation: if this is predominantly printable ASCII cases, it's probably token/command dispatch.
+            var printable = cases.Keys.Count(b => b >= 0x20 && b <= 0x7E);
+            var maybeAsciiDispatch = printable >= 4 && (printable * 1.0 / cases.Count) >= 0.75;
+            var maybeTokenChar = maybeAsciiDispatch && cases.Keys.Any(b => b == 0x20 || b == (byte)'-' || b == (byte)'/' || b == (byte)'.' || b == (byte)'_');
+            var kind = maybeTokenChar
+                ? "ASCII dispatch (likely token/command char)"
+                : (maybeAsciiDispatch ? "ASCII dispatch" : string.Empty);
 
             var parts = cases
                 .OrderBy(k => k.Key)
@@ -774,7 +815,8 @@ namespace DOSRE.Dasm
                 .ToList();
 
             var more = cases.Count > 10 ? $", ... (+{cases.Count - 10})" : string.Empty;
-            return $"BBHINT: switch({reg}) decision tree: {string.Join(", ", parts)}{more}";
+            var kindSuffix = string.IsNullOrEmpty(kind) ? string.Empty : $" {kind}:";
+            return $"BBHINT: switch({reg}) decision tree{kindSuffix} {string.Join(", ", parts)}{more}";
         }
 
         private static string RewriteStackFrameOperands(string insText)
@@ -3174,6 +3216,11 @@ namespace DOSRE.Dasm
 
                 ushort? lastDxImm16 = null;
 
+                // Suppress repeating switch/decision-tree hints on every bb_ label inside the same compare chain.
+                string lastSwitchSig = null;
+                int lastSwitchIdx = int.MinValue;
+                var emittedSwitchSigs = new HashSet<string>(StringComparer.Ordinal);
+
                 for (var insLoopIndex = 0; insLoopIndex < instructions.Count; insLoopIndex++)
                 {
                     var ins = instructions[insLoopIndex];
@@ -3183,6 +3230,12 @@ namespace DOSRE.Dasm
                     {
                         sb.AppendLine();
                         sb.AppendLine($"func_{addr:X8}:");
+
+                        // Reset per-function hint dedup state.
+                        lastSwitchSig = null;
+                        lastSwitchIdx = int.MinValue;
+                        emittedSwitchSigs.Clear();
+
                         if (callXrefs.TryGetValue(addr, out var callers) && callers.Count > 0)
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; XREF: called from {string.Join(", ", callers.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}", commentColumn: 0, maxWidth: 160);
 
@@ -3226,9 +3279,17 @@ namespace DOSRE.Dasm
 
                         if (leInsights)
                         {
-                            var sw = TryAnnotateByteSwitchDecisionTree(instructions, insLoopIndex);
-                            if (!string.IsNullOrEmpty(sw))
-                                AppendWrappedDisasmLine(sb, string.Empty, $" ; {sw}", commentColumn: 0, maxWidth: 160);
+                            var sw = TryAnnotateByteSwitchDecisionTree(instructions, insLoopIndex, out var swSig);
+                            if (!string.IsNullOrEmpty(sw) && !string.IsNullOrEmpty(swSig))
+                            {
+                                if (!(swSig == lastSwitchSig && (insLoopIndex - lastSwitchIdx) <= 64) && !emittedSwitchSigs.Contains(swSig))
+                                {
+                                    AppendWrappedDisasmLine(sb, string.Empty, $" ; {sw}", commentColumn: 0, maxWidth: 160);
+                                    lastSwitchSig = swSig;
+                                    lastSwitchIdx = insLoopIndex;
+                                    emittedSwitchSigs.Add(swSig);
+                                }
+                            }
                         }
                     }
                     else if (leInsights && blockStarts != null && blockStarts.Contains(addr))
@@ -3241,9 +3302,17 @@ namespace DOSRE.Dasm
                         if (!string.IsNullOrEmpty(bbHint))
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; {bbHint}", commentColumn: 0, maxWidth: 160);
 
-                        var sw = TryAnnotateByteSwitchDecisionTree(instructions, insLoopIndex);
-                        if (!string.IsNullOrEmpty(sw))
-                            AppendWrappedDisasmLine(sb, string.Empty, $" ; {sw}", commentColumn: 0, maxWidth: 160);
+                        var sw = TryAnnotateByteSwitchDecisionTree(instructions, insLoopIndex, out var swSig);
+                        if (!string.IsNullOrEmpty(sw) && !string.IsNullOrEmpty(swSig))
+                        {
+                            if (!(swSig == lastSwitchSig && (insLoopIndex - lastSwitchIdx) <= 64) && !emittedSwitchSigs.Contains(swSig))
+                            {
+                                AppendWrappedDisasmLine(sb, string.Empty, $" ; {sw}", commentColumn: 0, maxWidth: 160);
+                                lastSwitchSig = swSig;
+                                lastSwitchIdx = insLoopIndex;
+                                emittedSwitchSigs.Add(swSig);
+                            }
+                        }
                     }
 
                     var bytes = BitConverter.ToString(ins.Bytes).Replace("-", string.Empty);
