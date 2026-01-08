@@ -172,11 +172,11 @@ namespace DOSRE.Dasm
             {
                 if (ah == 0x25) {
                     var alHex = al.HasValue ? $"{al.Value:X2}h" : "AL";
-                    return $"DOS: Set Vector for INT {alHex} to DS:DX";
+                    return $"DOS: Set INT {alHex} vector (hook) to DS:DX";
                 }
                 if (ah == 0x35) {
                     var alHex = al.HasValue ? $"{al.Value:X2}h" : "AL";
-                    return $"DOS: Get Vector for INT {alHex} (returns ES:BX)";
+                    return $"DOS: Get INT {alHex} vector (returns ES:BX)";
                 }
                 if (ah == 0x48) {
                     var bxStr = bx.HasValue ? $"{bx.Value} paragraphs (0x{bx.Value:X4})" : "BX paragraphs";
@@ -286,6 +286,11 @@ namespace DOSRE.Dasm
                                 {
                                     string pVal = GetRegName16(preg);
                                     string vVal = GetRegName16(reg);
+                                    if (ds.HasValue && ds.Value == 0x0000)
+                                    {
+                                        var maybeIntNo = pdisp / 4;
+                                        return $"STORE FAR PTR [DS:{pdisp:X4}] = {vVal}:{pVal} (IVT? INT {maybeIntNo:X2}h)";
+                                    }
                                     return $"STORE FAR PTR [DS:{pdisp:X4}] = {vVal}:{pVal}";
                                 }
                             }
@@ -460,9 +465,17 @@ namespace DOSRE.Dasm
             // Offsets are within the 0040:0000 area.
             var desc = off switch
             {
+                0x0000 => "COM1 base I/O port (word)",
+                0x0002 => "COM2 base I/O port (word)",
+                0x0004 => "COM3 base I/O port (word)",
+                0x0006 => "COM4 base I/O port (word)",
+                0x0008 => "LPT1 base I/O port (word)",
+                0x000A => "LPT2 base I/O port (word)",
+                0x000C => "LPT3 base I/O port (word)",
                 0x0010 => "Equipment list",
                 0x0013 => "Conventional memory size (KB)",
                 0x0017 => "Keyboard shift flags",
+                0x0040 => "Floppy drive motor/status",
                 0x0049 => "Current video mode",
                 0x0060 => "Keyboard buffer head",
                 0x0062 => "Keyboard buffer tail",
@@ -503,6 +516,9 @@ namespace DOSRE.Dasm
 
             var desc = off switch
             {
+                0x0000 => "INT 20h instruction / CP/M entrypoint",
+                0x0002 => "Memory size (paragraphs)",
+                0x0005 => "DOS function dispatcher entry (far call)",
                 0x000A => "Terminate address (INT 22h) vector",
                 0x000C => "Ctrl-Break address (INT 23h) vector",
                 0x000E => "Critical error handler (INT 24h) vector",
