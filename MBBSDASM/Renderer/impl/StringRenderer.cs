@@ -144,15 +144,12 @@ namespace MBBSDASM.Renderer.impl
                         foreach (var sr in d.StringReference)
                             d.Comments.Add($"Possible String reference from SEG {sr.Segment} -> \"{sr.Value}\"");
 
-                    //Only label Imports if Analysis is off, because Analysis does much more in-depth labeling
-                    if (!analysis)
-                    {
-                        foreach (var b in d.BranchToRecords?.Where(x =>
-                            x.IsRelocation && (x.BranchType == EnumBranchType.CallImport ||
-                                               x.BranchType == EnumBranchType.SegAddrImport)))
-                            d.Comments.Add(
-                                $"{(b.BranchType == EnumBranchType.CallImport ? "call" : "SEG ADDR of")} {_inputFile.ImportedNameTable.FirstOrDefault(x => x.Ordinal == b.Segment)?.Name}.Ord({b.Offset:X4}h)");
-                    }
+                    //Label Imports
+                    foreach (var b in d.BranchToRecords?.Where(x =>
+                                 x.IsRelocation && (x.BranchType == EnumBranchType.CallImport ||
+                                                    x.BranchType == EnumBranchType.SegAddrImport)))
+                        d.Comments.Add(
+                            $"{(b.BranchType == EnumBranchType.CallImport ? "call" : "SEG ADDR of")} {_inputFile.ImportedNameTable.FirstOrDefault(x => x.Ordinal == b.Segment)?.Name}.Ord({b.Offset:X4}h)");
 
                     var sOutputLine =
                         $"{d.Disassembly.Offset + s.Offset:X8}h:{s.Ordinal:0000}.{d.Disassembly.Offset:X4}h {BitConverter.ToString(d.Disassembly.Bytes).Replace("-", string.Empty).PadRight(Constants.MAX_INSTRUCTION_LENGTH, ' ')} {d.Disassembly}";

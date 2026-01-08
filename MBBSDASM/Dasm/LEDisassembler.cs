@@ -18,7 +18,7 @@ namespace MBBSDASM.Dasm
     /// This is intentionally "minimal" compared to the NE pipeline:
     /// - No relocation/fixup processing
     /// - No import/entry table analysis
-    /// - No MBBS analysis
+    /// - No NE-specific analysis
     /// - No string scanning
     ///
     /// It reconstructs object bytes from LE pages and disassembles executable objects as x86_32.

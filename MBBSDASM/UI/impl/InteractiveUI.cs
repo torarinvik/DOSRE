@@ -13,7 +13,7 @@ namespace MBBSDASM.UI.impl
         private string _selectedFile;
         private bool _DisassemblyLoaded;
 
-        private bool _optionMBBSAnalysis;
+        private bool _optionAdvancedAnalysis;
         private bool _optionStrings;
         private bool _optionMinimal;
         private string _outputFile;
@@ -29,13 +29,13 @@ namespace MBBSDASM.UI.impl
             //Define Main Window
             _mainWindow = new Window(new Rect(0, 1, Application.Top.Frame.Width, Application.Top.Frame.Height - 1), null);
             _mainWindow.Add(new Label(0, 0, $"--=[About {Constants.ProgramName}]=--"));
-            _mainWindow.Add(new Label(0, 1, $"{Constants.ProgramName} is a x86 16-Bit NE Disassembler with advanced analysis for MajorBBS/Worldgroup modules"));
+            _mainWindow.Add(new Label(0, 1, $"{Constants.ProgramName} is a disassembler for classic DOS/Windows-era binaries with optional analysis"));
             _mainWindow.Add(new Label(0, 3, $"--=[Credits]=--"));
             _mainWindow.Add(new Label(0, 4, $"{Constants.ProgramName} is Copyright (c) 2019 Eric Nusbaum and is distributed under the 2-clause \"Simplified BSD License\". "));
             _mainWindow.Add(new Label(0, 5, "SharpDisam is Copyright (c) 2015 Justin Stenning and is distributed under the 2-clause \"Simplified BSD License\". "));
             _mainWindow.Add(new Label(0, 6, "Terminal.Gui is Copyright (c) 2017 Microsoft Corp and is distributed under the MIT License"));
             _mainWindow.Add(new Label(0, 8, $"--=[Code]=--"));
-            _mainWindow.Add(new Label(0, 9, "http://www.github.com/enusbaum/mbbsdasm"));
+            _mainWindow.Add(new Label(0, 9, $"{Constants.ProgramName}"));
             _progressBar =
                 new ProgressBar(new Rect(1, Application.Top.Frame.Height - 5, Application.Top.Frame.Width - 4, 1));
             _mainWindow.Add(_progressBar);
@@ -88,7 +88,7 @@ namespace MBBSDASM.UI.impl
             _outputFile = $"{_selectedFile.Substring(0, _selectedFile.Length -3)}asm";
 
             //Show Disassembly Options
-            var analysisCheckBox = new CheckBox(20, 0, "Enhanced MBBS/WG Analysis") {Checked = true};
+            var analysisCheckBox = new CheckBox(20, 0, "Additional analysis") {Checked = true};
             var stringsCheckBox = new CheckBox(20, 1, "Process All Strings") { Checked = true };
             var disassemblyRadioGroup = new RadioGroup(0, 0, new NStack.ustring[] {"_Minimal", "_Normal"}, 1);
 
@@ -96,7 +96,7 @@ namespace MBBSDASM.UI.impl
             okBtn.Clicked += () =>
                 {
                     Application.RequestStop();
-                    _optionMBBSAnalysis = analysisCheckBox.Checked;
+                    _optionAdvancedAnalysis = analysisCheckBox.Checked;
                     _optionStrings = stringsCheckBox.Checked;
                     _optionMinimal = disassemblyRadioGroup.SelectedItem == 0;
                     Task.Factory.StartNew(() => DoDisassembly());
@@ -131,10 +131,10 @@ namespace MBBSDASM.UI.impl
                 var inputFile = dasm.Disassemble(_optionMinimal);
 
                 //Apply Selected Analysis
-                if (_optionMBBSAnalysis)
+                if (_optionAdvancedAnalysis)
                 {
                     _statusLabel.Text = "Performing Additional Analysis...";
-                    Analysis.MBBS.Analyze(inputFile);
+                    Analysis.AdvancedAnalysis.Analyze(inputFile);
                 }
                 _progressBar.Fraction = .25f;
 
@@ -153,7 +153,7 @@ namespace MBBSDASM.UI.impl
  
 
                 _statusLabel.Text = "Processing Disassembly...";
-                File.AppendAllText(_outputFile, _stringRenderer.RenderDisassembly(_optionMBBSAnalysis));
+                File.AppendAllText(_outputFile, _stringRenderer.RenderDisassembly(_optionAdvancedAnalysis));
                 _progressBar.Fraction = .85f;
 
 

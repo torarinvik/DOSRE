@@ -15,7 +15,7 @@ namespace MBBSDASM.UI.impl
     /// <summary>
     ///     ConsoleUI Class
     ///
-    ///     This class is used when command line switches are passed into MBBSDASM, allowing users
+    ///     This class is used when command line switches are passed into DOSRE, allowing users
     ///     to bypass the interactive UI functionality and work strictly with command line arguments
     /// </summary>
     public class ConsoleUI : IUserInterface
@@ -50,9 +50,9 @@ namespace MBBSDASM.UI.impl
         private bool _bMinimal;
 
         /// <summary>
-        ///     MBBS Analysis Mode
+        ///     Additional analysis mode
         ///     Specified with the -analysis argument
-        ///     Will perform in-depth analysis of imported MBBS/WG functions and include detailed information and labeling
+        ///     Performs extra best-effort analysis passes (subroutines, loop patterns, optional import annotation).
         /// </summary>
         private bool _bAnalysis;
 
@@ -424,7 +424,7 @@ namespace MBBSDASM.UI.impl
                 if (_bAnalysis)
                 {
                     _logger.Info($"Performing Additional Analysis");
-                    Analysis.MBBS.Analyze(inputFile);
+                    AdvancedAnalysis.Analyze(inputFile);
                 }
 
                 _logger.Info($"Writing Disassembly Output");
