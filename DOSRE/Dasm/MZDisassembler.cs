@@ -826,6 +826,18 @@ namespace DOSRE.Dasm
                     }
                 }
 
+                // Best-effort inline detail for common DS:DX filename/string APIs.
+                if (intNo == 0x21 && lastAh.HasValue)
+                {
+                    var ah = lastAh.Value;
+                    if (ah == 0x3D || ah == 0x3C || ah == 0x41 || ah == 0x43 || ah == 0x4B || ah == 0x4E)
+                    {
+                        var dxDetail = TryFormatDxStringDetail(lastDxImm, stringSyms, stringPrev);
+                        if (!string.IsNullOrEmpty(dxDetail))
+                            return dbDesc + " ; " + dxDetail;
+                    }
+                }
+
                 return dbDesc;
             }
 
@@ -884,6 +896,27 @@ namespace DOSRE.Dasm
             }
 
             return $"INT 0x{intNo:X2}";
+        }
+
+        private static string TryFormatDxStringDetail(ushort? lastDxImm, Dictionary<uint, string> stringSyms, Dictionary<uint, string> stringPrev)
+        {
+            if (!lastDxImm.HasValue)
+                return string.Empty;
+
+            var dx = (uint)lastDxImm.Value;
+
+            if (stringSyms != null && stringSyms.TryGetValue(dx, out var sym))
+            {
+                var prev = stringPrev != null && stringPrev.TryGetValue(dx, out var p) ? p : string.Empty;
+                if (!string.IsNullOrEmpty(prev))
+                    return $"DX={sym} \"{prev}\"";
+                return $"DX={sym}";
+            }
+
+            if (stringPrev != null && stringPrev.TryGetValue(dx, out var onlyPrev) && !string.IsNullOrEmpty(onlyPrev))
+                return $"DX=0x{dx:X} \"{onlyPrev}\"";
+
+            return $"DX=0x{dx:X}";
         }
     }
 }

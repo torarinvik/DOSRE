@@ -770,7 +770,7 @@ namespace DOSRE.Dasm
             return $"args~{pushes} ret={(retUsed ? "eax" : "(unused?)")}";
         }
 
-        private static string TryAnnotateInterrupt(List<Instruction> instructions, int idx)
+        private static string TryAnnotateInterrupt(List<Instruction> instructions, int idx, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> stringPreview)
         {
             if (instructions == null || idx < 0 || idx >= instructions.Count)
                 return string.Empty;
@@ -787,12 +787,26 @@ namespace DOSRE.Dasm
             if (intNo == 0x31 || intNo == 0x33)
                 dbAx = TryResolveAxBefore(instructions, idx);
 
+            var edxOperand = TryResolveEdxBefore(instructions, idx);
+            var edxDetail = TryFormatEdxStringDetail(edxOperand, stringSymbols, stringPreview);
+
             string db;
             if (DosInterruptDatabase.Instance.TryDescribe(intNo, dbAh, dbAx, out db) && !string.IsNullOrEmpty(db))
             {
                 // Preserve existing prefixing style for readability in LE output.
                 if (intNo == 0x21)
-                    return "INT21: " + db;
+                {
+                    var extra = string.Empty;
+                    if (dbAh.HasValue)
+                    {
+                        // Common DS:DX/DS:EDX pointer arguments.
+                        // (Exec/open/create/delete/findfirst/set DTA/print string)
+                        var ah = dbAh.Value;
+                        if ((ah == 0x09 || ah == 0x1A || ah == 0x3C || ah == 0x3D || ah == 0x41 || ah == 0x43 || ah == 0x4B || ah == 0x4E) && !string.IsNullOrEmpty(edxDetail))
+                            extra = " ; " + edxDetail;
+                    }
+                    return "INT21: " + db + extra;
+                }
                 if (intNo == 0x31)
                     return "INT31: " + db;
                 return "INT: " + db;
@@ -816,7 +830,13 @@ namespace DOSRE.Dasm
                     return "INT21: DOS";
 
                 var name = DescribeInt21Ah(ah.Value);
-                return string.IsNullOrEmpty(name) ? $"INT21: AH=0x{ah.Value:X2}" : $"INT21: {name} (AH=0x{ah.Value:X2})";
+                var baseText = string.IsNullOrEmpty(name) ? $"INT21: AH=0x{ah.Value:X2}" : $"INT21: {name} (AH=0x{ah.Value:X2})";
+
+                // Add DS:EDX best-effort pointer detail for common calls.
+                if ((ah.Value == 0x09 || ah.Value == 0x1A || ah.Value == 0x3C || ah.Value == 0x3D || ah.Value == 0x41 || ah.Value == 0x43 || ah.Value == 0x4B || ah.Value == 0x4E) && !string.IsNullOrEmpty(edxDetail))
+                    baseText += " ; " + edxDetail;
+
+                return baseText;
             }
 
             if (intNo == 0x31)
@@ -836,7 +856,7 @@ namespace DOSRE.Dasm
         {
             intNo = 0;
             if (ins?.Bytes == null || ins.Bytes.Length < 2)
-                return false;
+                return TryGetIntNumberFromText(ins, out intNo);
 
             var b = ins.Bytes;
             var p = 0;
@@ -854,12 +874,53 @@ namespace DOSRE.Dasm
             }
 
             if (p + 1 >= b.Length)
-                return false;
+                return TryGetIntNumberFromText(ins, out intNo);
             if (b[p] != 0xCD)
-                return false;
+                return TryGetIntNumberFromText(ins, out intNo);
 
             intNo = b[p + 1];
             return true;
+        }
+
+        private static bool TryGetIntNumberFromText(Instruction ins, out byte intNo)
+        {
+            intNo = 0;
+            var t = ins?.ToString()?.Trim();
+            if (string.IsNullOrEmpty(t))
+                return false;
+
+            // SharpDisasm commonly renders as: "int 0x21".
+            if (!t.StartsWith("int ", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var op = t.Substring(4).Trim();
+            if (op.Length == 0)
+                return false;
+
+            // Ignore int3/int1 special mnemonics that may show up as "int3" etc.
+            if (op.Equals("3", StringComparison.OrdinalIgnoreCase) || op.Equals("0x03", StringComparison.OrdinalIgnoreCase))
+            {
+                intNo = 0x03;
+                return true;
+            }
+
+            // Accept 0xNN, NNh, or decimal.
+            if (op.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!byte.TryParse(op.Substring(2), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out intNo))
+                    return false;
+                return true;
+            }
+
+            if (op.EndsWith("h", StringComparison.OrdinalIgnoreCase))
+            {
+                var hex = op.Substring(0, op.Length - 1);
+                if (!byte.TryParse(hex, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out intNo))
+                    return false;
+                return true;
+            }
+
+            return byte.TryParse(op, out intNo);
         }
 
         private static byte? TryResolveAhBefore(List<Instruction> instructions, int idx)
@@ -1847,15 +1908,16 @@ namespace DOSRE.Dasm
                         if (!string.IsNullOrEmpty(jt))
                             insText += $" ; {jt}";
 
-                        var intHint = TryAnnotateInterrupt(instructions, insLoopIndex);
-                        if (!string.IsNullOrEmpty(intHint))
-                            insText += $" ; {intHint}";
-
                         // If this instruction references a string symbol (or computes one), inline a short preview.
                         var strInline = TryInlineStringPreview(insText, stringPreview, objects, objBytesByIndex, instructions, insLoopIndex, stringSymbols, resourceGetterTargets);
                         if (!string.IsNullOrEmpty(strInline))
                             insText += $" ; {strInline}";
                     }
+
+                    // Interrupt annotation is useful even without the heavier LE insights pass.
+                    var intHint = TryAnnotateInterrupt(instructions, insLoopIndex, stringSymbols, stringPreview);
+                    if (!string.IsNullOrEmpty(intHint))
+                        insText += $" ; {intHint}";
 
                     if (haveFixups && fixupsHere.Count > 0)
                     {
@@ -2198,6 +2260,84 @@ namespace DOSRE.Dasm
             }
 
             return string.Empty;
+        }
+
+        private static string TryResolveEdxBefore(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null)
+                return string.Empty;
+
+            for (var i = idx - 1; i >= 0 && i >= idx - 10; i--)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (t.Length == 0)
+                    continue;
+
+                // mov edx, imm32 / symbol / reg
+                if (t.StartsWith("mov edx,", StringComparison.OrdinalIgnoreCase))
+                {
+                    var p = t.IndexOf(',');
+                    if (p >= 0 && p + 1 < t.Length)
+                        return t.Substring(p + 1).Trim();
+                }
+
+                // lea edx, [mem]
+                if (t.StartsWith("lea edx,", StringComparison.OrdinalIgnoreCase))
+                {
+                    var p = t.IndexOf(',');
+                    if (p >= 0 && p + 1 < t.Length)
+                        return t.Substring(p + 1).Trim();
+                }
+
+                // Stop if we hit another interrupt or a call (heuristic: value likely changed in another basic block).
+                if (t.StartsWith("int ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
+                    break;
+            }
+
+            return string.Empty;
+        }
+
+        private static string TryFormatEdxStringDetail(string edxOperand, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> stringPreview)
+        {
+            if (string.IsNullOrWhiteSpace(edxOperand))
+                return string.Empty;
+
+            var op = edxOperand.Trim();
+
+            // If EDX is a known string symbol, show preview.
+            if (StringSymRegex.IsMatch(op))
+            {
+                var hex = op.Substring(2);
+                if (TryParseHexUInt(hex, out var addr))
+                {
+                    var prev = stringPreview != null && stringPreview.TryGetValue(addr, out var p) ? p : string.Empty;
+                    if (!string.IsNullOrEmpty(prev))
+                        return $"EDX={op} \"{prev}\"";
+                    return $"EDX={op}";
+                }
+                return $"EDX={op}";
+            }
+
+            // Immediate linear address.
+            if (TryParseHexUInt(op, out var imm))
+            {
+                if (stringSymbols != null && stringSymbols.TryGetValue(imm, out var sym))
+                {
+                    var prev = stringPreview != null && stringPreview.TryGetValue(imm, out var p) ? p : string.Empty;
+                    if (!string.IsNullOrEmpty(prev))
+                        return $"EDX={sym} \"{prev}\"";
+                    return $"EDX={sym}";
+                }
+
+                var onlyPrev = stringPreview != null && stringPreview.TryGetValue(imm, out var p2) ? p2 : string.Empty;
+                if (!string.IsNullOrEmpty(onlyPrev))
+                    return $"EDX=0x{imm:X8} \"{onlyPrev}\"";
+
+                return $"EDX=0x{imm:X8}";
+            }
+
+            // Stack/local pointer etc.
+            return $"EDX={op}";
         }
 
         private static bool TryReadDwordAtLinear(List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex, uint addr, out uint value)
