@@ -26,6 +26,8 @@ Examples for DOS binaries:
 -i perform.EXE -o perform.disasm.txt -mzinsights -mzbytes 131072
 ```
 
+If you also pass `-splitkb <n>` together with `-o`, DOSRE will split the output into numbered chunks using the pattern `out.001.asm`, `out.002.asm`, ... (the chunk number is inserted before the `.asm` extension).
+
 * DOS4GW LE (insights + fixups/globals, limit output):
 ```
 -i EUROBLST.EXE -o EUROBLST.disasm.txt -leinsights -lefixups -leglobals -lebytes 131072

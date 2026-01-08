@@ -209,6 +209,9 @@ namespace DOSRE.Dasm
 
             FunctionInfo currentFunc = null;
 
+            byte? lastInt21GetVectorInt = null;
+            int lastInt21GetVectorIndex = -1;
+
             for (var i = 0; i < instructions.Count; i++)
             {
                 var ins = instructions[i];
@@ -319,6 +322,26 @@ namespace DOSRE.Dasm
                         stringSyms, stringPrev,
                         module);
                     if (!string.IsNullOrEmpty(intHint)) insText += $" ; {intHint}";
+
+                    // Heuristic: INT 21h hook/chaining detection.
+                    // If we see AH=35h (get vector) for INT xx, then shortly after AH=25h (set vector) for the same INT xx,
+                    // it's often a TSR/hook capturing the old handler and installing a new one.
+                    if (ins.Bytes?.Length >= 2 && ins.Bytes[0] == 0xCD && ins.Bytes[1] == 0x21)
+                    {
+                        if (lastAh == 0x35 && lastAl.HasValue)
+                        {
+                            lastInt21GetVectorInt = lastAl.Value;
+                            lastInt21GetVectorIndex = i;
+                        }
+
+                        if (lastAh == 0x25 && lastAl.HasValue && lastInt21GetVectorInt.HasValue)
+                        {
+                            if (lastAl.Value == lastInt21GetVectorInt.Value && lastInt21GetVectorIndex >= 0 && (i - lastInt21GetVectorIndex) <= 50)
+                            {
+                                insText += $" ; HOOK? captured old INT {lastAl.Value:X2}h vector earlier (ES:BX)";
+                            }
+                        }
+                    }
 
                     if (ins.Bytes?.Length >= 2 && ins.Bytes[0] == 0xCD && ins.Bytes[1] == 0x21 && lastAh == 0x4B)
                     {

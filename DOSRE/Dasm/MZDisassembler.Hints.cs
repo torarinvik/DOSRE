@@ -304,6 +304,14 @@ namespace DOSRE.Dasm
             }
 
             // Segment setup
+
+            var bdaHint = TryGetBiosDataAreaHint(text, ds, es);
+            if (!string.IsNullOrEmpty(bdaHint))
+                return bdaHint;
+
+            var pspHint = TryGetPspHint(text, ds, es, index);
+            if (!string.IsNullOrEmpty(pspHint))
+                return pspHint;
             if (ins.Mnemonic == ud_mnemonic_code.UD_Imov && ax.HasValue && text.Contains("ax"))
             {
                 if (Regex.IsMatch(text, @"\bds\b,\s*ax\b")) return $"SET DS=0x{ax.Value:X4}";
@@ -417,6 +425,100 @@ namespace DOSRE.Dasm
             if (b[0] == 0xCC) return "DEBUG BREAK";
 
             return null;
+        }
+
+        private static string TryGetBiosDataAreaHint(string insText, ushort? ds, ushort? es)
+        {
+            if (string.IsNullOrEmpty(insText))
+                return null;
+
+            // BDA lives at segment 0040h
+            var bdaSeg = (ushort)0x0040;
+            if (ds != bdaSeg && es != bdaSeg)
+                return null;
+
+            // Match direct memory operands like: [0x6c], [es:0x6c], [ds:0x10]
+            var m = Regex.Match(insText, @"\[(?:(?<seg>cs|ds|es|ss):)?0x(?<hex>[0-9a-fA-F]+)\]");
+            if (!m.Success)
+                return null;
+
+            var seg = m.Groups["seg"].Success ? m.Groups["seg"].Value : null;
+            if (!int.TryParse(m.Groups["hex"].Value, System.Globalization.NumberStyles.HexNumber, null, out var off))
+                return null;
+
+            ushort? effectiveSeg = seg switch
+            {
+                "ds" => ds,
+                "es" => es,
+                _ => ds // default for [disp16] is DS
+            };
+
+            if (effectiveSeg != bdaSeg)
+                return null;
+
+            // A small curated list of the most common BDA fields.
+            // Offsets are within the 0040:0000 area.
+            var desc = off switch
+            {
+                0x0010 => "Equipment list",
+                0x0013 => "Conventional memory size (KB)",
+                0x0017 => "Keyboard shift flags",
+                0x0049 => "Current video mode",
+                0x0060 => "Keyboard buffer head",
+                0x0062 => "Keyboard buffer tail",
+                0x006C => "BIOS tick count (dword, ~18.2Hz since midnight)",
+                _ => null
+            };
+
+            if (string.IsNullOrEmpty(desc))
+                return null;
+
+            return $"BDA 0040:{off:X4}h ; {desc}";
+        }
+
+        private static string TryGetPspHint(string insText, ushort? ds, ushort? es, int index)
+        {
+            if (string.IsNullOrEmpty(insText))
+                return null;
+
+            // PSP is in DS/ES at program startup, but we usually don't know the segment value.
+            // Keep this very conservative: only near the entry function and only for well-known PSP offsets.
+            if (index > 200)
+                return null;
+
+            // If DS/ES is explicitly set to the BDA, don't label as PSP.
+            if (ds == 0x0040 || es == 0x0040)
+                return null;
+
+            var m = Regex.Match(insText, @"\[(?:(?<seg>cs|ds|es|ss):)?0x(?<hex>[0-9a-fA-F]+)\]");
+            if (!m.Success)
+                return null;
+
+            if (!int.TryParse(m.Groups["hex"].Value, System.Globalization.NumberStyles.HexNumber, null, out var off))
+                return null;
+
+            // Only very low offsets are plausible PSP references.
+            if (off > 0x00FF)
+                return null;
+
+            var desc = off switch
+            {
+                0x000A => "Terminate address (INT 22h) vector",
+                0x000C => "Ctrl-Break address (INT 23h) vector",
+                0x000E => "Critical error handler (INT 24h) vector",
+                0x0016 => "Parent PSP segment",
+                0x002C => "Environment segment (word)",
+                0x005C => "FCB #1 (default)",
+                0x006C => "FCB #2 (default)",
+                0x0080 => "Command tail length",
+                0x0081 => "Command tail buffer",
+                _ => null
+            };
+
+            if (string.IsNullOrEmpty(desc))
+                return null;
+
+            return $"PSP? +{off:X2}h ; {desc}";
         }
 
         private static string TryDecodeExecParamBlockFromStack(sbyte? bxBpDisp8, bool esIsSs, Dictionary<sbyte, ushort> bpFrameWords, Dictionary<sbyte, string> bpFrameSyms, byte[] module)
