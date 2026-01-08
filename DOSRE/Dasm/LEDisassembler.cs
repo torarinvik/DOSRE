@@ -1060,6 +1060,63 @@ namespace DOSRE.Dasm
             public int Writes;
         }
 
+        private sealed class FlagBitStats
+        {
+            public int Total;
+            public Dictionary<int, int> BitCounts = new Dictionary<int, int>();
+        }
+
+        private static Dictionary<uint, string> BuildInferredFlagSymbols(List<Instruction> instructions, int minTests)
+        {
+            if (instructions == null || instructions.Count == 0)
+                return new Dictionary<uint, string>();
+
+            var counts = new Dictionary<uint, int>();
+
+            foreach (var ins in instructions)
+            {
+                var t = ins?.ToString();
+                if (string.IsNullOrWhiteSpace(t))
+                    continue;
+
+                if (!TryParseAbsBitTest(t.Trim(), out var abs, out var mask))
+                    continue;
+                if (mask == 0 || (mask & (mask - 1)) != 0)
+                    continue;
+
+                counts.TryGetValue(abs, out var c);
+                counts[abs] = c + 1;
+            }
+
+            var map = new Dictionary<uint, string>();
+            foreach (var kvp in counts.Where(k => k.Value >= minTests).OrderByDescending(k => k.Value).ThenBy(k => k.Key))
+                map[kvp.Key] = $"flags_{kvp.Key:X8}";
+
+            return map;
+        }
+
+        private static string RewriteFlagSymbols(string insText, Dictionary<uint, string> flagSymbols)
+        {
+            if (string.IsNullOrWhiteSpace(insText) || flagSymbols == null || flagSymbols.Count == 0)
+                return insText;
+
+            // Replace absolute memory operands [0x1234] / [1234h] with [flags_XXXXXXXX] when known.
+            return Regex.Replace(
+                insText,
+                @"\[(?<abs>(?:0x)?[0-9A-Fa-f]+)h?\]",
+                m =>
+                {
+                    var tok = m.Groups["abs"].Value.Trim();
+                    tok = tok.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? tok.Substring(2) : tok;
+                    if (!uint.TryParse(tok, System.Globalization.NumberStyles.HexNumber, null, out var abs))
+                        return m.Value;
+                    if (!flagSymbols.TryGetValue(abs, out var name))
+                        return m.Value;
+                    return $"[{name}]";
+                },
+                RegexOptions.IgnoreCase);
+        }
+
         private static readonly Dictionary<ushort, string> KnownIoPorts = new Dictionary<ushort, string>
         {
             // VGA / EGA ports (common in DOS games and demos)
@@ -1249,6 +1306,87 @@ namespace DOSRE.Dasm
             return $"BBHINT: cache [esi+disp] to globals: {mappingText} ({pairs.Count} stores)";
         }
 
+        private static bool TryParseAbsBitTest(string insText, out uint abs, out uint mask)
+        {
+            abs = 0;
+            mask = 0;
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            // Examples:
+            //   test dword [0xbab6c], 0x4
+            //   test byte [0x1234], 0x40
+            var m = Regex.Match(insText.Trim(), @"^test\s+(?:byte|word|dword)\s+\[(?<abs>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\]\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?|\d+)\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            var absTok = m.Groups["abs"].Value.Trim().TrimEnd('h', 'H');
+            var immTok = m.Groups["imm"].Value.Trim().TrimEnd('h', 'H');
+
+            if (!TryParseHexOrDecUInt32(absTok, out abs))
+                return false;
+            if (!TryParseHexOrDecUInt32(immTok, out mask))
+                return false;
+            return true;
+        }
+
+        private static void CollectFlagBitTestsForFunction(List<Instruction> instructions, int startIdx, int endIdx, out Dictionary<uint, FlagBitStats> statsByAbs)
+        {
+            statsByAbs = new Dictionary<uint, FlagBitStats>();
+            if (instructions == null || startIdx < 0 || endIdx > instructions.Count || startIdx >= endIdx)
+                return;
+
+            for (var i = startIdx; i < endIdx; i++)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (!TryParseAbsBitTest(t, out var abs, out var mask))
+                    continue;
+
+                // Only summarize single-bit tests; multi-bit masks are noisy.
+                if (mask == 0 || (mask & (mask - 1)) != 0)
+                    continue;
+
+                var bit = 0;
+                var x = mask;
+                while (x > 1) { x >>= 1; bit++; }
+
+                if (!statsByAbs.TryGetValue(abs, out var st))
+                    statsByAbs[abs] = st = new FlagBitStats();
+
+                st.Total++;
+                if (!st.BitCounts.TryGetValue(bit, out var c)) c = 0;
+                st.BitCounts[bit] = c + 1;
+            }
+        }
+
+        private static string FormatFlagBitSummary(Dictionary<uint, FlagBitStats> statsByAbs, Dictionary<uint, string> flagSymbols)
+        {
+            if (statsByAbs == null || statsByAbs.Count == 0)
+                return string.Empty;
+
+            var parts = new List<string>();
+
+            foreach (var kvp in statsByAbs.OrderByDescending(k => k.Value.Total).ThenBy(k => k.Key).Take(3))
+            {
+                var abs = kvp.Key;
+                var st = kvp.Value;
+
+                var bits = st.BitCounts
+                    .OrderByDescending(b => b.Value)
+                    .ThenBy(b => b.Key)
+                    .Take(8)
+                    .Select(b => $"{b.Key}(x{b.Value})")
+                    .ToList();
+
+                if (flagSymbols != null && flagSymbols.TryGetValue(abs, out var sym))
+                    parts.Add($"[{sym}] bits {string.Join(",", bits)}");
+                else
+                    parts.Add($"[0x{abs:X}] bits {string.Join(",", bits)}");
+            }
+
+            return string.Join(" ; ", parts);
+        }
+
         private static string TryAnnotateRestoreCachedGlobalsToEsi(List<Instruction> instructions, int startIdx)
         {
             // Detect repeated pattern:
@@ -1357,7 +1495,7 @@ namespace DOSRE.Dasm
             return int.TryParse(d, out disp);
         }
 
-        private static string TryAnnotateGenericInstruction(string rawInsText)
+        private static string TryAnnotateGenericInstruction(string rawInsText, Dictionary<uint, string> flagSymbols)
         {
             if (string.IsNullOrWhiteSpace(rawInsText))
                 return string.Empty;
@@ -1386,7 +1524,12 @@ namespace DOSRE.Dasm
                     var bit = 0;
                     var x = imm;
                     while (x > 1) { x >>= 1; bit++; }
-                    return $"FLAGS: test bit {bit} (mask 0x{imm:X}) of [{NormalizeAbsToken(absTok)}]";
+
+                    var label = NormalizeAbsToken(absTok);
+                    if (TryParseHexOrDecUInt32(absTok, out var abs) && flagSymbols != null && flagSymbols.TryGetValue(abs, out var sym))
+                        label = sym;
+
+                    return $"FLAGS: test bit {bit} (mask 0x{imm:X}) of [{label}]";
                 }
             }
 
@@ -2482,6 +2625,65 @@ namespace DOSRE.Dasm
                     }
                 }
 
+                // Per-function flag-bit test summaries (insights)
+                Dictionary<uint, string> funcFlagSummaries = null;
+                if (leInsights && functionStarts != null && functionStarts.Count > 0)
+                {
+                    funcFlagSummaries = new Dictionary<uint, string>();
+                    var sortedStarts = functionStarts.OrderBy(x => x).ToList();
+                    for (var si = 0; si < sortedStarts.Count; si++)
+                    {
+                        var startAddr = sortedStarts[si];
+                        if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                            continue;
+
+                        var endIdx = instructions.Count;
+                        if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                            endIdx = nextIdx;
+
+                        CollectFlagBitTestsForFunction(instructions, startIdx, endIdx, out var st);
+                        var summary = FormatFlagBitSummary(st, null);
+                        if (!string.IsNullOrEmpty(summary))
+                            funcFlagSummaries[startAddr] = summary;
+                    }
+                }
+
+                // Infer common flag variable addresses and emit symbols for them.
+                // Keep the threshold fairly high to avoid spamming.
+                var inferredFlagSymbols = leInsights ? BuildInferredFlagSymbols(instructions, minTests: 6) : new Dictionary<uint, string>();
+
+                // Re-format per-function flag summaries using the inferred symbols (when available).
+                if (leInsights && funcFlagSummaries != null && funcFlagSummaries.Count > 0 && inferredFlagSymbols.Count > 0)
+                {
+                    var sortedStarts = functionStarts.OrderBy(x => x).ToList();
+                    for (var si = 0; si < sortedStarts.Count; si++)
+                    {
+                        var startAddr = sortedStarts[si];
+                        if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                            continue;
+
+                        var endIdx = instructions.Count;
+                        if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                            endIdx = nextIdx;
+
+                        CollectFlagBitTestsForFunction(instructions, startIdx, endIdx, out var st);
+                        var summary = FormatFlagBitSummary(st, inferredFlagSymbols);
+                        if (!string.IsNullOrEmpty(summary))
+                            funcFlagSummaries[startAddr] = summary;
+                    }
+                }
+
+                if (leInsights && inferredFlagSymbols.Count > 0)
+                {
+                    sb.AppendLine(";");
+                    sb.AppendLine("; Inferred Flag Variables (best-effort, from repeated single-bit tests)");
+                    foreach (var kvp in inferredFlagSymbols.OrderBy(k => k.Key).Take(64))
+                        sb.AppendLine($"{kvp.Value} EQU 0x{kvp.Key:X8} ; bitfield (inferred)");
+                    if (inferredFlagSymbols.Count > 64)
+                        sb.AppendLine($";   (flag symbol table truncated: {inferredFlagSymbols.Count} entries)");
+                    sb.AppendLine(";");
+                }
+
                 // Live alias tracking for operand rewriting during rendering.
                 var liveAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                 {
@@ -2510,6 +2712,9 @@ namespace DOSRE.Dasm
 
                         if (leInsights && funcIoSummaries != null && funcIoSummaries.TryGetValue(addr, out var ioSum))
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; IO: {ioSum}", commentColumn: 0, maxWidth: 160);
+
+                        if (leInsights && funcFlagSummaries != null && funcFlagSummaries.TryGetValue(addr, out var flagSum))
+                            AppendWrappedDisasmLine(sb, string.Empty, $" ; FLAGS: {flagSum}", commentColumn: 0, maxWidth: 160);
 
                         if (leInsights && funcFieldSummaries != null && funcFieldSummaries.TryGetValue(addr, out var fsum))
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; {fsum}", commentColumn: 0, maxWidth: 160);
@@ -2555,6 +2760,10 @@ namespace DOSRE.Dasm
 
                         // Rewrite [reg+disp] into [this/argX + field_..] when it looks like a struct access.
                         insText = RewriteFieldOperands(insText, liveAliases);
+
+                        // Rewrite frequently-tested absolute flag variables into symbolic names.
+                        if (inferredFlagSymbols != null && inferredFlagSymbols.Count > 0)
+                            insText = RewriteFlagSymbols(insText, inferredFlagSymbols);
                     }
 
                     if (TryGetRelativeBranchTarget(ins, out var branchTarget, out var isCall2))
@@ -2634,7 +2843,7 @@ namespace DOSRE.Dasm
                     if (!string.IsNullOrEmpty(ioHint))
                         insText += $" ; {ioHint}";
 
-                    var genHint = TryAnnotateGenericInstruction(rawInsText);
+                    var genHint = TryAnnotateGenericInstruction(rawInsText, inferredFlagSymbols);
                     if (!string.IsNullOrEmpty(genHint))
                         insText += $" ; {genHint}";
 
