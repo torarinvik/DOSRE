@@ -1,6 +1,6 @@
-﻿using MBBSDASM.Enums;
+﻿using DOSRE.Enums;
 
-namespace MBBSDASM.Dasm
+namespace DOSRE.Dasm
 {
     public class BranchRecord
     {

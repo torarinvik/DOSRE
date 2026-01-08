@@ -1,6 +1,6 @@
 ﻿using System;
 
-namespace MBBSDASM.Artifacts
+namespace DOSRE.Artifacts
 {
     public class NEHeader
     {

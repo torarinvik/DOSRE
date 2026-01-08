@@ -1,4 +1,4 @@
-﻿namespace MBBSDASM.Dasm
+﻿namespace DOSRE.Dasm
 {
     public class ExportedFunctionRecord
     {

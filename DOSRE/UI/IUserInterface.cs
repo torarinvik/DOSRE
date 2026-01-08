@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 
-namespace MBBSDASM.UI
+namespace DOSRE.UI
 {
     internal interface IUserInterface
     {

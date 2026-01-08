@@ -4,10 +4,10 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
-using MBBSDASM.Analysis;
+using DOSRE.Analysis;
 using SharpDisasm;
 
-namespace MBBSDASM.Dasm
+namespace DOSRE.Dasm
 {
     /// <summary>
     /// Minimal disassembler for DOS MZ ("old" EXE) format.

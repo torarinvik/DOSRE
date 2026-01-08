@@ -3,14 +3,14 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
-using MBBSDASM.Analysis;
-using MBBSDASM.Dasm;
-using MBBSDASM.Enums;
-using MBBSDASM.Logging;
-using MBBSDASM.Renderer.impl;
+using DOSRE.Analysis;
+using DOSRE.Dasm;
+using DOSRE.Enums;
+using DOSRE.Logging;
+using DOSRE.Renderer.impl;
 using NLog;
 
-namespace MBBSDASM.UI.impl
+namespace DOSRE.UI.impl
 {
     /// <summary>
     ///     ConsoleUI Class

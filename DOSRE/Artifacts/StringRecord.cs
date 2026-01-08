@@ -1,6 +1,6 @@
 ﻿using System.Linq;
 
-namespace MBBSDASM.Artifacts
+namespace DOSRE.Artifacts
 {
     public class StringRecord
     {

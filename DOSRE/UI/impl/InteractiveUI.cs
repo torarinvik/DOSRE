@@ -2,16 +2,15 @@
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
-using MBBSDASM.Dasm;
-using MBBSDASM.Renderer.impl;
+using DOSRE.Dasm;
+using DOSRE.Renderer.impl;
 using Terminal.Gui;
 
-namespace MBBSDASM.UI.impl
+namespace DOSRE.UI.impl
 {
     public class InteractiveUI : IUserInterface
     {
         private string _selectedFile;
-        private bool _DisassemblyLoaded;
 
         private bool _optionAdvancedAnalysis;
         private bool _optionStrings;

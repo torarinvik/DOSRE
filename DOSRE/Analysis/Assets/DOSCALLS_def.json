@@ -14,610 +14,460 @@
       {
         "name": "DOSENTERCRITSEC",
         "ord": 3,
-        "Signature": "VOID DosEnterCritSec(VOID);",
-        "Comments": [
-          "Disables thread switching for the current process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSEXIT",
         "ord": 5,
-        "Signature": "VOID DosExit(USHORT ActionCode, USHORT ResultCode);",
-        "Comments": [
-          "Ends the current thread or process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSEXITCRITSEC",
         "ord": 6,
-        "Signature": "VOID DosExitCritSec(VOID);",
-        "Comments": [
-          "Re-enables thread switching for the current process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSEXITLIST",
         "ord": 7,
-        "Signature": "USHORT DosExitList(USHORT OrderCode, PFNEXITLIST RoutineAddress);",
-        "Comments": [
-          "Maintains a list of routines to be executed when the current process ends."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETINFOSEG",
         "ord": 8,
-        "Signature": "USHORT DosGetInfoSeg(PSEL GlobalSegSelector, PSEL LocalSegSelector);",
-        "Comments": [
-          "Returns the selectors for the global and local information segments."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETPRTY",
         "ord": 9,
-        "Signature": "USHORT DosGetPrty(USHORT Scope, PUSHORT Priority, USHORT ID);",
-        "Comments": [
-          "Returns the priority of a thread, process, or process tree."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSKILLPROCESS",
         "ord": 10,
-        "Signature": "USHORT DosKillProcess(USHORT Scope, USHORT PID);",
-        "Comments": [
-          "Terminates a process or a process tree."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSKILLPROCESS",
         "ord": 11,
-        "Signature": "USHORT DosKillProcess(USHORT Scope, USHORT PID);",
-        "Comments": [
-          "Terminates a process or a process tree."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSPTRACE",
         "ord": 12,
-        "Signature": "USHORT DosPTrace(PCHAR PB);",
-        "Comments": [
-          "Provides a debugging interface for process control."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSHOLDSIGNAL",
         "ord": 13,
-        "Signature": "USHORT DosHoldSignal(USHORT ActionCode);",
-        "Comments": [
-          "Enables or disables signal processing for the current process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSETSIGHANDLER",
         "ord": 14,
-        "Signature": "USHORT DosSetSigHandler(PFNSIGRoutine RoutineAddress, PFNSIGRoutine PrevAddress, PUSHORT PrevAction, USHORT Action, USHORT SigNumber);",
+        "Signature": "",
         "Comments": [
-          "Registers a signal handler for the current process."
+          "Registers signal handler"
         ]
       },
       {
         "name": "DOSFLAGPROCESS",
         "ord": 15,
-        "Signature": "USHORT DosFlagProcess(PID PID, USHORT Scope, USHORT FlagNum, USHORT FlagArg);",
-        "Comments": [
-          "Sets a process flag."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSMAKEPIPE",
         "ord": 16,
-        "Signature": "USHORT DosMakePipe(PHANDLE ReadHandle, PHANDLE WriteHandle, USHORT PipeSize);",
-        "Comments": [
-          "Creates an anonymous pipe."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSEMSETWAIT",
         "ord": 20,
-        "Signature": "USHORT DosSemSetWait(HSEM SemHandle, LONG Timeout);",
-        "Comments": [
-          "Sets a semaphore and waits for it to be cleared."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSMUXSEMWAIT",
         "ord": 22,
-        "Signature": "USHORT DosMuxSemWait(PUSHORT IndexN, PVOID ListAddr, LONG Timeout);",
-        "Comments": [
-          "Waits for one or more semaphores to be cleared."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSCLOSESEM",
         "ord": 23,
-        "Signature": "USHORT DosCloseSem(HSEM SemHandle);",
-        "Comments": [
-          "Closes a semaphore."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSCREATESEM",
         "ord": 24,
-        "Signature": "USHORT DosCreateSem(USHORT NoExclusive, PHSEM SemHandle, PSZ SemName);",
-        "Comments": [
-          "Creates a semaphore."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSOPENSEM",
         "ord": 25,
-        "Signature": "USHORT DosOpenSem(PHSEM SemHandle, PSZ SemName);",
-        "Comments": [
-          "Opens an existing semaphore."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSRESUMETHREAD",
         "ord": 26,
-        "Signature": "USHORT DosResumeThread(TID ThreadID);",
-        "Comments": [
-          "Resumes a suspended thread."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSUSPENDTHREAD",
         "ord": 27,
-        "Signature": "USHORT DosSuspendThread(TID ThreadID);",
-        "Comments": [
-          "Suspends a thread."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSETDATETIME",
         "ord": 28,
-        "Signature": "USHORT DosSetDateTime(PDATETIME DateTime);",
-        "Comments": [
-          "Sets the system date and time."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSTIMERASYNC",
         "ord": 29,
-        "Signature": "USHORT DosTimerAsync(ULONG TimeInterval, HSEM SemHandle, PHTIMER TimerHandle);",
-        "Comments": [
-          "Starts an asynchronous timer."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSTIMERSTART",
         "ord": 30,
-        "Signature": "USHORT DosTimerStart(ULONG TimeInterval, HSEM SemHandle, PHTIMER TimerHandle);",
-        "Comments": [
-          "Starts a periodic timer."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSTIMERSTOP",
         "ord": 31,
-        "Signature": "USHORT DosTimerStop(HTIMER TimerHandle);",
-        "Comments": [
-          "Stops a timer."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSTIMERSTOP",
         "ord": 31,
-        "Signature": "USHORT DosTimerStop(HTIMER TimerHandle);",
-        "Comments": [
-          "Stops a timer."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSLEEP",
         "ord": 32,
-        "Signature": "USHORT DosSleep(ULONG TimeInterval);",
-        "Comments": [
-          "Suspends the current thread for a specified amount of time."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETDATETIME",
         "ord": 33,
-        "Signature": "USHORT DosGetDateTime(PDATETIME DateTime);",
-        "Comments": [
-          "Returns the current system date and time."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSALLOCSEG",
         "ord": 34,
-        "Signature": "USHORT DosAllocSeg(USHORT Size, PSEL Selector, USHORT Flags);",
-        "Comments": [
-          "Allocates a segment of memory."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSALLOCSHRSEG",
         "ord": 35,
-        "Signature": "USHORT DosAllocShrSeg(USHORT Size, PSZ Name, PSEL Selector);",
-        "Comments": [
-          "Allocates a shared segment of memory."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETSHRSEG",
         "ord": 36,
-        "Signature": "USHORT DosGetShrSeg(PSZ Name, PSEL Selector);",
-        "Comments": [
-          "Returns a selector for an existing shared segment."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGIVESEG",
         "ord": 37,
-        "Signature": "USHORT DosGiveSeg(SEL Selector, PID ProcessID, PSEL NewSelector);",
-        "Comments": [
-          "Gives a segment to another process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSREALLOCSEG",
         "ord": 38,
-        "Signature": "USHORT DosReallocSeg(USHORT NewSize, SEL Selector);",
-        "Comments": [
-          "Changes the size of a previously allocated segment."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFREESEG",
         "ord": 39,
-        "Signature": "USHORT DosFreeSeg(SEL Selector);",
-        "Comments": [
-          "Frees a segment of memory."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSALLOCHUGE",
         "ord": 40,
-        "Signature": "USHORT DosAllocHuge(USHORT NumSegs, USHORT LastSegSize, PSEL Selector, USHORT MaxSegs, USHORT Flags);",
-        "Comments": [
-          "Allocates a multiple-segment memory block."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETHUGESHIFT",
         "ord": 41,
-        "Signature": "USHORT DosGetHugeShift(PUSHORT ShiftCount);",
-        "Comments": [
-          "Returns the increment used to calculate selectors for a multiple-segment block."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSREALLOCHUGE",
         "ord": 42,
-        "Signature": "USHORT DosReallocHuge(USHORT NumSegs, USHORT LastSegSize, SEL Selector);",
-        "Comments": [
-          "Changes the size of a multiple-segment block."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSCREATECSALIAS",
         "ord": 43,
-        "Signature": "USHORT DosCreateCSAlias(SEL DataSelector, PSEL CodeSelector);",
-        "Comments": [
-          "Creates a code segment alias for a data segment."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSLOADMODULE",
         "ord": 44,
-        "Signature": "USHORT DosLoadModule(PSZ ObjLibName, USHORT ObjLibNameLen, PSZ ModuleName, PHMODULE ModuleHandle);",
-        "Comments": [
-          "Loads a dynamic-link module."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETPROCADDR",
         "ord": 45,
-        "Signature": "USHORT DosGetProcAddr(HMODULE ModuleHandle, PSZ ProcName, PFN *ProcAddress);",
-        "Comments": [
-          "Returns the address of a procedure within a dynamic-link module."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFREEMODULE",
         "ord": 46,
-        "Signature": "USHORT DosFreeModule(HMODULE ModuleHandle);",
-        "Comments": [
-          "Frees a dynamic-link module."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETMODHANDLE",
         "ord": 47,
-        "Signature": "USHORT DosGetModHandle(PSZ ModuleName, PHMODULE ModuleHandle);",
-        "Comments": [
-          "Returns the handle of a dynamic-link module."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETMODNAME",
         "ord": 48,
-        "Signature": "USHORT DosGetModName(HMODULE ModuleHandle, USHORT BufferLen, PSZ Buffer);",
-        "Comments": [
-          "Returns the name of a dynamic-link module."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETMACHINEMODE",
         "ord": 49,
-        "Signature": "USHORT DosGetMachineMode(PBYTE MachineMode);",
-        "Comments": [
-          "Returns the current processor mode."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSBEEP",
         "ord": 50,
-        "Signature": "USHORT DosBeep(USHORT Frequency, USHORT Duration);",
-        "Comments": [
-          "Generates a sound from the system speaker."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSCLIACCESS",
         "ord": 51,
-        "Signature": "USHORT DosCliAccess(VOID);",
-        "Comments": [
-          "Requests permission to use CLI and STI instructions."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSDEVCONFIG",
         "ord": 52,
-        "Signature": "USHORT DosDevConfig(PVOID DeviceInfo, USHORT Item, USHORT Reserved);",
-        "Comments": [
-          "Returns information about the system configuration."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSDEVIOCTL",
         "ord": 53,
-        "Signature": "USHORT DosDevIOCtl(PVOID Data, PVOID Parms, USHORT Function, USHORT Category, HFILE Handle);",
-        "Comments": [
-          "Performs a device control function."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSBUFRESET",
         "ord": 56,
-        "Signature": "USHORT DosBufReset(HFILE Handle);",
-        "Comments": [
-          "Flushes the file buffers."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSCHDIR",
         "ord": 57,
-        "Signature": "USHORT DosChDir(PSZ PathName, ULONG Reserved);",
-        "Comments": [
-          "Changes the current directory for the process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSCHGFILEPTR",
         "ord": 58,
-        "Signature": "USHORT DosChgFilePtr(HFILE Handle, LONG Offset, USHORT Type, PULONG NewOffset);",
-        "Comments": [
-          "Moves the file pointer for a managed file."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSCLOSE",
         "ord": 59,
-        "Signature": "USHORT DosClose(HFILE Handle);",
-        "Comments": [
-          "Closes a managed file handle."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSDELETE",
         "ord": 60,
-        "Signature": "USHORT DosDelete(PSZ FileName, ULONG Reserved);",
-        "Comments": [
-          "Deletes a file."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSDUPHANDLE",
         "ord": 61,
-        "Signature": "USHORT DosDupHandle(HFILE OldHandle, PHFILE NewHandle);",
-        "Comments": [
-          "Duplicates a managed file handle."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFILELOCKS",
         "ord": 62,
-        "Signature": "USHORT DosFileLocks(HFILE Handle, PLONG UnlockRange, PLONG LockRange);",
-        "Comments": [
-          "Locks or unlocks a range of bytes in a file."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFINDCLOSE",
         "ord": 63,
-        "Signature": "USHORT DosFindClose(HDIR DirHandle);",
-        "Comments": [
-          "Closes a directory search handle."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFINDFIRST",
         "ord": 64,
-        "Signature": "USHORT DosFindFirst(PSZ FileName, PHDIR DirHandle, USHORT Attribute, PVOID ResultBuffer, USHORT ResultBufferLen, PUSHORT SearchCount, ULONG Reserved);",
-        "Comments": [
-          "Starts a directory search."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFINDNEXT",
         "ord": 65,
-        "Signature": "USHORT DosFindNext(HDIR DirHandle, PVOID ResultBuffer, USHORT ResultBufferLen, PUSHORT SearchCount);",
-        "Comments": [
-          "Continues a directory search."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSMKDIR",
         "ord": 66,
-        "Signature": "USHORT DosMkDir(PSZ DirName, ULONG Reserved);",
-        "Comments": [
-          "Creates a new directory."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSMOVE",
         "ord": 67,
-        "Signature": "USHORT DosMove(PSZ OldPathName, PSZ NewPathName, ULONG Reserved);",
-        "Comments": [
-          "Moves or renames a file or directory."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSNEWSIZE",
         "ord": 68,
-        "Signature": "USHORT DosNewSize(HFILE Handle, ULONG NewSize);",
-        "Comments": [
-          "Changes the size of a managed file."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSPORTACCESS",
         "ord": 69,
-        "Signature": "USHORT DosPortAccess(USHORT Reserved, USHORT Type, USHORT FirstPort, USHORT LastPort);",
-        "Comments": [
-          "Requests or releases access to a range of I/O ports."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSOPEN",
         "ord": 70,
-        "Signature": "USHORT DosOpen(PSZ FileName, PHFILE Handle, PUSHORT ActionTaken, ULONG FileSize, USHORT FileAttribute, USHORT OpenFlag, USHORT OpenMode, ULONG Reserved);",
-        "Comments": [
-          "Opens or creates a file."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSQCURDIR",
         "ord": 71,
-        "Signature": "USHORT DosQCurDir(USHORT DriveNumber, PSZ DirectoryPath, PUSHORT DirectoryPathLen);",
-        "Comments": [
-          "Returns the current directory for a drive."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSQCURDISK",
         "ord": 72,
-        "Signature": "USHORT DosQCurDisk(PUSHORT DriveNumber, PULONG LogicalDriveMap);",
-        "Comments": [
-          "Returns the current drive for the process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSQFHANDSTATE",
         "ord": 73,
-        "Signature": "USHORT DosQFHandState(HFILE Handle, PUSHORT FileHandleState);",
-        "Comments": [
-          "Returns the state of a managed file handle."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSQFILEINFO",
         "ord": 74,
-        "Signature": "USHORT DosQFileInfo(HFILE Handle, USHORT InfoLevel, PVOID InfoBuffer, USHORT InfoBufferLen);",
-        "Comments": [
-          "Returns information about a managed file."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSQFILEMODE",
         "ord": 75,
-        "Signature": "USHORT DosQFileMode(PSZ FileName, PUSHORT Attribute, ULONG Reserved);",
-        "Comments": [
-          "Returns the attributes of a file."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSQFSINFO",
         "ord": 76,
-        "Signature": "USHORT DosQFSInfo(USHORT DriveNumber, USHORT InfoLevel, PVOID InfoBuffer, USHORT InfoBufferLen);",
-        "Comments": [
-          "Returns information about a file system."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSQHANDTYPE",
         "ord": 77,
-        "Signature": "USHORT DosQHandType(HFILE Handle, PUSHORT HandType, PUSHORT DeviceAttr);",
-        "Comments": [
-          "Returns the type of a managed file handle."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSQVERIFY",
         "ord": 78,
-        "Signature": "USHORT DosQVerify(PUSHORT VerifySetting);",
-        "Comments": [
-          "Returns the state of the system verify flag."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSRMDIR",
         "ord": 80,
-        "Signature": "USHORT DosRmDir(PSZ DirName, ULONG Reserved);",
-        "Comments": [
-          "Removes an empty directory."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSELECTDISK",
         "ord": 81,
-        "Signature": "USHORT DosSelectDisk(USHORT DriveNumber);",
-        "Comments": [
-          "Changes the current drive for the process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSETFHANDSTATE",
         "ord": 82,
-        "Signature": "USHORT DosSetFHandState(HFILE Handle, USHORT FileHandleState);",
-        "Comments": [
-          "Sets the state of a managed file handle."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSETFILEINFO",
         "ord": 83,
-        "Signature": "USHORT DosSetFileInfo(HFILE Handle, USHORT InfoLevel, PVOID InfoBuffer, USHORT InfoBufferLen);",
-        "Comments": [
-          "Sets information for a managed file."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSETFILEMODE",
         "ord": 84,
-        "Signature": "USHORT DosSetFileMode(PSZ FileName, USHORT Attribute, ULONG Reserved);",
-        "Comments": [
-          "Sets the attributes of a file."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSETMAXFH",
         "ord": 85,
-        "Signature": "USHORT DosSetMaxFH(USHORT NumberHandles);",
-        "Comments": [
-          "Sets the maximum number of file handles for the process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSETVERIFY",
@@ -630,10 +480,8 @@
       {
         "name": "DOSSYSTEMSERVICE",
         "ord": 88,
-        "Signature": "USHORT DosSystemService(USHORT Category, PVOID Request, PVOID Response);",
-        "Comments": [
-          "Direct access to system services."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSETVEC",
@@ -647,530 +495,398 @@
       {
         "name": "DOSSYSTRACE",
         "ord": 90,
-        "Signature": "USHORT DosSysTrace(USHORT Major, USHORT Minor, USHORT Length, PVOID Data);",
-        "Comments": [
-          "Adds a trace record to the system trace buffer."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETENV",
         "ord": 91,
-        "Signature": "USHORT DosGetEnv(PUSHORT EnvSelector, PUSHORT CmdOffset);",
-        "Comments": [
-          "Returns the selector of the process environment and the offset to the command line."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETVERSION",
         "ord": 92,
-        "Signature": "USHORT DosGetVersion(PUSHORT Version);",
-        "Comments": [
-          "Returns the DOS version number."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETPID",
         "ord": 94,
-        "Signature": "USHORT DosGetPid(PPIDINFO PIDInfo);",
-        "Comments": [
-          "Returns the process, thread, and parent process identifiers."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSOPEN2",
         "ord": 95,
-        "Signature": "USHORT DosOpen2(PSZ FileName, PHFILE Handle, PUSHORT ActionTaken, ULONG FileSize, USHORT FileAttribute, USHORT OpenFlag, USHORT OpenMode, PEAOP EAOP, ULONG Reserved);",
-        "Comments": [
-          "Opens or creates a file with extended attributes."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSLIBINIT",
         "ord": 96,
-        "Signature": "USHORT DosLibInit(PVOID Reserved);",
-        "Comments": [
-          "Initializes a dynamic link library."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSETFSINFO",
         "ord": 97,
-        "Signature": "USHORT DosSetFSInfo(USHORT DriveNumber, USHORT InfoLevel, PVOID InfoBuffer, USHORT InfoBufferLen);",
-        "Comments": [
-          "Sets information for a file system."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSQPATHINFO",
         "ord": 98,
-        "Signature": "USHORT DosQPathInfo(PSZ PathName, USHORT InfoLevel, PVOID InfoBuffer, USHORT InfoBufferLen, ULONG Reserved);",
-        "Comments": [
-          "Returns information about a file or directory path."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSDEVIOCTL2",
         "ord": 99,
-        "Signature": "USHORT DosDevIOCtl2(PVOID Data, USHORT DataLen, PVOID Parms, USHORT ParmsLen, USHORT Function, USHORT Category, HFILE Handle);",
-        "Comments": [
-          "Performs a generic I/O control operation on a device with data/parameter buffers."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSETPATHINFO",
         "ord": 104,
-        "Signature": "USHORT DosSetPathInfo(PSZ PathName, USHORT InfoLevel, PVOID InfoBuffer, USHORT InfoBufferLen, USHORT Flags, ULONG Reserved);",
-        "Comments": [
-          "Sets information for a file or directory path."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSERROR",
         "ord": 120,
-        "Signature": "USHORT DosError(ULONG Flags);",
-        "Comments": [
-          "Enables or disables hard-error and exception handling."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETSEG",
         "ord": 121,
-        "Signature": "USHORT DosGetSeg(SEL Selector);",
-        "Comments": [
-          "Returns the handle of a shared memory segment."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSLOCKSEG",
         "ord": 122,
-        "Signature": "USHORT DosLockSeg(SEL Selector);",
-        "Comments": [
-          "Locks a discardable segment in memory."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSUNLOCKSEG",
         "ord": 123,
-        "Signature": "USHORT DosUnlockSeg(SEL Selector);",
-        "Comments": [
-          "Unlocks a discardable segment in memory."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSIZESEG",
         "ord": 126,
-        "Signature": "USHORT DosSizeSeg(SEL Selector, PULONG Size);",
-        "Comments": [
-          "Returns the size of a memory segment."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSMEMAVAIL",
         "ord": 127,
-        "Signature": "USHORT DosMemAvail(PULONG MemAvail);",
-        "Comments": [
-          "Returns the size of the largest free block of memory."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSPHYSICALDISK",
         "ord": 129,
-        "Signature": "USHORT DosPhysicalDisk(USHORT Function, PVOID Data, USHORT DataLen, PVOID Parms, USHORT ParmsLen);",
-        "Comments": [
-          "Returns information about partitionable disks."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETCP",
         "ord": 130,
-        "Signature": "USHORT DosGetCp(USHORT Length, PUSHORT CpList, PUSHORT CpCount);",
-        "Comments": [
-          "Returns the code page list for the process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSENDSIGNAL",
         "ord": 134,
-        "Signature": "USHORT DosSendSignal(USHORT ProcessID, USHORT SignalNumber);",
-        "Comments": [
-          "Sends a signal to a process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSHUGESHIFT",
         "ord": 135,
-        "Signature": "USHORT DosHugeShift(VOID);",
-        "Comments": [
-          "Returns the left shift count used to compute selectors for huge segments."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSHUGEINCR",
         "ord": 136,
-        "Signature": "USHORT DosHugeIncr(VOID);",
-        "Comments": [
-          "Returns the value to be added to a selector to compute the next selector of a huge segment."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSREAD",
         "ord": 137,
-        "Signature": "USHORT DosRead(HFILE Handle, PVOID Buffer, USHORT BufferLen, PUSHORT BytesRead);",
-        "Comments": [
-          "Reads bytes from a managed file handle."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSWRITE",
         "ord": 138,
-        "Signature": "USHORT DosWrite(HFILE Handle, PVOID Buffer, USHORT BufferLen, PUSHORT BytesWritten);",
-        "Comments": [
-          "Writes bytes to a managed file handle."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSERRCLASS",
         "ord": 139,
-        "Signature": "USHORT DosErrClass(USHORT Code, PUSHORT Class, PUSHORT Action, PUSHORT Locus);",
-        "Comments": [
-          "Returns the error class, action, and locus for a given error code."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSEMREQUEST",
         "ord": 140,
-        "Signature": "USHORT DosSemRequest(HSEM SemHandle, LONG Timeout);",
-        "Comments": [
-          "Requests a system semaphore."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSEMCLEAR",
         "ord": 141,
-        "Signature": "USHORT DosSemClear(HSEM SemHandle);",
-        "Comments": [
-          "Releases a system semaphore."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSEMWAIT",
         "ord": 142,
-        "Signature": "USHORT DosSemWait(HSEM SemHandle, LONG Timeout);",
-        "Comments": [
-          "Waits for a system semaphore to be cleared."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSEMSET",
         "ord": 143,
-        "Signature": "USHORT DosSemSet(HSEM SemHandle);",
-        "Comments": [
-          "Sets a system semaphore."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSEXECPGM",
         "ord": 144,
-        "Signature": "USHORT DosExecPgm(PCHAR ObjNameBuf, USHORT ObjNameBufLen, USHORT Flags, PSZ Args, PSZ Envs, PRESULTCODES ResultCodes, PSZ PgmName);",
-        "Comments": [
-          "Executes a program as a child process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSCREATETHREAD",
         "ord": 145,
-        "Signature": "USHORT DosCreateThread(PFNTHREAD ThreadAddr, PTID ThreadID, PBYTE ThreadStack);",
-        "Comments": [
-          "Creates a new thread of execution within the current process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSUBSET",
         "ord": 146,
-        "Signature": "USHORT DosSubSet(SEL Selector, USHORT Flags, USHORT Size);",
-        "Comments": [
-          "Initializes a segment for suballocation."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSUBALLOC",
         "ord": 147,
-        "Signature": "USHORT DosSubAlloc(SEL Selector, PUSHORT Offset, USHORT Size);",
-        "Comments": [
-          "Allocates memory from a suballocated segment."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSUBFREE",
         "ord": 148,
-        "Signature": "USHORT DosSubFree(SEL Selector, USHORT Offset, USHORT Size);",
-        "Comments": [
-          "Frees memory in a suballocated segment."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSREADASYNC",
         "ord": 149,
-        "Signature": "USHORT DosReadAsync(HFILE Handle, PULONG RamSem, PUSHORT RetCode, PVOID Buffer, USHORT BufferLen, PUSHORT BytesRead);",
-        "Comments": [
-          "Reads bytes from a managed file handle asynchronously."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSWRITEASYNC",
         "ord": 150,
-        "Signature": "USHORT DosWriteAsync(HFILE Handle, PULONG RamSem, PUSHORT RetCode, PVOID Buffer, USHORT BufferLen, PUSHORT BytesWritten);",
-        "Comments": [
-          "Writes bytes to a managed file handle asynchronously."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSEARCHPATH",
         "ord": 151,
-        "Signature": "USHORT DosSearchPath(USHORT Control, PSZ PathRef, PSZ FileName, PBYTE ResultBuf, USHORT ResultBufLen);",
-        "Comments": [
-          "Searches a path for a file."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSCANENV",
         "ord": 152,
-        "Signature": "USHORT DosScanEnv(PSZ EnvVarName, PSZ *ResultPointer);",
-        "Comments": [
-          "Searches the process environment for a variable."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSETCP",
         "ord": 153,
-        "Signature": "USHORT DosSetCp(USHORT CodePage, USHORT Reserved);",
-        "Comments": [
-          "Sets the code page for the process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETRESOURCE",
         "ord": 155,
-        "Signature": "USHORT DosGetResource(HMODULE ModHandle, USHORT TypeID, USHORT ResID, PSEL Selector);",
-        "Comments": [
-          "Returns the selector of a resource."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETPPID",
         "ord": 156,
-        "Signature": "USHORT DosGetPpid(USHORT PID, PUSHORT PPID);",
-        "Comments": [
-          "Returns the parent process identifier for a given process."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSCALLBACK",
         "ord": 157,
-        "Signature": "USHORT DosCallback(PFN Routine);",
-        "Comments": [
-          "Allows a Ring 3 process to be called from Ring 0 (Device Driver)."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSR2STACKREALLOC",
         "ord": 160,
-        "Signature": "USHORT DosR2StackRealloc(USHORT NewSize);",
-        "Comments": [
-          "Reallocates the Ring 2 stack."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFSRAMSEMREQUEST",
         "ord": 161,
-        "Signature": "USHORT DosFsRamSemRequest(PVALLOCK Lock, LONG Timeout);",
-        "Comments": [
-          "Requests a RAM semaphore for file system access."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFSRAMSEMCLEAR",
         "ord": 162,
-        "Signature": "USHORT DosFsRamSemClear(PVALLOCK Lock);",
-        "Comments": [
-          "Releases a RAM semaphore for file system access."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSQAPPTYPE",
         "ord": 163,
-        "Signature": "USHORT DosQAppType(PSZ ProgramName, PUSHORT AppType);",
-        "Comments": [
-          "Returns the application type (Windowed, Fullscreen, etc.) for an executable."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSETPROCCP",
         "ord": 164,
-        "Signature": "USHORT DosSetProcCp(USHORT CodePage, USHORT Reserved);",
-        "Comments": [
-          "Sets the code page for the process and its descendants."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSDYNAMICTRACE",
         "ord": 165,
-        "Signature": "USHORT DosDynamicTrace(USHORT Major, USHORT Minor, USHORT Length, PVOID Data);",
-        "Comments": [
-          "Adds a dynamic trace record."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSQSYSINFO",
         "ord": 166,
-        "Signature": "USHORT DosQSysInfo(USHORT Index, PVOID Buffer, USHORT BufferLen);",
-        "Comments": [
-          "Returns system information."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFSATTACH",
         "ord": 181,
-        "Signature": "USHORT DosFSAttach(PSZ DeviceName, PSZ FSDName, PVOID DataBuffer, USHORT DataBufferLen, USHORT OpFlag);",
-        "Comments": [
-          "Attaches/detaches a drive or device to/from a File System Driver."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSQFSATTACH",
         "ord": 182,
-        "Signature": "USHORT DosQFSAttach(PSZ DeviceName, USHORT Ordinal, USHORT InfoLevel, PVOID DataBuffer, PUSHORT DataBufferLen);",
-        "Comments": [
-          "Returns information about an attached file system."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFSCTL",
         "ord": 183,
-        "Signature": "USHORT DosFSCtl(PVOID DataBuffer, USHORT DataBufferLen, PUSHORT DataCount, PVOID ParmBuffer, USHORT ParmBufferLen, PUSHORT ParmCount, USHORT Function, PSZ RouteName, HFILE Handle);",
-        "Comments": [
-          "Provides an interface to a File System Driver."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFINDFIRST2",
         "ord": 184,
-        "Signature": "USHORT DosFindFirst2(PSZ FileName, PHDIR DirHandle, USHORT Attribute, PVOID ResultBuffer, USHORT ResultBufferLen, PUSHORT SearchCount, USHORT InfoLevel, ULONG Reserved);",
-        "Comments": [
-          "Starts a directory search with extended attributes or file information levels."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSMKDIR2",
         "ord": 185,
-        "Signature": "USHORT DosMkDir2(PSZ DirName, USHORT InfoLevel, PVOID InfoBuffer, ULONG Reserved);",
-        "Comments": [
-          "Creates a directory with extended attributes."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFILEIO",
         "ord": 186,
-        "Signature": "USHORT DosFileIO(HFILE Handle, PVOID CommandList, USHORT CommandListLen, PUSHORT ErrorOffset);",
-        "Comments": [
-          "Performs multiple file I/O operations (Lock, Unlock, Seek, Read, Write) in a single atomic call."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFINDNOTIFYCLOSE",
         "ord": 187,
-        "Signature": "USHORT DosFindNotifyClose(HDIR Handle);",
-        "Comments": [
-          "Closes a directory change notification handle."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFINDNOTIFYFIRST",
         "ord": 188,
-        "Signature": "USHORT DosFindNotifyFirst(PSZ FileName, PHDIR Handle, USHORT Attribute, PVOID Buffer, USHORT BufferLen, PUSHORT SearchCount, USHORT InfoLevel, ULONG Timeout);",
-        "Comments": [
-          "Starts a directory change notification request."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFINDNOTIFYNEXT",
         "ord": 189,
-        "Signature": "USHORT DosFindNotifyNext(HDIR Handle, PVOID Buffer, USHORT BufferLen, PUSHORT SearchCount, USHORT InfoLevel, ULONG Timeout);",
-        "Comments": [
-          "Requests the next directory change notification."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSEDITNAME",
         "ord": 191,
-        "Signature": "USHORT DosEditName(USHORT EditLevel, PSZ SourceString, PSZ EditString, PBYTE TargetBuffer, USHORT TargetBufferLen);",
-        "Comments": [
-          "Edits a file or directory name using global file name characters."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSLOGREGISTER",
         "ord": 195,
-        "Signature": "USHORT DosLogRegister(PVOID Buffer, USHORT BufferLen, PUSHORT LogHandle);",
-        "Comments": [
-          "Registers a process for logging."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSLOGREAD",
         "ord": 196,
-        "Signature": "USHORT DosLogRead(USHORT LogHandle, PVOID Buffer, USHORT BufferLen, PUSHORT BytesRead);",
-        "Comments": [
-          "Reads from the system log."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSCOPY",
         "ord": 201,
-        "Signature": "USHORT DosCopy(PSZ SourceName, PSZ TargetName, USHORT OpMode, ULONG Reserved);",
-        "Comments": [
-          "Copies a file or directory."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFORCEDELETE",
         "ord": 203,
-        "Signature": "USHORT DosForceDelete(PSZ FileName, ULONG Reserved);",
-        "Comments": [
-          "Deletes a file, even if it has the read-only attribute set."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSENUMATTRIBUTE",
         "ord": 204,
-        "Signature": "USHORT DosEnumAttribute(USHORT RefType, PVOID FileHandle, ULONG Entry, PVOID Buffer, ULONG BufferLen, PULONG Count, USHORT InfoLevel, ULONG Reserved);",
-        "Comments": [
-          "Enumerates the extended attributes of a file or directory."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSSHUTDOWN",
         "ord": 206,
-        "Signature": "USHORT DosShutdown(ULONG Reserved);",
-        "Comments": [
-          "Prepares the file system for a system shutdown."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSGETRESOURCE2",
         "ord": 207,
-        "Signature": "USHORT DosGetResource2(HMODULE ModHandle, USHORT TypeID, USHORT ResID, PSEL Selector);",
-        "Comments": [
-          "Returns the selector of a resource, similar to DosGetResource but used in newer OS/2 versions."
-        ]
+        "Signature": "",
+        "Comments": []
       },
       {
         "name": "DOSFREERESOURCE",
         "ord": 208,
-        "Signature": "USHORT DosFreeResource(SEL Selector);",
-        "Comments": [
-          "Frees a resource previously obtained with DosGetResource or DosGetResource2."
-        ]
+        "Signature": "",
+        "Comments": []
       }
     ]
   }

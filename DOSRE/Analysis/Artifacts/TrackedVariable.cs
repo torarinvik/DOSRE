@@ -1,4 +1,4 @@
-﻿namespace MBBSDASM.Analysis.Artifacts
+﻿namespace DOSRE.Analysis.Artifacts
 {
     public class TrackedVariable
     {

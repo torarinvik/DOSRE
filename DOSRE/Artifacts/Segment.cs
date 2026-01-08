@@ -1,9 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
-using MBBSDASM.Dasm;
-using MBBSDASM.Enums;
+using DOSRE.Dasm;
+using DOSRE.Enums;
 
-namespace MBBSDASM.Artifacts
+namespace DOSRE.Artifacts
 {
     /// <summary>
     ///     Represents a single segment of the segmented EXE/DLL file

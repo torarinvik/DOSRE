@@ -1,4 +1,4 @@
-﻿namespace MBBSDASM.Enums
+﻿namespace DOSRE.Enums
 {
     public enum EnumEntryFlags
     {

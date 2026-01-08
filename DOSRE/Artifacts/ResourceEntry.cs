@@ -1,4 +1,4 @@
-﻿namespace MBBSDASM.Artifacts
+﻿namespace DOSRE.Artifacts
 {
     /// <summary>
     ///     Represents a single Resource Entry in a Resource Record

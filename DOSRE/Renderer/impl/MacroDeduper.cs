@@ -4,7 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 
-namespace MBBSDASM.Renderer.impl
+namespace DOSRE.Renderer.impl
 {
     /// <summary>
     /// Post-processing helper: find repeated straight-line instruction chunks and replace them with macros.

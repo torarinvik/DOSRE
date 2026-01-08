@@ -1,9 +1,9 @@
 ﻿using System.Collections.Concurrent;
 using System.Collections.Generic;
-using MBBSDASM.Artifacts;
+using DOSRE.Artifacts;
 using Instruction = SharpDisasm.Instruction;
 
-namespace MBBSDASM.Dasm
+namespace DOSRE.Dasm
 {
     /// <summary>
     ///     Class that contains the actual disassembly obejct from SharpDisasm but also

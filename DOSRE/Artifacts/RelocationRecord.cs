@@ -1,7 +1,7 @@
 ﻿using System;
-using MBBSDASM.Enums;
+using DOSRE.Enums;
 
-namespace MBBSDASM.Artifacts
+namespace DOSRE.Artifacts
 {
     /// <summary>
     ///     Represents a single Relocation Record

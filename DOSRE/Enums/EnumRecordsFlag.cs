@@ -1,6 +1,6 @@
 ﻿using System;
 
-namespace MBBSDASM.Enums
+namespace DOSRE.Enums
 {
     [Flags]
     public enum EnumRecordsFlag

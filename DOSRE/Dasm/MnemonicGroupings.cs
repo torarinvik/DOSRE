@@ -2,7 +2,7 @@
 using System.Linq;
 using SharpDisasm.Udis86;
 
-namespace MBBSDASM.Dasm
+namespace DOSRE.Dasm
 {
     public static class MnemonicGroupings
     {

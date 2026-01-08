@@ -5,11 +5,11 @@ using System.Linq;
 using System.Reflection;
 using Newtonsoft.Json.Linq;
 
-namespace MBBSDASM.Analysis
+namespace DOSRE.Analysis
 {
     public sealed class DosInterruptDatabase
     {
-        private const string ResourceName = "MBBSDASM.Analysis.Assets.DOSINTS_def.json";
+        private const string ResourceName = "DOSRE.Analysis.Assets.DOSINTS_def.json";
 
         private readonly Dictionary<byte, InterruptEntry> _intsByNo;
 

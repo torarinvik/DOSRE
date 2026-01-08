@@ -2,9 +2,9 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
-using MBBSDASM.Enums;
+using DOSRE.Enums;
 
-namespace MBBSDASM.Artifacts
+namespace DOSRE.Artifacts
 {
     /// <summary>
     ///     Class Represents the Parsed Content of a 16-bit NE Format EXE/DLL file
@@ -55,7 +55,7 @@ namespace MBBSDASM.Artifacts
 
             var relocationTableOffset = BitConverter.ToUInt16(FileContent, 0x18);
             if (relocationTableOffset < 0x40)
-                throw new Exception("Unsupported executable: DOS MZ without an extended header pointer. DOSRE currently supports 16-bit NE files only.");
+                throw new Exception("Unsupported executable: DOS MZ without an extended header pointer. MBBSDASM currently supports 16-bit NE files only.");
 
             var windowsHeaderOffset = (int)BitConverter.ToUInt32(FileContent, 0x3C);
             if (windowsHeaderOffset <= 0 || windowsHeaderOffset + 2 > FileContent.Length)
@@ -69,15 +69,15 @@ namespace MBBSDASM.Artifacts
             }
             else if (newHeaderSig0 == (byte)'L' && (newHeaderSig1 == (byte)'E' || newHeaderSig1 == (byte)'X'))
             {
-                throw new Exception($"Unsupported executable format: {(char)newHeaderSig0}{(char)newHeaderSig1} (Linear Executable). DOSRE currently supports 16-bit NE files only.");
+                throw new Exception($"Unsupported executable format: {(char)newHeaderSig0}{(char)newHeaderSig1} (Linear Executable). MBBSDASM currently supports 16-bit NE files only.");
             }
             else if (newHeaderSig0 == (byte)'P' && newHeaderSig1 == (byte)'E')
             {
-                throw new Exception("Unsupported executable format: PE (Portable Executable). DOSRE currently supports 16-bit NE files only.");
+                throw new Exception("Unsupported executable format: PE (Portable Executable). MBBSDASM currently supports 16-bit NE files only.");
             }
             else
             {
-                throw new Exception($"Unsupported executable format: {(char)newHeaderSig0}{(char)newHeaderSig1}. DOSRE currently supports 16-bit NE files only.");
+                throw new Exception($"Unsupported executable format: {(char)newHeaderSig0}{(char)newHeaderSig1}. MBBSDASM currently supports 16-bit NE files only.");
             }
 
             //Load Windows Header
@@ -127,7 +127,7 @@ namespace MBBSDASM.Artifacts
             
             //Load Resource Table
             ResourceTable = new List<ResourceRecord>();
-            //TODO -- Resource Table isn't used by many binaries we test, so we currently skip loading this.
+            //TODO -- Resource Table isn't used by MBBS modules so we'll skip loading this for now
             //TODO -- Implement this in a future version
             
             //Load Resident Name Table

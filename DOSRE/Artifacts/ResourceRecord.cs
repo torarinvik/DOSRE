@@ -1,6 +1,6 @@
 ﻿using System.Collections.Generic;
 
-namespace MBBSDASM.Artifacts
+namespace DOSRE.Artifacts
 {
     /// <summary>
     ///     Represents a single record in the Resource Table

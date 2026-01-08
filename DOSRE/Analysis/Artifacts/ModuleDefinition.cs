@@ -1,6 +1,6 @@
 ﻿using System.Collections.Generic;
 
-namespace MBBSDASM.Analysis.Artifacts
+namespace DOSRE.Analysis.Artifacts
 {
     public class ModuleDefinition
     {

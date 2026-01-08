@@ -5,14 +5,14 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Tasks;
-using MBBSDASM.Artifacts;
-using MBBSDASM.Enums;
-using MBBSDASM.Logging;
+using DOSRE.Artifacts;
+using DOSRE.Enums;
+using DOSRE.Logging;
 using NLog;
 using SharpDisasm;
 using SharpDisasm.Udis86;
 
-namespace MBBSDASM.Dasm
+namespace DOSRE.Dasm
 {
     /// <summary>
     ///     Main Disassembler Class for 16-Bit x86 NE Format EXE/DLL Files

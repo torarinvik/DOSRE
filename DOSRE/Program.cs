@@ -1,7 +1,7 @@
-﻿using MBBSDASM.UI;
-using MBBSDASM.UI.impl;
+﻿using DOSRE.UI;
+using DOSRE.UI.impl;
 
-namespace MBBSDASM
+namespace DOSRE
 {
     /// <summary>
     ///     Main ConsoleUI Entrypoint

@@ -1,6 +1,6 @@
 ﻿using System;
 
-namespace MBBSDASM.Artifacts
+namespace DOSRE.Artifacts
 {
     /// <summary>
     ///     One Block == 512 Bytes

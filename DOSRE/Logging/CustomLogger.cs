@@ -1,7 +1,7 @@
 ﻿using NLog;
 using NLog.Layouts;
 
-namespace MBBSDASM.Logging
+namespace DOSRE.Logging
 {
     public class CustomLogger : Logger
     {

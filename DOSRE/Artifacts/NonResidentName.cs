@@ -1,4 +1,4 @@
-﻿namespace MBBSDASM.Artifacts
+﻿namespace DOSRE.Artifacts
 {
     /// <summary>
     ///     Represents a single record in the Non-Resident Name Table

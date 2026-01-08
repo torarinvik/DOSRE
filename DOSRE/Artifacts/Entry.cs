@@ -1,4 +1,4 @@
-﻿namespace MBBSDASM.Artifacts
+﻿namespace DOSRE.Artifacts
 {
     public class Entry
     {
