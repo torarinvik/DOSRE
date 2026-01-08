@@ -205,7 +205,7 @@ namespace DOSRE.Dasm
             return argIndex >= 0;
         }
 
-        private static void UpdatePointerAliases(string insText, Dictionary<string, string> aliases)
+        private static void UpdatePointerAliases(string insText, Dictionary<string, string> aliases, Dictionary<uint, string> ptrSymbols = null)
         {
             if (aliases == null || string.IsNullOrEmpty(insText))
                 return;
@@ -255,6 +255,16 @@ namespace DOSRE.Dasm
                 if (TryParseEbpArgIndex(hex, out var argIndex))
                 {
                     aliases[dst] = $"arg{argIndex}";
+                    return;
+                }
+            }
+
+            // mov dst, [abs] => if abs is an inferred pointer global, treat dst as that pointer base
+            if (ptrSymbols != null && ptrSymbols.Count > 0)
+            {
+                if (TryParseMovRegFromAbs(t, out var dstReg, out var abs) && ptrSymbols.TryGetValue(abs, out var ptrName))
+                {
+                    aliases[dstReg] = ptrName;
                     return;
                 }
             }
@@ -381,7 +391,8 @@ namespace DOSRE.Dasm
             List<Instruction> instructions,
             int startIdx,
             int endIdxExclusive,
-            out Dictionary<string, Dictionary<uint, FieldAccessStats>> statsByBase)
+            out Dictionary<string, Dictionary<uint, FieldAccessStats>> statsByBase,
+            Dictionary<uint, string> ptrSymbols = null)
         {
             statsByBase = new Dictionary<string, Dictionary<uint, FieldAccessStats>>(StringComparer.Ordinal);
             if (instructions == null || startIdx < 0 || endIdxExclusive > instructions.Count || startIdx >= endIdxExclusive)
@@ -398,7 +409,7 @@ namespace DOSRE.Dasm
                 var insText = instructions[i].ToString().Trim();
 
                 // Update aliases first so we model dataflow forward.
-                UpdatePointerAliases(insText, aliases);
+                UpdatePointerAliases(insText, aliases, ptrSymbols);
 
                 // Prefer size when present (byte/word/dword).
                 var size = string.Empty;
@@ -503,10 +514,165 @@ namespace DOSRE.Dasm
                     return m.Value;
 
                 // Use field_0 for vptr-like deref.
+                // For inferred pointer globals (ptr_XXXXXXXX), prefer dotted form: [ptr_XXXXXXXX.field_0030]
+                if (a.StartsWith("ptr_", StringComparison.OrdinalIgnoreCase))
+                {
+                    return disp == 0
+                        ? $"[{a}.field_0000]"
+                        : $"[{a}.field_{disp:X4}]";
+                }
+
                 return disp == 0
                     ? $"[{a}+field_0]"
                     : $"[{a}+field_{disp:X}]";
             });
+        }
+
+        private sealed class FpuStats
+        {
+            public int Total;
+            public Dictionary<string, int> MnemonicCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            public bool HasConvert;
+            public bool HasCompare;
+            public bool HasFld1;
+            public bool HasFldz;
+        }
+
+        private static void CollectFpuOpsForFunction(List<Instruction> instructions, int startIdx, int endIdx, out FpuStats stats)
+        {
+            stats = new FpuStats();
+            if (instructions == null || startIdx < 0 || endIdx > instructions.Count || startIdx >= endIdx)
+                return;
+
+            for (var i = startIdx; i < endIdx; i++)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (string.IsNullOrEmpty(t))
+                    continue;
+
+                var sp = t.IndexOf(' ');
+                var mnemonic = (sp > 0 ? t.Substring(0, sp) : t).Trim().ToLowerInvariant();
+                if (string.IsNullOrEmpty(mnemonic))
+                    continue;
+
+                // Best-effort: x87 mnemonics are typically 'f*' (fld/fstp/fmul/...)
+                if (!mnemonic.StartsWith('f'))
+                    continue;
+
+                stats.Total++;
+                stats.MnemonicCounts.TryGetValue(mnemonic, out var c);
+                stats.MnemonicCounts[mnemonic] = c + 1;
+
+                if (mnemonic.StartsWith("fild", StringComparison.OrdinalIgnoreCase) || mnemonic.StartsWith("fist", StringComparison.OrdinalIgnoreCase))
+                    stats.HasConvert = true;
+                if (mnemonic.StartsWith("fcom", StringComparison.OrdinalIgnoreCase) || mnemonic.StartsWith("fucom", StringComparison.OrdinalIgnoreCase))
+                    stats.HasCompare = true;
+                if (mnemonic.Equals("fld1", StringComparison.OrdinalIgnoreCase))
+                    stats.HasFld1 = true;
+                if (mnemonic.Equals("fldz", StringComparison.OrdinalIgnoreCase))
+                    stats.HasFldz = true;
+            }
+        }
+
+        private static string FormatFpuSummary(FpuStats stats)
+        {
+            if (stats == null || stats.Total < 4)
+                return string.Empty;
+
+            var top = stats.MnemonicCounts
+                .OrderByDescending(k => k.Value)
+                .ThenBy(k => k.Key)
+                .Take(6)
+                .Select(k => $"{k.Key}(x{k.Value})")
+                .ToList();
+
+            var tags = new List<string>();
+            if (stats.HasConvert)
+                tags.Add("convert");
+            if (stats.HasCompare)
+                tags.Add("compare/branch?");
+            if (stats.HasFld1 || stats.HasFldz)
+                tags.Add("constants");
+
+            var tagText = tags.Count > 0 ? $" ; patterns: {string.Join(", ", tags)}" : string.Empty;
+            return $"x87 ops={stats.Total}: {string.Join(", ", top)}{tagText}";
+        }
+
+        private static string TryAnnotateCriticalSectionIo(List<Instruction> instructions, int startIdx)
+        {
+            if (instructions == null || startIdx < 0 || startIdx >= instructions.Count)
+                return string.Empty;
+
+            // Critical sections can be fairly long (e.g., VGA register programming).
+            // Keep it bounded, but large enough to catch typical cli..sti sequences.
+            var cliSearchLimit = Math.Min(instructions.Count, startIdx + 64);
+            var cliIdx = -1;
+            var stiIdx = -1;
+
+            for (var i = startIdx; i < cliSearchLimit; i++)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (t.Equals("cli", StringComparison.OrdinalIgnoreCase))
+                {
+                    cliIdx = i;
+                    break;
+                }
+            }
+
+            if (cliIdx < 0)
+                return string.Empty;
+
+            var stiSearchLimit = Math.Min(instructions.Count, cliIdx + 256);
+            for (var i = cliIdx + 1; i < stiSearchLimit; i++)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (t.Equals("sti", StringComparison.OrdinalIgnoreCase))
+                {
+                    stiIdx = i;
+                    break;
+                }
+            }
+
+            if (stiIdx < 0)
+                return string.Empty;
+
+            ushort? lastDxImm16 = null;
+            var ports = new Dictionary<ushort, IoPortStats>();
+
+            for (var i = cliIdx + 1; i < stiIdx; i++)
+            {
+                var t = instructions[i].ToString();
+                if (TryParseMovDxImmediate(t, out var dxImm))
+                    lastDxImm16 = dxImm;
+
+                if (!TryParseIoAccess(t, lastDxImm16, out var port, out var isWrite, out var _))
+                    continue;
+
+                if (!ports.TryGetValue(port, out var st))
+                    ports[port] = st = new IoPortStats();
+                if (isWrite) st.Writes++; else st.Reads++;
+            }
+
+            if (ports.Count == 0)
+                return string.Empty;
+
+            var top = ports
+                .OrderByDescending(p => p.Value.Reads + p.Value.Writes)
+                .ThenBy(p => p.Key)
+                .Take(4)
+                .Select(p =>
+                {
+                    KnownIoPorts.TryGetValue(p.Key, out var name);
+                    var rw = p.Value.Writes > 0 && p.Value.Reads > 0
+                        ? $"r{p.Value.Reads}/w{p.Value.Writes}"
+                        : (p.Value.Writes > 0 ? $"w{p.Value.Writes}" : $"r{p.Value.Reads}");
+                    return !string.IsNullOrEmpty(name)
+                        ? $"{name} (0x{p.Key:X4}) {rw}"
+                        : $"0x{p.Key:X4} {rw}";
+                })
+                .ToList();
+
+            return $"BBHINT: critical section (cli..sti) around I/O: {string.Join(", ", top)}";
         }
 
         private static string RewriteStackFrameOperands(string insText)
@@ -1095,6 +1261,81 @@ namespace DOSRE.Dasm
             return map;
         }
 
+        private static Dictionary<uint, string> BuildInferredPointerSymbols(List<Instruction> instructions, int minBaseUses)
+        {
+            if (instructions == null || instructions.Count == 0)
+                return new Dictionary<uint, string>();
+
+            var baseUseCounts = new Dictionary<uint, int>();
+
+            for (var i = 0; i < instructions.Count - 1; i++)
+            {
+                var t = instructions[i]?.ToString();
+                if (string.IsNullOrWhiteSpace(t))
+                    continue;
+
+                if (!TryParseMovRegFromAbs(t.Trim(), out var reg, out var abs))
+                    continue;
+
+                // Ignore obvious scalars (ax/al/etc) and stack regs.
+                if (string.IsNullOrEmpty(reg))
+                    continue;
+                var r = reg.ToLowerInvariant();
+                if (r == "esp" || r == "ebp" || r == "sp" || r == "bp")
+                    continue;
+                if (!(r == "eax" || r == "ebx" || r == "ecx" || r == "edx" || r == "esi" || r == "edi"))
+                    continue;
+
+                // Heuristic: within a short window, the loaded reg is used as a memory base (e.g. [esi+0x30]).
+                var usedAsBase = false;
+                for (var j = i + 1; j < instructions.Count && j <= i + 10; j++)
+                {
+                    var u = instructions[j]?.ToString();
+                    if (string.IsNullOrWhiteSpace(u))
+                        continue;
+
+                    // Stop if reg is overwritten quickly.
+                    if (Regex.IsMatch(u, $@"^\s*mov\s+{Regex.Escape(r)}\s*,", RegexOptions.IgnoreCase))
+                        break;
+
+                    // Count only base uses with smallish displacements; avoids counting random table jumps.
+                    var m = Regex.Match(u, $@"\[(?<base>{Regex.Escape(r)})\+(?<disp>0x[0-9A-Fa-f]+|\d+)\]", RegexOptions.IgnoreCase);
+                    if (m.Success)
+                    {
+                        var dTok = m.Groups["disp"].Value;
+                        if (dTok.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (int.TryParse(dTok.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out var d) && d >= 0 && d <= 0x400)
+                            {
+                                usedAsBase = true;
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            if (int.TryParse(dTok, out var d) && d >= 0 && d <= 0x400)
+                            {
+                                usedAsBase = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (!usedAsBase)
+                    continue;
+
+                baseUseCounts.TryGetValue(abs, out var c);
+                baseUseCounts[abs] = c + 1;
+            }
+
+            var map = new Dictionary<uint, string>();
+            foreach (var kvp in baseUseCounts.Where(k => k.Value >= minBaseUses).OrderByDescending(k => k.Value).ThenBy(k => k.Key))
+                map[kvp.Key] = $"ptr_{kvp.Key:X8}";
+
+            return map;
+        }
+
         private static string RewriteFlagSymbols(string insText, Dictionary<uint, string> flagSymbols)
         {
             if (string.IsNullOrWhiteSpace(insText) || flagSymbols == null || flagSymbols.Count == 0)
@@ -1111,6 +1352,27 @@ namespace DOSRE.Dasm
                     if (!uint.TryParse(tok, System.Globalization.NumberStyles.HexNumber, null, out var abs))
                         return m.Value;
                     if (!flagSymbols.TryGetValue(abs, out var name))
+                        return m.Value;
+                    return $"[{name}]";
+                },
+                RegexOptions.IgnoreCase);
+        }
+
+        private static string RewritePointerSymbols(string insText, Dictionary<uint, string> ptrSymbols)
+        {
+            if (string.IsNullOrWhiteSpace(insText) || ptrSymbols == null || ptrSymbols.Count == 0)
+                return insText;
+
+            return Regex.Replace(
+                insText,
+                @"\[(?<abs>(?:0x)?[0-9A-Fa-f]+)h?\]",
+                m =>
+                {
+                    var tok = m.Groups["abs"].Value.Trim();
+                    tok = tok.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? tok.Substring(2) : tok;
+                    if (!uint.TryParse(tok, System.Globalization.NumberStyles.HexNumber, null, out var abs))
+                        return m.Value;
+                    if (!ptrSymbols.TryGetValue(abs, out var name))
                         return m.Value;
                     return $"[{name}]";
                 },
@@ -1265,9 +1527,11 @@ namespace DOSRE.Dasm
             if (instructions == null || startIdx < 0 || startIdx >= instructions.Count)
                 return string.Empty;
 
+            var hints = new List<string>();
+
             var restoreHint = TryAnnotateRestoreCachedGlobalsToEsi(instructions, startIdx);
             if (!string.IsNullOrEmpty(restoreHint))
-                return restoreHint;
+                hints.Add(restoreHint);
 
             // Detect repeated pattern:
             //   mov r32, [esi+disp]
@@ -1290,20 +1554,98 @@ namespace DOSRE.Dasm
                 i++; // consume the store
             }
 
-            if (pairs.Count < 3)
+            if (pairs.Count >= 3)
+            {
+                // Prefer an explicit mapping list (more useful than a min/max range since globals may not be monotonic).
+                var mappingParts = pairs
+                    .Take(6)
+                    .Select(p => $"+0x{p.disp:X}->0x{p.abs:X}")
+                    .ToList();
+
+                var mappingText = string.Join(", ", mappingParts);
+                if (pairs.Count > 6)
+                    mappingText += ", ...";
+
+                hints.Add($"BBHINT: cache [esi+disp] to globals: {mappingText} ({pairs.Count} stores)");
+            }
+
+            var crit = TryAnnotateCriticalSectionIo(instructions, startIdx);
+            if (!string.IsNullOrEmpty(crit))
+                hints.Add(crit);
+
+            return hints.Count > 0 ? string.Join(" ; ", hints) : string.Empty;
+        }
+
+        private static bool TryParseCmpAbsImm(string insText, out uint abs, out uint imm)
+        {
+            abs = 0;
+            imm = 0;
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            var m = Regex.Match(insText.Trim(), @"^cmp\s+(?:byte|word|dword)?\s*\[(?<abs>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\]\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?|\d+)\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            var absTok = m.Groups["abs"].Value.Trim().TrimEnd('h', 'H');
+            var immTok = m.Groups["imm"].Value.Trim().TrimEnd('h', 'H');
+            if (!TryParseHexOrDecUInt32(absTok, out abs))
+                return false;
+            if (!TryParseHexOrDecUInt32(immTok, out imm))
+                return false;
+            return true;
+        }
+
+        private static bool TryParseMovAbsImm(string insText, out uint abs, out uint imm)
+        {
+            abs = 0;
+            imm = 0;
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            var m = Regex.Match(insText.Trim(), @"^mov\s+(?:byte|word|dword)?\s*\[(?<abs>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\]\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?|\d+)\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            var absTok = m.Groups["abs"].Value.Trim().TrimEnd('h', 'H');
+            var immTok = m.Groups["imm"].Value.Trim().TrimEnd('h', 'H');
+            if (!TryParseHexOrDecUInt32(absTok, out abs))
+                return false;
+            if (!TryParseHexOrDecUInt32(immTok, out imm))
+                return false;
+            return true;
+        }
+
+        private static string TryAnnotateInitOnceSentinel(List<Instruction> instructions, int idx, Dictionary<uint, string> ptrSymbols)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
                 return string.Empty;
 
-            // Prefer an explicit mapping list (more useful than a min/max range since globals may not be monotonic).
-            var mappingParts = pairs
-                .Take(6)
-                .Select(p => $"+0x{p.disp:X}->0x{p.abs:X}")
-                .ToList();
+            var t = instructions[idx].ToString().Trim();
+            if (!TryParseCmpAbsImm(t, out var abs, out var immCmp))
+                return string.Empty;
 
-            var mappingText = string.Join(", ", mappingParts);
-            if (pairs.Count > 6)
-                mappingText += ", ...";
+            var scanLimit = Math.Min(instructions.Count, idx + 12);
+            for (var j = idx + 1; j < scanLimit; j++)
+            {
+                var u = instructions[j].ToString().Trim();
+                if (!TryParseMovAbsImm(u, out var abs2, out var immMov))
+                    continue;
+                if (abs2 != abs)
+                    continue;
 
-            return $"BBHINT: cache [esi+disp] to globals: {mappingText} ({pairs.Count} stores)";
+                var name = ptrSymbols != null && ptrSymbols.TryGetValue(abs, out var sym) ? $"[{sym}]" : $"[0x{abs:X}]";
+
+                if (immMov == immCmp)
+                    return $"INIT: sentinel {name} == 0x{immCmp:X} (init-once / cache-valid?)";
+
+                if ((immCmp == 0 || immCmp == 1) && (immMov == 0 || immMov == 1))
+                    return $"INIT: sentinel {name} {immCmp}-> {immMov} (init-once?)";
+
+                return $"INIT: sentinel {name} (cmp 0x{immCmp:X} then set 0x{immMov:X})";
+            }
+
+            return string.Empty;
         }
 
         private static bool TryParseAbsBitTest(string insText, out uint abs, out uint mask)
@@ -2579,6 +2921,10 @@ namespace DOSRE.Dasm
                     funcSummaries = SummarizeFunctions(instructions, functionStarts, blockStarts, sortedFixups, globalSymbols, stringSymbols);
                 }
 
+                // Infer common pointer globals (absolute addresses frequently loaded into a register and used as a base).
+                // This is needed early so field summaries can attribute [reg+disp] to ptr_XXXXXXXX bases.
+                var inferredPtrSymbols = leInsights ? BuildInferredPointerSymbols(instructions, minBaseUses: 3) : new Dictionary<uint, string>();
+
                 // Per-function field summaries (insights)
                 Dictionary<uint, string> funcFieldSummaries = null;
                 if (leInsights && functionStarts != null && functionStarts.Count > 0)
@@ -2595,10 +2941,33 @@ namespace DOSRE.Dasm
                         if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
                             endIdx = nextIdx;
 
-                        CollectFieldAccessesForFunction(instructions, startIdx, endIdx, out var stats);
+                        CollectFieldAccessesForFunction(instructions, startIdx, endIdx, out var stats, inferredPtrSymbols);
                         var summary = FormatFieldSummary(stats);
                         if (!string.IsNullOrEmpty(summary))
                             funcFieldSummaries[startAddr] = summary;
+                    }
+                }
+
+                // Per-function FPU summaries (insights)
+                Dictionary<uint, string> funcFpuSummaries = null;
+                if (leInsights && functionStarts != null && functionStarts.Count > 0)
+                {
+                    funcFpuSummaries = new Dictionary<uint, string>();
+                    var sortedStarts = functionStarts.OrderBy(x => x).ToList();
+                    for (var si = 0; si < sortedStarts.Count; si++)
+                    {
+                        var startAddr = sortedStarts[si];
+                        if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                            continue;
+
+                        var endIdx = instructions.Count;
+                        if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                            endIdx = nextIdx;
+
+                        CollectFpuOpsForFunction(instructions, startIdx, endIdx, out var st);
+                        var summary = FormatFpuSummary(st);
+                        if (!string.IsNullOrEmpty(summary))
+                            funcFpuSummaries[startAddr] = summary;
                     }
                 }
 
@@ -2684,6 +3053,17 @@ namespace DOSRE.Dasm
                     sb.AppendLine(";");
                 }
 
+                if (leInsights && inferredPtrSymbols.Count > 0)
+                {
+                    sb.AppendLine(";");
+                    sb.AppendLine("; Inferred Pointer Variables (best-effort, from base+disp access patterns)");
+                    foreach (var kvp in inferredPtrSymbols.OrderBy(k => k.Key).Take(64))
+                        sb.AppendLine($"{kvp.Value} EQU 0x{kvp.Key:X8} ; ptr (inferred)");
+                    if (inferredPtrSymbols.Count > 64)
+                        sb.AppendLine($";   (ptr symbol table truncated: {inferredPtrSymbols.Count} entries)");
+                    sb.AppendLine(";");
+                }
+
                 // Live alias tracking for operand rewriting during rendering.
                 var liveAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                 {
@@ -2715,6 +3095,16 @@ namespace DOSRE.Dasm
 
                         if (leInsights && funcFlagSummaries != null && funcFlagSummaries.TryGetValue(addr, out var flagSum))
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; FLAGS: {flagSum}", commentColumn: 0, maxWidth: 160);
+
+                        if (leInsights && funcFpuSummaries != null && funcFpuSummaries.TryGetValue(addr, out var fpuSum))
+                            AppendWrappedDisasmLine(sb, string.Empty, $" ; FPU: {fpuSum}", commentColumn: 0, maxWidth: 160);
+
+                        if (leInsights)
+                        {
+                            var critHint = TryAnnotateCriticalSectionIo(instructions, insLoopIndex);
+                            if (!string.IsNullOrEmpty(critHint))
+                                AppendWrappedDisasmLine(sb, string.Empty, $" ; {critHint}", commentColumn: 0, maxWidth: 160);
+                        }
 
                         if (leInsights && funcFieldSummaries != null && funcFieldSummaries.TryGetValue(addr, out var fsum))
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; {fsum}", commentColumn: 0, maxWidth: 160);
@@ -2756,7 +3146,7 @@ namespace DOSRE.Dasm
                         insText = RewriteStackFrameOperands(insText);
 
                         // Update aliases based on the *current* instruction before rewriting.
-                        UpdatePointerAliases(insText, liveAliases);
+                        UpdatePointerAliases(insText, liveAliases, inferredPtrSymbols);
 
                         // Rewrite [reg+disp] into [this/argX + field_..] when it looks like a struct access.
                         insText = RewriteFieldOperands(insText, liveAliases);
@@ -2764,6 +3154,10 @@ namespace DOSRE.Dasm
                         // Rewrite frequently-tested absolute flag variables into symbolic names.
                         if (inferredFlagSymbols != null && inferredFlagSymbols.Count > 0)
                             insText = RewriteFlagSymbols(insText, inferredFlagSymbols);
+
+                        // Rewrite inferred pointer globals into symbols too.
+                        if (inferredPtrSymbols != null && inferredPtrSymbols.Count > 0)
+                            insText = RewritePointerSymbols(insText, inferredPtrSymbols);
                     }
 
                     if (TryGetRelativeBranchTarget(ins, out var branchTarget, out var isCall2))
@@ -2846,6 +3240,13 @@ namespace DOSRE.Dasm
                     var genHint = TryAnnotateGenericInstruction(rawInsText, inferredFlagSymbols);
                     if (!string.IsNullOrEmpty(genHint))
                         insText += $" ; {genHint}";
+
+                    if (leInsights)
+                    {
+                        var initHint = TryAnnotateInitOnceSentinel(instructions, insLoopIndex, inferredPtrSymbols);
+                        if (!string.IsNullOrEmpty(initHint))
+                            insText += $" ; {initHint}";
+                    }
 
                     if (haveFixups && fixupsHere.Count > 0)
                     {
