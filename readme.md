@@ -129,6 +129,12 @@ A big shoutout to the grey beards keeping this archaic software alive and still 
 
 # License / Copyright
 
+<<<<<<< Updated upstream
+=======
+
+DOSRE(Dos Reconstructor) is forked from MBBSDASM created by Eric Nusbaum in 2017 https://github.com/mbbsemu/MBBSDASM and thus inherits it's license
+
+>>>>>>> Stashed changes
 MBBSDASM is Copyright (c) 2017 Eric Nusbaum and is distributed under the 2-clause "Simplified BSD License". 
 
 SharpDisam is Copyright (c) 2015 Justin Stenning and is distributed under the 2-clause "Simplified BSD License". 

@@ -3,6 +3,11 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
     <LangVersion>7.2</LangVersion>
+<<<<<<<< Updated upstream:MBBSDASM/MBBSDASM.csproj
+========
+    <AssemblyName>DOSRE</AssemblyName>
+    <RootNamespace>DOSRE</RootNamespace>
+>>>>>>>> Stashed changes:DOSRE/DOSRE.csproj
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
