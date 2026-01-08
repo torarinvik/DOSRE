@@ -293,6 +293,10 @@ namespace DOSRE.UI.impl
                             _bMacros = true;
                             break;
                         case "-?":
+                        case "-H":
+                        case "-HELP":
+                        case "--HELP":
+                        case "/?":
                             Console.WriteLine("-I <file> -- Input File to DisassembleSegment");
                             Console.WriteLine("-O <file> -- Output File for Disassembly (Default ConsoleUI)");
                             Console.WriteLine("-MINIMAL -- Minimal Disassembler Output");

@@ -331,6 +331,7 @@ namespace DOSRE.Dasm
             ushort? lastDxImm = null;
             ushort? lastSiImm = null;
             ushort? lastDiImm = null;
+            ushort? lastBpImm = null;
             ushort? lastDsImm = null;
             ushort? lastEsImm = null;
             FunctionInfo currentFunc = null;
@@ -356,6 +357,7 @@ namespace DOSRE.Dasm
                     lastDxImm = null;
                     lastSiImm = null;
                     lastDiImm = null;
+                    lastBpImm = null;
                     lastDsImm = null;
                     lastEsImm = null;
 
@@ -398,7 +400,7 @@ namespace DOSRE.Dasm
                 if (mzInsights)
                 {
                     // Track a tiny amount of state for DOS interrupt hints.
-                    UpdateSimpleDosState(ins, ref lastAh, ref lastAl, ref lastAxImm, ref lastBxImm, ref lastCxImm, ref lastDxImm, ref lastSiImm, ref lastDiImm, ref lastDsImm, ref lastEsImm);
+                    UpdateSimpleDosState(ins, ref lastAh, ref lastAl, ref lastAxImm, ref lastBxImm, ref lastCxImm, ref lastDxImm, ref lastSiImm, ref lastDiImm, ref lastBpImm, ref lastDsImm, ref lastEsImm);
 
                     var higherHint = TryGetHigherLevelHint(ins, i > 0 ? instructions[i - 1] : null, lastAh, lastAl, lastAxImm, lastBxImm, lastCxImm, lastDxImm, lastSiImm, lastDiImm, lastDsImm, lastEsImm);
                     if (!string.IsNullOrEmpty(higherHint))
@@ -430,7 +432,7 @@ namespace DOSRE.Dasm
 
                 if (mzInsights)
                 {
-                    var hint = TryDecodeInterruptHint(ins, lastAh, lastAl, lastAxImm, lastBxImm, lastCxImm, lastDxImm, lastSiImm, lastDiImm, lastDsImm, lastEsImm, stringSyms, stringPrev, module);
+                    var hint = TryDecodeInterruptHint(ins, lastAh, lastAl, lastAxImm, lastBxImm, lastCxImm, lastDxImm, lastSiImm, lastDiImm, lastBpImm, lastDsImm, lastEsImm, stringSyms, stringPrev, module);
                     if (!string.IsNullOrEmpty(hint))
                         insText += $" ; {hint}";
                 }
@@ -1037,6 +1039,7 @@ namespace DOSRE.Dasm
             ref ushort? lastDxImm,
             ref ushort? lastSiImm,
             ref ushort? lastDiImm,
+            ref ushort? lastBpImm,
             ref ushort? lastDsImm,
             ref ushort? lastEsImm)
         {
@@ -1130,12 +1133,20 @@ namespace DOSRE.Dasm
                 return;
             }
 
+            // mov bp, imm16: BD iw
+            if (b[0] == 0xBD && b.Length >= 3)
+            {
+                lastBpImm = (ushort)(b[1] | (b[2] << 8));
+                return;
+            }
+
             // Register-to-register moves (subset of common ones)
             if (b.Length >= 2 && b[0] == 0x89) // mov r/m, r
             {
                 if (b[1] == 0xC3) { lastBxImm = lastAxImm; return; } // mov bx, ax
                 if (b[1] == 0xC1) { lastCxImm = lastAxImm; return; } // mov cx, ax
                 if (b[1] == 0xC2) { lastDxImm = lastAxImm; return; } // mov dx, ax
+                if (b[1] == 0xC5) { lastBpImm = lastAxImm; return; } // mov bp, ax
             }
             if (b.Length >= 2 && b[0] == 0x8B) // mov r, r/m
             {
@@ -1143,6 +1154,7 @@ namespace DOSRE.Dasm
                 if (b[1] == 0xC8) { lastCxImm = lastAxImm; return; } // mov cx, ax
                 if (b[1] == 0xD0) { lastDxImm = lastAxImm; return; } // mov dx, ax
                 if (b[1] == 0xC3) { lastAxImm = lastBxImm; lastAh = lastAxImm.HasValue ? (byte?)(lastAxImm >> 8) : null; lastAl = lastAxImm.HasValue ? (byte?)(lastAxImm & 0xFF) : null; return; } // mov ax, bx
+                if (b[1] == 0xE8) { lastBpImm = lastAxImm; return; } // mov bp, ax
             }
 
             // Segments
@@ -1182,6 +1194,7 @@ namespace DOSRE.Dasm
             else if (dest.Contains("dx")) lastDxImm = null;
             else if (dest.Contains("si")) lastSiImm = null;
             else if (dest.Contains("di")) lastDiImm = null;
+            else if (dest.Contains("bp")) lastBpImm = null;
             else if (dest.Contains("ds")) lastDsImm = null;
             else if (dest.Contains("es")) lastEsImm = null;
 
@@ -1355,6 +1368,7 @@ namespace DOSRE.Dasm
             ushort? lastDxImm,
             ushort? lastSiImm,
             ushort? lastDiImm,
+            ushort? lastBpImm,
             ushort? lastDsImm,
             ushort? lastEsImm,
             Dictionary<uint, string> stringSyms,
@@ -1598,6 +1612,33 @@ namespace DOSRE.Dasm
                             var sub = al.Value switch { 0 => "LoadExec", 1 => "LoadDebug", 3 => "LoadOverlay", 5 => "SetExecState", _ => $"sub=0x{al.Value:X2}" };
                             dbDesc += $" ; {sub}";
                         }
+
+                        if (lastDxImm.HasValue)
+                        {
+                            var linear = lastDsImm.HasValue ? (uint)((lastDsImm.Value << 4) + lastDxImm.Value) : lastDxImm.Value;
+                            var fn = TryReadAsciiString(module, linear, 128);
+                            if (!string.IsNullOrEmpty(fn)) dbDesc += $" ; path=\"{fn}\"";
+                        }
+
+                        // EXEC parameter block at ES:BX
+                        if (lastEsImm.HasValue && lastBxImm.HasValue)
+                        {
+                            var pbLinear = (uint)((lastEsImm.Value << 4) + lastBxImm.Value);
+                            if (module != null && pbLinear + 14 <= (uint)module.Length)
+                            {
+                                var pbOff = (int)pbLinear;
+                                var envSeg = ReadUInt16(module, pbOff + 0);
+                                var cmdPtr = ReadUInt32(module, pbOff + 2);
+                                var cmdOff = (ushort)(cmdPtr & 0xFFFF);
+                                var cmdSeg = (ushort)(cmdPtr >> 16);
+
+                                dbDesc += $" ; PB env=0x{envSeg:X4} cmd={cmdSeg:X4}:{cmdOff:X4}";
+
+                                var cmdLinear = (uint)((cmdSeg << 4) + cmdOff);
+                                var cmd = TryReadDosCommandTail(module, cmdLinear, 126);
+                                if (!string.IsNullOrEmpty(cmd)) dbDesc += $" \"{cmd}\"";
+                            }
+                        }
                         dbDesc += " ; AL: 0=Exec 1=Debug 3=Overlay DS:DX=path ES:BX=params";
                     }
 
@@ -1637,6 +1678,12 @@ namespace DOSRE.Dasm
                     // AH=39h, 0x3Ah, 0x3Bh: Mkdir/Rmdir/Chdir
                     if (ah == 0x39 || ah == 0x3A || ah == 0x3B)
                     {
+                        if (lastDxImm.HasValue)
+                        {
+                            var linear = lastDsImm.HasValue ? (uint)((lastDsImm.Value << 4) + lastDxImm.Value) : lastDxImm.Value;
+                            var p = TryReadAsciiString(module, linear, 128);
+                            if (!string.IsNullOrEmpty(p)) dbDesc += $" ; path=\"{p}\"";
+                        }
                         dbDesc += " ; DS:DX=path";
                     }
 
@@ -1668,6 +1715,20 @@ namespace DOSRE.Dasm
                     // AH=56h: Rename
                     if (ah == 0x56)
                     {
+                        if (lastDxImm.HasValue)
+                        {
+                            var linear = lastDsImm.HasValue ? (uint)((lastDsImm.Value << 4) + lastDxImm.Value) : lastDxImm.Value;
+                            var oldp = TryReadAsciiString(module, linear, 128);
+                            if (!string.IsNullOrEmpty(oldp)) dbDesc += $" ; old=\"{oldp}\"";
+                        }
+
+                        if (lastEsImm.HasValue && lastDiImm.HasValue)
+                        {
+                            var linear = (uint)((lastEsImm.Value << 4) + lastDiImm.Value);
+                            var newp = TryReadAsciiString(module, linear, 128);
+                            if (!string.IsNullOrEmpty(newp)) dbDesc += $" ; new=\"{newp}\"";
+                        }
+
                         dbDesc += " ; DS:DX=oldpath ES:DI=newpath";
                     }
 
@@ -1717,6 +1778,13 @@ namespace DOSRE.Dasm
                         if (lastBxImm.HasValue) dbDesc += $" ; BX=0x{lastBxImm.Value:X} (mode)";
                         if (lastCxImm.HasValue) dbDesc += $" ; CX=0x{lastCxImm.Value:X} (attr)";
                         if (lastDxImm.HasValue) dbDesc += $" ; DX=0x{lastDxImm.Value:X} (action)";
+
+                        if (lastSiImm.HasValue)
+                        {
+                            var linear = lastDsImm.HasValue ? (uint)((lastDsImm.Value << 4) + lastSiImm.Value) : lastSiImm.Value;
+                            var fn = TryReadAsciiString(module, linear, 128);
+                            if (!string.IsNullOrEmpty(fn)) dbDesc += $" ; path=\"{fn}\"";
+                        }
                         dbDesc += " ; BX=mode CX=attr DX=action DS:SI=path";
                     }
 
@@ -1872,6 +1940,13 @@ namespace DOSRE.Dasm
                     }
                     else if (ah == 0x13) // Write String
                     {
+                        if (lastEsImm.HasValue && lastBpImm.HasValue && lastCxImm.HasValue)
+                        {
+                            var linear = (uint)((lastEsImm.Value << 4) + lastBpImm.Value);
+                            var s = TryReadAsciiStringFixed(module, linear, Math.Min((int)lastCxImm.Value, 256));
+                            if (!string.IsNullOrEmpty(s))
+                                dbDesc += $" ; \"{s}\"";
+                        }
                         dbDesc += " ; AL=mode BH=page BL=attr CX=len DX=row/col ES:BP=string";
                     }
                 }
@@ -2015,6 +2090,72 @@ namespace DOSRE.Dasm
             }
 
             return $"INT 0x{intNo:X2}";
+        }
+
+        private static string TryReadAsciiStringFixed(byte[] module, uint linear, int length)
+        {
+            if (module == null || length <= 0)
+                return string.Empty;
+
+            if (linear >= (uint)module.Length)
+                return string.Empty;
+
+            var start = (int)linear;
+            var end = Math.Min(module.Length, start + length);
+            var sb = new StringBuilder();
+
+            for (var i = start; i < end; i++)
+            {
+                var b = module[i];
+                if (b == 0x00)
+                    break;
+                if (b < 0x20 || b > 0x7E)
+                    return string.Empty;
+                sb.Append((char)b);
+            }
+
+            var s = sb.ToString().Trim();
+            if (s.Length == 0)
+                return string.Empty;
+
+            return s.Replace("\"", "\\\"");
+        }
+
+        private static string TryReadDosCommandTail(byte[] module, uint linear, int maxLen)
+        {
+            if (module == null || maxLen <= 0)
+                return string.Empty;
+
+            if (linear >= (uint)module.Length)
+                return string.Empty;
+
+            var start = (int)linear;
+            if (start + 1 > module.Length)
+                return string.Empty;
+
+            var len = module[start];
+            if (len == 0)
+                return string.Empty;
+
+            var readLen = Math.Min((int)len, maxLen);
+            var end = Math.Min(module.Length, start + 1 + readLen);
+            var sb = new StringBuilder();
+
+            for (var i = start + 1; i < end; i++)
+            {
+                var b = module[i];
+                if (b == 0x0D)
+                    break;
+                if (b < 0x20 || b > 0x7E)
+                    return string.Empty;
+                sb.Append((char)b);
+            }
+
+            var s = sb.ToString().Trim();
+            if (s.Length == 0)
+                return string.Empty;
+
+            return s.Replace("\"", "\\\"");
         }
 
         private static string TryReadAsciiString(byte[] module, uint linear, int maxLen)
