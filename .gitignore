@@ -31,8 +31,8 @@ bld/
 *.PDF
 
 # Local (untracked) interrupt database packs
-DosInterrupts/
-DosInterrupts/**
+#DosInterrupts/
+#DosInterrupts/**
 
 # Generated helper outputs
 dosre.unknown-ints.txt
