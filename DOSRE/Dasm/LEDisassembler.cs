@@ -574,6 +574,15 @@ namespace DOSRE.Dasm
                 var lo = Math.Max(start, idx - 32);
                 var candidateRegs = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { indexReg };
                 var candidateStackSyms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                // Track (best-effort) constants loaded into registers within the scan window so we can
+                // treat `cmp idx, regConst` as a bounds check.
+                var regConst = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+                var regClobbered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                // Track constants stored into stack locals/args so we can match `cmp idx, [local]`.
+                var stackConst = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+                var stackClobbered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 for (var j = idx - 1; j >= lo; j--)
                 {
                     var t = insList[j].ToString().Trim();
@@ -583,6 +592,71 @@ namespace DOSRE.Dasm
                     // Don't scan across clear control-flow boundaries.
                     if (t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) || t.StartsWith("jmp ", StringComparison.OrdinalIgnoreCase))
                         break;
+
+                    // Stack slot constants.
+                    var movStackImm = Regex.Match(
+                        t,
+                        @"^mov\s+\[(?<sym>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\]\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$",
+                        RegexOptions.IgnoreCase);
+                    if (movStackImm.Success)
+                    {
+                        var sym = movStackImm.Groups["sym"].Value;
+                        if (!stackConst.ContainsKey(sym) && !stackClobbered.Contains(sym))
+                        {
+                            if (TryParseHexOrDecUInt32(movStackImm.Groups["imm"].Value, out var su) && su > 0)
+                                stackConst[sym] = su;
+                            else
+                                stackClobbered.Add(sym);
+                        }
+                    }
+
+                    var movStackReg = Regex.Match(
+                        t,
+                        @"^mov\s+\[(?<sym>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\]\s*,\s*(?<src>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*$",
+                        RegexOptions.IgnoreCase);
+                    if (movStackReg.Success)
+                    {
+                        var sym = movStackReg.Groups["sym"].Value;
+                        if (!stackConst.ContainsKey(sym) && !stackClobbered.Contains(sym))
+                        {
+                            var src = CanonReg(movStackReg.Groups["src"].Value);
+                            if (regConst.TryGetValue(src, out var ru) && ru > 0)
+                                stackConst[sym] = ru;
+                            else
+                                stackClobbered.Add(sym);
+                        }
+                    }
+
+                    // Record immediate constants assigned to registers.
+                    // Because we're scanning backward, only accept the *first* assignment we see for a reg
+                    // (i.e., closest to the use), and ignore if we've seen other writes to that reg.
+                    var movImm = Regex.Match(
+                        t,
+                        @"^mov\s+(?<dst>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$",
+                        RegexOptions.IgnoreCase);
+                    if (movImm.Success)
+                    {
+                        var dst = CanonReg(movImm.Groups["dst"].Value);
+                        if (!regConst.ContainsKey(dst) && !regClobbered.Contains(dst))
+                        {
+                            if (TryParseHexOrDecUInt32(movImm.Groups["imm"].Value, out var u) && u > 0)
+                                regConst[dst] = u;
+                            else
+                                regClobbered.Add(dst);
+                        }
+                    }
+
+                    // Track other simple writes that should invalidate constant provenance.
+                    var writesReg = Regex.Match(
+                        t,
+                        @"^(?:add|sub|imul|idiv|div|and|or|xor|shl|shr|sar|rol|ror|inc|dec|lea|pop)\s+(?<dst>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\b",
+                        RegexOptions.IgnoreCase);
+                    if (writesReg.Success)
+                    {
+                        var dst = CanonReg(writesReg.Groups["dst"].Value);
+                        if (!regConst.ContainsKey(dst))
+                            regClobbered.Add(dst);
+                    }
 
                     // Track reg <-> [local_X]/[arg_Y] so we can match cmp [local_X], imm style bounds checks.
                     // Keep this conservative: only stack symbols (locals/args), not arbitrary memory.
@@ -636,12 +710,70 @@ namespace DOSRE.Dasm
                         continue;
                     }
 
+                    // cmp <reg>, <regConst>
+                    var mrr = Regex.Match(
+                        t,
+                        @"^cmp\s+(?:(?:byte|word|dword)\s+)?(?<r1>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*,\s*(?:(?:byte|word|dword)\s+)?(?<r2>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*$",
+                        RegexOptions.IgnoreCase);
+                    if (mrr.Success)
+                    {
+                        var r1 = CanonReg(mrr.Groups["r1"].Value);
+                        var r2 = CanonReg(mrr.Groups["r2"].Value);
+                        if (candidateRegs.Contains(r1) && regConst.TryGetValue(r2, out var b) && b > 0)
+                            return b;
+                        if (candidateRegs.Contains(r2) && regConst.TryGetValue(r1, out var b2) && b2 > 0)
+                            return b2;
+                        continue;
+                    }
+
+                    // cmp <candidateReg>, [stackSymConst]
+                    var mrs = Regex.Match(
+                        t,
+                        @"^cmp\s+(?:(?:byte|word|dword)\s+)?(?<reg>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*,\s*(?:(?:byte|word|dword)\s+)?\[(?<sym>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\]\s*$",
+                        RegexOptions.IgnoreCase);
+                    if (mrs.Success)
+                    {
+                        var rr = CanonReg(mrs.Groups["reg"].Value);
+                        var sym = mrs.Groups["sym"].Value;
+                        if (candidateRegs.Contains(rr) && candidateStackSyms.Contains(sym) && stackConst.TryGetValue(sym, out var b4) && b4 > 0)
+                            return b4;
+                        continue;
+                    }
+
+                    // cmp [stackSymConst], <candidateReg>
+                    var msr2 = Regex.Match(
+                        t,
+                        @"^cmp\s+(?:(?:byte|word|dword)\s+)?\[(?<sym>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\]\s*,\s*(?:(?:byte|word|dword)\s+)?(?<reg>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*$",
+                        RegexOptions.IgnoreCase);
+                    if (msr2.Success)
+                    {
+                        var sym = msr2.Groups["sym"].Value;
+                        var rr = CanonReg(msr2.Groups["reg"].Value);
+                        if (candidateRegs.Contains(rr) && candidateStackSyms.Contains(sym) && stackConst.TryGetValue(sym, out var b5) && b5 > 0)
+                            return b5;
+                        continue;
+                    }
+
                     var m2 = Regex.Match(
                         t,
                         @"^cmp\s+(?:(?:byte|word|dword)\s+)?\[(?<sym>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\]\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$",
                         RegexOptions.IgnoreCase);
                     if (!m2.Success)
+                    {
+                        // cmp [stackSym], regConst
+                        var msr = Regex.Match(
+                            t,
+                            @"^cmp\s+(?:(?:byte|word|dword)\s+)?\[(?<sym>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\]\s*,\s*(?:(?:byte|word|dword)\s+)?(?<reg>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*$",
+                            RegexOptions.IgnoreCase);
+                        if (msr.Success)
+                        {
+                            var sym = msr.Groups["sym"].Value;
+                            var rr = CanonReg(msr.Groups["reg"].Value);
+                            if (candidateStackSyms.Contains(sym) && regConst.TryGetValue(rr, out var b3) && b3 > 0)
+                                return b3;
+                        }
                         continue;
+                    }
 
                     var sym2 = m2.Groups["sym"].Value;
                     if (!candidateStackSyms.Contains(sym2))
