@@ -1003,7 +1003,109 @@ namespace DOSRE.Dasm
                             // Only treat dec/inc/add/sub as a countdown/update hint for equality-style latches.
                             // For other jccs (e.g., jb/jae), the latch usually depends on a preceding cmp, not dec/inc.
                             if (!isEqLatch)
+                            {
+                                // Non-equality latch heuristic (safe): if the latch is fed by a nearby `cmp lhs, rhs`,
+                                // and we see an update of `lhs` shortly before the cmp/jcc, treat `lhs` as the iv.
+                                // This catches common idioms like:
+                                //   inc edx
+                                //   cmp edx, ecx
+                                //   jb  header
+                                // and avoids using unrelated dec/inc used for string ops unless it participates in cmp.
+
+                                string cmpLhs = null;
+                                string cmpRhs = null;
+
+                                // Find the closest cmp in a small window before the latch.
+                                for (var k = Math.Max(startIdx, latchIdx - 4); k < latchIdx; k++)
+                                {
+                                    var prev = RewriteStackFrameOperands(instructions[k].ToString()).Trim();
+                                    var mCmpReg = Regex.Match(prev, @"^cmp\s+(?<lhs>e?(ax|bx|cx|dx|si|di|bp|sp))\s*,\s*(?<rhs>0x[0-9A-Fa-f]+|[0-9]+|e?(ax|bx|cx|dx|si|di|bp|sp))\s*$", RegexOptions.IgnoreCase);
+                                    var mCmpMem = Regex.Match(prev, @"^cmp\s+(?:byte|word|dword)?\s*\[(?<lhs>local_[0-9A-Fa-f]+)\]\s*,\s*(?<rhs>0x[0-9A-Fa-f]+|[0-9]+|e?(ax|bx|cx|dx|si|di|bp|sp))\s*$", RegexOptions.IgnoreCase);
+                                    if (mCmpReg.Success)
+                                    {
+                                        cmpLhs = mCmpReg.Groups["lhs"].Value.ToLowerInvariant();
+                                        cmpRhs = mCmpReg.Groups["rhs"].Value.ToLowerInvariant();
+                                    }
+                                    else if (mCmpMem.Success)
+                                    {
+                                        cmpLhs = mCmpMem.Groups["lhs"].Value;
+                                        cmpRhs = mCmpMem.Groups["rhs"].Value.ToLowerInvariant();
+                                    }
+                                }
+
+                                if (!string.IsNullOrWhiteSpace(cmpLhs))
+                                {
+                                    // Find an update of cmpLhs shortly before the latch.
+                                    for (var k = Math.Max(startIdx, latchIdx - 8); k < latchIdx; k++)
+                                    {
+                                        var prev = RewriteStackFrameOperands(instructions[k].ToString()).Trim();
+
+                                        if (cmpLhs.StartsWith("local_", StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            var esc = Regex.Escape(cmpLhs);
+                                            if (Regex.IsMatch(prev, $@"^inc\s+(?:byte|word|dword)?\s*\[{esc}\]\s*$", RegexOptions.IgnoreCase))
+                                            {
+                                                ls.InductionVar = cmpLhs;
+                                                ls.Step = 1;
+                                                break;
+                                            }
+                                            if (Regex.IsMatch(prev, $@"^dec\s+(?:byte|word|dword)?\s*\[{esc}\]\s*$", RegexOptions.IgnoreCase))
+                                            {
+                                                ls.InductionVar = cmpLhs;
+                                                ls.Step = -1;
+                                                break;
+                                            }
+
+                                            var mAddMem2 = Regex.Match(prev, $@"^(?<op>add|sub)\s+(?:byte|word|dword)?\s*\[{esc}\]\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$", RegexOptions.IgnoreCase);
+                                            if (mAddMem2.Success && TryParseHexOrDecUInt32(mAddMem2.Groups["imm"].Value, out var u3) && u3 <= 0x100)
+                                            {
+                                                var step = (int)u3;
+                                                if (mAddMem2.Groups["op"].Value.Equals("sub", StringComparison.OrdinalIgnoreCase))
+                                                    step = -step;
+                                                ls.InductionVar = cmpLhs;
+                                                ls.Step = step;
+                                                break;
+                                            }
+                                        }
+                                        else
+                                        {
+                                            var esc = Regex.Escape(cmpLhs);
+                                            if (Regex.IsMatch(prev, $@"^inc\s+{esc}\s*$", RegexOptions.IgnoreCase))
+                                            {
+                                                ls.InductionVar = cmpLhs;
+                                                ls.Step = 1;
+                                                break;
+                                            }
+                                            if (Regex.IsMatch(prev, $@"^dec\s+{esc}\s*$", RegexOptions.IgnoreCase))
+                                            {
+                                                ls.InductionVar = cmpLhs;
+                                                ls.Step = -1;
+                                                break;
+                                            }
+
+                                            var mAddReg2 = Regex.Match(prev, $@"^(?<op>add|sub)\s+{esc}\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$", RegexOptions.IgnoreCase);
+                                            if (mAddReg2.Success && TryParseHexOrDecUInt32(mAddReg2.Groups["imm"].Value, out var u4) && u4 <= 0x100)
+                                            {
+                                                var step = (int)u4;
+                                                if (mAddReg2.Groups["op"].Value.Equals("sub", StringComparison.OrdinalIgnoreCase))
+                                                    step = -step;
+                                                ls.InductionVar = cmpLhs;
+                                                ls.Step = step;
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if (!string.IsNullOrWhiteSpace(ls.InductionVar) && ls.Step.HasValue)
+                                    {
+                                        if (string.IsNullOrWhiteSpace(ls.Bound) && !string.IsNullOrWhiteSpace(cmpRhs))
+                                            ls.Bound = cmpRhs;
+                                        break;
+                                    }
+                                }
+
                                 continue;
+                            }
 
                             for (var k = Math.Max(startIdx, latchIdx - 3); k < latchIdx; k++)
                             {
