@@ -1453,7 +1453,7 @@ namespace DOSRE.Dasm
         private static void InferLoopsForFunction(
             List<Instruction> instructions,
             Dictionary<uint, int> insIndexByAddr,
-            HashSet<uint> blockStarts,
+            List<uint> sortedBlockStarts,
             uint startAddr,
             uint endAddrExclusive,
             int startIdx,
@@ -1496,10 +1496,25 @@ namespace DOSRE.Dasm
             // Helper: find the end of a basic block starting at blockStart.
             uint FindBlockEnd(uint blockStart)
             {
-                if (blockStarts == null || blockStarts.Count == 0)
+                if (sortedBlockStarts == null || sortedBlockStarts.Count == 0)
                     return endAddrExclusive;
-                var next = blockStarts.Where(b => b > blockStart && b < endAddrExclusive).OrderBy(b => b).FirstOrDefault();
-                return next == 0 ? endAddrExclusive : next;
+
+                var idx = sortedBlockStarts.BinarySearch(blockStart);
+                idx = idx < 0 ? ~idx : idx + 1;
+                while (idx >= 0 && idx < sortedBlockStarts.Count)
+                {
+                    var b = sortedBlockStarts[idx];
+                    if (b <= blockStart)
+                    {
+                        idx++;
+                        continue;
+                    }
+                    if (b >= endAddrExclusive)
+                        break;
+                    return b;
+                }
+
+                return endAddrExclusive;
             }
 
             // Induction-var heuristic: look for cmp [local_X], imm near header and inc/add/sub/dec of same local near a latch.
@@ -2548,6 +2563,63 @@ namespace DOSRE.Dasm
             }
         }
 
+        private static void CollectLocalBitWidthHintsForFunction(
+            string[] cookedByIndex,
+            int startIdx,
+            int endIdx,
+            out Dictionary<string, int> bitsByLocal)
+        {
+            bitsByLocal = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            if (cookedByIndex == null || startIdx < 0 || endIdx <= startIdx)
+                return;
+
+            var max = Math.Min(cookedByIndex.Length, endIdx);
+            for (var i = startIdx; i < max; i++)
+            {
+                var cooked = cookedByIndex[i] ?? string.Empty;
+                var t = cooked.Trim();
+
+                // mov [local_XX], reg
+                var m = Regex.Match(t, @"^mov\s+\[(?<local>local_[0-9A-Fa-f]+)\]\s*,\s*(?<reg>e?[abcd]x|e?[sd]i|e?bp|e?sp|[abcd][lh])\b", RegexOptions.IgnoreCase);
+                if (m.Success)
+                {
+                    var bits = GetRegBitWidth(m.Groups["reg"].Value);
+                    if (bits.HasValue)
+                        MergeBitWidthHint(bitsByLocal, m.Groups["local"].Value, bits.Value);
+                    continue;
+                }
+
+                // mov reg, [local_XX]
+                m = Regex.Match(t, @"^mov\s+(?<reg>e?[abcd]x|e?[sd]i|e?bp|e?sp|[abcd][lh])\s*,\s*\[(?<local>local_[0-9A-Fa-f]+)\]", RegexOptions.IgnoreCase);
+                if (m.Success)
+                {
+                    var bits = GetRegBitWidth(m.Groups["reg"].Value);
+                    if (bits.HasValue)
+                        MergeBitWidthHint(bitsByLocal, m.Groups["local"].Value, bits.Value);
+                    continue;
+                }
+
+                // explicit-sized mem ops (byte/word/dword/qword/tword)
+                m = Regex.Match(t, @"\b(?<sz>byte|word|dword|qword|tword)\s+\[(?<local>local_[0-9A-Fa-f]+)\]", RegexOptions.IgnoreCase);
+                if (m.Success)
+                {
+                    var sz = m.Groups["sz"].Value.ToLowerInvariant();
+                    var bits = sz switch
+                    {
+                        "byte" => 8,
+                        "word" => 16,
+                        "dword" => 32,
+                        "qword" => 64,
+                        "tword" => 80,
+                        _ => 0
+                    };
+                    if (bits > 0)
+                        MergeBitWidthHint(bitsByLocal, m.Groups["local"].Value, bits);
+                    continue;
+                }
+            }
+        }
+
         private static string UpgradeOutpAliasWithBitWidth(string alias, int bits)
         {
             if (string.IsNullOrWhiteSpace(alias))
@@ -2844,6 +2916,290 @@ namespace DOSRE.Dasm
             }
         }
 
+        private static void InferProtoHintsForFunction(
+            List<Instruction> instructions,
+            int startIdx,
+            int endIdx,
+            out Dictionary<string, string> inferredOutAliases,
+            out List<string> outAliasHints,
+            out Dictionary<string, int> bitsByLocal,
+            out int argCount,
+            out string cc,
+            out int? retImmBytes)
+        {
+            inferredOutAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            outAliasHints = new List<string>();
+            bitsByLocal = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            argCount = 0;
+            cc = null;
+            retImmBytes = null;
+
+            if (instructions == null || startIdx < 0 || endIdx <= startIdx)
+                return;
+
+            // Out-param alias tracking.
+            var lastLeaLocalByReg = new Dictionary<string, (string local, int idx)>(StringComparer.OrdinalIgnoreCase);
+            var hintedLocals = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // Track pushes in a small sliding window before calls.
+            var pushRegCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var pushWindow = new Queue<string>();
+            const int pushWindowSize = 12;
+
+            // Args usage.
+            var usedArgMax = -1;
+
+            var max = Math.Min(instructions.Count, endIdx);
+            for (var i = startIdx; i < max; i++)
+            {
+                var cooked = RewriteStackFrameOperands(instructions[i].ToString());
+                var t = cooked.Trim();
+
+                // Update arg usage (fast scan for arg_N).
+                var pos = 0;
+                while (pos < t.Length)
+                {
+                    pos = t.IndexOf("arg_", pos, StringComparison.OrdinalIgnoreCase);
+                    if (pos < 0)
+                        break;
+                    var j = pos + 4;
+                    var n = 0;
+                    var any = false;
+                    while (j < t.Length)
+                    {
+                        var ch = t[j];
+                        if (ch < '0' || ch > '9')
+                            break;
+                        any = true;
+                        n = (n * 10) + (ch - '0');
+                        if (n > 4096)
+                            break;
+                        j++;
+                    }
+                    if (any)
+                        usedArgMax = Math.Max(usedArgMax, n);
+                    pos = j;
+                }
+
+                // Bit width hints (locals).
+                var m = Regex.Match(t, @"^mov\s+\[(?<local>local_[0-9A-Fa-f]+)\]\s*,\s*(?<reg>e?[abcd]x|e?[sd]i|e?bp|e?sp|[abcd][lh])\b", RegexOptions.IgnoreCase);
+                if (m.Success)
+                {
+                    var bits = GetRegBitWidth(m.Groups["reg"].Value);
+                    if (bits.HasValue)
+                        MergeBitWidthHint(bitsByLocal, m.Groups["local"].Value, bits.Value);
+                }
+                else
+                {
+                    m = Regex.Match(t, @"^mov\s+(?<reg>e?[abcd]x|e?[sd]i|e?bp|e?sp|[abcd][lh])\s*,\s*\[(?<local>local_[0-9A-Fa-f]+)\]", RegexOptions.IgnoreCase);
+                    if (m.Success)
+                    {
+                        var bits = GetRegBitWidth(m.Groups["reg"].Value);
+                        if (bits.HasValue)
+                            MergeBitWidthHint(bitsByLocal, m.Groups["local"].Value, bits.Value);
+                    }
+                    else
+                    {
+                        m = Regex.Match(t, @"\b(?<sz>byte|word|dword|qword|tword)\s+\[(?<local>local_[0-9A-Fa-f]+)\]", RegexOptions.IgnoreCase);
+                        if (m.Success)
+                        {
+                            var sz = m.Groups["sz"].Value.ToLowerInvariant();
+                            var bits = sz switch
+                            {
+                                "byte" => 8,
+                                "word" => 16,
+                                "dword" => 32,
+                                "qword" => 64,
+                                "tword" => 80,
+                                _ => 0
+                            };
+                            if (bits > 0)
+                                MergeBitWidthHint(bitsByLocal, m.Groups["local"].Value, bits);
+                        }
+                    }
+                }
+
+                // Track lea reg,[local] for outparam inference.
+                if (TryParseLeaRegOfLocal(t, out var leaReg, out var localName))
+                {
+                    lastLeaLocalByReg[leaReg] = (localName, i);
+                }
+
+                // Track push reg window.
+                if (TryParsePushReg(t, out var pushedReg))
+                {
+                    pushWindow.Enqueue(pushedReg);
+                    pushRegCounts.TryGetValue(pushedReg, out var pc);
+                    pushRegCounts[pushedReg] = pc + 1;
+
+                    while (pushWindow.Count > pushWindowSize)
+                    {
+                        var old = pushWindow.Dequeue();
+                        if (pushRegCounts.TryGetValue(old, out var oc))
+                        {
+                            oc--;
+                            if (oc <= 0)
+                                pushRegCounts.Remove(old);
+                            else
+                                pushRegCounts[old] = oc;
+                        }
+                    }
+                }
+
+                // Invalidate lea-tracked regs if this instruction writes a reg.
+                var wm = WritesRegRegex.Match(t);
+                if (wm.Success)
+                {
+                    var dst = wm.Groups["dst"].Value;
+                    if (!string.IsNullOrWhiteSpace(dst))
+                        lastLeaLocalByReg.Remove(dst);
+                }
+
+                // On call, decide whether any recent lea reg,[local] looks like an outparam.
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) && lastLeaLocalByReg.Count > 0)
+                {
+                    foreach (var kv in lastLeaLocalByReg.ToList())
+                    {
+                        var reg = kv.Key;
+                        var (loc, leaIdx) = kv.Value;
+                        if ((i - leaIdx) > 8)
+                            continue;
+
+                        var isPushedArg = pushRegCounts.ContainsKey(reg);
+                        var isImmediateRegArg = (i - leaIdx) == 1;
+                        if (!isPushedArg && !isImmediateRegArg)
+                            continue;
+
+                        if (!isPushedArg)
+                        {
+                            if (hintedLocals.Add(loc))
+                                outAliasHints.Add($"VARHINT: {loc} maybe outparam (lea {reg}, [{loc}] immediately before call)");
+                            continue;
+                        }
+
+                        if (inferredOutAliases.ContainsKey(loc))
+                            continue;
+
+                        var alias = MakeOutpAliasFromLocal(loc);
+                        if (string.IsNullOrWhiteSpace(alias) || !IsSafeAliasIdent(alias))
+                            continue;
+
+                        inferredOutAliases[loc] = alias;
+                        outAliasHints.Add($"VARALIAS: {loc} -> {alias} (outparam; inferred from push+call)");
+                    }
+                }
+            }
+
+            // Determine calling convention / ret imm.
+            for (var i = Math.Min(max, instructions.Count) - 1; i >= startIdx; i--)
+            {
+                var rt = instructions[i].ToString().Trim();
+                if (!rt.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var mret = Regex.Match(rt, @"^ret\s+(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$", RegexOptions.IgnoreCase);
+                if (mret.Success && TryParseHexOrDecUInt32(mret.Groups["imm"].Value, out var imm))
+                    retImmBytes = (int)imm;
+                break;
+            }
+
+            if (retImmBytes.HasValue && retImmBytes.Value > 0)
+            {
+                cc = "stdcall";
+                if (retImmBytes.Value % 4 == 0)
+                    argCount = Math.Max(argCount, retImmBytes.Value / 4);
+            }
+            else
+            {
+                cc = "cdecl";
+            }
+
+            if (usedArgMax >= 0)
+                argCount = Math.Max(argCount, usedArgMax + 1);
+        }
+
+        private static void InferOutParamLocalAliasesForFunction(
+            string[] cookedByIndex,
+            int startIdx,
+            int endIdx,
+            out Dictionary<string, string> inferredAliases,
+            out List<string> aliasHints)
+        {
+            inferredAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            aliasHints = new List<string>();
+
+            if (cookedByIndex == null || startIdx < 0 || endIdx <= startIdx)
+                return;
+
+            // Track most recent address-taken locals per register.
+            var lastLeaLocalByReg = new Dictionary<string, (string local, int idx)>(StringComparer.OrdinalIgnoreCase);
+            var hintedLocals = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            var max = Math.Min(cookedByIndex.Length, endIdx);
+            for (var i = startIdx; i < max; i++)
+            {
+                var cooked = cookedByIndex[i] ?? string.Empty;
+
+                if (TryParseLeaRegOfLocal(cooked, out var leaReg, out var localName))
+                {
+                    lastLeaLocalByReg[leaReg] = (localName, i);
+                    continue;
+                }
+
+                // Invalidate reg->local if the reg is overwritten.
+                foreach (var k in lastLeaLocalByReg.Keys.ToList())
+                {
+                    if (InstructionWritesReg(cooked, k))
+                        lastLeaLocalByReg.Remove(k);
+                }
+
+                var t = cooked.TrimStart();
+                if (!t.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var pushedRegs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var back = Math.Max(startIdx, i - 10);
+                for (var j = back; j < i; j++)
+                {
+                    var prev = cookedByIndex[j] ?? string.Empty;
+                    if (TryParsePushReg(prev, out var pr))
+                        pushedRegs.Add(pr);
+                }
+
+                foreach (var kv in lastLeaLocalByReg.ToList())
+                {
+                    var reg = kv.Key;
+                    var (loc, leaIdx) = kv.Value;
+
+                    if ((i - leaIdx) > 8)
+                        continue;
+
+                    var isPushedArg = pushedRegs.Contains(reg);
+                    var isImmediateRegArg = (i - leaIdx) == 1;
+
+                    if (!isPushedArg && !isImmediateRegArg)
+                        continue;
+
+                    if (!isPushedArg)
+                    {
+                        if (hintedLocals.Add(loc))
+                            aliasHints.Add($"VARHINT: {loc} maybe outparam (lea {reg}, [{loc}] immediately before call)");
+                        continue;
+                    }
+
+                    if (inferredAliases.ContainsKey(loc))
+                        continue;
+
+                    var alias = MakeOutpAliasFromLocal(loc);
+                    if (string.IsNullOrWhiteSpace(alias) || !IsSafeAliasIdent(alias))
+                        continue;
+
+                    inferredAliases[loc] = alias;
+                    aliasHints.Add($"VARALIAS: {loc} -> {alias} (outparam; inferred from push+call)");
+                }
+            }
+        }
+
         private static void InferArgsAndCallingConventionForFunction(
             List<Instruction> instructions,
             int startIdx,
@@ -2868,6 +3224,89 @@ namespace DOSRE.Dasm
                 {
                     if (int.TryParse(m.Groups["idx"].Value, out var idx))
                         usedArgMax = Math.Max(usedArgMax, idx);
+                }
+            }
+
+            // Find the last ret in the function range.
+            for (var i = max - 1; i >= startIdx; i--)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (!t.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var m = Regex.Match(t, @"^ret\s+(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$", RegexOptions.IgnoreCase);
+                if (m.Success && TryParseHexOrDecUInt32(m.Groups["imm"].Value, out var imm))
+                    retImmBytes = (int)imm;
+                break;
+            }
+
+            if (retImmBytes.HasValue && retImmBytes.Value > 0)
+            {
+                cc = "stdcall";
+                if (retImmBytes.Value % 4 == 0)
+                    argCount = Math.Max(argCount, retImmBytes.Value / 4);
+            }
+            else
+            {
+                cc = "cdecl";
+            }
+
+            if (usedArgMax >= 0)
+                argCount = Math.Max(argCount, usedArgMax + 1);
+        }
+
+        private static void InferArgsAndCallingConventionForFunction(
+            string[] cookedByIndex,
+            List<Instruction> instructions,
+            int startIdx,
+            int endIdx,
+            out int argCount,
+            out string cc,
+            out int? retImmBytes)
+        {
+            argCount = 0;
+            cc = null;
+            retImmBytes = null;
+
+            if (cookedByIndex == null || instructions == null || startIdx < 0 || endIdx <= startIdx)
+                return;
+
+            var max = Math.Min(Math.Min(instructions.Count, endIdx), cookedByIndex.Length);
+            var usedArgMax = -1;
+
+            // Fast scan for arg_N tokens without regex.
+            for (var i = startIdx; i < max; i++)
+            {
+                var cooked = cookedByIndex[i];
+                if (string.IsNullOrEmpty(cooked))
+                    continue;
+
+                var idx = 0;
+                while (idx < cooked.Length)
+                {
+                    idx = cooked.IndexOf("arg_", idx, StringComparison.OrdinalIgnoreCase);
+                    if (idx < 0)
+                        break;
+
+                    var j = idx + 4;
+                    var n = 0;
+                    var any = false;
+                    while (j < cooked.Length)
+                    {
+                        var ch = cooked[j];
+                        if (ch < '0' || ch > '9')
+                            break;
+                        any = true;
+                        n = (n * 10) + (ch - '0');
+                        if (n > 4096)
+                            break;
+                        j++;
+                    }
+
+                    if (any)
+                        usedArgMax = Math.Max(usedArgMax, n);
+
+                    idx = j;
                 }
             }
 
@@ -5394,7 +5833,7 @@ namespace DOSRE.Dasm
                     funcFieldSummaries = new Dictionary<uint, string>();
                     ptrFieldStatsGlobal = new Dictionary<string, Dictionary<uint, FieldAccessStats>>(StringComparer.Ordinal);
                     thisFieldStatsGlobal = new Dictionary<string, Dictionary<uint, FieldAccessStats>>(StringComparer.Ordinal);
-                    var sortedStarts = functionStarts.OrderBy(x => x).ToList();
+                    var sortedStarts = functionStarts.Where(a => insIndexByAddr.ContainsKey(a)).OrderBy(x => x).ToList();
                     for (var si = 0; si < sortedStarts.Count; si++)
                     {
                         if ((si % 250) == 0 && si > 0)
@@ -5421,7 +5860,7 @@ namespace DOSRE.Dasm
                 if (leInsights && functionStarts != null && functionStarts.Count > 0)
                 {
                     funcFpuSummaries = new Dictionary<uint, string>();
-                    var sortedStarts = functionStarts.OrderBy(x => x).ToList();
+                    var sortedStarts = functionStarts.Where(a => insIndexByAddr.ContainsKey(a)).OrderBy(x => x).ToList();
                     for (var si = 0; si < sortedStarts.Count; si++)
                     {
                         if ((si % 500) == 0 && si > 0)
@@ -5446,7 +5885,7 @@ namespace DOSRE.Dasm
                 if (leInsights && functionStarts != null && functionStarts.Count > 0)
                 {
                     funcIoSummaries = new Dictionary<uint, string>();
-                    var sortedStarts = functionStarts.OrderBy(x => x).ToList();
+                    var sortedStarts = functionStarts.Where(a => insIndexByAddr.ContainsKey(a)).OrderBy(x => x).ToList();
                     for (var si = 0; si < sortedStarts.Count; si++)
                     {
                         if ((si % 500) == 0 && si > 0)
@@ -5471,7 +5910,7 @@ namespace DOSRE.Dasm
                 if (leInsights && functionStarts != null && functionStarts.Count > 0)
                 {
                     funcFlagSummaries = new Dictionary<uint, string>();
-                    var sortedStarts = functionStarts.OrderBy(x => x).ToList();
+                    var sortedStarts = functionStarts.Where(a => insIndexByAddr.ContainsKey(a)).OrderBy(x => x).ToList();
                     for (var si = 0; si < sortedStarts.Count; si++)
                     {
                         if ((si % 500) == 0 && si > 0)
@@ -5515,11 +5954,51 @@ namespace DOSRE.Dasm
                     funcLoopHeaderHints = new Dictionary<uint, Dictionary<uint, string>>();
                     funcLoopLatchHints = new Dictionary<uint, Dictionary<uint, string>>();
 
-                    var sortedStarts = functionStarts.OrderBy(x => x).ToList();
+                    var sortedStarts = functionStarts.Where(a => insIndexByAddr.ContainsKey(a)).OrderBy(x => x).ToList();
+                    var sortedBlockStarts = blockStarts != null && blockStarts.Count > 0
+                        ? blockStarts.OrderBy(x => x).ToList()
+                        : null;
+
+                    // Timing stats for diagnosing slow proto/loop phases.
+                    var freq = (double)Stopwatch.Frequency;
+                    long protoTicks = 0;
+                    long loopTicks = 0;
+                    var worst = new List<(uint start, int insCount, long totalTicks, long protoTicks, long loopTicks)>();
+
+                    void RecordWorst(uint start, int insCount, long total, long p, long l)
+                    {
+                        if (total <= 0)
+                            return;
+                        worst.Add((start, insCount, total, p, l));
+                        if (worst.Count > 6)
+                            worst = worst.OrderByDescending(x => x.totalTicks).Take(6).ToList();
+                    }
+
                     for (var si = 0; si < sortedStarts.Count; si++)
                     {
                         if ((si % 250) == 0 && si > 0)
-                            _logger.Info($"LE: Proto/loop/alias hints... {si}/{sortedStarts.Count}");
+                        {
+                            var protoMs = protoTicks * 1000.0 / freq;
+                            var loopMs = loopTicks * 1000.0 / freq;
+                            var totMs = (protoTicks + loopTicks) * 1000.0 / freq;
+
+                            var worstText = string.Empty;
+                            if (worst.Count > 0)
+                            {
+                                var top = worst.OrderByDescending(x => x.totalTicks).Take(3).ToList();
+                                worstText = " ; worst=" + string.Join(", ", top.Select(w =>
+                                {
+                                    var ms = w.totalTicks * 1000.0 / freq;
+                                    return $"func_{w.start:X8}({w.insCount} ins) {ms:0}ms";
+                                }));
+                            }
+
+                            _logger.Info($"LE: Proto/loop/alias hints... {si}/{sortedStarts.Count} (proto {protoMs:0}ms, loops {loopMs:0}ms, total {totMs:0}ms){worstText}");
+                            protoTicks = 0;
+                            loopTicks = 0;
+                            worst.Clear();
+                        }
+
                         var startAddr = sortedStarts[si];
                         if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
                             continue;
@@ -5528,17 +6007,22 @@ namespace DOSRE.Dasm
                         if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
                             endIdx = nextIdx;
 
-                        InferOutParamLocalAliasesForFunction(instructions, startIdx, endIdx, out var aliases, out var hints);
+                        var funcInsCount = Math.Max(0, endIdx - startIdx);
+
+                        var p0 = Stopwatch.GetTimestamp();
+                        InferProtoHintsForFunction(instructions, startIdx, endIdx, out var aliases, out var hints, out var bitsByLocal, out var argCount, out var cc, out var retImm);
+                        var p1 = Stopwatch.GetTimestamp();
+                        var pt = p1 - p0;
+                        if (pt > 0)
+                            protoTicks += pt;
                         if (aliases != null && aliases.Count > 0)
                             funcOutLocalAliases[startAddr] = aliases;
                         if (hints != null && hints.Count > 0)
                             funcOutLocalAliasHints[startAddr] = hints;
 
-                        CollectLocalBitWidthHintsForFunction(instructions, startIdx, endIdx, out var bitsByLocal);
                         if (bitsByLocal != null && bitsByLocal.Count > 0)
                             funcLocalBitWidths[startAddr] = bitsByLocal;
 
-                        InferArgsAndCallingConventionForFunction(instructions, startIdx, endIdx, out var argCount, out var cc, out var retImm);
                         if (argCount > 0 || !string.IsNullOrWhiteSpace(cc) || (retImm.HasValue && retImm.Value > 0))
                         {
                             var args = FormatProtoArgs(argCount, maxArgs: 12);
@@ -5552,7 +6036,15 @@ namespace DOSRE.Dasm
                         if (blockStarts != null)
                         {
                             var endAddr = (si + 1 < sortedStarts.Count) ? sortedStarts[si + 1] : uint.MaxValue;
-                            InferLoopsForFunction(instructions, insIndexByAddr, blockStarts, startAddr, endAddr, startIdx, endIdx, out var loops);
+                            var l0 = Stopwatch.GetTimestamp();
+                            InferLoopsForFunction(instructions, insIndexByAddr, sortedBlockStarts, startAddr, endAddr, startIdx, endIdx, out var loops);
+                            var l1 = Stopwatch.GetTimestamp();
+                            var lt = l1 - l0;
+                            if (lt > 0)
+                                loopTicks += lt;
+
+                            RecordWorst(startAddr, funcInsCount, pt + lt, pt, lt);
+
                             var loopSum = FormatLoopSummaryForFunction(loops);
                             if (!string.IsNullOrEmpty(loopSum))
                                 funcLoopSummaries[startAddr] = loopSum;

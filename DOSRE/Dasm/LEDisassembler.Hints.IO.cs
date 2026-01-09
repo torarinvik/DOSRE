@@ -256,6 +256,11 @@ namespace DOSRE.Dasm
             if (string.IsNullOrWhiteSpace(insText))
                 return string.Empty;
 
+            // Call sites sometimes pass an instruction line that already has other comments appended.
+            // Normalize to just the instruction text so our exact-match patterns still work.
+            SplitInstructionAndComments(insText, out var instructionOnly, out _);
+            insText = instructionOnly;
+
             // Loose parse so we can still annotate dx-based I/O even when DX isn't an immediate.
             var mout = Regex.Match(insText.Trim(), @"^out\s+(?<port>dx|(?:0x)?[0-9A-Fa-f]+h?)\s*,\s*(?<reg>al|ax|eax)\s*$", RegexOptions.IgnoreCase);
             var min = Regex.Match(insText.Trim(), @"^in\s+(?<reg>al|ax|eax)\s*,\s*(?<port>dx|(?:0x)?[0-9A-Fa-f]+h?)\s*$", RegexOptions.IgnoreCase);
@@ -315,12 +320,16 @@ namespace DOSRE.Dasm
 
             for (var i = startIdx; i < endIdx; i++)
             {
-                var text = instructions[i].ToString();
+                var ins = instructions[i];
+                if (ins?.Bytes == null || ins.Bytes.Length == 0)
+                    continue;
 
-                if (TryParseMovDxImmediate(text, out var dxImm))
-                    lastDxImm16 = dxImm;
+                if (TryDecodeMovDxImm16(ins.Bytes, out var dxImm16))
+                    lastDxImm16 = dxImm16;
+                else if (TryDecodeMovEdxImm32(ins.Bytes, out var edxImm32))
+                    lastDxImm16 = (ushort)(edxImm32 & 0xFFFF);
 
-                if (!TryParseIoAccess(text, lastDxImm16, out var port, out var isWrite, out _))
+                if (!TryDecodeIoAccess(ins.Bytes, lastDxImm16, out var port, out var isWrite))
                     continue;
 
                 if (!ports.TryGetValue(port, out var st))
@@ -331,6 +340,91 @@ namespace DOSRE.Dasm
                 else
                     st.Reads++;
             }
+        }
+
+        private static bool TryDecodeMovDxImm16(byte[] bytes, out ushort imm16)
+        {
+            imm16 = 0;
+            if (bytes == null)
+                return false;
+
+            // mov dx, imm16 in 32-bit mode is typically: 66 BA iw
+            if (bytes.Length >= 4 && bytes[0] == 0x66 && bytes[1] == 0xBA)
+            {
+                imm16 = (ushort)(bytes[2] | (bytes[3] << 8));
+                return true;
+            }
+
+            // mov dx, imm16 in 16-bit mode: BA iw
+            if (bytes.Length >= 3 && bytes[0] == 0xBA)
+            {
+                imm16 = (ushort)(bytes[1] | (bytes[2] << 8));
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryDecodeMovEdxImm32(byte[] bytes, out uint imm32)
+        {
+            imm32 = 0;
+            if (bytes == null)
+                return false;
+
+            // mov edx, imm32: BA id
+            if (bytes.Length >= 5 && bytes[0] == 0xBA)
+            {
+                imm32 = (uint)(bytes[1] | (bytes[2] << 8) | (bytes[3] << 16) | (bytes[4] << 24));
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryDecodeIoAccess(byte[] bytes, ushort? lastDxImm16, out ushort port, out bool isWrite)
+        {
+            port = 0;
+            isWrite = false;
+            if (bytes == null || bytes.Length == 0)
+                return false;
+
+            // Handle operand-size prefix (common for IN/OUT AX,DX and MOV DX,imm16)
+            var idx = 0;
+            if (bytes.Length >= 2 && bytes[0] == 0x66)
+                idx = 1;
+
+            if (idx >= bytes.Length)
+                return false;
+
+            var op = bytes[idx];
+
+            // Immediate port forms (8-bit port number)
+            // IN AL, imm8:  E4 ib
+            // IN AX/EAX,imm8: E5 ib
+            // OUT imm8, AL: E6 ib
+            // OUT imm8, AX/EAX: E7 ib
+            if ((op == 0xE4 || op == 0xE5 || op == 0xE6 || op == 0xE7) && idx + 1 < bytes.Length)
+            {
+                port = bytes[idx + 1];
+                isWrite = (op == 0xE6 || op == 0xE7);
+                return true;
+            }
+
+            // DX port forms
+            // IN AL, DX:  EC
+            // IN AX/EAX,DX: ED
+            // OUT DX, AL: EE
+            // OUT DX, AX/EAX: EF
+            if (op == 0xEC || op == 0xED || op == 0xEE || op == 0xEF)
+            {
+                if (!lastDxImm16.HasValue)
+                    return false;
+                port = lastDxImm16.Value;
+                isWrite = (op == 0xEE || op == 0xEF);
+                return true;
+            }
+
+            return false;
         }
 
         private static string FormatIoPortSummary(Dictionary<ushort, IoPortStats> ports)
