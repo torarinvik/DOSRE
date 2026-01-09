@@ -72,6 +72,106 @@ namespace DOSRE.Dasm
             return $"HINT: load {which} dword of 8-byte entry: [{baseReg}+{idxReg}*8{(disp != 0 ? $"+0x{disp:X}" : string.Empty)}]";
         }
 
+        private static string TryAnnotateScale8EntryLoadViaLeaAdd(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 2 || idx + 1 >= instructions.Count)
+                return string.Empty;
+
+            // Pattern (seen in loc_000770B3 / loc_00077B63):
+            //   lea tmp, [idx*8]
+            //   add tmp, base
+            //   mov hi, [tmp+0x4]
+            //   mov lo, [tmp]
+            // -> load 8-byte entry via computed address.
+            var cur = instructions[idx].ToString().Trim();
+            var mHi = Regex.Match(cur, @"^mov\s+(?<hi>e[a-z]{2})\s*,\s*\[(?<tmp>e[a-z]{2})\+0x4\]\s*$", RegexOptions.IgnoreCase);
+            if (!mHi.Success)
+                return string.Empty;
+
+            var tmp = mHi.Groups["tmp"].Value.ToLowerInvariant();
+
+            var next = instructions[idx + 1].ToString().Trim();
+            if (!Regex.IsMatch(next, $@"^mov\s+e[a-z]{{2}}\s*,\s*\[{Regex.Escape(tmp)}\]\s*$", RegexOptions.IgnoreCase))
+                return string.Empty;
+
+            var prev = instructions[idx - 1].ToString().Trim();
+            var mAdd = Regex.Match(prev, $@"^add\s+{Regex.Escape(tmp)}\s*,\s*(?<base>e[a-z]{{2}})\s*$", RegexOptions.IgnoreCase);
+            if (!mAdd.Success)
+                return string.Empty;
+
+            var baseReg = mAdd.Groups["base"].Value.ToLowerInvariant();
+            var prev2 = instructions[idx - 2].ToString().Trim();
+            var mLea = Regex.Match(prev2, $@"^lea\s+{Regex.Escape(tmp)}\s*,\s*\[(?<idx>e[a-z]{{2}})\*8\]\s*$", RegexOptions.IgnoreCase);
+            if (!mLea.Success)
+                return string.Empty;
+
+            var idxReg = mLea.Groups["idx"].Value.ToLowerInvariant();
+            return $"HINT: load 8-byte entry via [{baseReg}+{idxReg}*8]";
+        }
+
+        private static string TryAnnotateStructInitInterleavedAtEax(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            // Heuristic: within a short window, many constant stores to [eax+disp] (even if interleaved with LEA/MOV)
+            // usually mean struct/object init.
+            static bool IsConstStoreToEax(string t, out string disp)
+            {
+                disp = string.Empty;
+                if (string.IsNullOrWhiteSpace(t))
+                    return false;
+
+                var s = t.Trim();
+                var m = Regex.Match(
+                    s,
+                    @"^mov\s+(?:byte|word|dword)\s+\[eax(?<disp>\+0x[0-9A-Fa-f]+)?\]\s*,\s*(?:0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?|\d+)\s*$",
+                    RegexOptions.IgnoreCase
+                );
+                if (!m.Success)
+                    return false;
+
+                disp = m.Groups["disp"].Value;
+                return true;
+            }
+
+            if (!IsConstStoreToEax(instructions[idx].ToString(), out _))
+                return string.Empty;
+
+            // Only annotate at the first const-store in the local init window.
+            for (var back = 1; back <= 6 && idx - back >= 0; back++)
+            {
+                if (IsConstStoreToEax(instructions[idx - back].ToString(), out _))
+                    return string.Empty;
+
+                var t = instructions[idx - back].ToString().Trim();
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+            }
+
+            var lookahead = 18;
+            var constStores = 0;
+            var uniqueOffsets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (var j = idx; j < instructions.Count && j < idx + lookahead; j++)
+            {
+                var t = instructions[j].ToString().Trim();
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+
+                if (IsConstStoreToEax(t, out var disp))
+                {
+                    constStores++;
+                    uniqueOffsets.Add(string.IsNullOrEmpty(disp) ? "+0x0" : disp);
+                }
+            }
+
+            // Keep noise low: require a fairly dense init.
+            if (constStores < 6 || uniqueOffsets.Count < 5)
+                return string.Empty;
+
+            return "HINT: init struct @eax (defaults/fields)";
+        }
+
         private static string TryAnnotateUnalignedU16LoadViaShr(List<Instruction> instructions, int idx)
         {
             if (instructions == null || idx < 4 || idx >= instructions.Count)
@@ -184,6 +284,48 @@ namespace DOSRE.Dasm
                 return string.Empty;
 
             return $"HINT: ptr = base + {dst}*8 (8-byte entries)";
+        }
+
+        private static string TryAnnotateMovsdBlockCopy(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            // Pattern (e.g. func_00076C42):
+            //   lea edi, [dst]
+            //   lea esi, [src]
+            //   movsd
+            //   movsd
+            // -> copy 8 bytes (2 dwords) from src to dst.
+            var cur = instructions[idx].ToString().Trim();
+            if (!cur.Equals("movsd", StringComparison.OrdinalIgnoreCase))
+                return string.Empty;
+
+            // Only annotate the first movsd in a pair to reduce noise.
+            if (idx > 0 && instructions[idx - 1].ToString().Trim().Equals("movsd", StringComparison.OrdinalIgnoreCase))
+                return string.Empty;
+            if (idx + 1 >= instructions.Count || !instructions[idx + 1].ToString().Trim().Equals("movsd", StringComparison.OrdinalIgnoreCase))
+                return string.Empty;
+
+            // Require nearby lea edi/esi setup.
+            var sawLeaEdi = false;
+            var sawLeaEsi = false;
+            for (var back = 1; back <= 4 && idx - back >= 0; back++)
+            {
+                var t = instructions[idx - back].ToString().Trim();
+                if (!sawLeaEdi && Regex.IsMatch(t, @"^lea\s+edi\s*,\s*\[.+\]\s*$", RegexOptions.IgnoreCase))
+                    sawLeaEdi = true;
+                if (!sawLeaEsi && Regex.IsMatch(t, @"^lea\s+esi\s*,\s*\[.+\]\s*$", RegexOptions.IgnoreCase))
+                    sawLeaEsi = true;
+
+                if (sawLeaEdi && sawLeaEsi)
+                    break;
+            }
+
+            if (!sawLeaEdi || !sawLeaEsi)
+                return string.Empty;
+
+            return "HINT: memcpy 8 bytes (2 dwords) via movsd";
         }
 
         private static string TryAnnotateStructInitDefaultsAtEax(List<Instruction> instructions, int idx)

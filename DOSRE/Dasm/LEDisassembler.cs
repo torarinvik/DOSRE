@@ -5997,6 +5997,18 @@ namespace DOSRE.Dasm
                         if (!string.IsNullOrEmpty(ptr8Hint))
                             insText += $" ; {ptr8Hint}";
 
+                        var qLoadHint2 = TryAnnotateScale8EntryLoadViaLeaAdd(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(qLoadHint2))
+                            insText += $" ; {qLoadHint2}";
+
+                        var movsdHint = TryAnnotateMovsdBlockCopy(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(movsdHint))
+                            insText += $" ; {movsdHint}";
+
+                        var initHint3 = TryAnnotateStructInitInterleavedAtEax(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(initHint3))
+                            insText += $" ; {initHint3}";
+
                         var initHint2 = TryAnnotateStructInitDefaultsAtEax(instructions, insLoopIndex);
                         if (!string.IsNullOrEmpty(initHint2))
                             insText += $" ; {initHint2}";

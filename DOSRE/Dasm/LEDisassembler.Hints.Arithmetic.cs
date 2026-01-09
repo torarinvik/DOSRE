@@ -30,6 +30,10 @@ namespace DOSRE.Dasm
                 return hint;
             if (TryAnnotateBitstreamExtractViaShr3AndShRD(instructions, idx, out hint))
                 return hint;
+            if (TryAnnotateMulThenShRdEaxEdxByCl(instructions, idx, out hint))
+                return hint;
+            if (TryAnnotatePackHiByteWithLow24(instructions, idx, out hint))
+                return hint;
             if (TryAnnotatePackStride4BytesIntoDword(instructions, idx, out hint))
                 return hint;
             if (TryAnnotateShift16Add8000FlatPtr(instructions, idx, out hint))
@@ -148,6 +152,76 @@ namespace DOSRE.Dasm
                 return false;
 
             hint = "HINT: bitstream extract (byte=idx>>3, bit=idx&7)";
+            return true;
+        }
+
+        private static bool TryAnnotateMulThenShRdEaxEdxByCl(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 1 || idx >= instructions.Count)
+                return false;
+
+            // Pattern (e.g. loc_000880A4):
+            //   mul <src>
+            //   shrd eax, edx, cl
+            // -> take a product and shift-right by variable amount (common fixed-point scaling).
+            var i0 = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(i0, @"^shrd\s+eax\s*,\s*edx\s*,\s*cl\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            for (var back = 1; back <= 2 && idx - back >= 0; back++)
+            {
+                var t = instructions[idx - back].ToString().Trim();
+                if (Regex.IsMatch(t, @"^mul\s+.+$", RegexOptions.IgnoreCase))
+                {
+                    hint = "HINT: (eax*src) >> cl (mul + shrd)";
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TryAnnotatePackHiByteWithLow24(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 4 || idx >= instructions.Count)
+                return false;
+
+            // Pattern (e.g. loc_000880A4):
+            //   mov eax, [base+offA]
+            //   shl eax, 0x18
+            //   mov edx, [base+offB]
+            //   shr edx, 0x8
+            //   or eax, edx
+            // -> (byte<<24) | (low24bits)
+            var i0 = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(i0, @"^or\s+eax\s*,\s*edx\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i1 = instructions[idx - 1].ToString().Trim();
+            if (!Regex.IsMatch(i1, @"^shr\s+edx\s*,\s*(?:0x)?8\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i2 = instructions[idx - 2].ToString().Trim();
+            var mMovEdx = Regex.Match(i2, @"^mov\s+edx\s*,\s*\[(?<base>e[a-z]{2})\+0x[0-9a-f]+\]\s*$", RegexOptions.IgnoreCase);
+            if (!mMovEdx.Success)
+                return false;
+
+            var i3 = instructions[idx - 3].ToString().Trim();
+            if (!Regex.IsMatch(i3, @"^shl\s+eax\s*,\s*(?:0x)?18\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i4 = instructions[idx - 4].ToString().Trim();
+            var mMovEax = Regex.Match(i4, @"^mov\s+eax\s*,\s*\[(?<base>e[a-z]{2})\+0x[0-9a-f]+\]\s*$", RegexOptions.IgnoreCase);
+            if (!mMovEax.Success)
+                return false;
+
+            // Require same base reg to reduce false positives.
+            if (!mMovEax.Groups["base"].Value.Equals(mMovEdx.Groups["base"].Value, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            hint = "HINT: pack (byte<<24) | (val & 0x00FFFFFF)";
             return true;
         }
 
