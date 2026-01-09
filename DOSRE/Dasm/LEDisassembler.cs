@@ -4344,6 +4344,128 @@ namespace DOSRE.Dasm
             return string.Empty;
         }
 
+        private static bool TryParseMovClFromIndexByte(string insText, out string indexReg, out int scale, out uint disp)
+        {
+            indexReg = null;
+            scale = 0;
+            disp = 0;
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            // Example: mov cl, [edi*4+0x1]
+            var m = Regex.Match(insText.Trim(), @"^mov\s+cl,\s*\[(?<idx>e[a-z]{2})\*(?<scale>\d+)\+0x(?<disp>[0-9A-Fa-f]+)\]\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            indexReg = m.Groups["idx"].Value.ToLowerInvariant();
+            if (!int.TryParse(m.Groups["scale"].Value, out scale) || scale <= 0)
+                return false;
+            if (!TryParseHexOrDecUInt32(m.Groups["disp"].Value, out disp))
+                return false;
+            return true;
+        }
+
+        private static bool TryParseMovEaxFromTableLookup(string insText, out string tableBaseReg, out string indexReg, out int scale, out uint disp)
+        {
+            tableBaseReg = null;
+            indexReg = null;
+            scale = 0;
+            disp = 0;
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            // Example: mov eax, [edx+ecx*4+0x10b08]
+            var m = Regex.Match(insText.Trim(), @"^mov\s+eax,\s*\[(?<base>e[a-z]{2})\+(?<idx>e[a-z]{2})\*(?<scale>\d+)\+0x(?<disp>[0-9A-Fa-f]+)\]\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            tableBaseReg = m.Groups["base"].Value.ToLowerInvariant();
+            indexReg = m.Groups["idx"].Value.ToLowerInvariant();
+            if (!int.TryParse(m.Groups["scale"].Value, out scale) || scale <= 0)
+                return false;
+            if (!TryParseHexOrDecUInt32(m.Groups["disp"].Value, out disp))
+                return false;
+            return true;
+        }
+
+        private static bool TryParseAddMemEbpDispEax(string insText, out uint disp)
+        {
+            disp = 0;
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            // Example: add [ds:ebp+0x311c8], eax
+            var m = Regex.Match(insText.Trim(), @"^add\s+\[(?:ds:)?ebp\+0x(?<disp>[0-9A-Fa-f]+)\]\s*,\s*eax\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            return TryParseHexOrDecUInt32(m.Groups["disp"].Value, out disp);
+        }
+
+        private static string TryAnnotateByteTableAccumulationUnroll(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            // Pattern (common in the big uncommented block):
+            //   mov cl, [idx*4+off]
+            //   mov eax, [tbl + ecx*4 + base]
+            //   add [ds:ebp + accDisp], eax
+            // Emit hint on the ADD line to keep noise down while breaking long runs.
+            var insText = instructions[idx].ToString();
+            if (!TryParseAddMemEbpDispEax(insText, out var accDisp))
+                return string.Empty;
+
+            if (idx < 2)
+                return string.Empty;
+
+            var prev1 = instructions[idx - 1].ToString();
+            var prev2 = instructions[idx - 2].ToString();
+
+            if (!TryParseMovEaxFromTableLookup(prev1, out var tableReg, out var tableIdxReg, out var tableScale, out var tableDisp))
+                return string.Empty;
+
+            // Expect the index to be in ECX (cl) for this idiom.
+            if (!tableIdxReg.Equals("ecx", StringComparison.OrdinalIgnoreCase) || tableScale != 4)
+                return string.Empty;
+
+            if (!TryParseMovClFromIndexByte(prev2, out var srcIdxReg, out var srcScale, out var srcDisp))
+                return string.Empty;
+
+            // We mostly see edi*4+{1,3}; keep it broad but avoid overfitting.
+            var srcExpr = $"byte([{srcIdxReg}*{srcScale}+0x{srcDisp:X}])";
+            var tblExpr = $"[{tableReg}+0x{tableDisp:X} + ecx*4]";
+            return $"HINT: acc[ebp+0x{accDisp:X}] += {tblExpr}[{srcExpr}]";
+        }
+
+        private static string TryAnnotateAddAdc64Advance(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx <= 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            // Pattern: add loReg, [abs] ; adc hiReg, [abs]
+            // Example in the big block: add ebx, [0x3b1fc] ; adc edi, [0x3b200]
+            var a = instructions[idx - 1].ToString().Trim();
+            var b = instructions[idx].ToString().Trim();
+
+            var ma = Regex.Match(a, @"^add\s+(?<lo>e[a-z]{2})\s*,\s*\[(?<abs>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\]\s*$", RegexOptions.IgnoreCase);
+            var mb = Regex.Match(b, @"^adc\s+(?<hi>e[a-z]{2})\s*,\s*\[(?<abs>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\]\s*$", RegexOptions.IgnoreCase);
+            if (!ma.Success || !mb.Success)
+                return string.Empty;
+
+            var lo = ma.Groups["lo"].Value.ToLowerInvariant();
+            var hi = mb.Groups["hi"].Value.ToLowerInvariant();
+            var absLoTok = ma.Groups["abs"].Value.Trim().TrimEnd('h', 'H');
+            var absHiTok = mb.Groups["abs"].Value.Trim().TrimEnd('h', 'H');
+
+            if (!TryParseHexOrDecUInt32(absLoTok, out var absLo))
+                return string.Empty;
+            if (!TryParseHexOrDecUInt32(absHiTok, out var absHi))
+                return string.Empty;
+
+            return $"HINT: advance {hi}:{lo} += [0x{absHi:X}]:[0x{absLo:X}] (adc chain)";
+        }
+
         private static bool TryAnnotateMulByConstShort(List<Instruction> instructions, int idx, out string hint)
         {
             hint = null;
@@ -6704,6 +6826,14 @@ namespace DOSRE.Dasm
                         var arHint = TryAnnotateArithmeticIdioms(instructions, insLoopIndex);
                         if (!string.IsNullOrEmpty(arHint))
                             insText += $" ; {arHint}";
+
+                        var tabHint = TryAnnotateByteTableAccumulationUnroll(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(tabHint))
+                            insText += $" ; {tabHint}";
+
+                        var advHint = TryAnnotateAddAdc64Advance(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(advHint))
+                            insText += $" ; {advHint}";
                     }
 
                     var genHint = TryAnnotateGenericInstruction(rawInsText, inferredFlagSymbols);
