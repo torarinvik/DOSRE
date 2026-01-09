@@ -185,5 +185,164 @@ namespace DOSRE.Dasm
 
             return $"HINT: ptr = base + {dst}*8 (8-byte entries)";
         }
+
+        private static string TryAnnotateStructInitDefaultsAtEax(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            // Heuristic: a dense run of constant stores to [eax+disp] is typically struct init / defaults.
+            // Example block: mov dword [eax],0; mov byte [eax+0x17],0xff; mov dword [eax+0x4],0xffffffff; ...
+            static bool IsConstStoreToEax(string t)
+            {
+                if (string.IsNullOrWhiteSpace(t))
+                    return false;
+                var s = t.Trim();
+                return Regex.IsMatch(
+                    s,
+                    @"^mov\s+(?:byte|word|dword)\s+\[eax(?:\+0x[0-9A-Fa-f]+)?\]\s*,\s*(?:0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?|\d+)\s*$",
+                    RegexOptions.IgnoreCase
+                );
+            }
+
+            var cur = instructions[idx].ToString();
+            if (!IsConstStoreToEax(cur))
+                return string.Empty;
+
+            // Identify the bounds of the contiguous const-store streak.
+            var start = idx;
+            while (start > 0 && IsConstStoreToEax(instructions[start - 1].ToString()))
+                start--;
+
+            var end = idx;
+            while (end + 1 < instructions.Count && IsConstStoreToEax(instructions[end + 1].ToString()))
+                end++;
+
+            var count = end - start + 1;
+            if (count < 8)
+                return string.Empty;
+
+            var pos = idx - start;
+
+            // Keep noise low: annotate at the start, and once more mid-streak for longer init runs.
+            if (pos == 0)
+                return $"HINT: init struct @eax (set {count} default fields)";
+            if (count >= 10 && pos == 5)
+                return "HINT: init struct @eax (continued)";
+
+            return string.Empty;
+        }
+
+        private static string TryAnnotatePushArgsBeforeIndirectCall(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            // Heuristic: a run of pushes shortly followed by an indirect call often means
+            // the block is preparing stack args for a callback/dispatch.
+            var cur = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(cur, @"^push\s+.+$", RegexOptions.IgnoreCase))
+                return string.Empty;
+
+            var lookahead = 16;
+            var pushes = 0;
+            for (var j = idx; j < instructions.Count && j < idx + lookahead; j++)
+            {
+                var t = instructions[j].ToString().Trim();
+                if (Regex.IsMatch(t, @"^push\s+.+$", RegexOptions.IgnoreCase))
+                    pushes++;
+
+                if (Regex.IsMatch(t, @"^call\s+(?:dword\s+)?\[(?:esp|ebp)\+0x[0-9A-Fa-f]+\]\s*$", RegexOptions.IgnoreCase))
+                {
+                    if (pushes >= 3)
+                        return "HINT: build stack args for indirect call";
+                    return string.Empty;
+                }
+
+                // Stop scanning if we hit another control-transfer; we only want local setup.
+                if (j != idx && Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    return string.Empty;
+            }
+
+            return string.Empty;
+        }
+
+        private static string TryAnnotateStructFieldStoreDlAtEaxAfterDefaults(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            // Pattern: mov [eax+disp], dl following a dense defaults init streak to eax.
+            var cur = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(cur, @"^mov\s+\[eax\+0x[0-9A-Fa-f]+\]\s*,\s*dl\s*$", RegexOptions.IgnoreCase))
+                return string.Empty;
+
+            // If we recently wrote lots of constants to [eax+disp], interpret this as
+            // finishing init with a couple fields copied from inputs.
+            var lookback = 20;
+            var constStores = 0;
+            for (var j = idx - 1; j >= 0 && j >= idx - lookback; j--)
+            {
+                var t = instructions[j].ToString().Trim();
+                if (Regex.IsMatch(t, @"^mov\s+(?:byte|word|dword)\s+\[eax(?:\+0x[0-9A-Fa-f]+)?\]\s*,\s*(?:0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?|\d+)\s*$", RegexOptions.IgnoreCase))
+                    constStores++;
+
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+            }
+
+            if (constStores < 6)
+                return string.Empty;
+
+            return "HINT: struct init: copy byte field(s) from dl";
+        }
+
+        private static string TryAnnotateAbsStoreStreak(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            // Pattern: mov [0xADDR], <src> (optionally with size: mov dword [0xADDR], <src>)
+            var cur = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(cur, @"^mov\s+(?:byte|word|dword\s+)?\[(?:0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\]\s*,\s*.+$", RegexOptions.IgnoreCase))
+                return string.Empty;
+
+            // Only annotate when there are several absolute stores clustered together.
+            var lookahead = 14;
+            var ahead = 0;
+            for (var j = idx; j < instructions.Count && j <= idx + lookahead; j++)
+            {
+                var t = instructions[j].ToString().Trim();
+                if (Regex.IsMatch(t, @"^mov\s+(?:byte|word|dword\s+)?\[(?:0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\]\s*,\s*.+$", RegexOptions.IgnoreCase))
+                    ahead++;
+
+                if (j != idx && Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+            }
+
+            if (ahead < 3)
+                return string.Empty;
+
+            var lookback = 14;
+            var behind = 0;
+            for (var j = idx - 1; j >= 0 && j >= idx - lookback; j--)
+            {
+                var t = instructions[j].ToString().Trim();
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+
+                if (Regex.IsMatch(t, @"^mov\s+(?:byte|word|dword\s+)?\[(?:0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\]\s*,\s*.+$", RegexOptions.IgnoreCase))
+                    behind++;
+            }
+
+            if (behind == 0)
+                return "HINT: update globals/state";
+            if (behind == 2)
+                return "HINT: update globals/state (continued)";
+            if (behind == 3)
+                return "HINT: update globals/state (continued)";
+
+            return string.Empty;
+        }
     }
 }

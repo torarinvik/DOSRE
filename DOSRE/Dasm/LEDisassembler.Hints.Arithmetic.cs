@@ -16,6 +16,14 @@ namespace DOSRE.Dasm
 
             if (TryAnnotateMovEaxFromAbsScaled4(instructions, idx, out hint))
                 return hint;
+            if (TryAnnotateMulBy1000ViaShifts(instructions, idx, out hint))
+                return hint;
+            if (TryAnnotateMovEsi10ForDigitExtract(instructions, idx, out hint))
+                return hint;
+            if (TryAnnotateSignedDivBy10DigitSplit(instructions, idx, out hint))
+                return hint;
+            if (TryAnnotateMulU8FromTwoMovzx(instructions, idx, out hint))
+                return hint;
             if (TryAnnotateShift16Add8000FlatPtr(instructions, idx, out hint))
                 return hint;
 
@@ -30,6 +38,8 @@ namespace DOSRE.Dasm
             if (TryAnnotateFixedPointMulRound16(instructions, idx, out hint))
                 return hint;
             if (TryAnnotateSignedDiv(instructions, idx, out hint))
+                return hint;
+            if (TryAnnotateUnsignedDiv(instructions, idx, out hint))
                 return hint;
 
             return string.Empty;
@@ -54,6 +64,204 @@ namespace DOSRE.Dasm
 
             hint = $"HINT: eax = table32[ eax ] @0x{abs:X}";
             return true;
+        }
+
+        private static bool TryAnnotateMulBy1000ViaShifts(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 5 || idx >= instructions.Count)
+                return false;
+
+            // Pattern (as seen in loc_0007D602):
+            //   mov eax, edx
+            //   shl eax, 0x5
+            //   sub eax, edx          ; eax = edx*31
+            //   shl eax, 0x2          ; eax = edx*124
+            //   add edx, eax          ; edx = edx*125
+            //   shl edx, 0x3          ; edx = edx*1000
+            var i0 = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(i0, @"^(shl|sal)\s+edx\s*,\s*(?:0x)?3\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i1 = instructions[idx - 1].ToString().Trim();
+            if (!Regex.IsMatch(i1, @"^add\s+edx\s*,\s*eax\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i2 = instructions[idx - 2].ToString().Trim();
+            if (!Regex.IsMatch(i2, @"^(shl|sal)\s+eax\s*,\s*(?:0x)?2\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i3 = instructions[idx - 3].ToString().Trim();
+            if (!Regex.IsMatch(i3, @"^sub\s+eax\s*,\s*edx\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i4 = instructions[idx - 4].ToString().Trim();
+            if (!Regex.IsMatch(i4, @"^(shl|sal)\s+eax\s*,\s*(?:0x)?5\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i5 = instructions[idx - 5].ToString().Trim();
+            if (!Regex.IsMatch(i5, @"^mov\s+eax\s*,\s*edx\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            hint = "HINT: edx *= 1000 (x125<<3)";
+            return true;
+        }
+
+        private static bool TryAnnotateSignedDivBy10DigitSplit(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 3 || idx >= instructions.Count)
+                return false;
+
+            // Common formatting idiom:
+            //   mov esi, 0xa
+            //   mov edx, <v>
+            //   mov eax, <v>
+            //   sar edx, 0x1f
+            //   idiv esi
+            // (repeat) -> quotient/remainder base-10
+            var i0 = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(i0, @"^idiv\s+esi\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i1 = instructions[idx - 1].ToString().Trim();
+            if (!Regex.IsMatch(i1, @"^sar\s+edx\s*,\s*(?:0x)?1f\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i2 = instructions[idx - 2].ToString().Trim();
+            var i3 = instructions[idx - 3].ToString().Trim();
+            var mMovEax = Regex.Match(i2, @"^mov\s+eax\s*,\s*(?<src>e[a-z]{2})\s*$", RegexOptions.IgnoreCase);
+            var mMovEdx = Regex.Match(i3, @"^mov\s+edx\s*,\s*(?<src>e[a-z]{2})\s*$", RegexOptions.IgnoreCase);
+            if (!mMovEax.Success || !mMovEdx.Success)
+                return false;
+
+            var srcA = mMovEax.Groups["src"].Value.ToLowerInvariant();
+            var srcD = mMovEdx.Groups["src"].Value.ToLowerInvariant();
+            if (!srcA.Equals(srcD, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            // Ensure divisor was set to 10 nearby.
+            var foundTen = false;
+            for (var back = 1; back <= 20 && idx - back >= 0; back++)
+            {
+                var t = instructions[idx - back].ToString().Trim();
+                if (Regex.IsMatch(t, @"^mov\s+esi\s*,\s*(?:0x)?0?a\s*$", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(t, @"^mov\s+esi\s*,\s*10\s*$", RegexOptions.IgnoreCase))
+                {
+                    foundTen = true;
+                    break;
+                }
+            }
+            if (!foundTen)
+                return false;
+
+            hint = "HINT: signed div by 10 (quot eax, rem edx)";
+            return true;
+        }
+
+        private static bool TryAnnotateMovEsi10ForDigitExtract(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return false;
+
+            var i0 = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(i0, @"^mov\s+esi\s*,\s*(?:0x)?0?a\s*$", RegexOptions.IgnoreCase) &&
+                !Regex.IsMatch(i0, @"^mov\s+esi\s*,\s*10\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            // Look ahead for the actual digit-split idiv pattern.
+            var lookahead = 10;
+            for (var j = idx + 1; j < instructions.Count && j <= idx + lookahead; j++)
+            {
+                var t = instructions[j].ToString().Trim();
+                if (Regex.IsMatch(t, @"^idiv\s+esi\s*$", RegexOptions.IgnoreCase))
+                {
+                    // Require sign-extend via sar edx, 0x1f nearby.
+                    for (var back = 1; back <= 3 && j - back >= 0; back++)
+                    {
+                        var p = instructions[j - back].ToString().Trim();
+                        if (Regex.IsMatch(p, @"^sar\s+edx\s*,\s*(?:0x)?1f\s*$", RegexOptions.IgnoreCase))
+                        {
+                            hint = "HINT: prepare for base-10 digit extraction (divisor=10)";
+                            return true;
+                        }
+                    }
+                }
+
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+            }
+
+            return false;
+        }
+
+        private static bool TryAnnotateMulU8FromTwoMovzx(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 2 || idx >= instructions.Count)
+                return false;
+
+            // Pattern:
+            //   movzx r1, byte [mem]
+            //   movzx r2, byte [mem]
+            //   imul r2, r1
+            var i0 = instructions[idx].ToString().Trim();
+            var mImul = Regex.Match(i0, @"^imul\s+(?<dst>e[a-z]{2})\s*,\s*(?<src>e[a-z]{2})\s*$", RegexOptions.IgnoreCase);
+            if (!mImul.Success)
+                return false;
+
+            var dst = mImul.Groups["dst"].Value.ToLowerInvariant();
+            var src = mImul.Groups["src"].Value.ToLowerInvariant();
+
+            bool HasMovzxByteToReg(string t, string reg)
+            {
+                return Regex.IsMatch(
+                    t,
+                    $@"^movzx\s+{Regex.Escape(reg)}\s*,\s*byte\s+\[[^\]]+\]\s*$",
+                    RegexOptions.IgnoreCase
+                );
+            }
+
+            var p1 = instructions[idx - 1].ToString().Trim();
+            var p2 = instructions[idx - 2].ToString().Trim();
+
+            if ((HasMovzxByteToReg(p1, dst) && HasMovzxByteToReg(p2, src)) ||
+                (HasMovzxByteToReg(p1, src) && HasMovzxByteToReg(p2, dst)))
+            {
+                hint = "HINT: u8*u8 multiply (size/scale)";
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryAnnotateUnsignedDiv(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 1 || idx >= instructions.Count)
+                return false;
+
+            var i0 = instructions[idx].ToString().Trim();
+            var m = Regex.Match(i0, @"^div\s+(?<div>e[a-d]x|e[sdi]i|e[bp]p|dword\s+\[[^\]]+\])\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            var div = m.Groups["div"].Value.Trim();
+            for (var back = 1; back <= 3 && idx - back >= 0; back++)
+            {
+                var p = instructions[idx - back].ToString().Trim();
+                if (Regex.IsMatch(p, @"^xor\s+edx\s*,\s*edx\s*$", RegexOptions.IgnoreCase))
+                {
+                    hint = $"HINT: unsigned div by {div} (eax=quot, edx=rem)";
+                    return true;
+                }
+
+                if (Regex.IsMatch(p, @"^\s*(mov|lea|add|sub|xor|and|or|shl|shr|sar|imul)\s+edx\b", RegexOptions.IgnoreCase))
+                    break;
+            }
+
+            return false;
         }
 
         private static bool TryAnnotateShift16Add8000FlatPtr(List<Instruction> instructions, int idx, out string hint)
@@ -503,6 +711,13 @@ namespace DOSRE.Dasm
                 {
                     var p = instructions[sarIdx - back].ToString().Trim();
                     if (Regex.IsMatch(p, @"^\s*mov\s+edx\s*,\s*eax\s*$", RegexOptions.IgnoreCase))
+                    {
+                        hint = $"HINT: signed div by {div} (eax=quot, edx=rem)";
+                        return true;
+                    }
+
+                    // Also common: mov eax, edx; sar edx, 0x1f; idiv <div>
+                    if (Regex.IsMatch(p, @"^\s*mov\s+eax\s*,\s*edx\s*$", RegexOptions.IgnoreCase))
                     {
                         hint = $"HINT: signed div by {div} (eax=quot, edx=rem)";
                         return true;

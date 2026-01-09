@@ -5969,6 +5969,10 @@ namespace DOSRE.Dasm
                         if (!string.IsNullOrEmpty(stHint))
                             insText += $" ; {stHint}";
 
+                        var pushArgsHint = TryAnnotatePushArgsBeforeIndirectCall(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(pushArgsHint))
+                            insText += $" ; {pushArgsHint}";
+
                         var qHint = TryAnnotateScale8TableLoad(instructions, insLoopIndex);
                         if (!string.IsNullOrEmpty(qHint))
                             insText += $" ; {qHint}";
@@ -5984,6 +5988,18 @@ namespace DOSRE.Dasm
                         var ptr8Hint = TryAnnotateScale8PtrAdd(instructions, insLoopIndex);
                         if (!string.IsNullOrEmpty(ptr8Hint))
                             insText += $" ; {ptr8Hint}";
+
+                        var initHint2 = TryAnnotateStructInitDefaultsAtEax(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(initHint2))
+                            insText += $" ; {initHint2}";
+
+                        var dlStoreHint = TryAnnotateStructFieldStoreDlAtEaxAfterDefaults(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(dlStoreHint))
+                            insText += $" ; {dlStoreHint}";
+
+                        var absStoreHint = TryAnnotateAbsStoreStreak(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(absStoreHint))
+                            insText += $" ; {absStoreHint}";
 
                         var arHint = TryAnnotateArithmeticIdioms(instructions, insLoopIndex);
                         if (!string.IsNullOrEmpty(arHint))
