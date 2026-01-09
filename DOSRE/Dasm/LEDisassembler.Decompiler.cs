@@ -295,9 +295,17 @@ namespace DOSRE.Dasm
             sb.AppendLine("// - It reuses LE insights/symbolization from the disassembler output.");
             sb.AppendLine("// - Memory operands use uint*_t; assume <stdint.h>.");
             sb.AppendLine("#include <stdint.h>");
-            sb.AppendLine("typedef uint32_t size_t;");
+            sb.AppendLine("#if defined(__has_include) && __has_include(<memory.h>)");
+            sb.AppendLine("#include <memory.h>");
+            sb.AppendLine("#elif defined(__has_include) && __has_include(<string.h>)");
+            sb.AppendLine("#include <string.h>");
+            sb.AppendLine("#else");
+            sb.AppendLine("#ifndef size_t");
+            sb.AppendLine("typedef __SIZE_TYPE__ size_t;");
+            sb.AppendLine("#endif");
             sb.AppendLine("void* memcpy(void *dst, const void *src, size_t n);");
             sb.AppendLine("void* memset(void *s, int c, size_t n);");
+            sb.AppendLine("#endif");
             sb.AppendLine();
             sb.AppendLine("// Stubs for compilability");
             sb.AppendLine("#define strlen_rep(edi, al, ecx) 0 /* stub */");
@@ -1456,6 +1464,20 @@ namespace DOSRE.Dasm
                 var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true, fn);
                 var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn);
                 var op = mn == "shl" ? "<<=" : ">>=";
+                // If rhs is constant > 31, mask it to avoid C undefined behavior (matching x86 behavior)
+                if (rhs.StartsWith("0x") || int.TryParse(rhs, out _))
+                {
+                    long val = 0;
+                    bool parsed = false;
+                    if (rhs.StartsWith("0x")) { try { val = Convert.ToInt64(rhs, 16); parsed = true; } catch {} }
+                    else { parsed = int.TryParse(rhs, out int iv); val = iv; }
+
+                    if (parsed && val >= 32)
+                    {
+                        var masked = val % 32;
+                        return $"{lhs} {op} {masked}; // masked from {rhs} to match x86 behavior{commentSuffix}";
+                    }
+                }
                 return $"{lhs} {op} {rhs};{commentSuffix}";
             }
 
