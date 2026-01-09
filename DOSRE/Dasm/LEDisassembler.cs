@@ -71,6 +71,9 @@ namespace DOSRE.Dasm
         private static readonly Regex MemOpRegex = new Regex(
             @"\[(?<base>e[a-z]{2})(?:\+0x(?<disp>[0-9A-Fa-f]+))?\]",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static readonly Regex MemOpIndexedRegex = new Regex(
+            @"\[(?<base>e[a-z]{2})(?:\+(?<index>e[a-z]{2})\*(?<scale>[0-9]+))?(?:(?<sign>[\+\-])0x(?<disp>[0-9A-Fa-f]+))?\]",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
         private static readonly Regex MemOpWithSizeRegex = new Regex(
             @"(?<size>byte|word|dword)\s+\[(?<base>e[a-z]{2})(?:\+0x(?<disp>[0-9A-Fa-f]+))?\]",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -188,6 +191,54 @@ namespace DOSRE.Dasm
             public int WriteCount;
             public string Size = string.Empty;
             public int PointerUseCount;
+            public readonly Dictionary<int, int> IndexScaleCounts = new Dictionary<int, int>();
+        }
+
+        private static void RecordFieldIndexScale(
+            Dictionary<string, Dictionary<uint, FieldAccessStats>> statsByBase,
+            string baseAlias,
+            uint disp,
+            int scale)
+        {
+            if (statsByBase == null || string.IsNullOrWhiteSpace(baseAlias) || scale <= 0)
+                return;
+
+            if (!statsByBase.TryGetValue(baseAlias, out var byDisp))
+                statsByBase[baseAlias] = byDisp = new Dictionary<uint, FieldAccessStats>();
+
+            if (!byDisp.TryGetValue(disp, out var st))
+                byDisp[disp] = st = new FieldAccessStats();
+
+            st.IndexScaleCounts.TryGetValue(scale, out var c);
+            st.IndexScaleCounts[scale] = c + 1;
+        }
+
+        private static int? GetMostCommonIndexScale(FieldAccessStats st)
+        {
+            if (st == null || st.IndexScaleCounts == null || st.IndexScaleCounts.Count == 0)
+                return null;
+
+            // Require at least 2 hits to avoid noisy one-offs.
+            var best = st.IndexScaleCounts.OrderByDescending(k => k.Value).ThenBy(k => k.Key).FirstOrDefault();
+            return best.Value >= 2 ? best.Key : null;
+        }
+
+        private static string FormatFieldExtraHints(FieldAccessStats st)
+        {
+            if (st == null)
+                return string.Empty;
+
+            var hints = new List<string>();
+
+            var ptr = st.PointerUseCount > 0 && (string.IsNullOrEmpty(st.Size) || string.Equals(st.Size, "dword", StringComparison.OrdinalIgnoreCase));
+            if (ptr)
+                hints.Add("ptr");
+
+            var scale = GetMostCommonIndexScale(st);
+            if (scale.HasValue)
+                hints.Add($"arr*{scale.Value}");
+
+            return hints.Count == 0 ? string.Empty : " " + string.Join(" ", hints);
         }
 
         private static string BitWidthToMemSize(int bits)
@@ -500,7 +551,7 @@ namespace DOSRE.Dasm
                     }
                 }
 
-                foreach (Match m in MemOpRegex.Matches(insText))
+                foreach (Match m in MemOpIndexedRegex.Matches(insText))
                 {
                     var baseReg = m.Groups["base"].Value.ToLowerInvariant();
                     if (baseReg == "esp" || baseReg == "ebp")
@@ -519,7 +570,14 @@ namespace DOSRE.Dasm
 
                     var disp = 0u;
                     if (m.Groups["disp"].Success)
+                    {
                         disp = Convert.ToUInt32(m.Groups["disp"].Value, 16);
+                        if (m.Groups["sign"].Success && m.Groups["sign"].Value == "-")
+                        {
+                            // Negative displacements aren't meaningful as struct fields.
+                            continue;
+                        }
+                    }
 
                     // Avoid treating huge displacements as struct fields; these are often absolute tables
                     // or misclassified addressing modes.
@@ -531,6 +589,9 @@ namespace DOSRE.Dasm
                     GetMemAccessRW(insText, memText, out var r, out var w);
                     var size = InferMemOperandSize(insText, memText);
                     RecordFieldAccess(statsByBase, baseAlias, disp, r, w, size);
+
+                    if (m.Groups["index"].Success && m.Groups["scale"].Success && int.TryParse(m.Groups["scale"].Value, out var scale) && (scale == 2 || scale == 4 || scale == 8))
+                        RecordFieldIndexScale(statsByBase, baseAlias, disp, scale);
                 }
             }
         }
@@ -566,9 +627,9 @@ namespace DOSRE.Dasm
                         var disp = k.Key;
                         var st = k.Value;
                         var rw = $"r{st.ReadCount}/w{st.WriteCount}";
-                        var ptr = (st.PointerUseCount > 0 && (string.IsNullOrEmpty(st.Size) || string.Equals(st.Size, "dword", StringComparison.OrdinalIgnoreCase))) ? " ptr" : "";
                         var sz = string.IsNullOrEmpty(st.Size) ? "" : $" {st.Size}";
-                        return $"+0x{disp:X}({rw}{sz}{ptr})";
+                        var extra = FormatFieldExtraHints(st);
+                        return $"+0x{disp:X}({rw}{sz}{extra})";
                     });
                 parts.Add($"{baseAlias}: {string.Join(", ", fields)}");
             }
@@ -605,6 +666,15 @@ namespace DOSRE.Dasm
                     stDst.ReadCount += stSrc.ReadCount;
                     stDst.WriteCount += stSrc.WriteCount;
                     stDst.PointerUseCount += stSrc.PointerUseCount;
+
+                    if (stSrc.IndexScaleCounts != null && stSrc.IndexScaleCounts.Count > 0)
+                    {
+                        foreach (var sc in stSrc.IndexScaleCounts)
+                        {
+                            stDst.IndexScaleCounts.TryGetValue(sc.Key, out var c);
+                            stDst.IndexScaleCounts[sc.Key] = c + sc.Value;
+                        }
+                    }
 
                     if (string.IsNullOrEmpty(stDst.Size))
                     {
@@ -666,9 +736,9 @@ namespace DOSRE.Dasm
                         var disp = k.Key;
                         var st = k.Value;
                         var rw = $"r{st.ReadCount}/w{st.WriteCount}";
-                        var ptr = (st.PointerUseCount > 0 && (string.IsNullOrEmpty(st.Size) || string.Equals(st.Size, "dword", StringComparison.OrdinalIgnoreCase))) ? " ptr" : "";
                         var sz = string.IsNullOrEmpty(st.Size) ? "" : $" {st.Size}";
-                        return $"+0x{disp:X}({rw}{sz}{ptr})";
+                        var extra = FormatFieldExtraHints(st);
+                        return $"+0x{disp:X}({rw}{sz}{extra})";
                     })
                     .ToList();
 
