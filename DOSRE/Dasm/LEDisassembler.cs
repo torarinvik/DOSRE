@@ -2103,6 +2103,9 @@ namespace DOSRE.Dasm
                 return string.Empty;
 
             ushort? localDxImm16 = null;
+            string localDxSource = null;
+            byte? localAlImm8 = null;
+            ushort? localAxImm16 = null;
             var localNotes = new List<string>();
 
             var max = Math.Min(instructions.Count, idx + 28);
@@ -2144,9 +2147,23 @@ namespace DOSRE.Dasm
                 }
 
                 if (TryParseMovDxImmediate(cooked, out var dxImm))
+                {
                     localDxImm16 = dxImm;
+                    localDxSource = $"0x{dxImm:X4}";
+                }
 
-                var ioHint = TryAnnotateIoPortAccess(instructions, i, localDxImm16);
+                if (TryParseMovDxFromMemory(cooked, out var dxMem))
+                {
+                    localDxImm16 = null;
+                    localDxSource = $"[{dxMem}]";
+                }
+
+                if (TryParseMovAlImmediate(cooked, out var alImm))
+                    localAlImm8 = alImm;
+                if (TryParseMovAxImmediate(cooked, out var axImm))
+                    localAxImm16 = axImm;
+
+                var ioHint = TryAnnotateIoPortAccess(cooked, localDxImm16, localDxSource, localAlImm8, localAxImm16);
                 if (!string.IsNullOrEmpty(ioHint))
                 {
                     var shortIo = ShortenIoHintForCase(ioHint);
@@ -3785,22 +3802,170 @@ namespace DOSRE.Dasm
             return false;
         }
 
-        private static string TryAnnotateIoPortAccess(List<Instruction> instructions, int idx, ushort? lastDxImm16)
+        private static bool TryParseMovAlImmediate(string insText, out byte imm8)
         {
-            if (instructions == null || idx < 0 || idx >= instructions.Count)
+            imm8 = 0;
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            var m = Regex.Match(insText.Trim(), @"^mov\s+al,\s*(?<imm>(?:0x)?[0-9A-Fa-f]+)h?\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            var tok = m.Groups["imm"].Value.Trim();
+            if (!TryParseHexOrDecUInt32(tok, out var u) || u > 0xFF)
+                return false;
+
+            imm8 = (byte)u;
+            return true;
+        }
+
+        private static bool TryParseMovAxImmediate(string insText, out ushort imm16)
+        {
+            imm16 = 0;
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            var m = Regex.Match(insText.Trim(), @"^mov\s+ax,\s*(?<imm>(?:0x)?[0-9A-Fa-f]+)h?\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            var tok = m.Groups["imm"].Value.Trim();
+            return TryParseImmUShort(tok, out imm16);
+        }
+
+        private static bool TryParseXorRegReg(string insText, string reg, out bool isSelfXor)
+        {
+            isSelfXor = false;
+            if (string.IsNullOrWhiteSpace(insText) || string.IsNullOrWhiteSpace(reg))
+                return false;
+
+            var r = Regex.Escape(reg);
+            var m = Regex.Match(insText.Trim(), $@"^xor\s+{r}\s*,\s*{r}\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            isSelfXor = true;
+            return true;
+        }
+
+        private static bool TryParseMovDxFromMemory(string insText, out string mem)
+        {
+            mem = null;
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            var m = Regex.Match(insText.Trim(), @"^mov\s+dx,\s*(?:word\s+)?\[(?<mem>[^\]]+)\]\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            mem = m.Groups["mem"].Value.Trim();
+            return !string.IsNullOrWhiteSpace(mem);
+        }
+
+        private static void UpdateIoTrackingFromInstruction(
+            string insText,
+            ref ushort? lastDxImm16,
+            ref string lastDxSource,
+            ref byte? lastAlImm8,
+            ref ushort? lastAxImm16)
+        {
+            if (string.IsNullOrWhiteSpace(insText))
+                return;
+
+            // Track DX (port register)
+            if (TryParseMovDxImmediate(insText, out var dxImm))
+            {
+                lastDxImm16 = dxImm;
+                lastDxSource = $"0x{dxImm:X4}";
+                return;
+            }
+
+            if (TryParseMovDxFromMemory(insText, out var mem))
+            {
+                lastDxImm16 = null;
+                lastDxSource = $"[{mem}]";
+                return;
+            }
+
+            // Track AL/AX immediates (common right before OUT)
+            if (TryParseMovAlImmediate(insText, out var alImm))
+            {
+                lastAlImm8 = alImm;
+                return;
+            }
+
+            if (TryParseMovAxImmediate(insText, out var axImm))
+            {
+                lastAxImm16 = axImm;
+                return;
+            }
+
+            if (TryParseXorRegReg(insText, "al", out var selfXorAl) && selfXorAl)
+            {
+                lastAlImm8 = 0;
+                return;
+            }
+
+            if (TryParseXorRegReg(insText, "ax", out var selfXorAx) && selfXorAx)
+            {
+                lastAxImm16 = 0;
+                return;
+            }
+        }
+
+        private static string TryAnnotateIoPortAccess(string insText, ushort? lastDxImm16, string lastDxSource, byte? lastAlImm8, ushort? lastAxImm16)
+        {
+            if (string.IsNullOrWhiteSpace(insText))
                 return string.Empty;
 
-            var insText = instructions[idx].ToString();
-            if (!TryParseIoAccess(insText, lastDxImm16, out var port, out var isWrite, out var dataReg))
+            // Loose parse so we can still annotate dx-based I/O even when DX isn't an immediate.
+            var mout = Regex.Match(insText.Trim(), @"^out\s+(?<port>dx|(?:0x)?[0-9A-Fa-f]+h?)\s*,\s*(?<reg>al|ax|eax)\s*$", RegexOptions.IgnoreCase);
+            var min = Regex.Match(insText.Trim(), @"^in\s+(?<reg>al|ax|eax)\s*,\s*(?<port>dx|(?:0x)?[0-9A-Fa-f]+h?)\s*$", RegexOptions.IgnoreCase);
+            var isWrite = mout.Success;
+            var isRead = min.Success;
+            if (!isWrite && !isRead)
                 return string.Empty;
 
-            KnownIoPorts.TryGetValue(port, out var name);
+            var portTok = (isWrite ? mout.Groups["port"].Value : min.Groups["port"].Value).Trim();
+            var dataReg = (isWrite ? mout.Groups["reg"].Value : min.Groups["reg"].Value).Trim().ToLowerInvariant();
 
-            var dir = isWrite ? "<-" : "->";
-            if (!string.IsNullOrEmpty(name))
-                return $"IO: {(isWrite ? "OUT" : "IN")} {name} (0x{port:X4}) {dir} {dataReg}";
+            string dataText = dataReg;
+            if (dataReg == "al" && lastAlImm8.HasValue)
+                dataText = $"al=0x{lastAlImm8.Value:X2}";
+            else if (dataReg == "ax" && lastAxImm16.HasValue)
+                dataText = $"ax=0x{lastAxImm16.Value:X4}";
 
-            return $"IO: {(isWrite ? "OUT" : "IN")} 0x{port:X4} {dir} {dataReg}";
+            if (portTok.Equals("dx", StringComparison.OrdinalIgnoreCase))
+            {
+                // Best-effort: use immediate DX if we have it, otherwise still emit a useful hint.
+                if (lastDxImm16.HasValue)
+                {
+                    var port = lastDxImm16.Value;
+                    KnownIoPorts.TryGetValue(port, out var name);
+                    var dir = isWrite ? "<-" : "->";
+                    if (!string.IsNullOrEmpty(name))
+                        return $"IO: {(isWrite ? "OUT" : "IN")} {name} (0x{port:X4}) {dir} {dataText}";
+                    return $"IO: {(isWrite ? "OUT" : "IN")} 0x{port:X4} {dir} {dataText}";
+                }
+
+                var dxDesc = !string.IsNullOrWhiteSpace(lastDxSource) ? lastDxSource : "dx";
+                var dir2 = isWrite ? "<-" : "->";
+                return $"IO: {(isWrite ? "OUT" : "IN")} (port in {dxDesc}) {dir2} {dataText}";
+            }
+
+            // Immediate port
+            var p = portTok.TrimEnd('h', 'H');
+            if (!TryParseImmUShort(p, out var portImm))
+                return string.Empty;
+
+            KnownIoPorts.TryGetValue(portImm, out var name2);
+
+            var dir3 = isWrite ? "<-" : "->";
+            if (!string.IsNullOrEmpty(name2))
+                return $"IO: {(isWrite ? "OUT" : "IN")} {name2} (0x{portImm:X4}) {dir3} {dataText}";
+
+            return $"IO: {(isWrite ? "OUT" : "IN")} 0x{portImm:X4} {dir3} {dataText}";
         }
 
         private static string TryAnnotateBasicBlockSummary(List<Instruction> instructions, int startIdx)
@@ -6199,6 +6364,9 @@ namespace DOSRE.Dasm
                 uint currentFunctionStart = 0;
 
                 ushort? lastDxImm16 = null;
+                string lastDxSource = null;
+                byte? lastAlImm8 = null;
+                ushort? lastAxImm16 = null;
 
                 // Suppress repeating switch/decision-tree hints on every bb_ label inside the same compare chain.
                 string lastSwitchSig = null;
@@ -6243,6 +6411,9 @@ namespace DOSRE.Dasm
                         liveAliases["ecx"] = "this";
 
                         lastDxImm16 = null;
+                        lastDxSource = null;
+                        lastAlImm8 = null;
+                        lastAxImm16 = null;
                     }
 
                     if (functionStarts.Contains(addr))
@@ -6321,6 +6492,9 @@ namespace DOSRE.Dasm
 
                         // Reset per-function port tracking to avoid stale DX.
                         lastDxImm16 = null;
+                        lastDxSource = null;
+                        lastAlImm8 = null;
+                        lastAxImm16 = null;
                     }
                     else if (labelTargets.Contains(addr))
                     {
@@ -6435,6 +6609,9 @@ namespace DOSRE.Dasm
                             insText = RewritePointerSymbols(insText, inferredPtrSymbols);
                     }
 
+                    // Update IO tracking on the best-effort rewritten instruction text (so it can capture g_... symbols).
+                    UpdateIoTrackingFromInstruction(insText, ref lastDxImm16, ref lastDxSource, ref lastAlImm8, ref lastAxImm16);
+
                     if (TryGetRelativeBranchTarget(ins, out var branchTarget, out var isCall2))
                     {
                         var label = isCall2 ? $"func_{branchTarget:X8}" : $"loc_{branchTarget:X8}";
@@ -6518,7 +6695,7 @@ namespace DOSRE.Dasm
                     if (!string.IsNullOrEmpty(intHint))
                         insText += $" ; {intHint}";
 
-                    var ioHint = TryAnnotateIoPortAccess(instructions, insLoopIndex, lastDxImm16);
+                    var ioHint = TryAnnotateIoPortAccess(insText, lastDxImm16, lastDxSource, lastAlImm8, lastAxImm16);
                     if (!string.IsNullOrEmpty(ioHint))
                         insText += $" ; {ioHint}";
 
