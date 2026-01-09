@@ -192,6 +192,7 @@ namespace DOSRE.Dasm
             public string Size = string.Empty;
             public int PointerUseCount;
             public readonly Dictionary<int, int> IndexScaleCounts = new Dictionary<int, int>();
+            public readonly Dictionary<uint, int> ArrayBoundCounts = new Dictionary<uint, int>();
         }
 
         private static void RecordFieldIndexScale(
@@ -223,6 +224,40 @@ namespace DOSRE.Dasm
             return best.Value >= 2 ? best.Key : null;
         }
 
+        private static uint? GetMostCommonArrayBound(FieldAccessStats st)
+        {
+            if (st == null || st.ArrayBoundCounts == null || st.ArrayBoundCounts.Count == 0)
+                return null;
+
+            var best = st.ArrayBoundCounts.OrderByDescending(k => k.Value).ThenBy(k => k.Key).FirstOrDefault();
+            if (best.Value >= 2)
+                return best.Key;
+
+            // If we only ever saw one bound value for this field, a single hit can still be useful.
+            // (Keeps things conservative: avoids emitting when multiple different bounds were observed.)
+            return st.ArrayBoundCounts.Count == 1 && best.Value >= 1 ? best.Key : null;
+        }
+
+        private static void RecordFieldArrayBound(
+            Dictionary<string, Dictionary<uint, FieldAccessStats>> statsByBase,
+            string baseAlias,
+            uint disp,
+            uint bound)
+        {
+            if (statsByBase == null || string.IsNullOrWhiteSpace(baseAlias))
+                return;
+            if (bound == 0 || bound > 0x100000)
+                return;
+
+            if (!statsByBase.TryGetValue(baseAlias, out var byDisp))
+                statsByBase[baseAlias] = byDisp = new Dictionary<uint, FieldAccessStats>();
+            if (!byDisp.TryGetValue(disp, out var st))
+                byDisp[disp] = st = new FieldAccessStats();
+
+            st.ArrayBoundCounts.TryGetValue(bound, out var c);
+            st.ArrayBoundCounts[bound] = c + 1;
+        }
+
         private static string FormatFieldExtraHints(FieldAccessStats st)
         {
             if (st == null)
@@ -237,6 +272,10 @@ namespace DOSRE.Dasm
             var scale = GetMostCommonIndexScale(st);
             if (scale.HasValue)
                 hints.Add($"arr*{scale.Value}");
+
+            var bound = GetMostCommonArrayBound(st);
+            if (bound.HasValue)
+                hints.Add($"n~0x{bound.Value:X}");
 
             return hints.Count == 0 ? string.Empty : " " + string.Join(" ", hints);
         }
@@ -506,6 +545,74 @@ namespace DOSRE.Dasm
 
             var regFromField = new Dictionary<string, (string baseAlias, uint disp)>(StringComparer.OrdinalIgnoreCase);
 
+            static uint? FindNearbyCmpImmBoundForIndex(List<Instruction> insList, int idx, int start, int end, string indexReg)
+            {
+                if (insList == null || string.IsNullOrWhiteSpace(indexReg))
+                    return null;
+                static string CanonReg(string r)
+                {
+                    if (string.IsNullOrWhiteSpace(r))
+                        return string.Empty;
+                    r = r.Trim().ToLowerInvariant();
+                    return r switch
+                    {
+                        "al" or "ah" or "ax" or "eax" => "eax",
+                        "bl" or "bh" or "bx" or "ebx" => "ebx",
+                        "cl" or "ch" or "cx" or "ecx" => "ecx",
+                        "dl" or "dh" or "dx" or "edx" => "edx",
+                        "si" or "esi" => "esi",
+                        "di" or "edi" => "edi",
+                        _ => r,
+                    };
+                }
+
+                indexReg = CanonReg(indexReg);
+                if (indexReg == "esp" || indexReg == "ebp")
+                    return null;
+
+                // Most bounds checks happen before the indexed access; scan backward a bit.
+                var lo = Math.Max(start, idx - 32);
+                var candidateRegs = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { indexReg };
+                for (var j = idx - 1; j >= lo; j--)
+                {
+                    var t = insList[j].ToString().Trim();
+                    if (t.Length == 0)
+                        continue;
+
+                    // Don't scan across clear control-flow boundaries.
+                    if (t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) || t.StartsWith("jmp ", StringComparison.OrdinalIgnoreCase))
+                        break;
+
+                    // Track simple register-to-register moves so we can match a cmp against a source reg.
+                    var mv = Regex.Match(
+                        t,
+                        @"^(?:mov|movsx|movzx)\s+(?<dst>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*,\s*(?<src>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*$",
+                        RegexOptions.IgnoreCase);
+                    if (mv.Success)
+                    {
+                        var dst = CanonReg(mv.Groups["dst"].Value);
+                        var src = CanonReg(mv.Groups["src"].Value);
+                        if (candidateRegs.Contains(dst))
+                            candidateRegs.Add(src);
+                    }
+
+                    var m = Regex.Match(
+                        t,
+                        @"^cmp\s+(?:(?:byte|word|dword)\s+)?(?<reg>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$",
+                        RegexOptions.IgnoreCase);
+                    if (!m.Success)
+                        continue;
+
+                    var reg = CanonReg(m.Groups["reg"].Value);
+                    if (!candidateRegs.Contains(reg))
+                        continue;
+
+                    if (TryParseHexOrDecUInt32(m.Groups["imm"].Value, out var u) && u > 0)
+                        return u;
+                }
+                return null;
+            }
+
             for (var i = startIdx; i < endIdxExclusive; i++)
             {
                 var insText = instructions[i].ToString().Trim();
@@ -591,7 +698,15 @@ namespace DOSRE.Dasm
                     RecordFieldAccess(statsByBase, baseAlias, disp, r, w, size);
 
                     if (m.Groups["index"].Success && m.Groups["scale"].Success && int.TryParse(m.Groups["scale"].Value, out var scale) && (scale == 2 || scale == 4 || scale == 8))
+                    {
                         RecordFieldIndexScale(statsByBase, baseAlias, disp, scale);
+
+                        // If we can see a repeated compare against a constant on the index, treat it as an array bound candidate.
+                        var idxReg = m.Groups["index"].Value.ToLowerInvariant();
+                        var bound = FindNearbyCmpImmBoundForIndex(instructions, i, startIdx, endIdxExclusive, idxReg);
+                        if (bound.HasValue)
+                            RecordFieldArrayBound(statsByBase, baseAlias, disp, bound.Value);
+                    }
                 }
             }
         }

@@ -40,6 +40,7 @@ A practical “disassembly → C” workflow looks like:
 - Group inferred pointer bases into per-type structs (best-effort field table aggregation for `ptr_XXXXXXXX` is implemented).
 - Field type inference (partial): infer access width (byte/word/dword) and mark some fields as pointer-like (`ptr`) based on usage.
 - Detect array strides (best-effort): mark fields as array-indexed (`arr*2/4/8`) when accessed via `base+idx*scale+disp`.
+- Detect array bounds/counts (best-effort, conservative): annotate array-indexed fields with `n~0xNN` when a nearby `cmp idx, imm` suggests a stable upper bound.
 - Improve vtable detection and slot labelling.
 
 ### 5) Control-flow structuring
