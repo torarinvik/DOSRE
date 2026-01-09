@@ -987,6 +987,20 @@ namespace DOSRE.Dasm
             return $"LOOPS: {string.Join(", ", parts)}{more}";
         }
 
+        private static string FormatLoopHeaderHint(LoopSummary loop)
+        {
+            if (loop == null)
+                return string.Empty;
+
+            var latch = loop.Latches.Count > 0 ? $"latch=0x{loop.Latches.Min():X8}" : string.Empty;
+            var iv = !string.IsNullOrWhiteSpace(loop.InductionVar) ? $"iv={loop.InductionVar}" : string.Empty;
+            var step = loop.Step.HasValue ? $"step={(loop.Step.Value >= 0 ? "+" : string.Empty)}{loop.Step.Value}" : string.Empty;
+            var bound = !string.IsNullOrWhiteSpace(loop.Bound) ? $"bound={loop.Bound}" : string.Empty;
+            var cond = !string.IsNullOrWhiteSpace(loop.Cond) ? $"cond={loop.Cond}" : string.Empty;
+            var parts = new[] { latch, iv, step, bound, cond }.Where(x => !string.IsNullOrWhiteSpace(x)).ToList();
+            return parts.Count == 0 ? "LOOPHDR" : $"LOOPHDR: {string.Join(" ", parts)}";
+        }
+
         private static string InferPointerishArgSummaryForFunction(
             List<Instruction> instructions,
             int startIdx,
@@ -4401,6 +4415,8 @@ namespace DOSRE.Dasm
                 Dictionary<uint, string> funcProtoHints = null;
                 Dictionary<uint, string> funcLoopSummaries = null;
                 Dictionary<uint, string> funcCSketchHints = null;
+                Dictionary<uint, Dictionary<uint, string>> funcLoopHeaderHints = null;
+                Dictionary<uint, Dictionary<uint, string>> funcLoopLatchHints = null;
                 if (leInsights && functionStarts != null && functionStarts.Count > 0)
                 {
                     funcOutLocalAliases = new Dictionary<uint, Dictionary<string, string>>();
@@ -4409,6 +4425,8 @@ namespace DOSRE.Dasm
                     funcProtoHints = new Dictionary<uint, string>();
                     funcLoopSummaries = new Dictionary<uint, string>();
                     funcCSketchHints = new Dictionary<uint, string>();
+                    funcLoopHeaderHints = new Dictionary<uint, Dictionary<uint, string>>();
+                    funcLoopLatchHints = new Dictionary<uint, Dictionary<uint, string>>();
 
                     var sortedStarts = functionStarts.OrderBy(x => x).ToList();
                     for (var si = 0; si < sortedStarts.Count; si++)
@@ -4449,6 +4467,39 @@ namespace DOSRE.Dasm
                             var loopSum = FormatLoopSummaryForFunction(loops);
                             if (!string.IsNullOrEmpty(loopSum))
                                 funcLoopSummaries[startAddr] = loopSum;
+
+                            if (loops != null && loops.Count > 0)
+                            {
+                                var byHdr = new Dictionary<uint, string>();
+                                var byLatch = new Dictionary<uint, string>();
+                                foreach (var l in loops)
+                                {
+                                    var hint = FormatLoopHeaderHint(l);
+                                    if (!string.IsNullOrWhiteSpace(hint))
+                                        byHdr[l.Header] = hint;
+
+                                    if (l.Latches != null && l.Latches.Count > 0)
+                                    {
+                                        foreach (var la in l.Latches)
+                                        {
+                                            // Prefer the first-seen header if multiple loops share a latch (rare).
+                                            if (!byLatch.ContainsKey(la))
+                                            {
+                                                var latchHint = $"LOOPLATCH: hdr=0x{l.Header:X8}";
+                                                if (!string.IsNullOrWhiteSpace(l.Bound))
+                                                    latchHint += $" bound={l.Bound}";
+                                                if (!string.IsNullOrWhiteSpace(l.Cond))
+                                                    latchHint += $" cond={l.Cond}";
+                                                byLatch[la] = latchHint;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (byHdr.Count > 0)
+                                    funcLoopHeaderHints[startAddr] = byHdr;
+                                if (byLatch.Count > 0)
+                                    funcLoopLatchHints[startAddr] = byLatch;
+                            }
 
                             // C sketch header (best-effort)
                             var ptrArgs = InferPointerishArgSummaryForFunction(instructions, startIdx, endIdx);
@@ -4530,6 +4581,8 @@ namespace DOSRE.Dasm
                 // Per-function local aliasing (best-effort). Keys are like "local_1C".
                 var localAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
+                uint currentFunctionStart = 0;
+
                 ushort? lastDxImm16 = null;
 
                 // Suppress repeating switch/decision-tree hints on every bb_ label inside the same compare chain.
@@ -4547,6 +4600,7 @@ namespace DOSRE.Dasm
                     // leaking across adjacent functions in linear disassembly.
                     if (leInsights && !functionStarts.Contains(addr) && LooksLikeFunctionFrameSetup(instructions, insLoopIndex))
                     {
+                        currentFunctionStart = 0;
                         lastSwitchSig = null;
                         lastSwitchIdx = int.MinValue;
                         emittedSwitchSigs.Clear();
@@ -4564,6 +4618,8 @@ namespace DOSRE.Dasm
                     {
                         sb.AppendLine();
                         sb.AppendLine($"func_{addr:X8}:");
+
+                        currentFunctionStart = addr;
 
                         // Reset per-function hint dedup state.
                         lastSwitchSig = null;
@@ -4641,6 +4697,9 @@ namespace DOSRE.Dasm
                         if (jumpXrefs.TryGetValue(addr, out var sources) && sources.Count > 0)
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; XREF: jumped from {string.Join(", ", sources.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}", commentColumn: 0, maxWidth: 160);
 
+                        if (leInsights && currentFunctionStart != 0 && funcLoopHeaderHints != null && funcLoopHeaderHints.TryGetValue(currentFunctionStart, out var byHdr) && byHdr != null && byHdr.TryGetValue(addr, out var lh) && !string.IsNullOrWhiteSpace(lh))
+                            AppendWrappedDisasmLine(sb, string.Empty, $" ; {lh}", commentColumn: 0, maxWidth: 160);
+
                         if (leInsights)
                         {
                             var sw = TryAnnotateByteSwitchDecisionTree(instructions, insIndexByAddr, insLoopIndex, stringSymbols, stringPreview, objects, objBytesByIndex, out var swSig, out var inferredLocals, out var aliasHints);
@@ -4675,6 +4734,9 @@ namespace DOSRE.Dasm
                         sb.AppendLine($"bb_{addr:X8}:");
                         if (blockPreds != null && blockPreds.TryGetValue(addr, out var preds) && preds.Count > 0)
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; CFG: preds {string.Join(", ", preds.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}", commentColumn: 0, maxWidth: 160);
+
+                        if (leInsights && currentFunctionStart != 0 && funcLoopHeaderHints != null && funcLoopHeaderHints.TryGetValue(currentFunctionStart, out var byHdr) && byHdr != null && byHdr.TryGetValue(addr, out var lh) && !string.IsNullOrWhiteSpace(lh))
+                            AppendWrappedDisasmLine(sb, string.Empty, $" ; {lh}", commentColumn: 0, maxWidth: 160);
 
                         var bbHint = TryAnnotateBasicBlockSummary(instructions, insLoopIndex);
                         if (!string.IsNullOrEmpty(bbHint))
@@ -4747,6 +4809,9 @@ namespace DOSRE.Dasm
                         var label = isCall2 ? $"func_{branchTarget:X8}" : $"loc_{branchTarget:X8}";
                         insText += $" ; {(isCall2 ? "call" : "jmp")} {label}";
                     }
+
+                    if (leInsights && currentFunctionStart != 0 && funcLoopLatchHints != null && funcLoopLatchHints.TryGetValue(currentFunctionStart, out var byLatch2) && byLatch2 != null && byLatch2.TryGetValue(addr, out var ll) && !string.IsNullOrWhiteSpace(ll))
+                        insText += $" ; {ll}";
 
                     var haveFixups = sortedFixups != null && sortedFixups.Count > 0;
                     var fixupsHere = haveFixups ? GetFixupsForInstruction(sortedFixups, ins, ref fixupIdx) : new List<LEFixup>(0);
