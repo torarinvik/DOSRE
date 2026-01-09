@@ -571,7 +571,7 @@ namespace DOSRE.Dasm
                     return null;
 
                 // Most bounds checks happen before the indexed access; scan backward a bit.
-                var lo = Math.Max(start, idx - 128);
+                var lo = Math.Max(start, idx - 64);
                 var candidateRegs = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { indexReg };
                 var candidateStackSyms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -583,11 +583,38 @@ namespace DOSRE.Dasm
                 // Track constants stored into stack locals/args so we can match `cmp idx, [local]`.
                 var stackConst = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
                 var stackClobbered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                // Prefer cmp-based bounds (direct checks) over mask-based bounds.
+                (uint bound, int distance)? bestCmp = null;
+                (uint bound, int distance)? bestMask = null;
+
+                static bool TryMaskToBound(uint mask, out uint bound)
+                {
+                    bound = 0;
+                    if (mask == 0)
+                        return false;
+                    // mask is (2^k - 1) iff mask & (mask+1) == 0
+                    var plus = mask + 1;
+                    if ((mask & plus) != 0)
+                        return false;
+                    bound = plus;
+                    return true;
+                }
+
+                static void RecordBest(ref (uint bound, int distance)? best, uint bound, int distance)
+                {
+                    if (bound == 0)
+                        return;
+                    if (best == null || distance < best.Value.distance)
+                        best = (bound, distance);
+                }
                 for (var j = idx - 1; j >= lo; j--)
                 {
                     var t = insList[j].ToString().Trim();
                     if (t.Length == 0)
                         continue;
+
+                    var dist = idx - j;
 
                     // Don't scan across clear control-flow boundaries.
                     if (t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) || t.StartsWith("jmp ", StringComparison.OrdinalIgnoreCase))
@@ -595,19 +622,6 @@ namespace DOSRE.Dasm
 
                     // Bounds by bitmask: `and idx, (2^k-1)` implies idx in [0..(2^k-1)], so n = 2^k.
                     // This is common when indexing fixed-size tables.
-                    static bool TryMaskToBound(uint mask, out uint bound)
-                    {
-                        bound = 0;
-                        if (mask == 0)
-                            return false;
-                        // mask is (2^k - 1) iff mask & (mask+1) == 0
-                        var plus = mask + 1;
-                        if ((mask & plus) != 0)
-                            return false;
-                        bound = plus;
-                        return true;
-                    }
-
                     var andRegImm = Regex.Match(
                         t,
                         @"^and\s+(?:(?:byte|word|dword)\s+)?(?<reg>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$",
@@ -616,7 +630,7 @@ namespace DOSRE.Dasm
                     {
                         var rr = CanonReg(andRegImm.Groups["reg"].Value);
                         if (candidateRegs.Contains(rr) && TryParseHexOrDecUInt32(andRegImm.Groups["imm"].Value, out var mask) && TryMaskToBound(mask, out var b) && b > 0)
-                            return b;
+                            RecordBest(ref bestMask, b, dist);
                     }
 
                     var andStackImm = Regex.Match(
@@ -627,7 +641,7 @@ namespace DOSRE.Dasm
                     {
                         var sym = andStackImm.Groups["sym"].Value;
                         if (candidateStackSyms.Contains(sym) && TryParseHexOrDecUInt32(andStackImm.Groups["imm"].Value, out var mask) && TryMaskToBound(mask, out var b) && b > 0)
-                            return b;
+                            RecordBest(ref bestMask, b, dist);
                     }
 
                     // Stack slot constants.
@@ -743,7 +757,7 @@ namespace DOSRE.Dasm
                     {
                         var reg = CanonReg(m.Groups["reg"].Value);
                         if (candidateRegs.Contains(reg) && TryParseHexOrDecUInt32(m.Groups["imm"].Value, out var u) && u > 0)
-                            return u;
+                            RecordBest(ref bestCmp, u, dist);
                         continue;
                     }
 
@@ -757,9 +771,9 @@ namespace DOSRE.Dasm
                         var r1 = CanonReg(mrr.Groups["r1"].Value);
                         var r2 = CanonReg(mrr.Groups["r2"].Value);
                         if (candidateRegs.Contains(r1) && regConst.TryGetValue(r2, out var b) && b > 0)
-                            return b;
+                            RecordBest(ref bestCmp, b, dist);
                         if (candidateRegs.Contains(r2) && regConst.TryGetValue(r1, out var b2) && b2 > 0)
-                            return b2;
+                            RecordBest(ref bestCmp, b2, dist);
                         continue;
                     }
 
@@ -773,7 +787,7 @@ namespace DOSRE.Dasm
                         var rr = CanonReg(mrs.Groups["reg"].Value);
                         var sym = mrs.Groups["sym"].Value;
                         if (candidateRegs.Contains(rr) && candidateStackSyms.Contains(sym) && stackConst.TryGetValue(sym, out var b4) && b4 > 0)
-                            return b4;
+                            RecordBest(ref bestCmp, b4, dist);
                         continue;
                     }
 
@@ -787,7 +801,7 @@ namespace DOSRE.Dasm
                         var sym = msr2.Groups["sym"].Value;
                         var rr = CanonReg(msr2.Groups["reg"].Value);
                         if (candidateRegs.Contains(rr) && candidateStackSyms.Contains(sym) && stackConst.TryGetValue(sym, out var b5) && b5 > 0)
-                            return b5;
+                            RecordBest(ref bestCmp, b5, dist);
                         continue;
                     }
 
@@ -807,7 +821,7 @@ namespace DOSRE.Dasm
                             var sym = msr.Groups["sym"].Value;
                             var rr = CanonReg(msr.Groups["reg"].Value);
                             if (candidateStackSyms.Contains(sym) && regConst.TryGetValue(rr, out var b3) && b3 > 0)
-                                return b3;
+                                RecordBest(ref bestCmp, b3, dist);
                         }
                         continue;
                     }
@@ -817,8 +831,16 @@ namespace DOSRE.Dasm
                         continue;
 
                     if (TryParseHexOrDecUInt32(m2.Groups["imm"].Value, out var u2) && u2 > 0)
-                        return u2;
+                        RecordBest(ref bestCmp, u2, dist);
                 }
+
+                if (bestCmp.HasValue)
+                    return bestCmp.Value.bound;
+
+                // Mask-derived bounds are weaker; require they be reasonably close to the access.
+                if (bestMask.HasValue && bestMask.Value.distance <= 16)
+                    return bestMask.Value.bound;
+
                 return null;
             }
 
