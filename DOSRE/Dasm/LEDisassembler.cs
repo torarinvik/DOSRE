@@ -1079,6 +1079,28 @@ namespace DOSRE.Dasm
             string intSummary,
             string loopSummary)
         {
+            static string CapCommaSummary(string summary, int maxItems, int maxLen)
+            {
+                if (string.IsNullOrWhiteSpace(summary))
+                    return string.Empty;
+
+                var s = summary.Trim();
+                var items = s.Split(new[] { ", " }, StringSplitOptions.None)
+                    .Select(x => x.Trim())
+                    .Where(x => x.Length > 0)
+                    .ToList();
+
+                if (items.Count > maxItems)
+                    s = string.Join(", ", items.Take(maxItems)) + ",...";
+                else
+                    s = string.Join(", ", items);
+
+                if (maxLen > 16 && s.Length > maxLen)
+                    s = s.Substring(0, maxLen - 3).TrimEnd() + "...";
+
+                return s;
+            }
+
             var parts = new List<string>();
 
             if (!string.IsNullOrWhiteSpace(protoHint))
@@ -1096,10 +1118,11 @@ namespace DOSRE.Dasm
                     parts.Add($"proto=func_{startAddr:X8}()");
             }
 
+            // Prioritize reconstructability: out-params + pointer-ish args + loops.
             if (outLocalAliases != null && outLocalAliases.Count > 0)
             {
                 var vals = new List<string>();
-                foreach (var kv in outLocalAliases.OrderBy(k => k.Key).Take(10))
+                foreach (var kv in outLocalAliases.OrderBy(k => k.Key).Take(8))
                 {
                     var alias = kv.Value;
                     if (localBitWidths != null && localBitWidths.TryGetValue(kv.Key, out var bits))
@@ -1114,18 +1137,22 @@ namespace DOSRE.Dasm
             if (!string.IsNullOrWhiteSpace(ptrArgSummary))
                 parts.Add($"args={ptrArgSummary}");
 
+            var intShort = CapCommaSummary(intSummary, maxItems: 1, maxLen: 70);
+            if (!string.IsNullOrWhiteSpace(intShort))
+                parts.Add($"int={intShort}");
+
+            var ioShort = CapCommaSummary(ioSummary, maxItems: 1, maxLen: 70);
+            if (!string.IsNullOrWhiteSpace(ioShort))
+                parts.Add($"io={ioShort}");
+
             if (summary != null)
             {
                 if (summary.Globals != null && summary.Globals.Count > 0)
-                    parts.Add($"globals={string.Join(",", summary.Globals.OrderBy(x => x).Take(6))}{(summary.Globals.Count > 6 ? ",..." : string.Empty)}");
+                    parts.Add($"globals={string.Join(",", summary.Globals.OrderBy(x => x).Take(4))}{(summary.Globals.Count > 4 ? ",..." : string.Empty)}");
                 if (summary.Strings != null && summary.Strings.Count > 0)
-                    parts.Add($"strings={string.Join(",", summary.Strings.OrderBy(x => x).Take(4))}{(summary.Strings.Count > 4 ? ",..." : string.Empty)}");
+                    parts.Add($"strings={string.Join(",", summary.Strings.OrderBy(x => x).Take(3))}{(summary.Strings.Count > 3 ? ",..." : string.Empty)}");
             }
 
-            if (!string.IsNullOrWhiteSpace(ioSummary))
-                parts.Add($"io={ioSummary}");
-            if (!string.IsNullOrWhiteSpace(intSummary))
-                parts.Add($"int={intSummary}");
             if (!string.IsNullOrWhiteSpace(loopSummary))
                 parts.Add(loopSummary);
 
