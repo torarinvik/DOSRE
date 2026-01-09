@@ -1233,6 +1233,160 @@ namespace DOSRE.Dasm
             };
         }
 
+        private static string FormatProtoArgs(int argCount, int maxArgs)
+        {
+            if (argCount <= 0)
+                return string.Empty;
+            if (maxArgs <= 0)
+                maxArgs = 12;
+
+            var shown = Math.Min(argCount, maxArgs);
+            var args = string.Join(", ", Enumerable.Range(0, shown).Select(x => $"arg_{x}"));
+            if (shown < argCount)
+                args += $", ... (+{argCount - shown})";
+            return args;
+        }
+
+        private static bool TryParseMovRegFromTokenMem(string insText, out string reg, out string token)
+        {
+            reg = null;
+            token = null;
+            if (string.IsNullOrWhiteSpace(insText))
+                return false;
+
+            // Examples: "mov eax, [arg_0]", "mov edx, [local_20]"
+            var m = Regex.Match(insText.Trim(), @"^mov\s+(?<reg>e[a-z]{2})\s*,\s*\[(?<tok>(arg_[0-9]+|local_[0-9A-Fa-f]+))\]\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            reg = m.Groups["reg"].Value.ToLowerInvariant();
+            token = m.Groups["tok"].Value;
+            return true;
+        }
+
+        private static bool InsTextUsesRegAsMemBase(string insText, string reg)
+        {
+            if (string.IsNullOrWhiteSpace(insText) || string.IsNullOrWhiteSpace(reg))
+                return false;
+
+            // Any memory operand like [reg] or [reg+...] etc.
+            return Regex.IsMatch(insText, $@"\[(?:[^\]]*\b{Regex.Escape(reg)}\b[^\]]*)\]", RegexOptions.IgnoreCase);
+        }
+
+        private static void InferPointerishTokensForFunction(
+            List<Instruction> instructions,
+            int startIdx,
+            int endIdx,
+            out HashSet<string> pointerTokens)
+        {
+            pointerTokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (instructions == null || startIdx < 0 || endIdx <= startIdx)
+                return;
+
+            // Tracks reg <- [arg/local], and marks that source as pointer-ish if the reg is later used as a memory base.
+            var regSource = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var max = Math.Min(instructions.Count, endIdx);
+            for (var i = startIdx; i < max; i++)
+            {
+                var cooked = RewriteStackFrameOperands(instructions[i].ToString());
+
+                // Far-pointer loads imply the argument/local represents a pointer value (ES:reg etc).
+                // Examples: "les edi, [arg_1]", "lgs eax, [arg_3]".
+                var fp = Regex.Match(cooked.Trim(), @"^(?<op>les|lfs|lgs)\s+\w+\s*,\s*\[(?<tok>(arg_[0-9]+|local_[0-9A-Fa-f]+))\]\b", RegexOptions.IgnoreCase);
+                if (fp.Success)
+                    pointerTokens.Add(fp.Groups["tok"].Value);
+
+                if (TryParseMovRegFromTokenMem(cooked, out var dstReg, out var tok))
+                    regSource[dstReg] = tok;
+
+                foreach (var kv in regSource.ToList())
+                {
+                    var reg = kv.Key;
+                    var src = kv.Value;
+
+                    if (InsTextUsesRegAsMemBase(cooked, reg))
+                        pointerTokens.Add(src);
+
+                    if (InstructionWritesReg(cooked, reg))
+                        regSource.Remove(reg);
+                }
+            }
+        }
+
+        private static string RewriteArgAliasTokens(string text, Dictionary<string, string> argAliases)
+        {
+            if (string.IsNullOrEmpty(text) || argAliases == null || argAliases.Count == 0)
+                return text;
+
+            return Regex.Replace(text, @"\barg_[0-9]+\b", m =>
+            {
+                var key = m.Value;
+                if (argAliases.TryGetValue(key, out var alias) && !string.IsNullOrWhiteSpace(alias))
+                    return alias;
+                return key;
+            }, RegexOptions.IgnoreCase);
+        }
+
+        private static void ApplyPointerAliasForToken(string token, Dictionary<string, string> argAliases, Dictionary<string, string> localAliases)
+        {
+            if (string.IsNullOrWhiteSpace(token))
+                return;
+
+            if (token.StartsWith("arg_", StringComparison.OrdinalIgnoreCase))
+            {
+                if (argAliases != null && !argAliases.ContainsKey(token))
+                    argAliases[token] = "ptr_" + token;
+                return;
+            }
+
+            if (token.StartsWith("local_", StringComparison.OrdinalIgnoreCase))
+            {
+                if (localAliases == null)
+                    return;
+
+                if (localAliases.TryGetValue(token, out var existing) && !string.IsNullOrWhiteSpace(existing))
+                {
+                    if (!existing.StartsWith("opt_", StringComparison.OrdinalIgnoreCase) && !existing.StartsWith("ptr_", StringComparison.OrdinalIgnoreCase))
+                        localAliases[token] = "ptr_" + existing;
+                }
+                else
+                {
+                    localAliases[token] = "ptr_" + token;
+                }
+            }
+        }
+
+        private static void UpdatePointerishTokenAliases(
+            string insText,
+            Dictionary<string, string> regSources,
+            Dictionary<string, string> argAliases,
+            Dictionary<string, string> localAliases)
+        {
+            if (string.IsNullOrWhiteSpace(insText))
+                return;
+
+            // Far-pointer loads imply the operand token represents a pointer value.
+            var fp = Regex.Match(insText.Trim(), @"^(?<op>les|lfs|lgs)\s+\w+\s*,\s*\[(?<tok>(arg_[0-9]+|local_[0-9A-Fa-f]+))\]\s*$", RegexOptions.IgnoreCase);
+            if (fp.Success)
+                ApplyPointerAliasForToken(fp.Groups["tok"].Value, argAliases, localAliases);
+
+            // Track reg <- [arg/local]
+            if (TryParseMovRegFromTokenMem(insText, out var dstReg, out var tok))
+                regSources[dstReg] = tok;
+
+            // If a tracked reg is used as a memory base, mark its source token pointer-ish.
+            foreach (var kv in regSources.ToList())
+            {
+                var reg = kv.Key;
+                var src = kv.Value;
+                if (InsTextUsesRegAsMemBase(insText, reg))
+                    ApplyPointerAliasForToken(src, argAliases, localAliases);
+
+                if (InstructionWritesReg(insText, reg))
+                    regSources.Remove(reg);
+            }
+        }
+
         private static void InferOutParamLocalAliasesForFunction(
             List<Instruction> instructions,
             int startIdx,
@@ -3835,7 +3989,7 @@ namespace DOSRE.Dasm
                         InferArgsAndCallingConventionForFunction(instructions, startIdx, endIdx, out var argCount, out var cc, out var retImm);
                         if (argCount > 0 || !string.IsNullOrWhiteSpace(cc) || (retImm.HasValue && retImm.Value > 0))
                         {
-                            var args = argCount > 0 ? string.Join(", ", Enumerable.Range(0, argCount).Select(x => $"arg_{x}")) : string.Empty;
+                            var args = FormatProtoArgs(argCount, maxArgs: 12);
                             var proto = $"PROTO: func_{startAddr:X8}({args})";
                             var ccSuffix = string.IsNullOrWhiteSpace(cc) ? string.Empty : $" ; CC: {cc}";
                             var retSuffix = retImm.HasValue && retImm.Value > 0 ? $" (ret 0x{retImm.Value:X})" : string.Empty;
@@ -3893,6 +4047,12 @@ namespace DOSRE.Dasm
                     ["ecx"] = "this"
                 };
 
+                // Per-function arg aliasing (best-effort). Keys are like "arg_0".
+                var argAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+                // Per-function pointer-ish tracking: reg -> (arg_/local_) token.
+                var ptrTokenByReg = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
                 // Per-function local aliasing (best-effort). Keys are like "local_1C".
                 var localAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
@@ -3920,6 +4080,8 @@ namespace DOSRE.Dasm
 
                         // Reset per-function local aliasing.
                         localAliases.Clear();
+                        argAliases.Clear();
+                        ptrTokenByReg.Clear();
 
                         if (leInsights && funcOutLocalAliases != null && funcOutLocalAliases.TryGetValue(addr, out var preAliases) && preAliases != null)
                         {
@@ -3931,6 +4093,8 @@ namespace DOSRE.Dasm
                                 localAliases[kv.Key] = alias;
                             }
                         }
+
+                        // Pointer-ish aliases are updated on-the-fly during rendering.
 
                         if (callXrefs.TryGetValue(addr, out var callers) && callers.Count > 0)
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; XREF: called from {string.Join(", ", callers.Distinct().OrderBy(x => x).Select(x => $"0x{x:X8}"))}", commentColumn: 0, maxWidth: 160);
@@ -4059,8 +4223,14 @@ namespace DOSRE.Dasm
                     {
                         insText = RewriteStackFrameOperands(insText);
 
+                        // Update pointer-ish arg/local aliases from the current instruction.
+                        UpdatePointerishTokenAliases(insText, ptrTokenByReg, argAliases, localAliases);
+
                         // Apply any inferred per-function local aliases after stack-frame normalization.
                         insText = RewriteLocalAliasTokens(insText, localAliases);
+
+                        // Apply any inferred per-function arg aliases.
+                        insText = RewriteArgAliasTokens(insText, argAliases);
 
                         // Update aliases based on the *current* instruction before rewriting.
                         UpdatePointerAliases(insText, liveAliases, inferredPtrSymbols);
