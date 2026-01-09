@@ -956,8 +956,111 @@ namespace DOSRE.Dasm
                             break;
                     }
 
-                    ls.Bound = cmpImm;
-                    ls.Cond = cmpCond;
+                    // Only keep header-derived bound/cond if it also gave us a matching induction update.
+                    // Otherwise, it is likely an unrelated in-loop compare.
+                    if (!string.IsNullOrWhiteSpace(ls.InductionVar))
+                    {
+                        ls.Bound = cmpImm;
+                        ls.Cond = cmpCond;
+                    }
+                }
+
+                // Countdown-loop heuristic: look for `dec/inc/add/sub` right before a back-edge jcc,
+                // or x86 `loop/loope/loopne` which implies ECX-- and jump while ECX != 0.
+                if (string.IsNullOrWhiteSpace(ls.InductionVar) || !ls.Step.HasValue)
+                {
+                    foreach (var latch in ls.Latches.OrderBy(x => x))
+                    {
+                        if (!insIndexByAddr.TryGetValue(latch, out var latchIdx))
+                            continue;
+
+                        var latchText = RewriteStackFrameOperands(instructions[latchIdx].ToString()).Trim();
+                        var sp = latchText.IndexOf(' ');
+                        var latchMn = (sp > 0 ? latchText.Substring(0, sp) : latchText).Trim().ToLowerInvariant();
+
+                        // `loop` family
+                        if (latchMn == "loop" || latchMn == "loope" || latchMn == "loopz" || latchMn == "loopne" || latchMn == "loopnz")
+                        {
+                            ls.InductionVar = "ecx";
+                            ls.Step = -1;
+                            ls.Bound ??= "0";
+                            ls.Cond = latchMn;
+                            break;
+                        }
+
+                        // For conditional branches, try to infer a counter update directly preceding.
+                        if (latchMn.StartsWith("j", StringComparison.OrdinalIgnoreCase) && latchMn != "jmp")
+                        {
+                            // Prefer the actual latch condition.
+                            ls.Cond = latchMn;
+
+                            var isEqLatch = latchMn == "jnz" || latchMn == "jne" || latchMn == "jz" || latchMn == "je";
+
+                            // If it's a jnz/jne style back-edge, common idiom is count-down to zero.
+                            if ((latchMn == "jnz" || latchMn == "jne") && string.IsNullOrWhiteSpace(ls.Bound))
+                                ls.Bound = "0";
+
+                            // Only treat dec/inc/add/sub as a countdown/update hint for equality-style latches.
+                            // For other jccs (e.g., jb/jae), the latch usually depends on a preceding cmp, not dec/inc.
+                            if (!isEqLatch)
+                                continue;
+
+                            for (var k = Math.Max(startIdx, latchIdx - 3); k < latchIdx; k++)
+                            {
+                                var prev = RewriteStackFrameOperands(instructions[k].ToString()).Trim();
+
+                                // dec/inc reg
+                                var mDecReg = Regex.Match(prev, @"^(?<op>dec|inc)\s+(?<reg>e?(ax|bx|cx|dx|si|di|bp|sp))\s*$", RegexOptions.IgnoreCase);
+                                if (mDecReg.Success)
+                                {
+                                    var reg = mDecReg.Groups["reg"].Value.ToLowerInvariant();
+                                    var op = mDecReg.Groups["op"].Value.ToLowerInvariant();
+                                    ls.InductionVar = reg;
+                                    ls.Step = op == "dec" ? -1 : 1;
+                                    break;
+                                }
+
+                                // dec/inc [local]
+                                var mDecMem = Regex.Match(prev, @"^(?<op>dec|inc)\s+(?:byte|word|dword)?\s*\[(?<var>local_[0-9A-Fa-f]+)\]\s*$", RegexOptions.IgnoreCase);
+                                if (mDecMem.Success)
+                                {
+                                    var v = mDecMem.Groups["var"].Value;
+                                    var op = mDecMem.Groups["op"].Value.ToLowerInvariant();
+                                    ls.InductionVar = v;
+                                    ls.Step = op == "dec" ? -1 : 1;
+                                    break;
+                                }
+
+                                // add/sub reg, imm or add/sub [local], imm
+                                var mAddReg = Regex.Match(prev, @"^(?<op>add|sub)\s+(?<dst>e?(ax|bx|cx|dx|si|di|bp|sp))\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$", RegexOptions.IgnoreCase);
+                                if (mAddReg.Success && TryParseHexOrDecUInt32(mAddReg.Groups["imm"].Value, out var u1) && u1 <= 0x100)
+                                {
+                                    var dst = mAddReg.Groups["dst"].Value.ToLowerInvariant();
+                                    var step = (int)u1;
+                                    if (mAddReg.Groups["op"].Value.Equals("sub", StringComparison.OrdinalIgnoreCase))
+                                        step = -step;
+                                    ls.InductionVar = dst;
+                                    ls.Step = step;
+                                    break;
+                                }
+
+                                var mAddMem = Regex.Match(prev, @"^(?<op>add|sub)\s+(?:byte|word|dword)?\s*\[(?<var>local_[0-9A-Fa-f]+)\]\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$", RegexOptions.IgnoreCase);
+                                if (mAddMem.Success && TryParseHexOrDecUInt32(mAddMem.Groups["imm"].Value, out var u2) && u2 <= 0x100)
+                                {
+                                    var dst = mAddMem.Groups["var"].Value;
+                                    var step = (int)u2;
+                                    if (mAddMem.Groups["op"].Value.Equals("sub", StringComparison.OrdinalIgnoreCase))
+                                        step = -step;
+                                    ls.InductionVar = dst;
+                                    ls.Step = step;
+                                    break;
+                                }
+                            }
+
+                            if (!string.IsNullOrWhiteSpace(ls.InductionVar) && ls.Step.HasValue)
+                                break;
+                        }
+                    }
                 }
 
                 loops.Add(ls);
@@ -4486,6 +4589,10 @@ namespace DOSRE.Dasm
                                             if (!byLatch.ContainsKey(la))
                                             {
                                                 var latchHint = $"LOOPLATCH: hdr=0x{l.Header:X8}";
+                                                if (!string.IsNullOrWhiteSpace(l.InductionVar))
+                                                    latchHint += $" iv={l.InductionVar}";
+                                                if (l.Step.HasValue)
+                                                    latchHint += $" step={(l.Step.Value >= 0 ? "+" : string.Empty)}{l.Step.Value}";
                                                 if (!string.IsNullOrWhiteSpace(l.Bound))
                                                     latchHint += $" bound={l.Bound}";
                                                 if (!string.IsNullOrWhiteSpace(l.Cond))
