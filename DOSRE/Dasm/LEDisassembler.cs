@@ -1122,6 +1122,7 @@ namespace DOSRE.Dasm
             }
 
             // Prioritize reconstructability: out-params + pointer-ish args + loops.
+            var hasStrongSignals = false;
             if (outLocalAliases != null && outLocalAliases.Count > 0)
             {
                 var vals = new List<string>();
@@ -1134,30 +1135,47 @@ namespace DOSRE.Dasm
                         vals.Add(alias);
                 }
                 if (vals.Count > 0)
+                {
                     parts.Add($"out={string.Join(",", vals)}");
+                    hasStrongSignals = true;
+                }
             }
 
             if (!string.IsNullOrWhiteSpace(ptrArgSummary))
+            {
                 parts.Add($"args={ptrArgSummary}");
+                hasStrongSignals = true;
+            }
 
             var intShort = CapCommaSummary(intSummary, maxItems: 1, maxLen: 70);
             if (!string.IsNullOrWhiteSpace(intShort))
+            {
                 parts.Add($"int={intShort}");
+                hasStrongSignals = true;
+            }
 
             var ioShort = CapCommaSummary(ioSummary, maxItems: 1, maxLen: 70);
             if (!string.IsNullOrWhiteSpace(ioShort))
+            {
                 parts.Add($"io={ioShort}");
+                hasStrongSignals = true;
+            }
 
             if (summary != null)
             {
-                if (summary.Globals != null && summary.Globals.Count > 0)
+                var hasGlobals = summary.Globals != null && summary.Globals.Count > 0;
+                if (hasGlobals)
                     parts.Add($"globals={string.Join(",", summary.Globals.OrderBy(x => x).Take(3))}{(summary.Globals.Count > 3 ? ",..." : string.Empty)}");
-                if (summary.Strings != null && summary.Strings.Count > 0)
+
+                if (!hasStrongSignals && !hasGlobals && summary.Strings != null && summary.Strings.Count > 0)
                     parts.Add($"strings={string.Join(",", summary.Strings.OrderBy(x => x).Take(2))}{(summary.Strings.Count > 2 ? ",..." : string.Empty)}");
             }
 
             if (!string.IsNullOrWhiteSpace(loopSummary))
+            {
                 parts.Add(loopSummary);
+                hasStrongSignals = true;
+            }
 
             return parts.Count == 0 ? string.Empty : $"C: {string.Join(" | ", parts)}";
         }
