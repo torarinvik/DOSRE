@@ -4162,6 +4162,240 @@ namespace DOSRE.Dasm
             return string.Empty;
         }
 
+        private static string TryAnnotateArithmeticIdioms(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            if (TryAnnotateMulByConstShort(instructions, idx, out var hint))
+                return hint;
+            if (TryAnnotateMulByConst171(instructions, idx, out hint))
+                return hint;
+            if (TryAnnotateFixedPointMulRound16(instructions, idx, out hint))
+                return hint;
+            if (TryAnnotateSignedDiv(instructions, idx, out hint))
+                return hint;
+
+            return string.Empty;
+        }
+
+        private static bool TryAnnotateMulByConstShort(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (idx < 1)
+                return false;
+
+            // Tolerant pattern (strength-reduce multiply, allows small interleavings):
+            //   lea dst, [src*{2|4|8}]
+            //   add dst, src
+            //   add dst, dst
+            // => dst = src * ((scale+1)*2)
+            var cur = instructions[idx].ToString().Trim();
+            var mCur = Regex.Match(cur, @"^\s*add\s+(?<dst>e[a-d]x|e[sdi]i|e[bp]p)\s*,\s*(?<src>e[a-d]x|e[sdi]i|e[bp]p)\s*$", RegexOptions.IgnoreCase);
+            if (!mCur.Success)
+                return false;
+
+            var dst = mCur.Groups["dst"].Value.ToLowerInvariant();
+            var src2 = mCur.Groups["src"].Value.ToLowerInvariant();
+            if (dst != src2)
+                return false;
+
+            string src = null;
+            int? scale = null;
+            var foundAdd = false;
+
+            // Scan back a few instructions, ignoring unrelated ops that don't write dst.
+            for (var back = 1; back <= 4 && idx - back >= 0; back++)
+            {
+                var t = instructions[idx - back].ToString().Trim();
+
+                if (!foundAdd)
+                {
+                    var mAdd = Regex.Match(t, $@"^\s*add\s+{Regex.Escape(dst)}\s*,\s*(?<src>e[a-d]x|e[sdi]i|e[bp]p)\s*$", RegexOptions.IgnoreCase);
+                    if (mAdd.Success)
+                    {
+                        var s = mAdd.Groups["src"].Value.ToLowerInvariant();
+                        if (s == dst)
+                            return false;
+                        src = s;
+                        foundAdd = true;
+                        continue;
+                    }
+                }
+                else
+                {
+                    var mLea = Regex.Match(t, $@"^\s*lea\s+{Regex.Escape(dst)}\s*,\s*\[{Regex.Escape(src)}\*(?<scale>2|4|8)\]\s*$", RegexOptions.IgnoreCase);
+                    if (mLea.Success)
+                    {
+                        if (int.TryParse(mLea.Groups["scale"].Value, out var sc) && (sc == 2 || sc == 4 || sc == 8))
+                            scale = sc;
+                        break;
+                    }
+                }
+
+                // Abort if dst is overwritten by something else in the window.
+                if (Regex.IsMatch(t, $@"^\s*(mov|lea|add|sub|xor|and|or|shl|shr|sar|imul)\s+{Regex.Escape(dst)}\b", RegexOptions.IgnoreCase))
+                    return false;
+            }
+
+            if (!foundAdd || !scale.HasValue)
+                return false;
+
+            var mul = (scale.Value + 1) * 2;
+            hint = $"HINT: {dst} = {src}*{mul}";
+            return true;
+        }
+
+        private static bool TryAnnotateMulByConst171(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (idx < 6)
+                return false;
+
+            // Pattern (observed in FIDEMO):
+            //   lea eax, [src*4]
+            //   add eax, src
+            //   shl eax, 0x2
+            //   sub eax, src
+            //   mov edx, eax
+            //   shl eax, 0x3
+            //   add eax, edx
+            // => eax = src * 171
+            var i0 = instructions[idx].ToString().Trim();
+            var i1 = instructions[idx - 1].ToString().Trim();
+            var i2 = instructions[idx - 2].ToString().Trim();
+            var i3 = instructions[idx - 3].ToString().Trim();
+            var i4 = instructions[idx - 4].ToString().Trim();
+            var i5 = instructions[idx - 5].ToString().Trim();
+            var i6 = instructions[idx - 6].ToString().Trim();
+
+            if (!Regex.IsMatch(i0, @"^\s*add\s+eax\s*,\s*edx\s*$", RegexOptions.IgnoreCase))
+                return false;
+            if (!Regex.IsMatch(i1, @"^\s*shl\s+eax\s*,\s*(?:0x)?3\s*$", RegexOptions.IgnoreCase))
+                return false;
+            if (!Regex.IsMatch(i2, @"^\s*mov\s+edx\s*,\s*eax\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var mSub = Regex.Match(i3, @"^\s*sub\s+eax\s*,\s*(?<src>e[a-d]x|e[sdi]i|e[bp]p)\s*$", RegexOptions.IgnoreCase);
+            if (!mSub.Success)
+                return false;
+            var src = mSub.Groups["src"].Value.ToLowerInvariant();
+
+            if (!Regex.IsMatch(i4, @"^\s*shl\s+eax\s*,\s*(?:0x)?2\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var mAdd = Regex.Match(i5, @"^\s*add\s+eax\s*,\s*(?<src>e[a-d]x|e[sdi]i|e[bp]p)\s*$", RegexOptions.IgnoreCase);
+            if (!mAdd.Success)
+                return false;
+            if (!string.Equals(src, mAdd.Groups["src"].Value, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var mLea = Regex.Match(i6, @"^\s*lea\s+eax\s*,\s*\[(?<src>e[a-d]x|e[sdi]i|e[bp]p)\*(?<scale>2|4|8)\]\s*$", RegexOptions.IgnoreCase);
+            if (!mLea.Success)
+                return false;
+            if (!string.Equals(src, mLea.Groups["src"].Value, StringComparison.OrdinalIgnoreCase))
+                return false;
+            if (!int.TryParse(mLea.Groups["scale"].Value, out var scale) || scale != 4)
+                return false;
+
+            hint = $"HINT: eax = {src}*171";
+            return true;
+        }
+
+        private static bool TryAnnotateFixedPointMulRound16(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (idx < 3)
+                return false;
+
+            // Pattern:
+            //   imul edx
+            //   add eax, 0x8000
+            //   adc edx, 0
+            //   shrd eax, edx, 0x10
+            // => eax = (eax*edx + 0x8000) >> 16  (best-effort)
+            var i0 = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(i0, @"^\s*shrd\s+eax\s*,\s*edx\s*,\s*(?:0x)?10\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i1 = instructions[idx - 1].ToString().Trim();
+            var i2 = instructions[idx - 2].ToString().Trim();
+            var i3 = instructions[idx - 3].ToString().Trim();
+
+            if (!Regex.IsMatch(i1, @"^\s*adc\s+edx\s*,\s*(?:0x)?0\s*$", RegexOptions.IgnoreCase))
+                return false;
+            if (!Regex.IsMatch(i2, @"^\s*add\s+eax\s*,\s*(?:0x)?8000\s*$", RegexOptions.IgnoreCase))
+                return false;
+            if (!Regex.IsMatch(i3, @"^\s*imul\s+edx\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            hint = "HINT: eax = (eax*edx + 0x8000) >> 16 (mul+round)";
+            return true;
+        }
+
+        private static bool TryAnnotateSignedDiv(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (idx < 1)
+                return false;
+
+            var i0 = instructions[idx].ToString().Trim();
+            var m = Regex.Match(i0, @"^\s*idiv\s+(?<div>e[a-d]x|e[sdi]i|e[bp]p|dword\s+\[[^\]]+\])\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            var div = m.Groups["div"].Value.Trim();
+
+            // cdq is canonical (sign-extend eax into edx); allow a small gap.
+            for (var back = 1; back <= 3 && idx - back >= 0; back++)
+            {
+                var p = instructions[idx - back].ToString().Trim();
+                if (p.Equals("cdq", StringComparison.OrdinalIgnoreCase))
+                {
+                    hint = $"HINT: signed div by {div} (eax=quot, edx=rem)";
+                    return true;
+                }
+
+                // If EDx is overwritten before we find cdq, stop.
+                if (Regex.IsMatch(p, @"^\s*(mov|lea|add|sub|xor|and|or|shl|shr|sar|imul)\s+edx\b", RegexOptions.IgnoreCase))
+                    break;
+            }
+
+            // Alternative: mov edx, eax; sar edx, 0x1f  (allow one or two interleaving instructions)
+            var sarIdx = -1;
+            for (var back = 1; back <= 4 && idx - back >= 0; back++)
+            {
+                var p = instructions[idx - back].ToString().Trim();
+                if (Regex.IsMatch(p, @"^\s*sar\s+edx\s*,\s*(?:0x)?1f\s*$", RegexOptions.IgnoreCase))
+                {
+                    sarIdx = idx - back;
+                    break;
+                }
+
+                // Stop if EDX is clobbered.
+                if (Regex.IsMatch(p, @"^\s*(mov|lea|add|sub|xor|and|or|shl|shr|sar|imul)\s+edx\b", RegexOptions.IgnoreCase))
+                    return false;
+            }
+
+            if (sarIdx >= 1)
+            {
+                for (var back = 1; back <= 4 && sarIdx - back >= 0; back++)
+                {
+                    var p = instructions[sarIdx - back].ToString().Trim();
+                    if (Regex.IsMatch(p, @"^\s*mov\s+edx\s*,\s*eax\s*$", RegexOptions.IgnoreCase))
+                    {
+                        hint = $"HINT: signed div by {div} (eax=quot, edx=rem)";
+                        return true;
+                    }
+
+                    if (Regex.IsMatch(p, @"^\s*(mov|lea|add|sub|xor|and|or|shl|shr|sar|imul)\s+edx\b", RegexOptions.IgnoreCase))
+                        return false;
+                }
+            }
+
+            return false;
+        }
+
         private static bool TryParseHexOrDecUInt32(string token, out uint value)
         {
             value = 0;
@@ -5801,6 +6035,13 @@ namespace DOSRE.Dasm
                     var ioHint = TryAnnotateIoPortAccess(instructions, insLoopIndex, lastDxImm16);
                     if (!string.IsNullOrEmpty(ioHint))
                         insText += $" ; {ioHint}";
+
+                    if (leInsights)
+                    {
+                        var arHint = TryAnnotateArithmeticIdioms(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(arHint))
+                            insText += $" ; {arHint}";
+                    }
 
                     var genHint = TryAnnotateGenericInstruction(rawInsText, inferredFlagSymbols);
                     if (!string.IsNullOrEmpty(genHint))
