@@ -43,6 +43,90 @@ namespace DOSRE.Dasm
             return $"HINT: stack alloc 0x{imm:X} (locals/arg block)";
         }
 
+        private static string TryAnnotateZeroInitStackLocals(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            static bool IsMovEspStore(string t, out string srcReg, out string disp)
+            {
+                srcReg = string.Empty;
+                disp = string.Empty;
+                if (string.IsNullOrWhiteSpace(t))
+                    return false;
+
+                var s = t.Trim();
+                var m = Regex.Match(
+                    s,
+                    @"^mov\s+\[esp(?<disp>\+0x[0-9A-Fa-f]+)?\]\s*,\s*(?<r>e[a-z]{2})\s*$",
+                    RegexOptions.IgnoreCase
+                );
+                if (!m.Success)
+                    return false;
+
+                srcReg = m.Groups["r"].Value.ToLowerInvariant();
+                disp = m.Groups["disp"].Value;
+                return true;
+            }
+
+            if (!IsMovEspStore(instructions[idx].ToString(), out var r0, out _))
+                return string.Empty;
+
+            // Require a recent zeroing of the source reg.
+            var zeroed = false;
+            for (var back = 1; back <= 4 && idx - back >= 0; back++)
+            {
+                var t = instructions[idx - back].ToString().Trim();
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+
+                if (Regex.IsMatch(t, $@"^(?:xor|sub)\s+{Regex.Escape(r0)}\s*,\s*{Regex.Escape(r0)}\s*$", RegexOptions.IgnoreCase)
+                    || Regex.IsMatch(t, $@"^mov\s+{Regex.Escape(r0)}\s*,\s*(?:0x0+|0)\s*$", RegexOptions.IgnoreCase))
+                {
+                    zeroed = true;
+                    break;
+                }
+            }
+            if (!zeroed)
+                return string.Empty;
+
+            // Annotate only at the first store in this local streak.
+            for (var back = 1; back <= 6 && idx - back >= 0; back++)
+            {
+                var t = instructions[idx - back].ToString().Trim();
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+
+                if (IsMovEspStore(t, out var r, out _)
+                    && r.Equals(r0, StringComparison.OrdinalIgnoreCase))
+                {
+                    return string.Empty;
+                }
+            }
+
+            var lookahead = 10;
+            var stores = 0;
+            var uniqueOffsets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (var j = idx; j < instructions.Count && j < idx + lookahead; j++)
+            {
+                var t = instructions[j].ToString().Trim();
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+
+                if (IsMovEspStore(t, out var r, out var disp)
+                    && r.Equals(r0, StringComparison.OrdinalIgnoreCase))
+                {
+                    stores++;
+                    uniqueOffsets.Add(string.IsNullOrEmpty(disp) ? "+0x0" : disp);
+                }
+            }
+
+            if (stores < 4 || uniqueOffsets.Count < 3)
+                return string.Empty;
+
+            return "HINT: zero-init stack locals/arg block";
+        }
+
         private static string TryAnnotateScale8TableLoad(List<Instruction> instructions, int idx)
         {
             if (instructions == null || idx < 0 || idx >= instructions.Count)
@@ -453,6 +537,290 @@ namespace DOSRE.Dasm
                 return "HINT: memset(dst=edi, value=al, count=ecx)";
 
             return $"HINT: memset(dst=edi, 0, count={countText})";
+        }
+
+        private static string TryAnnotateRepMovsdMemcpy(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            var cur = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(cur, @"^rep\s+movsd\s*$", RegexOptions.IgnoreCase))
+                return string.Empty;
+
+            // Look back for: mov ecx, <count>
+            string countText = "ecx";
+            for (var back = 1; back <= 6 && idx - back >= 0; back++)
+            {
+                var t = instructions[idx - back].ToString().Trim();
+                var mCount = Regex.Match(t, @"^mov\s+ecx\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?|\d+)\s*$", RegexOptions.IgnoreCase);
+                if (mCount.Success)
+                {
+                    countText = mCount.Groups["imm"].Value;
+                    break;
+                }
+
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+            }
+
+            return $"HINT: memcpy(dst=edi, src=esi, dwords={countText}) via rep movsd";
+        }
+
+        private static string TryAnnotateMemcpyBytesViaRepMovs(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 2 || idx + 3 >= instructions.Count)
+                return string.Empty;
+
+            var cur = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(cur, @"^(?:rep|repne)\s+movsd\s*$", RegexOptions.IgnoreCase))
+                return string.Empty;
+
+            var p1 = instructions[idx - 1].ToString().Trim();
+            if (!Regex.IsMatch(p1, @"^shr\s+ecx\s*,\s*(?:0x)?2\s*$", RegexOptions.IgnoreCase))
+                return string.Empty;
+
+            var p2 = instructions[idx - 2].ToString().Trim();
+            if (!Regex.IsMatch(p2, @"^mov\s+eax\s*,\s*ecx\s*$", RegexOptions.IgnoreCase))
+                return string.Empty;
+
+            var n1 = instructions[idx + 1].ToString().Trim();
+            var n2 = instructions[idx + 2].ToString().Trim();
+            var n3 = instructions[idx + 3].ToString().Trim();
+            if (!Regex.IsMatch(n1, @"^mov\s+cl\s*,\s*al\s*$", RegexOptions.IgnoreCase))
+                return string.Empty;
+            if (!Regex.IsMatch(n2, @"^and\s+cl\s*,\s*(?:0x)?3\s*$", RegexOptions.IgnoreCase))
+                return string.Empty;
+            if (!Regex.IsMatch(n3, @"^(?:rep|repne)\s+movsb\s*$", RegexOptions.IgnoreCase))
+                return string.Empty;
+
+            return "HINT: memcpy bytes via rep movsd + tail movsb (count in eax)";
+        }
+
+        private static string TryAnnotateStructStoreStreakAtEax(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            static bool IsStoreToEax(string t, out string disp)
+            {
+                disp = string.Empty;
+                if (string.IsNullOrWhiteSpace(t))
+                    return false;
+
+                var s = t.Trim();
+                var m = Regex.Match(
+                    s,
+                    @"^mov\s+(?:byte|word|dword\s+)?\[eax(?<disp>\+0x[0-9A-Fa-f]+)?\]\s*,\s*.+$",
+                    RegexOptions.IgnoreCase
+                );
+                if (!m.Success)
+                    return false;
+
+                disp = m.Groups["disp"].Value;
+                return true;
+            }
+
+            if (!IsStoreToEax(instructions[idx].ToString(), out _))
+                return string.Empty;
+
+            // Annotate at the first store in the local streak.
+            for (var back = 1; back <= 5 && idx - back >= 0; back++)
+            {
+                if (IsStoreToEax(instructions[idx - back].ToString(), out _))
+                    return string.Empty;
+
+                var t = instructions[idx - back].ToString().Trim();
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+            }
+
+            var lookahead = 18;
+            var stores = 0;
+            var uniqueOffsets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (var j = idx; j < instructions.Count && j < idx + lookahead; j++)
+            {
+                var t = instructions[j].ToString().Trim();
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+
+                if (IsStoreToEax(t, out var disp))
+                {
+                    stores++;
+                    uniqueOffsets.Add(string.IsNullOrEmpty(disp) ? "+0x0" : disp);
+                }
+            }
+
+            // Keep noise low: only for dense init/update blocks.
+            if (stores < 8 || uniqueOffsets.Count < 6)
+                return string.Empty;
+
+            return "HINT: init/update struct @eax (many field stores)";
+        }
+
+        private static string TryAnnotateGlobalPtrFieldStoreStreak(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            static bool IsStoreToPtrField(string t, out string baseSym, out string field)
+            {
+                baseSym = string.Empty;
+                field = string.Empty;
+                if (string.IsNullOrWhiteSpace(t))
+                    return false;
+
+                var s = t.Trim();
+                var m = Regex.Match(
+                    s,
+                    @"^mov\s+(?:(?:byte|word|dword)\s+)?\[(?<base>ptr_[0-9A-Fa-f]{8})\.(?<field>field_[0-9A-Fa-f]+)\]\s*,\s*.+$",
+                    RegexOptions.IgnoreCase
+                );
+                if (!m.Success)
+                    return false;
+
+                baseSym = m.Groups["base"].Value;
+                field = m.Groups["field"].Value;
+                return true;
+            }
+
+            if (!IsStoreToPtrField(instructions[idx].ToString(), out var baseSym0, out _))
+                return string.Empty;
+
+            // Annotate at the first store in the local streak for this base symbol.
+            for (var back = 1; back <= 8 && idx - back >= 0; back++)
+            {
+                var t = instructions[idx - back].ToString().Trim();
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+
+                if (IsStoreToPtrField(t, out var baseSym, out _)
+                    && baseSym.Equals(baseSym0, StringComparison.OrdinalIgnoreCase))
+                {
+                    return string.Empty;
+                }
+            }
+
+            var lookahead = 22;
+            var stores = 0;
+            var uniqueFields = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (var j = idx; j < instructions.Count && j < idx + lookahead; j++)
+            {
+                var t = instructions[j].ToString().Trim();
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+
+                if (IsStoreToPtrField(t, out var baseSym, out var field)
+                    && baseSym.Equals(baseSym0, StringComparison.OrdinalIgnoreCase))
+                {
+                    stores++;
+                    uniqueFields.Add(field);
+                }
+            }
+
+            // Keep noise low: only for dense init/update blocks.
+            if (stores < 7 || uniqueFields.Count < 6)
+                return string.Empty;
+
+            return $"HINT: init/update global struct @{baseSym0} (many field stores)";
+        }
+
+        private static string TryAnnotateStructInitDefaultsAtLoadedPtrReg(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            static bool IsConstStoreToReg(string t, out string reg, out string disp)
+            {
+                reg = string.Empty;
+                disp = string.Empty;
+                if (string.IsNullOrWhiteSpace(t))
+                    return false;
+
+                var s = t.Trim();
+                var m = Regex.Match(
+                    s,
+                    @"^mov\s+(?:byte|word|dword)\s+(?:ptr\s+)?\[(?<reg>e[a-z]{2})(?<disp>\+0x[0-9A-Fa-f]+)?\]\s*,\s*(?:0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?|\d+)\s*$",
+                    RegexOptions.IgnoreCase
+                );
+                if (!m.Success)
+                    return false;
+
+                reg = m.Groups["reg"].Value.ToLowerInvariant();
+                disp = m.Groups["disp"].Value;
+                return true;
+            }
+
+            if (!IsConstStoreToReg(instructions[idx].ToString(), out var baseReg, out _))
+                return string.Empty;
+
+            // Don't fight the existing @eax heuristics.
+            if (baseReg.Equals("eax", StringComparison.OrdinalIgnoreCase))
+                return string.Empty;
+
+            // Keep noise low: only when the base reg was just loaded from an absolute/global pointer.
+            var loadedFromAbs = false;
+            for (var back = 1; back <= 4 && idx - back >= 0; back++)
+            {
+                var t = instructions[idx - back].ToString().Trim();
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+
+                if (Regex.IsMatch(
+                        t,
+                        $@"^mov\s+{Regex.Escape(baseReg)}\s*,\s*(?:dword\s+)?\[(?:0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\]\s*$",
+                        RegexOptions.IgnoreCase
+                    )
+                    || Regex.IsMatch(
+                        t,
+                        $@"^mov\s+{Regex.Escape(baseReg)}\s*,\s*(?:0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\s*$",
+                        RegexOptions.IgnoreCase
+                    ))
+                {
+                    loadedFromAbs = true;
+                    break;
+                }
+            }
+            if (!loadedFromAbs)
+                return string.Empty;
+
+            // Annotate at the first const-store in the local init window.
+            for (var back = 1; back <= 8 && idx - back >= 0; back++)
+            {
+                var t = instructions[idx - back].ToString().Trim();
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+
+                if (IsConstStoreToReg(t, out var r, out _)
+                    && r.Equals(baseReg, StringComparison.OrdinalIgnoreCase))
+                {
+                    return string.Empty;
+                }
+            }
+
+            var lookahead = 20;
+            var constStores = 0;
+            var uniqueOffsets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (var j = idx; j < instructions.Count && j < idx + lookahead; j++)
+            {
+                var t = instructions[j].ToString().Trim();
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+
+                if (IsConstStoreToReg(t, out var r, out var disp))
+                {
+                    if (!r.Equals(baseReg, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    constStores++;
+                    uniqueOffsets.Add(string.IsNullOrEmpty(disp) ? "+0x0" : disp);
+                }
+            }
+
+            if (constStores < 6 || uniqueOffsets.Count < 5)
+                return string.Empty;
+
+            return $"HINT: init struct @{baseReg} (defaults/fields)";
         }
 
         private static string TryAnnotateComputeRemainingIndexIn4(List<Instruction> instructions, int idx)

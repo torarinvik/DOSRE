@@ -30,6 +30,8 @@ namespace DOSRE.Dasm
                 return hint;
             if (TryAnnotateBitstreamExtractViaShr3AndShRD(instructions, idx, out hint))
                 return hint;
+            if (TryAnnotateBitstreamExtractSecondShiftViaStackCl(instructions, idx, out hint))
+                return hint;
             if (TryAnnotateMulThenShRdEaxEdxByCl(instructions, idx, out hint))
                 return hint;
             if (TryAnnotatePackHiByteWithLow24(instructions, idx, out hint))
@@ -37,6 +39,11 @@ namespace DOSRE.Dasm
             if (TryAnnotatePackStride4BytesIntoDword(instructions, idx, out hint))
                 return hint;
             if (TryAnnotateShift16Add8000FlatPtr(instructions, idx, out hint))
+                return hint;
+
+            if (TryAnnotateEflagsToggleFeatureDetect(instructions, idx, out hint))
+                return hint;
+            if (TryAnnotateAddrBitPackFFFC000_3FFF(instructions, idx, out hint))
                 return hint;
 
             if (TryAnnotateImulImplicitEax64(instructions, idx, out hint))
@@ -55,6 +62,135 @@ namespace DOSRE.Dasm
                 return hint;
 
             return string.Empty;
+        }
+
+        private static bool TryAnnotateEflagsToggleFeatureDetect(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return false;
+
+            // Pattern (seen around loc_0007D902):
+            //   pushfd; pop eax; mov ecx,eax; xor/or eax, imm; push eax; popfd; pushfd; pop eax; xor eax,ecx; ...
+            // Common CPU feature detection via toggling EFLAGS bits.
+            var cur = instructions[idx].ToString().Trim();
+
+            if (Regex.IsMatch(cur, @"^xor\s+eax\s*,\s*0x40000\s*$", RegexOptions.IgnoreCase))
+            {
+                // EFLAGS.AC (bit 18) toggle test.
+                var sawPushfdPop = false;
+                for (var back = 1; back <= 6 && idx - back >= 0; back++)
+                {
+                    var t = instructions[idx - back].ToString().Trim();
+                    if (Regex.IsMatch(t, @"^pop\s+eax\s*$", RegexOptions.IgnoreCase) &&
+                        idx - back - 1 >= 0 && Regex.IsMatch(instructions[idx - back - 1].ToString().Trim(), @"^pushfd\s*$", RegexOptions.IgnoreCase))
+                    {
+                        sawPushfdPop = true;
+                        break;
+                    }
+                }
+
+                if (sawPushfdPop)
+                {
+                    hint = "HINT: CPU feature detect via toggling EFLAGS.AC (0x40000)";
+                    return true;
+                }
+            }
+
+            if (Regex.IsMatch(cur, @"^or\s+eax\s*,\s*0x200000\s*$", RegexOptions.IgnoreCase))
+            {
+                // EFLAGS.ID (bit 21) toggle test.
+                hint = "HINT: CPU feature detect via toggling EFLAGS.ID (0x200000)";
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryAnnotateBitstreamExtractSecondShiftViaStackCl(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 1 || idx + 1 >= instructions.Count)
+                return false;
+
+            // Pattern (seen in loc_00089F94 inner loop):
+            //   mov ecx, [esp]
+            //   shrd eax, eax, cl
+            //   and eax, ebp
+            // -> second extraction using step/stride from stack.
+            var i0 = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(i0, @"^shrd\s+eax\s*,\s*eax\s*,\s*cl\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var p1 = instructions[idx - 1].ToString().Trim();
+            if (!Regex.IsMatch(p1, @"^mov\s+ecx\s*,\s*\[esp(?:\+0x[0-9A-Fa-f]+)?\]\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var n1 = instructions[idx + 1].ToString().Trim();
+            if (!Regex.IsMatch(n1, @"^and\s+eax\s*,\s*ebp\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            // Reduce noise: require we recently loaded the packed dword via [eax+<base>].
+            var sawLoad = false;
+            for (var back = 2; back <= 8 && idx - back >= 0; back++)
+            {
+                var t = instructions[idx - back].ToString().Trim();
+                if (Regex.IsMatch(t, @"^mov\s+eax\s*,\s*\[eax\+e[a-z]{2}(?:\+0x[0-9a-f]+)?\]\s*$", RegexOptions.IgnoreCase))
+                {
+                    sawLoad = true;
+                    break;
+                }
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+            }
+            if (!sawLoad)
+                return false;
+
+            hint = "HINT: bitstream extract (second field via step in [esp])";
+            return true;
+        }
+
+        private static bool TryAnnotateAddrBitPackFFFC000_3FFF(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 5 || idx >= instructions.Count)
+                return false;
+
+            // Pattern (seen in bb_000931E9):
+            //   and ebx, 0xfffc000
+            //   and eax, 0x3fff
+            //   shr eax, 1
+            //   or  eax, ebx
+            //   shl eax, 0x9
+            var cur = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(cur, @"^shl\s+eax\s*,\s*(?:0x)?9\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i1 = instructions[idx - 1].ToString().Trim();
+            if (!Regex.IsMatch(i1, @"^or\s+eax\s*,\s*ebx\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i2 = instructions[idx - 2].ToString().Trim();
+            if (!Regex.IsMatch(i2, @"^shr\s+eax\s*,\s*1\s*$", RegexOptions.IgnoreCase) &&
+                !Regex.IsMatch(i2, @"^shr\s+eax\s*,\s*(?:0x)?1\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var sawAndA = false;
+            var sawAndB = false;
+            for (var back = 3; back <= 5; back++)
+            {
+                var t = instructions[idx - back].ToString().Trim();
+                if (Regex.IsMatch(t, @"^and\s+eax\s*,\s*0x3fff\s*$", RegexOptions.IgnoreCase))
+                    sawAndA = true;
+                if (Regex.IsMatch(t, @"^and\s+ebx\s*,\s*0xfffc000\s*$", RegexOptions.IgnoreCase))
+                    sawAndB = true;
+            }
+
+            if (!sawAndA || !sawAndB)
+                return false;
+
+            hint = "HINT: bit-pack address: ((addr&0x3FFF)>>1 | (addr&0xFFFC000))<<9";
+            return true;
         }
 
         private static bool TryAnnotateSar16ThenShlByCl(List<Instruction> instructions, int idx, out string hint)
