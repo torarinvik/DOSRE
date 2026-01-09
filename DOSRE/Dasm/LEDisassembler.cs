@@ -4711,58 +4711,482 @@ namespace DOSRE.Dasm
             }
         }
 
-        private static string TryAnnotateJumpTable(Instruction ins, List<LEFixup> fixupsHere, List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex,
-            Dictionary<uint, string> stringSymbols, Dictionary<uint, string> globalSymbols)
+        private static string TryAnnotateJumpTable(
+            List<Instruction> instructions,
+            Dictionary<uint, int> insIndexByAddr,
+            int insLoopIndex,
+            Instruction ins,
+            List<LEFixup> fixupsHere,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
+            Dictionary<uint, string> stringSymbols,
+            Dictionary<uint, string> globalSymbols)
         {
-            if (ins?.Bytes == null || ins.Bytes.Length < 6)
+            if (ins?.Bytes == null || ins.Bytes.Length < 7)
                 return string.Empty;
 
-            // Look for: FF 24 85 xx xx xx xx  (jmp dword [eax*4 + disp32])
+            // Look for (optionally with prefixes, e.g. cs: 0x2E):
+            //   FF 24 85 xx xx xx xx  (jmp dword [eax*4 + disp32])
             // ModRM=0x24 => rm=100 (SIB), reg=4 (JMP), mod=00
-            var b = ins.Bytes;
-            if (b[0] != 0xFF || b[1] != 0x24)
+            if (!TryParseIndirectJmpTable(ins.Bytes, out var disp, out var indexReg, out var scale))
                 return string.Empty;
 
-            var sib = b[2];
-            var scale = (sib >> 6) & 0x3;
-            var baseReg = sib & 0x7;
-            if (baseReg != 5)
-                return string.Empty; // we only handle disp32 base
-
-            if (scale != 2)
-                return string.Empty; // scale 4 => likely jump table
-
-            if (b.Length < 7)
+            if (scale != 4)
                 return string.Empty;
+            var reg = string.IsNullOrWhiteSpace(indexReg) ? "?" : indexReg;
 
-            var disp = (uint)(b[3] | (b[4] << 8) | (b[5] << 16) | (b[6] << 24));
-            // disp is a linear address in flat model.
-            if (!TryMapLinearToObject(objects, disp, out var tobj, out var toff))
-                return $"JUMPTABLE: base=0x{disp:X8} (unmapped)";
+            var want = 8;
+            if (TryInferJumpTableSwitchBound(instructions, insLoopIndex, indexReg, out var inferredCases, out var _))
+                want = Math.Min(64, Math.Max(1, inferredCases));
 
-            if (!objBytesByIndex.TryGetValue(tobj, out var tgtBytes) || tgtBytes == null)
-                return $"JUMPTABLE: base=0x{disp:X8} (no bytes)";
+            if (TryResolveJumpTableTargets(instructions, insIndexByAddr, insLoopIndex, ins, objects, objBytesByIndex, want, out var tableBase, out var targets, out var mode))
+            {
+                var symResolved = globalSymbols != null && globalSymbols.TryGetValue(tableBase, out var gResolved) ? gResolved : $"0x{tableBase:X8}";
+                var shownResolved = string.Join(", ", targets.Take(8).Select(x => $"0x{x:X8}"));
+                var modeSuffix = string.IsNullOrWhiteSpace(mode) ? string.Empty : $" {mode}";
+                return $"JUMPTABLE: idx={reg} base={symResolved}{modeSuffix} entries~{targets.Count} [{shownResolved}{(targets.Count > 8 ? ", ..." : string.Empty)}]";
+            }
+
+            // The disp32 in the encoding may be:
+            //  - a flat linear address, OR
+            //  - an object-relative offset (segment base added at runtime).
+            // We try both and pick the one that yields plausible table entries.
+            var base1 = disp;
+            var base2 = 0u;
+            if (TryMapLinearToObject(objects, (uint)ins.Offset, out var curObj, out var _))
+            {
+                var curBase = objects != null && curObj > 0 && curObj - 1 < objects.Count ? objects[curObj - 1].BaseAddress : 0u;
+                base2 = curBase + disp;
+            }
 
             var max = 16;
-            var entries = new List<uint>();
+            TryReadJumpTableEntries(objects, objBytesByIndex, base1, max, out var entries1, out var raw1, out var adjByBase1);
+            TryReadJumpTableEntries(objects, objBytesByIndex, base2, max, out var entries2, out var raw2, out var adjByBase2);
+
+            var useBase = base1;
+            var entries = entries1;
+            var raw = raw1;
+            var adjustedByBase = adjByBase1;
+            if ((entries2?.Count ?? 0) > (entries1?.Count ?? 0))
+            {
+                useBase = base2;
+                entries = entries2;
+                raw = raw2;
+                adjustedByBase = adjByBase2;
+            }
+
+            if (useBase == 0 || entries == null || raw == null)
+                return string.Empty;
+
+            var sym = globalSymbols != null && globalSymbols.TryGetValue(useBase, out var g) ? g : $"0x{useBase:X8}";
+            if (entries.Count == 0)
+            {
+                var rawShown = raw.Count == 0 ? string.Empty : string.Join(", ", raw.Take(6).Select(x => $"0x{x:X8}"));
+                var rawSuffix = string.IsNullOrEmpty(rawShown) ? string.Empty : $" raw=[{rawShown}{(raw.Count > 6 ? ", ..." : string.Empty)}]";
+                return $"JUMPTABLE: idx={reg} base={sym} entries=0{rawSuffix}";
+            }
+
+            var shown = string.Join(", ", entries.Select(x => $"0x{x:X8}").Take(8));
+            var adjSuffix = adjustedByBase ? " adj=+objbase" : string.Empty;
+            return $"JUMPTABLE: idx={reg} base={sym}{adjSuffix} entries~{entries.Count} [{shown}{(entries.Count > 8 ? ", ..." : string.Empty)}]";
+        }
+
+        private static bool TryResolveJumpTableTargets(
+            List<Instruction> instructions,
+            Dictionary<uint, int> insIndexByAddr,
+            int jmpIdx,
+            Instruction jmpIns,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
+            int wantEntries,
+            out uint tableBaseLinear,
+            out List<uint> targets,
+            out string mode)
+        {
+            tableBaseLinear = 0;
+            targets = null;
+            mode = string.Empty;
+            if (jmpIns?.Bytes == null || insIndexByAddr == null || objects == null || objBytesByIndex == null)
+                return false;
+
+            if (!TryParseIndirectJmpTable(jmpIns.Bytes, out var disp, out var indexReg, out var scale) || scale != 4)
+                return false;
+
+            // Determine current object and bytes.
+            if (!TryMapLinearToObject(objects, (uint)jmpIns.Offset, out var curObj, out var curOff))
+                return false;
+            if (!objBytesByIndex.TryGetValue(curObj, out var curBytes) || curBytes == null)
+                return false;
+
+            var curBase = objects[curObj - 1].BaseAddress;
+
+            var want = Math.Min(64, Math.Max(1, wantEntries));
+            // For scoring, we only need a small prefix.
+            var wantScan = Math.Min(8, want);
+            var bestScore = -1;
+            uint bestBase = 0;
+            var bestTargets = (List<uint>)null;
+            var bestMode = string.Empty;
+
+            int ScoreTableAtOffset(int off0, string m, out List<uint> list)
+            {
+                list = null;
+                if (off0 < 0 || off0 + 4 > curBytes.Length)
+                    return -1;
+
+                var tmp = new List<uint>();
+                var hits = 0;
+                var distinct = new HashSet<uint>();
+                var badZero = 0;
+
+                for (var i = 0; i < wantScan; i++)
+                {
+                    var off = off0 + i * 4;
+                    if (off + 4 > curBytes.Length)
+                        break;
+                    var v = (uint)(curBytes[off] | (curBytes[off + 1] << 8) | (curBytes[off + 2] << 16) | (curBytes[off + 3] << 24));
+                    if (v == 0)
+                        badZero++;
+
+                    uint t = m switch
+                    {
+                        "abs" => v,
+                        "csbase" => curBase + v,
+                        "rel" => unchecked((uint)((int)jmpIns.Offset + (int)v)),
+                        _ => v,
+                    };
+
+                    tmp.Add(t);
+                    distinct.Add(t);
+                    if (insIndexByAddr.ContainsKey(t))
+                        hits++;
+                }
+
+                if (tmp.Count < Math.Min(3, wantScan))
+                    return -1;
+
+                // Prefer many decoded targets + distinctness; penalize all-zero tables.
+                var score = hits * 10 + distinct.Count - badZero * 2;
+                if (distinct.Count <= 1)
+                    score -= 10;
+
+                list = tmp;
+                return score;
+            }
+
+            void ConsiderTable(uint candBase)
+            {
+                if (candBase == 0)
+                    return;
+                if (!TryMapLinearToObject(objects, candBase, out var tob, out var toff))
+                    return;
+                if (tob != curObj)
+                    return;
+                var off0 = (int)toff;
+                foreach (var m in new[] { "abs", "csbase", "rel" })
+                {
+                    var score = ScoreTableAtOffset(off0, m, out var list);
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestBase = candBase;
+                        bestTargets = list;
+                        bestMode = m;
+                    }
+                }
+            }
+
+            // 1) Try the two most likely base interpretations.
+            ConsiderTable(curBase + disp);
+            ConsiderTable(disp);
+
+            // 2) Scan near the dispatch (common compiler placement).
+            {
+                var around = (int)curOff;
+                var start = Math.Max(0, around - 0x400);
+                var end = Math.Min(curBytes.Length - 4, around + 0x8000);
+                for (var off = start; off <= end; off += 4)
+                {
+                    foreach (var m in new[] { "abs", "csbase" })
+                    {
+                        var score = ScoreTableAtOffset(off, m, out var list);
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            bestBase = curBase + (uint)off;
+                            bestTargets = list;
+                            bestMode = m;
+                        }
+                    }
+                }
+            }
+
+            // 3) If still nothing, scan around the disp-derived offsets within the object.
+            if (bestScore < 20)
+            {
+                foreach (var cand in new[] { curBase + disp, disp })
+                {
+                    if (!TryMapLinearToObject(objects, cand, out var tob, out var toff) || tob != curObj)
+                        continue;
+                    var center = (int)toff;
+                    var start = Math.Max(0, center - 0x8000);
+                    var end = Math.Min(curBytes.Length - 4, center + 0x8000);
+                    for (var off = start; off <= end; off += 4)
+                    {
+                        foreach (var m in new[] { "abs", "csbase" })
+                        {
+                            var score = ScoreTableAtOffset(off, m, out var list);
+                            if (score > bestScore)
+                            {
+                                bestScore = score;
+                                bestBase = curBase + (uint)off;
+                                bestTargets = list;
+                                bestMode = m;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4) Last resort: full object scan (still cheap for small wantScan).
+            if (bestScore < 20)
+            {
+                for (var off = 0; off + 4 <= curBytes.Length; off += 4)
+                {
+                    foreach (var m in new[] { "abs", "csbase" })
+                    {
+                        var score = ScoreTableAtOffset(off, m, out var list);
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            bestBase = curBase + (uint)off;
+                            bestTargets = list;
+                            bestMode = m;
+                            if (bestScore >= wantScan * 10 + wantScan)
+                                break;
+                        }
+                    }
+                }
+            }
+
+            // For small switches (<=8), accept 2 hits if they're distinct.
+            var minScore = wantScan <= 8 ? 12 : 25;
+            if (bestScore < minScore || bestTargets == null)
+                return false;
+
+            tableBaseLinear = bestBase;
+            // Trim to inferred case count if we have it.
+            if (TryInferJumpTableSwitchBound(instructions, jmpIdx, indexReg, out var cases, out var _))
+                bestTargets = bestTargets.Take(Math.Max(1, Math.Min(bestTargets.Count, cases))).ToList();
+            targets = bestTargets;
+            mode = bestMode switch
+            {
+                "csbase" => "enc=cs:off",
+                "rel" => "enc=rel",
+                _ => "enc=abs",
+            };
+            return true;
+        }
+
+        private static void TryReadJumpTableEntries(List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex, uint tableBaseLinear, int max,
+            out List<uint> entries, out List<uint> raw, out bool adjustedByBase)
+        {
+            entries = new List<uint>();
+            raw = new List<uint>();
+            adjustedByBase = false;
+            if (tableBaseLinear == 0)
+                return;
+            if (!TryMapLinearToObject(objects, tableBaseLinear, out var tobj, out var toff))
+                return;
+            if (!objBytesByIndex.TryGetValue(tobj, out var tgtBytes) || tgtBytes == null)
+                return;
+
+            var baseAdjust = objects != null && tobj > 0 && tobj - 1 < objects.Count ? objects[tobj - 1].BaseAddress : 0u;
             for (var i = 0; i < max; i++)
             {
                 var off = (int)toff + i * 4;
                 if (off + 4 > tgtBytes.Length)
                     break;
                 var v = (uint)(tgtBytes[off] | (tgtBytes[off + 1] << 8) | (tgtBytes[off + 2] << 16) | (tgtBytes[off + 3] << 24));
-                // Only keep plausible in-module targets.
-                if (!TryMapLinearToObject(objects, v, out var _, out var __))
-                    break;
-                entries.Add(v);
+                raw.Add(v);
+                var cand = v;
+                if (!TryMapLinearToObject(objects, cand, out var _tmpObj, out var _tmpOff))
+                {
+                    var adjusted = baseAdjust + cand;
+                    if (!TryMapLinearToObject(objects, adjusted, out var _tmpObj2, out var _tmpOff2))
+                        break;
+                    cand = adjusted;
+                    adjustedByBase = true;
+                }
+                entries.Add(cand);
+            }
+        }
+
+        private static bool TryParseIndirectJmpTable(byte[] bytes, out uint disp32, out string indexReg, out int scale)
+        {
+            disp32 = 0;
+            indexReg = string.Empty;
+            scale = 0;
+            if (bytes == null)
+                return false;
+
+            // Skip common prefixes (segment override, rep, operand/address-size override, lock).
+            var i = 0;
+            while (i < bytes.Length)
+            {
+                var p = bytes[i];
+                if (p == 0x2E || p == 0x36 || p == 0x3E || p == 0x26 || p == 0x64 || p == 0x65 || p == 0x66 || p == 0x67 || p == 0xF0 || p == 0xF2 || p == 0xF3)
+                {
+                    i++;
+                    continue;
+                }
+                break;
             }
 
-            var sym = globalSymbols != null && globalSymbols.TryGetValue(disp, out var g) ? g : $"0x{disp:X8}";
-            if (entries.Count == 0)
-                return $"JUMPTABLE: base={sym} entries=0";
+            // Need: FF /4, modrm=00 100 100, then SIB with base=101 (disp32) and scale=4.
+            if (i + 6 >= bytes.Length)
+                return false;
+            if (bytes[i] != 0xFF)
+                return false;
 
-            var shown = string.Join(", ", entries.Select(x => $"0x{x:X8}").Take(8));
-            return $"JUMPTABLE: base={sym} entries~{entries.Count} [{shown}{(entries.Count > 8 ? ", ..." : string.Empty)}]";
+            var modrm = bytes[i + 1];
+            var mod = (modrm >> 6) & 0x3;
+            var reg = (modrm >> 3) & 0x7;
+            var rm = modrm & 0x7;
+            if (mod != 0 || rm != 4)
+                return false;
+            if (reg != 4)
+                return false; // JMP r/m32
+
+            var sib = bytes[i + 2];
+            var sibScale = (sib >> 6) & 0x3;
+            var sibIndex = (sib >> 3) & 0x7;
+            var sibBase = sib & 0x7;
+            if (sibBase != 5)
+                return false; // disp32 base only
+
+            scale = 1 << (int)sibScale;
+            indexReg = sibIndex switch
+            {
+                0 => "eax",
+                1 => "ecx",
+                2 => "edx",
+                3 => "ebx",
+                4 => "esp",
+                5 => "ebp",
+                6 => "esi",
+                7 => "edi",
+                _ => string.Empty,
+            };
+
+            disp32 = (uint)(bytes[i + 3] | (bytes[i + 4] << 8) | (bytes[i + 5] << 16) | (bytes[i + 6] << 24));
+            return true;
+        }
+
+        private static bool TryGetJumpTableTargets(
+            List<Instruction> instructions,
+            Dictionary<uint, int> insIndexByAddr,
+            int insIdx,
+            Instruction ins,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
+            int maxEntries,
+            out uint tableBase,
+            out string indexReg,
+            out List<uint> targets)
+        {
+            tableBase = 0;
+            indexReg = string.Empty;
+            targets = null;
+            if (ins?.Bytes == null)
+                return false;
+            if (!TryParseIndirectJmpTable(ins.Bytes, out var disp, out var reg, out var scale))
+                return false;
+            if (scale != 4)
+                return false;
+
+            indexReg = reg;
+
+            if (TryResolveJumpTableTargets(instructions, insIndexByAddr, insIdx, ins, objects, objBytesByIndex, maxEntries, out var baseResolved, out var resolvedTargets, out var _))
+            {
+                tableBase = baseResolved;
+                targets = resolvedTargets;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryInferJumpTableSwitchBound(List<Instruction> instructions, int jmpIdx, string indexReg, out int caseCount, out uint defaultTarget)
+        {
+            caseCount = 0;
+            defaultTarget = 0;
+            if (instructions == null || jmpIdx <= 0 || string.IsNullOrWhiteSpace(indexReg))
+                return false;
+
+            // Pattern (common):
+            //   cmp <reg>, <imm>
+            //   ja  <default>
+            //   jmp [<reg>*4 + table]
+            // Allow small gaps.
+            for (var back = 1; back <= 6; back++)
+            {
+                var idx = jmpIdx - back;
+                if (idx < 0)
+                    break;
+
+                var t = instructions[idx]?.ToString() ?? string.Empty;
+                if (!t.StartsWith("cmp ", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var m = Regex.Match(t, @$"^cmp\s+{Regex.Escape(indexReg)}\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$", RegexOptions.IgnoreCase);
+                if (!m.Success)
+                    continue;
+
+                if (!TryParseHexUInt(m.Groups["imm"].Value, out var imm))
+                    continue;
+
+                // Find a following bounds-check jump (ja/jae/jg/jge) between cmp and jmp.
+                for (var fwd = idx + 1; fwd < jmpIdx && fwd <= idx + 3; fwd++)
+                {
+                    var jt = instructions[fwd]?.ToString() ?? string.Empty;
+                    if (jt.StartsWith("ja ", StringComparison.OrdinalIgnoreCase) || jt.StartsWith("jae ", StringComparison.OrdinalIgnoreCase) ||
+                        jt.StartsWith("jg ", StringComparison.OrdinalIgnoreCase) || jt.StartsWith("jge ", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (TryGetRelativeBranchTarget(instructions[fwd], out var target, out var isCall) && !isCall)
+                            defaultTarget = target;
+                        break;
+                    }
+                }
+
+                // cmp reg, imm => cases likely 0..imm (imm+1)
+                if (imm < 0x10000)
+                {
+                    caseCount = checked((int)imm + 1);
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static string TryAnnotateJumpTableSwitchBounds(List<Instruction> instructions, int insLoopIndex, Instruction ins)
+        {
+            if (instructions == null || insLoopIndex < 0 || insLoopIndex >= instructions.Count)
+                return string.Empty;
+            if (ins?.Bytes == null)
+                return string.Empty;
+
+            if (!TryParseIndirectJmpTable(ins.Bytes, out var _, out var indexReg, out var scale) || scale != 4)
+                return string.Empty;
+
+            if (!TryInferJumpTableSwitchBound(instructions, insLoopIndex, indexReg, out var cases, out var def))
+                return string.Empty;
+
+            // Keep it tight: just range + default.
+            var shownCases = Math.Min(256, Math.Max(1, cases));
+            var defText = def != 0 ? $"loc_{def:X8}" : "(unknown)";
+            return $"SWITCH: {indexReg} cases=0..{shownCases - 1} default={defText}";
         }
 
         private static bool TryParseHexUInt(string s, out uint v)
@@ -5354,12 +5778,18 @@ namespace DOSRE.Dasm
 
                 if (leInsights)
                 {
-                    // Add obvious prologues as function starts: 55 8B EC
-                    foreach (var ins in instructions)
+                    // Add obvious prologues as function starts (best-effort sequence scan).
+                    // Common forms:
+                    //   push ebp; mov ebp, esp
+                    //   push ebp; sub esp, imm
+                    for (var i = 0; i + 1 < instructions.Count; i++)
                     {
-                        var b = ins.Bytes;
-                        if (b != null && b.Length >= 3 && b[0] == 0x55 && b[1] == 0x8B && b[2] == 0xEC)
-                            functionStarts.Add((uint)ins.Offset);
+                        var a = instructions[i]?.ToString() ?? string.Empty;
+                        if (!a.Equals("push ebp", StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        var b = instructions[i + 1]?.ToString() ?? string.Empty;
+                        if (b.Equals("mov ebp, esp", StringComparison.OrdinalIgnoreCase) || b.StartsWith("sub esp, ", StringComparison.OrdinalIgnoreCase))
+                            functionStarts.Add((uint)instructions[i].Offset);
                     }
                 }
 
@@ -5382,6 +5812,39 @@ namespace DOSRE.Dasm
                                 if (!jumpXrefs.TryGetValue(target, out var sources))
                                     jumpXrefs[target] = sources = new List<uint>();
                                 sources.Add((uint)ins.Offset);
+                            }
+                        }
+                    }
+
+                    // Jump-table switches: add indirect case targets to label/xref sets.
+                    // This enables loc_XXXXXXXX labels and XREF headers for compiler-generated switch dispatches.
+                    if (leInsights)
+                    {
+                        if (insIndexByAddr.TryGetValue((uint)ins.Offset, out var insIdx))
+                        {
+                            var wantCases = 16;
+                            if (TryParseIndirectJmpTable(ins.Bytes, out var _, out var idxRegProbe, out var scaleProbe) && scaleProbe == 4)
+                            {
+                                if (TryInferJumpTableSwitchBound(instructions, insIdx, idxRegProbe, out var inferredCasesProbe, out var _))
+                                    wantCases = Math.Min(64, Math.Max(1, inferredCasesProbe));
+                            }
+
+                            if (TryGetJumpTableTargets(instructions, insIndexByAddr, insIdx, ins, objects, objBytesByIndex, maxEntries: wantCases, out var _, out var idxReg, out var jtTargets))
+                            {
+                                var maxCases = 32;
+                                var casesToAdd = jtTargets.Count;
+                                if (TryInferJumpTableSwitchBound(instructions, insIdx, idxReg, out var inferredCases, out var _))
+                                    casesToAdd = Math.Min(casesToAdd, Math.Max(1, inferredCases));
+                                casesToAdd = Math.Min(casesToAdd, maxCases);
+
+                                for (var ti = 0; ti < casesToAdd; ti++)
+                                {
+                                    var t = jtTargets[ti];
+                                    labelTargets.Add(t);
+                                    if (!jumpXrefs.TryGetValue(t, out var sources))
+                                        jumpXrefs[t] = sources = new List<uint>();
+                                    sources.Add((uint)ins.Offset);
+                                }
                             }
                         }
                     }
@@ -5747,6 +6210,22 @@ namespace DOSRE.Dasm
                     var ins = instructions[insLoopIndex];
                     var addr = (uint)ins.Offset;
 
+                    // Heuristic: if we just saw a RET and the following bytes have no known xrefs,
+                    // they're often padding/data (or a non-linear entry) that SharpDisasm will happily decode.
+                    // We don't change the decode here, but we add a clear note to avoid “why is this random?” moments.
+                    var postRetNoXref = false;
+                    if (insLoopIndex > 0)
+                    {
+                        var prevText = instructions[insLoopIndex - 1]?.ToString() ?? string.Empty;
+                        if (prevText.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var hasIncoming = (callXrefs != null && callXrefs.ContainsKey(addr)) || (jumpXrefs != null && jumpXrefs.ContainsKey(addr));
+                            var isEntry = (functionStarts != null && functionStarts.Contains(addr)) || (labelTargets != null && labelTargets.Contains(addr));
+                            if (!hasIncoming && !isEntry)
+                                postRetNoXref = true;
+                        }
+                    }
+
                     // Best-effort reset at likely function prologues even when we failed to
                     // identify the start as a call target. This prevents alias state from
                     // leaking across adjacent functions in linear disassembly.
@@ -6017,9 +6496,16 @@ namespace DOSRE.Dasm
                         if (!string.IsNullOrEmpty(fmtHint))
                             insText += $" ; {fmtHint}";
 
-                        var jt = TryAnnotateJumpTable(ins, fixupsHere, objects, objBytesByIndex, stringSymbols, globalSymbols);
+                        var jt = TryAnnotateJumpTable(instructions, insIndexByAddr, insLoopIndex, ins, fixupsHere, objects, objBytesByIndex, stringSymbols, globalSymbols);
                         if (!string.IsNullOrEmpty(jt))
                             insText += $" ; {jt}";
+
+                        var swBounds = TryAnnotateJumpTableSwitchBounds(instructions, insLoopIndex, ins);
+                        if (!string.IsNullOrEmpty(swBounds))
+                            insText += $" ; {swBounds}";
+
+                        if (postRetNoXref)
+                            insText += " ; NOTE: decoded after RET with no known XREFs (likely data/padding)";
 
                         // If this instruction references a string symbol (or computes one), inline a short preview.
                         var strInline = TryInlineStringPreview(insText, stringPreview, objects, objBytesByIndex, instructions, insLoopIndex, stringSymbols, resourceGetterTargets);
