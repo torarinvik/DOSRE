@@ -141,6 +141,8 @@ namespace DOSRE.Dasm
             sb.AppendLine("// Notes:");
             sb.AppendLine("// - This is not a full decompiler yet; it emits structured pseudo-C with gotos.");
             sb.AppendLine("// - It reuses LE insights/symbolization from the disassembler output.");
+            sb.AppendLine("// - Memory operands use uint*_t; assume <stdint.h>.");
+            sb.AppendLine("#include <stdint.h>");
             sb.AppendLine();
 
             foreach (var fn in functions)
@@ -359,8 +361,8 @@ namespace DOSRE.Dasm
                 {
                     pending.LastWasCmp = true;
                     pending.LastWasTest = false;
-                    pending.LastCmpLhs = parts.Value.lhs;
-                    pending.LastCmpRhs = parts.Value.rhs;
+                    pending.LastCmpLhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: false);
+                    pending.LastCmpRhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false);
                 }
                 return "// " + asm + commentSuffix;
             }
@@ -371,8 +373,8 @@ namespace DOSRE.Dasm
                 {
                     pending.LastWasTest = true;
                     pending.LastWasCmp = false;
-                    pending.LastTestLhs = parts.Value.lhs;
-                    pending.LastTestRhs = parts.Value.rhs;
+                    pending.LastTestLhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: false);
+                    pending.LastTestRhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false);
                 }
                 return "// " + asm + commentSuffix;
             }
@@ -384,7 +386,9 @@ namespace DOSRE.Dasm
                     return "/* " + asm + " */" + commentSuffix;
 
                 pending.Clear();
-                return $"{parts.Value.lhs} = {parts.Value.rhs};{commentSuffix}";
+                var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true);
+                var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false);
+                return $"{lhs} = {rhs};{commentSuffix}";
             }
 
             if (mn == "lea")
@@ -395,7 +399,11 @@ namespace DOSRE.Dasm
 
                 pending.Clear();
                 // Heuristic: lea dst, [expr] => dst = (expr);
-                return $"{parts.Value.lhs} = {parts.Value.rhs};{commentSuffix}";
+                var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: false);
+                var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false);
+                // If the RHS is a dereference (e.g. *(uint32_t*)(...)), de-pointer it for LEA.
+                rhs = StripSingleDeref(rhs);
+                return $"{lhs} = {rhs};{commentSuffix}";
             }
 
             if (mn is "add" or "sub" or "and" or "or" or "xor")
@@ -406,8 +414,11 @@ namespace DOSRE.Dasm
 
                 pending.Clear();
 
-                if (mn == "xor" && parts.Value.lhs.Equals(parts.Value.rhs, StringComparison.OrdinalIgnoreCase))
-                    return $"{parts.Value.lhs} = 0;{commentSuffix}";
+                var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true);
+                var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false);
+
+                if (mn == "xor" && lhs.Equals(rhs, StringComparison.OrdinalIgnoreCase))
+                    return $"{lhs} = 0;{commentSuffix}";
 
                 var op = mn switch
                 {
@@ -418,7 +429,7 @@ namespace DOSRE.Dasm
                     "xor" => "^=",
                     _ => "="
                 };
-                return $"{parts.Value.lhs} {op} {parts.Value.rhs};{commentSuffix}";
+                return $"{lhs} {op} {rhs};{commentSuffix}";
             }
 
             if (mn is "shl" or "shr" or "sar")
@@ -428,8 +439,10 @@ namespace DOSRE.Dasm
                     return "/* " + asm + " */" + commentSuffix;
 
                 pending.Clear();
+                var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true);
+                var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false);
                 var op = mn == "shl" ? "<<=" : ">>=";
-                return $"{parts.Value.lhs} {op} {parts.Value.rhs};{commentSuffix}";
+                return $"{lhs} {op} {rhs};{commentSuffix}";
             }
 
             if (mn == "inc" || mn == "dec")
@@ -438,7 +451,8 @@ namespace DOSRE.Dasm
                 if (string.IsNullOrWhiteSpace(ops))
                     return "/* " + asm + " */" + commentSuffix;
 
-                return mn == "inc" ? $"{ops}++;{commentSuffix}" : $"{ops}--;{commentSuffix}";
+                var opnd = NormalizeAsmOperandToC(ops, isMemoryWrite: true);
+                return mn == "inc" ? $"{opnd}++;{commentSuffix}" : $"{opnd}--;{commentSuffix}";
             }
 
             if (mn == "call")
@@ -476,6 +490,62 @@ namespace DOSRE.Dasm
             // Default: keep as comment.
             pending.Clear();
             return "// " + asm + commentSuffix;
+        }
+
+        private static string NormalizeAsmOperandToC(string op, bool isMemoryWrite)
+        {
+            if (string.IsNullOrWhiteSpace(op))
+                return string.Empty;
+
+            var t = op.Trim();
+
+            // Already looks like a C-ish deref; leave it.
+            if (t.StartsWith("*", StringComparison.Ordinal))
+                return t;
+
+            // byte/word/dword/qword [expr]  (optionally with 'ptr')
+            var sized = Regex.Match(
+                t,
+                @"^(?<sz>byte|word|dword|qword)\s+(?:ptr\s+)?\[(?<expr>.+)\]$",
+                RegexOptions.IgnoreCase);
+
+            if (sized.Success)
+            {
+                var sz = sized.Groups["sz"].Value.ToLowerInvariant();
+                var expr = sized.Groups["expr"].Value.Trim();
+                var ty = sz switch
+                {
+                    "byte" => "uint8_t",
+                    "word" => "uint16_t",
+                    "dword" => "uint32_t",
+                    "qword" => "uint64_t",
+                    _ => "uint32_t"
+                };
+                return $"*({ty}*)({expr})";
+            }
+
+            // Bare [expr] => assume dword in 32-bit mode.
+            var bare = Regex.Match(t, @"^\[(?<expr>.+)\]$", RegexOptions.None);
+            if (bare.Success)
+            {
+                var expr = bare.Groups["expr"].Value.Trim();
+                return $"*(uint32_t*)({expr})";
+            }
+
+            return t;
+        }
+
+        private static string StripSingleDeref(string expr)
+        {
+            if (string.IsNullOrWhiteSpace(expr))
+                return expr;
+
+            // *(uint32_t*)(something)  =>  (something)
+            var m = Regex.Match(expr.Trim(), @"^\*\([^\)]*\)\((?<inner>.*)\)$");
+            if (m.Success)
+                return m.Groups["inner"].Value.Trim();
+
+            return expr;
         }
 
         private static bool IsJcc(string mn)
