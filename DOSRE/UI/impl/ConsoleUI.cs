@@ -120,6 +120,13 @@ namespace DOSRE.UI.impl
         private bool _bLeInsights;
 
         /// <summary>
+        ///     LE (DOS4GW) decompile (pseudo-C)
+        ///     Specified with the -ledecomp or -ledecompile argument
+        ///     For LE inputs, emits best-effort pseudo-C derived from the LE disassembly output.
+        /// </summary>
+        private bool _bLeDecompile;
+
+        /// <summary>
         ///     LE (DOS4GW) fixup dump
         ///     Specified with the -lefixdump [maxPages] argument
         ///     For LE inputs, emits a raw per-page fixup table dump to help reverse the record layout.
@@ -238,6 +245,10 @@ namespace DOSRE.UI.impl
                         case "LEINSIGHTS":
                             _bLeInsights = true;
                             break;
+                        case "LEDECOMP":
+                        case "LEDECOMPILE":
+                            _bLeDecompile = true;
+                            break;
                         case "LEFIXDUMP":
                             _bLeFixDump = true;
                             if (i + 1 < _args.Length && int.TryParse(_args[i + 1], out var maxPages) && maxPages > 0)
@@ -333,6 +344,8 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LEINSIGHTS -- (LE inputs) Best-effort function/CFG/xref/stack-var/string analysis (more LLM-friendly)");
                             Console.WriteLine(
+                                "-LEDECOMP -- (LE inputs) Emit best-effort pseudo-C (builds on LE insights/symbolization)");
+                            Console.WriteLine(
                                 "-LEFIXDUMP [maxPages] -- (LE inputs) Dump raw fixup pages + decoding hints (writes <out>.fixups.txt if -O is used)");
                             Console.WriteLine(
                                 "-MZFULL -- (MZ inputs) Disassemble from entrypoint to end of load module");
@@ -368,7 +381,11 @@ namespace DOSRE.UI.impl
 
                 //LE/DOS4GW support (minimal): bypass NE-specific pipeline
                 //NOTE: This tool was originally NE-only; LE support does not include relocations/import analysis.
-                if (LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out var leOutput, out var leError))
+                var leOk = _bLeDecompile
+                    ? LEDisassembler.TryDecompileToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out var leOutput, out var leError)
+                    : LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out leOutput, out leError);
+
+                if (leOk)
                 {
                     if (_bAnalysis)
                         _logger.Warn("Warning: -analysis is not supported for LE inputs, ignoring");
@@ -378,6 +395,8 @@ namespace DOSRE.UI.impl
                         _logger.Warn("Warning: -minimal has no effect for LE inputs (LE output is always minimal)");
                     if (_bLeFull && _leBytesLimit.HasValue)
                         _logger.Warn("Warning: -lebytes is ignored when -lefull is specified");
+                    if (_bLeDecompile)
+                        _logger.Info("LE decompile mode enabled (best-effort pseudo-C)");
                     if (_bLeFixups)
                         _logger.Info("LE fixup annotations enabled (best-effort)");
                     if (_bLeGlobals && !_bLeFixups)

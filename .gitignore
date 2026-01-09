@@ -334,3 +334,4 @@ EUROBLST.entry-insights14.full.disasm.txt
 *.disasm
 *.pre_split
 tools/comment_sparse_runs.py
+EXES/disasm_le/FIDEMO.le.pseudo.c
