@@ -219,6 +219,8 @@ namespace DOSRE.Dasm
 
             foreach (var fn in functions)
             {
+                InferVariableTypes(fn);
+                MarkLoopHeaders(fn, labelByAddr);
                 var proto = ExtractProtoFromHeader(fn.HeaderComments);
                 if (string.IsNullOrWhiteSpace(proto))
                     proto = $"void {fn.Name}(void)";
@@ -243,9 +245,20 @@ namespace DOSRE.Dasm
                 }
 
                 var regs = CollectRegistersUsed(fn);
-                if (regs.Any())
+                var stackVars = CollectStackVarsUsed(fn);
+
+                var regDecls = FormatRegisterDeclarations(regs);
+                if (!string.IsNullOrEmpty(regDecls))
+                    sb.Append(regDecls);
+
+                if (stackVars.Any())
                 {
-                    sb.AppendLine("    uint32_t " + string.Join(", ", regs.OrderBy(r => r)) + ";");
+                    // Group by inferred type
+                    var byType = stackVars.GroupBy(v => fn.InferredTypes.GetValueOrDefault(v, "uint32_t"));
+                    foreach (var g in byType.OrderBy(x => x.Key))
+                    {
+                        sb.AppendLine($"    {g.Key} " + string.Join(", ", g.OrderBy(v => v)) + ";");
+                    }
                 }
 
                 var pending = new PendingFlags();
@@ -261,16 +274,22 @@ namespace DOSRE.Dasm
                     }
 
                     sb.AppendLine($"{SanitizeLabel(block.Label)}:");
+                    if (fn.LoopHeaders.Contains(block.Label))
+                    {
+                        sb.AppendLine("    while (1) {");
+                        scopeEnds.Push("LOOP_END_" + block.Label); // Placeholder to close loop? 
+                        // Actually we should close it at the back-edge if we want structured, 
+                        // but sticking to goto + while(1) wrapper for now.
+                    }
 
+                    var blockLines = new List<string>();
                     var suppressTailAfterRetDecode = false;
-                    var wroteTailSuppressionNote = false;
-
                     for (var lineIdx = 0; lineIdx < block.Lines.Count; lineIdx++)
                     {
                         var item = block.Lines[lineIdx];
                         if (item.Kind == ParsedLineKind.Comment)
                         {
-                            sb.AppendLine("    // " + item.Raw.TrimStart(';').Trim());
+                            blockLines.Add("// " + item.Raw.TrimStart(';').Trim());
                             continue;
                         }
 
@@ -279,11 +298,7 @@ namespace DOSRE.Dasm
                         {
                             suppressTailAfterRetDecode = true;
                             pending.Clear();
-                            if (!wroteTailSuppressionNote)
-                            {
-                                sb.AppendLine("    // NOTE: omitted tail bytes decoded after RET (likely data/padding)");
-                                wroteTailSuppressionNote = true;
-                            }
+                            blockLines.Add("// NOTE: omitted tail bytes decoded after RET (likely data/padding)");
                             continue;
                         }
 
@@ -291,8 +306,6 @@ namespace DOSRE.Dasm
                             continue;
 
                         // Basic If-Structure Detection:
-                        // If this is the last instruction in the block, and it's a conditional jump 
-                        // jumping over the next few blocks, we can turn it into an 'if'.
                         if (lineIdx == block.Lines.Count - 1 && IsJccLine(item, out var jccMn, out var jccTarget))
                         {
                             var cond = TryMakeConditionFromPending(jccMn, pending);
@@ -300,24 +313,22 @@ namespace DOSRE.Dasm
 
                             if (!string.IsNullOrWhiteSpace(cond) && !string.IsNullOrWhiteSpace(targetLabel))
                             {
-                                // We want to invert the condition to make it "if (!cond) { body }".
-                                // This applies if we are jumping over exactly the next set of lines to targetLabel.
                                 var inverted = InvertCondition(jccMn, pending);
                                 if (!string.IsNullOrWhiteSpace(inverted))
                                 {
-                                    sb.AppendLine($"    if ({inverted}) {{");
+                                    blockLines.Add($"if ({inverted}) {{");
                                     scopeEnds.Push(targetLabel);
                                     pending.Clear();
                                     continue;
                                 }
 
-                                sb.AppendLine($"    if ({cond}) goto {SanitizeLabel(targetLabel)};");
+                                blockLines.Add($"if ({cond}) goto {SanitizeLabel(targetLabel)};");
                                 pending.Clear();
                                 continue;
                             }
                         }
 
-                        // Call-site improvement: peek ahead for CALLHINT
+                        // Call-site improvement: peeks 
                         if (item.Asm.StartsWith("call", StringComparison.OrdinalIgnoreCase))
                         {
                             var hint = string.Empty;
@@ -334,55 +345,50 @@ namespace DOSRE.Dasm
 
                             if (!string.IsNullOrWhiteSpace(hint))
                             {
-                                var callStmt = TranslateCallWithHint(item, hint, labelByAddr);
+                                var callStmt = TranslateCallWithHint(item, hint, labelByAddr, pending, fn);
                                 if (!string.IsNullOrWhiteSpace(callStmt))
                                 {
-                                    sb.AppendLine("    " + callStmt);
-                                    pending.Clear();
+                                    blockLines.Add(callStmt);
                                     continue;
                                 }
                             }
                         }
 
                         // If-Else detection:
-                        // If this is the last instruction in the block, and it's an unconditional jump 
-                        // jumping over the current 'if' target, it might be an 'else'.
                         if (lineIdx == block.Lines.Count - 1 && item.Asm.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) && scopeEnds.Count > 0)
                         {
                             var targetAddr = item.Asm.Substring(4).Trim().TrimStart('0', 'x').ToUpperInvariant().PadLeft(8, '0');
                             var targetLabel = labelByAddr.GetValueOrDefault(targetAddr);
                             if (targetLabel != null && targetLabel != scopeEnds.Peek())
                             {
-                                sb.AppendLine("    } else {");
+                                blockLines.Add("} else {");
                                 scopeEnds.Pop();
                                 scopeEnds.Push(targetLabel);
-                                pending.Clear(false); // Flags don't cross else usually, but we keep EAX
+                                pending.Clear(false);
                                 continue;
                             }
                         }
 
-                        // Basic loop detection (do-while style)
-                        if (lineIdx == block.Lines.Count - 1 && IsJccLine(item, out var loopMn, out var loopTarget))
-                        {
-                             var loopTargetLabel = labelByAddr.GetValueOrDefault(loopTarget);
-                             // If it jumps BACK to a label we've already seen in this function, it's a loop.
-                             // For now, we don't 'structure' it as a while() but we can comment it.
-                        }
-
-                        var stmt = TranslateInstructionToPseudoC(item, labelByAddr, pending);
+                        var stmt = TranslateInstructionToPseudoC(item, labelByAddr, pending, fn);
                         if (!string.IsNullOrWhiteSpace(stmt))
                         {
-                            // Heuristic: convert "return;" after "eax = ...;" into "return eax;"
                             if (stmt == "return;" && !string.IsNullOrWhiteSpace(pending.LastEaxAssignment))
                             {
-                                sb.AppendLine($"    return {pending.LastEaxAssignment};");
+                                blockLines.Add($"return {pending.LastEaxAssignment};");
                                 pending.LastEaxAssignment = null;
                             }
                             else
                             {
-                                sb.AppendLine("    " + stmt);
+                                blockLines.Add(stmt);
                             }
                         }
+                    }
+
+                    // Apply peephole optimizations to blockLines
+                    var optimized = OptimizeStatements(blockLines);
+                    foreach (var s in optimized)
+                    {
+                        sb.AppendLine("    " + s);
                     }
                 }
 
@@ -392,6 +398,11 @@ namespace DOSRE.Dasm
                     sb.AppendLine("    }");
                 }
 
+                while (scopeEnds.Count > 0)
+                {
+                    scopeEnds.Pop();
+                    sb.AppendLine("    }");
+                }
                 sb.AppendLine("}");
                 sb.AppendLine();
             }
@@ -468,35 +479,108 @@ namespace DOSRE.Dasm
         private static HashSet<string> CollectRegistersUsed(ParsedFunction fn)
         {
             var res = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var regMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["al"] = "eax", ["ah"] = "eax", ["ax"] = "eax", ["eax"] = "eax",
-                ["bl"] = "ebx", ["bh"] = "ebx", ["bx"] = "ebx", ["ebx"] = "ebx",
-                ["cl"] = "ecx", ["ch"] = "ecx", ["cx"] = "ecx", ["ecx"] = "ecx",
-                ["dl"] = "edx", ["dh"] = "edx", ["dx"] = "edx", ["edx"] = "edx",
-                ["si"] = "esi", ["esi"] = "esi",
-                ["di"] = "edi", ["edi"] = "edi",
-                ["bp"] = "ebp", ["ebp"] = "ebp"
+            var commonRegs = new[] { 
+                "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+                "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+                "al", "ah", "bl", "bh", "cl", "ch", "dl", "dh"
             };
+
+            // Pre-compile regex for performance
+            var regPattern = @"\b(" + string.Join("|", commonRegs) + @")\b";
+            var regRegex = new Regex(regPattern, RegexOptions.IgnoreCase);
 
             foreach (var block in fn.Blocks)
             {
                 foreach (var line in block.Lines)
                 {
                     if (line.Kind != ParsedLineKind.Instruction) continue;
-                    foreach (var kvp in regMap)
+                    var matches = regRegex.Matches(line.Asm);
+                    foreach (Match m in matches)
                     {
-                        if (Regex.IsMatch(line.Asm, $@"\b{kvp.Key}\b", RegexOptions.IgnoreCase))
-                        {
-                            res.Add(kvp.Value);
-                        }
+                        var reg = m.Value.ToLowerInvariant();
+                        // Filter out sub-registers if the 32-bit version is also present? 
+                        // Actually let's just use a map to the "root" register to ensure we declare the root.
+                        res.Add(reg);
                     }
                 }
             }
             return res;
         }
 
-        private static string TranslateCallWithHint(ParsedInsOrComment callIns, string hint, Dictionary<string, string> labelByAddr)
+        private static string FormatRegisterDeclarations(HashSet<string> regs)
+        {
+            if (regs == null || regs.Count == 0) return string.Empty;
+
+            var roots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var subRegs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) {
+                ["al"]="eax", ["ah"]="eax", ["ax"]="eax", ["eax"]="eax",
+                ["bl"]="ebx", ["bh"]="ebx", ["bx"]="ebx", ["ebx"]="ebx",
+                ["cl"]="ecx", ["ch"]="ecx", ["cx"]="ecx", ["ecx"]="ecx",
+                ["dl"]="edx", ["dh"]="edx", ["dx"]="edx", ["edx"]="edx",
+                ["si"]="esi", ["esi"]="esi",
+                ["di"]="edi", ["edi"]="edi",
+                ["bp"]="ebp", ["ebp"]="ebp",
+                ["sp"]="esp", ["esp"]="esp"
+            };
+
+            foreach (var r in regs)
+            {
+                if (map.TryGetValue(r, out var root))
+                {
+                    roots.Add(root);
+                    if (r != root) subRegs.Add(r);
+                }
+                else roots.Add(r);
+            }
+
+            var sb = new StringBuilder();
+            if (roots.Any())
+            {
+                sb.AppendLine("    uint32_t " + string.Join(", ", roots.OrderBy(x => x)) + ";");
+            }
+            if (subRegs.Any())
+            {
+                var bySize = subRegs.GroupBy(r => {
+                    if (r.EndsWith("l") || r.EndsWith("h")) return "uint8_t";
+                    if (r.EndsWith("x") || r == "si" || r == "di" || r == "bp" || r == "sp") return "uint16_t";
+                    return "uint32_t";
+                });
+                foreach (var g in bySize.OrderBy(x => x.Key))
+                {
+                    sb.AppendLine($"    {g.Key} " + string.Join(", ", g.OrderBy(x => x)) + "; // sub-registers");
+                }
+            }
+            return sb.ToString();
+        }
+
+        private static HashSet<string> CollectStackVarsUsed(ParsedFunction fn)
+        {
+            var res = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var varRegex = new Regex(@"\b(local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\b", RegexOptions.IgnoreCase);
+
+            foreach (var block in fn.Blocks)
+            {
+                foreach (var line in block.Lines)
+                {
+                    if (line.Kind != ParsedLineKind.Instruction) continue;
+                    var matches = varRegex.Matches(line.Asm);
+                    foreach (Match m in matches)
+                        res.Add(m.Value.ToLowerInvariant());
+
+                    if (!string.IsNullOrEmpty(line.Comment))
+                    {
+                        var cm = varRegex.Matches(line.Comment);
+                        foreach (Match m in cm)
+                            res.Add(m.Value.ToLowerInvariant());
+                    }
+                }
+            }
+            return res;
+        }
+
+        private static string TranslateCallWithHint(ParsedInsOrComment callIns, string hint, Dictionary<string, string> labelByAddr, PendingFlags pending, ParsedFunction fn)
         {
             var targetRaw = callIns.Asm.Substring(4).Trim();
 
@@ -532,13 +616,34 @@ namespace DOSRE.Dasm
             {
                 var v = rm.Groups["val"].Value.Trim();
                 if (v.EndsWith(",")) v = v.Substring(0, v.Length - 1);
-                argList.Add(NormalizeAsmOperandToC(v, false));
+                argList.Add(NormalizeAsmOperandToC(v, false, fn));
             }
 
             var retVar = string.Empty;
-            if (retMatch.Success && !retMatch.Groups["ret"].Value.Contains("unused"))
+            if (retMatch.Success)
             {
-                retVar = retMatch.Groups["ret"].Value + " = ";
+                var r = retMatch.Groups["ret"].Value;
+                if (!r.Contains("unused"))
+                {
+                    retVar = r + " = ";
+                    if (r == "eax")
+                    {
+                        pending.ClearAll();
+                        pending.LastEaxAssignment = $"{target}({string.Join(", ", argList)})";
+                    }
+                    else
+                    {
+                        pending.ClearAll();
+                    }
+                }
+                else
+                {
+                    pending.ClearAll();
+                }
+            }
+            else
+            {
+                pending.ClearAll();
             }
 
             return $"{retVar}{target}({string.Join(", ", argList)});";
@@ -627,6 +732,90 @@ namespace DOSRE.Dasm
             public string Name;
             public List<string> HeaderComments;
             public List<ParsedBlock> Blocks;
+            public Dictionary<string, string> InferredTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            public HashSet<string> LoopHeaders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static void InferVariableTypes(ParsedFunction fn)
+        {
+            if (fn == null) return;
+            foreach (var block in fn.Blocks)
+            {
+                foreach (var line in block.Lines)
+                {
+                    if (line.Kind != ParsedLineKind.Instruction) continue;
+                    
+                    var lineText = line.Asm; 
+                    var m = Regex.Match(lineText, @"\b(?<size>byte|word|dword|qword)\s+(?:ptr\s+)?\[(?<op>[^\]]+)\]", RegexOptions.IgnoreCase);
+                    string inferredType = null;
+                    string targetOp = null;
+
+                    if (m.Success)
+                    {
+                        var size = m.Groups["size"].Value.ToLowerInvariant();
+                        targetOp = m.Groups["op"].Value;
+                        inferredType = size switch {
+                            "byte" => "uint8_t",
+                            "word" => "uint16_t",
+                            "dword" => "uint32_t",
+                            "qword" => "uint64_t",
+                            _ => null
+                        };
+                    }
+                    else
+                    {
+                        // Check for implied sizes: mov [ebp-47h], al
+                        var mBare = Regex.Match(lineText, @"\[(?<op>[^\]]+)\]", RegexOptions.IgnoreCase);
+                        if (mBare.Success)
+                        {
+                            targetOp = mBare.Groups["op"].Value;
+                            var sz = GetOperandSize(lineText);
+                            inferredType = sz switch { 1 => "uint8_t", 2 => "uint16_t", 4 => "uint32_t", _ => null };
+                        }
+                    }
+
+                    if (inferredType != null && targetOp != null)
+                    {
+                        var varName = (string)null;
+
+                        // Case 1: already symbolized [local_XX]
+                        var mSym = Regex.Match(targetOp.Trim(), @"^(?<var>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase);
+                        if (mSym.Success)
+                        {
+                            varName = mSym.Groups["var"].Value.ToLowerInvariant();
+                        }
+                        else
+                        {
+                            // Case 2: raw ebp index
+                            var ebpMatch = Regex.Match(targetOp, @"ebp\s*(?<sign>[\+\-])\s*(?<off>0x[0-9A-Fa-f]+|[0-9]+|(?<hexoff>[0-9A-Fa-f]+)h)", RegexOptions.IgnoreCase);
+                            if (ebpMatch.Success) {
+                                var sign = ebpMatch.Groups["sign"].Value;
+                                var offStr = ebpMatch.Groups["off"].Value;
+                                uint off;
+                                if (offStr.EndsWith("h", StringComparison.OrdinalIgnoreCase))
+                                    off = Convert.ToUInt32(offStr.TrimEnd('h', 'H'), 16);
+                                else if (offStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                                    off = Convert.ToUInt32(offStr.Substring(2), 16);
+                                else
+                                    off = uint.Parse(offStr);
+                                
+                                if (sign == "-") varName = "local_" + off.ToString("x");
+                                else varName = "arg_" + ((off-8)/4).ToString("x");
+                            }
+                        }
+
+                        if (varName != null)
+                        {
+                            if (!fn.InferredTypes.TryGetValue(varName, out var existing) || 
+                                (existing == "uint8_t" && inferredType != "uint8_t") ||
+                                (existing == "uint16_t" && inferredType == "uint32_t"))
+                            {
+                                fn.InferredTypes[varName] = inferredType;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         private sealed class PendingFlags
@@ -729,7 +918,8 @@ namespace DOSRE.Dasm
         private static string TranslateInstructionToPseudoC(
             ParsedInsOrComment ins,
             Dictionary<string, string> labelByAddr,
-            PendingFlags pending)
+            PendingFlags pending,
+            ParsedFunction fn)
         {
             var asm = ins.Asm;
             if (string.IsNullOrWhiteSpace(asm))
@@ -777,8 +967,10 @@ namespace DOSRE.Dasm
                 {
                     pending.LastWasCmp = true;
                     pending.LastWasTest = false;
-                    pending.LastCmpLhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: false);
-                    pending.LastCmpRhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false);
+                    var lhsSize = GetOperandSize(parts.Value.lhs);
+                    var rhsSize = GetOperandSize(parts.Value.rhs);
+                    pending.LastCmpLhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: false, fn, rhsSize);
+                    pending.LastCmpRhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize);
                 }
                 return "// " + asm + commentSuffix;
             }
@@ -789,8 +981,10 @@ namespace DOSRE.Dasm
                 {
                     pending.LastWasTest = true;
                     pending.LastWasCmp = false;
-                    pending.LastTestLhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: false);
-                    pending.LastTestRhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false);
+                    var lhsSize = GetOperandSize(parts.Value.lhs);
+                    var rhsSize = GetOperandSize(parts.Value.rhs);
+                    pending.LastTestLhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: false, fn, rhsSize);
+                    pending.LastTestRhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize);
                 }
                 return "// " + asm + commentSuffix;
             }
@@ -810,17 +1004,26 @@ namespace DOSRE.Dasm
             if (mn == "imul")
             {
                 pending.Clear(dstIsEax);
+                var p3 = SplitThreeOperands(ops);
+                if (p3 != null)
+                {
+                    var dst = NormalizeAsmOperandToC(p3.Value.o1, isMemoryWrite: true, fn);
+                    var src = NormalizeAsmOperandToC(p3.Value.o2, isMemoryWrite: false, fn);
+                    var imm = NormalizeAsmOperandToC(p3.Value.o3, isMemoryWrite: false, fn);
+                    return $"{dst} = {src} * {imm};{commentSuffix}";
+                }
+
                 var parts = SplitTwoOperands(ops);
                 if (parts != null)
                 {
-                    var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true);
-                    var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false);
+                    var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true, fn);
+                    var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn);
                     return $"{lhs} *= {rhs};{commentSuffix}";
                 }
                 else if (!string.IsNullOrWhiteSpace(ops))
                 {
                     // Single operand imul: edx:eax = eax * ops
-                    var src = NormalizeAsmOperandToC(ops, isMemoryWrite: false);
+                    var src = NormalizeAsmOperandToC(ops, isMemoryWrite: false, fn);
                     return $"{{ int64_t res = (int64_t)eax * (int64_t){src}; eax = (uint32_t)res; edx = (uint32_t)(res >> 32); }}{commentSuffix}";
                 }
             }
@@ -830,7 +1033,7 @@ namespace DOSRE.Dasm
                 pending.Clear(dstIsEax);
                 if (!string.IsNullOrWhiteSpace(ops))
                 {
-                    var divisor = NormalizeAsmOperandToC(ops, isMemoryWrite: false);
+                    var divisor = NormalizeAsmOperandToC(ops, isMemoryWrite: false, fn);
                     return $"{{ int64_t dividend = ((int64_t)edx << 32) | eax; eax = (uint32_t)(dividend / (int32_t){divisor}); edx = (uint32_t)(dividend % (int32_t){divisor}); }}{commentSuffix}";
                 }
             }
@@ -842,9 +1045,9 @@ namespace DOSRE.Dasm
                 var parts = SplitThreeOperands(ops);
                 if (parts != null)
                 {
-                    var dst = NormalizeAsmOperandToC(parts.Value.o1, isMemoryWrite: true);
-                    var src = NormalizeAsmOperandToC(parts.Value.o2, isMemoryWrite: false);
-                    var amt = NormalizeAsmOperandToC(parts.Value.o3, isMemoryWrite: false);
+                    var dst = NormalizeAsmOperandToC(parts.Value.o1, isMemoryWrite: true, fn);
+                    var src = NormalizeAsmOperandToC(parts.Value.o2, isMemoryWrite: false, fn);
+                    var amt = NormalizeAsmOperandToC(parts.Value.o3, isMemoryWrite: false, fn);
                     return $"{dst} = ({dst} >> {amt}) | ({src} << (32 - {amt}));{commentSuffix}";
                 }
             }
@@ -852,12 +1055,50 @@ namespace DOSRE.Dasm
             if (mn == "push")
             {
                 pending.Clear(dstIsEax);
-                return $"// push {NormalizeAsmOperandToC(ops, false)};";
+                return $"// push {NormalizeAsmOperandToC(ops, false, fn)};";
             }
+            if (mn is "shld" or "shrd")
+            {
+                var p3 = SplitThreeOperands(ops);
+                if (p3 != null)
+                {
+                    pending.Clear(dstIsEax);
+                    var dst = NormalizeAsmOperandToC(p3.Value.o1, isMemoryWrite: true, fn);
+                    var src = NormalizeAsmOperandToC(p3.Value.o2, isMemoryWrite: false, fn);
+                    var amt = NormalizeAsmOperandToC(p3.Value.o3, isMemoryWrite: false, fn);
+                    var op = mn == "shld" ? "<<" : ">>";
+                    var inv = mn == "shld" ? ">>" : "<<";
+                    return $"{dst} = ({dst} {op} {amt}) | ({src} {inv} (32 - {amt}));{commentSuffix}";
+                }
+            }
+
+            if (mn.StartsWith("cmov", StringComparison.Ordinal))
+            {
+                var parts = SplitTwoOperands(ops);
+                if (parts != null)
+                {
+                    var jcc = "j" + mn.Substring(4);
+                    var cond = TryMakeConditionFromPending(jcc, pending);
+                    if (!string.IsNullOrWhiteSpace(cond))
+                    {
+                        var dst = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true, fn);
+                        var src = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn);
+                        return $"if ({cond}) {dst} = {src};{commentSuffix}";
+                    }
+                }
+            }
+
+            if (mn == "bswap")
+            {
+                pending.Clear(dstIsEax);
+                var dst = NormalizeAsmOperandToC(ops, isMemoryWrite: true, fn);
+                return $"{dst} = __builtin_bswap32({dst});{commentSuffix}";
+            }
+
             if (mn == "pop")
             {
                 pending.Clear(dstIsEax);
-                return $"// {NormalizeAsmOperandToC(ops, true)} = pop();";
+                return $"// {NormalizeAsmOperandToC(ops, true, fn)} = pop();";
             }
 
             if (mn == "mov")
@@ -867,10 +1108,38 @@ namespace DOSRE.Dasm
                     return "/* " + asm + " */" + commentSuffix;
 
                 pending.Clear(dstIsEax);
-                var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true);
-                var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false);
+                var lhsSize = GetOperandSize(parts.Value.lhs);
+                var rhsSize = GetOperandSize(parts.Value.rhs);
+                var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true, fn, rhsSize);
+                var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize);
                 if (lhs == "eax") pending.LastEaxAssignment = rhs;
                 return $"{lhs} = {rhs};{commentSuffix}";
+            }
+
+            if (mn is "movzx" or "movsx")
+            {
+                var parts = SplitTwoOperands(ops);
+                if (parts != null)
+                {
+                    pending.Clear(dstIsEax);
+                    var lhsSize = GetOperandSize(parts.Value.lhs);
+                    var rhsSize = GetOperandSize(parts.Value.rhs);
+                    var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true, fn, rhsSize);
+                    var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize);
+                    var cast = mn == "movzx" ? "(uint32_t)" : "(int32_t)";
+                    return $"{lhs} = {cast}{rhs};{commentSuffix}";
+                }
+            }
+
+            if (mn.StartsWith("set", StringComparison.Ordinal) && !string.IsNullOrWhiteSpace(ops))
+            {
+                var jcc = "j" + mn.Substring(3);
+                var cond = TryMakeConditionFromPending(jcc, pending);
+                if (!string.IsNullOrWhiteSpace(cond))
+                {
+                    var dst = NormalizeAsmOperandToC(ops, isMemoryWrite: true, fn);
+                    return $"{dst} = ({cond}) ? 1 : 0;{commentSuffix}";
+                }
             }
 
             if (mn == "lea")
@@ -880,10 +1149,20 @@ namespace DOSRE.Dasm
                     return "/* " + asm + " */" + commentSuffix;
 
                 pending.Clear(dstIsEax);
-                // Heuristic: lea dst, [expr] => dst = (expr);
-                var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: false);
-                var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false);
-                // If the RHS is a dereference (e.g. *(uint32_t*)(...)), de-pointer it for LEA.
+                var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: false, fn);
+                
+                // For LEA, we want the address of the operand.
+                var rhsRaw = parts.Value.rhs;
+                var rhs = NormalizeAsmOperandToC(rhsRaw, isMemoryWrite: false, fn);
+
+                // If Normalize returned a bare variable name (because it was [local_XX]), 
+                // LEA needs the address of it.
+                if (Regex.IsMatch(rhs, @"^(local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase))
+                {
+                    return $"{lhs} = &{rhs};{commentSuffix}";
+                }
+
+                // If it's a deref like *(uint32_t*)(expr), strip the deref to get expr.
                 rhs = StripSingleDeref(rhs);
                 return $"{lhs} = {rhs};{commentSuffix}";
             }
@@ -896,8 +1175,10 @@ namespace DOSRE.Dasm
 
                 pending.Clear(dstIsEax);
 
-                var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true);
-                var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false);
+                var lhsSize = GetOperandSize(parts.Value.lhs);
+                var rhsSize = GetOperandSize(parts.Value.rhs);
+                var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true, fn, rhsSize);
+                var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize);
 
                 if (mn == "xor" && lhs.Equals(rhs, StringComparison.OrdinalIgnoreCase))
                 {
@@ -924,10 +1205,25 @@ namespace DOSRE.Dasm
                     return "/* " + asm + " */" + commentSuffix;
 
                 pending.Clear(dstIsEax);
-                var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true);
-                var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false);
+                var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true, fn);
+                var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn);
                 var op = mn == "shl" ? "<<=" : ">>=";
                 return $"{lhs} {op} {rhs};{commentSuffix}";
+            }
+
+            if (mn is "bt" or "bts" or "btr")
+            {
+                var parts = SplitTwoOperands(ops);
+                if (parts != null)
+                {
+                    var val = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: mn != "bt", fn);
+                    var bit = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn);
+                    if (mn == "bt") return $"// test bit: ({val} >> {bit}) & 1{commentSuffix}";
+                    var op = mn == "bts" ? "|=" : "&=";
+                    var bitVal = $"(1 << {bit})";
+                    if (mn == "btr") bitVal = "~" + bitVal;
+                    return $"{val} {op} {bitVal};{commentSuffix}";
+                }
             }
 
             if (mn == "inc" || mn == "dec")
@@ -936,8 +1232,24 @@ namespace DOSRE.Dasm
                 if (string.IsNullOrWhiteSpace(ops))
                     return "/* " + asm + " */" + commentSuffix;
 
-                var opnd = NormalizeAsmOperandToC(ops, isMemoryWrite: true);
+                var opnd = NormalizeAsmOperandToC(ops, isMemoryWrite: true, fn);
                 return mn == "inc" ? $"{opnd}++;{commentSuffix}" : $"{opnd}--;{commentSuffix}";
+            }
+
+            if (mn == "neg")
+            {
+                pending.Clear(dstIsEax);
+                if (string.IsNullOrWhiteSpace(ops)) return "// " + asm;
+                var opnd = NormalizeAsmOperandToC(ops, isMemoryWrite: true, fn);
+                return $"{opnd} = -{opnd};{commentSuffix}";
+            }
+
+            if (mn == "not")
+            {
+                pending.Clear(dstIsEax);
+                if (string.IsNullOrWhiteSpace(ops)) return "// " + asm;
+                var opnd = NormalizeAsmOperandToC(ops, isMemoryWrite: true, fn);
+                return $"{opnd} = ~{opnd};{commentSuffix}";
             }
 
             if (mn == "call")
@@ -958,7 +1270,31 @@ namespace DOSRE.Dasm
             {
                 pending.Clear(dstIsEax);
                 var target = ResolveTarget(ops, labelByAddr);
+                // Heuristic: if jumping to another function, it's a tail call.
+                if (target.StartsWith("func_", StringComparison.OrdinalIgnoreCase))
+                    return $"return {target}();{commentSuffix}";
                 return $"goto {target};{commentSuffix}";
+            }
+
+            if (mn == "loop")
+            {
+                pending.Clear(dstIsEax);
+                var target = ResolveTarget(ops, labelByAddr);
+                return $"if (--ecx != 0) goto {target};{commentSuffix}";
+            }
+
+            if (mn == "cld") return $"// direction = forward;{commentSuffix}";
+            if (mn == "std") return $"// direction = backward;{commentSuffix}";
+            if (mn == "leave")
+            {
+                pending.ClearAll();
+                return $"esp = ebp; ebp = pop();{commentSuffix}";
+            }
+
+            if (mn.StartsWith("f", StringComparison.Ordinal))
+            {
+                // FPU instruction: prefix with FPU to make it stand out.
+                return $"// FPU: {asm}{commentSuffix}";
             }
 
             if (IsJcc(mn))
@@ -978,7 +1314,23 @@ namespace DOSRE.Dasm
             return "// " + asm + commentSuffix;
         }
 
-        private static string NormalizeAsmOperandToC(string op, bool isMemoryWrite)
+        private static int GetOperandSize(string t)
+        {
+            if (string.IsNullOrEmpty(t)) return 0;
+            t = t.ToLowerInvariant();
+
+            if (t.Contains("byte") || Regex.IsMatch(t, @"\b(al|ah|bl|bh|cl|ch|dl|dh)\b")) return 1;
+            if (t.Contains("word") || Regex.IsMatch(t, @"\b(ax|bx|cx|dx|si|di|bp|sp)\b"))
+            {
+                if (t.Contains("dword")) return 4;
+                return 2;
+            }
+            if (t.Contains("dword") || Regex.IsMatch(t, @"\be(ax|bx|cx|dx|si|di|bp|sp)\b")) return 4;
+
+            return 0; // Unknown
+        }
+
+        private static string NormalizeAsmOperandToC(string op, bool isMemoryWrite, ParsedFunction fn, int sizeOverride = 0)
         {
             if (string.IsNullOrWhiteSpace(op))
                 return string.Empty;
@@ -988,6 +1340,31 @@ namespace DOSRE.Dasm
             // Already looks like a C-ish deref; leave it.
             if (t.StartsWith("*", StringComparison.Ordinal))
                 return t;
+
+            // Handle local/arg variables directly if they are inside brackets [local_XX]
+            // The disassembler often emits these as [local_XX] or [arg_X]
+            var varMatch = Regex.Match(t, @"^\[(?<var>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\]$", RegexOptions.IgnoreCase);
+            if (varMatch.Success)
+            {
+                var varName = varMatch.Groups["var"].Value.ToLowerInvariant();
+                var tyMatch = sizeOverride switch { 1 => "uint8_t", 2 => "uint16_t", _ => "uint32_t" };
+                if (fn.InferredTypes.TryGetValue(varName, out var inferred) && inferred == tyMatch)
+                    return varName;
+                if (!fn.InferredTypes.ContainsKey(varName)) return varName;
+                return $"*({tyMatch}*)&({varName})";
+            }
+
+            // Sized var access: dword [local_XX]
+            var sizedVar = Regex.Match(t, @"^(?<sz>byte|word|dword|qword)\s+(?:ptr\s+)?\[(?<var>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\]$", RegexOptions.IgnoreCase);
+            if (sizedVar.Success)
+            {
+                var sz = sizedVar.Groups["sz"].Value.ToLowerInvariant();
+                var varName = sizedVar.Groups["var"].Value.ToLowerInvariant();
+                var tySizedVar = sz switch { "byte" => "uint8_t", "word" => "uint16_t", "dword" => "uint32_t", "qword" => "uint64_t", _ => "uint32_t" };
+                if (fn.InferredTypes.TryGetValue(varName, out var inferred) && inferred == tySizedVar)
+                    return varName;
+                return $"*({tySizedVar}*)&({varName})";
+            }
 
             // byte/word/dword/qword [expr]  (optionally with 'ptr')
             var sized = Regex.Match(
@@ -999,6 +1376,33 @@ namespace DOSRE.Dasm
             {
                 var sz = sized.Groups["sz"].Value.ToLowerInvariant();
                 var expr = sized.Groups["expr"].Value.Trim();
+                // If the interior expression is a variable, it's just the variable.
+                if (Regex.IsMatch(expr, @"^(local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase))
+                    return expr.ToLowerInvariant();
+
+                // Handle ebp-based operands in [ebp-XX] form
+                var ebpMatch = Regex.Match(expr, @"^ebp\s*(?<sign>[\+\-])\s*(?<off>0x[0-9A-Fa-f]+|[0-9]+)$", RegexOptions.IgnoreCase);
+                if (ebpMatch.Success)
+                {
+                    var sign = ebpMatch.Groups["sign"].Value;
+                    var offStr = ebpMatch.Groups["off"].Value;
+                    if (offStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) offStr = offStr.Substring(2);
+                    else offStr = offStr.TrimEnd('h', 'H');
+
+                    if (uint.TryParse(offStr, System.Globalization.NumberStyles.HexNumber, null, out var off))
+                    {
+                        var tyEbp = sz switch { "byte" => "uint8_t", "word" => "uint16_t", "dword" => "uint32_t", "qword" => "uint64_t", _ => "uint32_t" };
+                        if (sign == "-") 
+                        {
+                            var varName = $"local_{off:X}".ToLowerInvariant();
+                            if (fn.InferredTypes.TryGetValue(varName, out var inferred) && inferred == tyEbp)
+                                return varName;
+                            return $"*({tyEbp}*)&({varName})";
+                        }
+                        if (off >= 8) return $"arg_{(off - 8) / 4}".ToLowerInvariant();
+                    }
+                }
+
                 var ty = sz switch
                 {
                     "byte" => "uint8_t",
@@ -1010,12 +1414,42 @@ namespace DOSRE.Dasm
                 return $"*({ty}*)({WrapExprForPointerMath(expr)})";
             }
 
-            // Bare [expr] => assume dword in 32-bit mode.
+            // Bare [expr] => assume dword in 32-bit mode unless sizeOverride set.
             var bare = Regex.Match(t, @"^\[(?<expr>.+?)\]$", RegexOptions.None);
             if (bare.Success)
             {
                 var expr = bare.Groups["expr"].Value.Trim();
-                return $"*(uint32_t*)({WrapExprForPointerMath(expr)})";
+                if (Regex.IsMatch(expr, @"^(local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase))
+                    return expr.ToLowerInvariant();
+
+                // Handle bare ebp-based operands if the rewriter missed them (e.g. in hints)
+                var ebpMatch = Regex.Match(expr, @"^ebp\s*(?<sign>[\+\-])\s*(?<off>0x[0-9A-Fa-f]+|[0-9]+)$", RegexOptions.IgnoreCase);
+                if (ebpMatch.Success)
+                {
+                    var sign = ebpMatch.Groups["sign"].Value;
+                    var offStr = ebpMatch.Groups["off"].Value;
+                    if (offStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) offStr = offStr.Substring(2);
+                    else offStr = offStr.TrimEnd('h', 'H');
+
+                    if (uint.TryParse(offStr, System.Globalization.NumberStyles.HexNumber, null, out var off))
+                    {
+                        var tyBareEbp = sizeOverride switch { 1 => "uint8_t", 2 => "uint16_t", _ => "uint32_t" };
+                        if (sign == "-") 
+                        {
+                            var varName = $"local_{off:X}".ToLowerInvariant();
+                            if (fn.InferredTypes.TryGetValue(varName, out var inferred) && inferred == tyBareEbp)
+                                return varName;
+                            return $"*({tyBareEbp}*)&({varName})";
+                        }
+                        if (off >= 8) return $"arg_{(off - 8) / 4}".ToLowerInvariant();
+                    }
+                }
+
+                string type = "uint32_t";
+                if (sizeOverride == 1) type = "uint8_t";
+                else if (sizeOverride == 2) type = "uint16_t";
+
+                return $"*({type}*)({WrapExprForPointerMath(expr)})";
             }
 
             return t;
@@ -1048,6 +1482,44 @@ namespace DOSRE.Dasm
                 return m.Groups["inner"].Value.Trim();
 
             return expr;
+        }
+
+        private static void MarkLoopHeaders(ParsedFunction fn, Dictionary<string, string> labelByAddr)
+        {
+            if (fn == null) return;
+            var seenLabels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            
+            foreach (var block in fn.Blocks)
+            {
+                seenLabels.Add(block.Label);
+                
+                // Check last line for jumps
+                if (block.Lines.Count > 0)
+                {
+                    var last = block.Lines.Last();
+                    if (last.Kind == ParsedLineKind.Instruction)
+                    {
+                        var asm = last.Asm.ToLowerInvariant();
+                        string target = null;
+                        
+                        if (asm.StartsWith("jmp", StringComparison.Ordinal) || IsJcc(asm.Split(' ')[0]))
+                        {
+                            var match = Regex.Match(asm, @"0x(?<addr>[0-9A-Fa-f]+)");
+                            if (match.Success)
+                            {
+                                var addr = match.Groups["addr"].Value.ToUpperInvariant().PadLeft(8, '0');
+                                target = labelByAddr.GetValueOrDefault(addr);
+                            }
+                        }
+                        
+                        if (target != null && seenLabels.Contains(target))
+                        {
+                            // Back-edge!
+                            fn.LoopHeaders.Add(target);
+                        }
+                    }
+                }
+            }
         }
 
         private static bool IsJcc(string mn)
@@ -1139,6 +1611,54 @@ namespace DOSRE.Dasm
                 return (items[0], items[1], items[2]);
 
             return null;
+        }
+
+        private static List<string> OptimizeStatements(List<string> lines)
+        {
+            if (lines == null || lines.Count < 2) return lines;
+
+            var res = new List<string>();
+            for (var i = 0; i < lines.Count; i++)
+            {
+                var cur = lines[i];
+
+                // Peephole 1: reg1 = var; var2 = reg1;  => var2 = var;
+                // Only if reg1 is one of the scratch registers (eax, etc) and not used immediately again.
+                if (i + 1 < lines.Count)
+                {
+                    var m1 = Regex.Match(cur, @"^(?<reg>e[a-z]{2})\s*=\s*(?<src>[^;/\s]+);.*$");
+                    var next = lines[i + 1];
+                    var m2 = Regex.Match(next, @"^(?<dst>[^;/\s]+)\s*=\s*(?<reg2>e[a-z]{2});.*$");
+
+                    if (m1.Success && m2.Success)
+                    {
+                        var reg1 = m1.Groups["reg"].Value;
+                        var reg2 = m2.Groups["reg2"].Value;
+                        var src = m1.Groups["src"].Value;
+                        var dst = m2.Groups["dst"].Value;
+
+                        if (reg1.Equals(reg2, StringComparison.OrdinalIgnoreCase) && 
+                            !src.Equals(dst, StringComparison.OrdinalIgnoreCase))
+                        {
+                            // Avoid optimizing if src or dst are complex pointer derefs for now 
+                            // though in pseudo-C it's often fine.
+                            if (!src.Contains("(") && !dst.Contains("("))
+                            {
+                                res.Add($"{dst} = {src}; // optimized: {cur.TrimEnd()} + {next.TrimStart()}");
+                                i++; // Skip next
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // Peephole 2: Simplify if (0 == 0) etc? 
+                // Not worth it yet.
+
+                res.Add(cur);
+            }
+
+            return res;
         }
 
         private static (string lhs, string rhs)? SplitTwoOperands(string ops)
