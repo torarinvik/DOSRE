@@ -1273,6 +1273,31 @@ namespace DOSRE.Dasm
             return Regex.IsMatch(insText, $@"\[(?:[^\]]*\b{Regex.Escape(reg)}\b[^\]]*)\]", RegexOptions.IgnoreCase);
         }
 
+        private static bool LooksLikeFunctionFrameSetup(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return false;
+
+            var t = instructions[idx].ToString().Trim();
+
+            // Classic: push ebp; mov ebp, esp
+            if (t.Equals("mov ebp, esp", StringComparison.OrdinalIgnoreCase))
+            {
+                var back = Math.Max(0, idx - 4);
+                for (var i = back; i < idx; i++)
+                {
+                    if (instructions[i].ToString().Trim().Equals("push ebp", StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+
+            // Less common, but still a clear frame setup.
+            if (t.StartsWith("enter ", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            return false;
+        }
+
         private static void InferPointerishTokensForFunction(
             List<Instruction> instructions,
             int startIdx,
@@ -1369,6 +1394,11 @@ namespace DOSRE.Dasm
             var fp = Regex.Match(insText.Trim(), @"^(?<op>les|lfs|lgs)\s+\w+\s*,\s*\[(?<tok>(arg_[0-9]+|local_[0-9A-Fa-f]+))\]\s*$", RegexOptions.IgnoreCase);
             if (fp.Success)
                 ApplyPointerAliasForToken(fp.Groups["tok"].Value, argAliases, localAliases);
+
+            // Track reg <- &arg/local
+            var lea = Regex.Match(insText.Trim(), @"^lea\s+(?<reg>e[a-z]{2})\s*,\s*\[(?<tok>(arg_[0-9]+|local_[0-9A-Fa-f]+))\]\s*$", RegexOptions.IgnoreCase);
+            if (lea.Success)
+                regSources[lea.Groups["reg"].Value.ToLowerInvariant()] = lea.Groups["tok"].Value;
 
             // Track reg <- [arg/local]
             if (TryParseMovRegFromTokenMem(insText, out var dstReg, out var tok))
@@ -4067,6 +4097,24 @@ namespace DOSRE.Dasm
                 {
                     var ins = instructions[insLoopIndex];
                     var addr = (uint)ins.Offset;
+
+                    // Best-effort reset at likely function prologues even when we failed to
+                    // identify the start as a call target. This prevents alias state from
+                    // leaking across adjacent functions in linear disassembly.
+                    if (leInsights && !functionStarts.Contains(addr) && LooksLikeFunctionFrameSetup(instructions, insLoopIndex))
+                    {
+                        lastSwitchSig = null;
+                        lastSwitchIdx = int.MinValue;
+                        emittedSwitchSigs.Clear();
+                        localAliases.Clear();
+                        argAliases.Clear();
+                        ptrTokenByReg.Clear();
+
+                        liveAliases.Clear();
+                        liveAliases["ecx"] = "this";
+
+                        lastDxImm16 = null;
+                    }
 
                     if (functionStarts.Contains(addr))
                     {
