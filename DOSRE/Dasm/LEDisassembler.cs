@@ -1106,6 +1106,55 @@ namespace DOSRE.Dasm
             return sb.ToString();
         }
 
+        private static string FormatThisStructTable(Dictionary<string, Dictionary<uint, FieldAccessStats>> statsByBase)
+        {
+            if (statsByBase == null || statsByBase.Count == 0)
+                return string.Empty;
+
+            var thisEntry = statsByBase.FirstOrDefault(k => string.Equals(k.Key, "this", StringComparison.OrdinalIgnoreCase));
+            if (string.IsNullOrWhiteSpace(thisEntry.Key) || thisEntry.Value == null || thisEntry.Value.Count == 0)
+                return string.Empty;
+
+            var total = thisEntry.Value.Sum(x => x.Value.ReadCount + x.Value.WriteCount);
+            if (total <= 0)
+                return string.Empty;
+
+            var fields = thisEntry.Value
+                .Where(k =>
+                {
+                    if (k.Key != 0)
+                        return true;
+                    var st = k.Value;
+                    if (string.Equals(st.Size, "dword", StringComparison.OrdinalIgnoreCase))
+                        return true;
+                    var tot = st.ReadCount + st.WriteCount;
+                    return string.IsNullOrEmpty(st.Size) && tot <= 8;
+                })
+                .OrderByDescending(k => k.Value.ReadCount + k.Value.WriteCount)
+                .ThenBy(k => k.Key)
+                .Take(12)
+                .Select(k =>
+                {
+                    var disp = k.Key;
+                    var st = k.Value;
+                    var rw = $"r{st.ReadCount}/w{st.WriteCount}";
+                    var sz = string.IsNullOrEmpty(st.Size) ? "" : $" {st.Size}";
+                    var extra = FormatFieldExtraHints(st);
+                    return $"+0x{disp:X}({rw}{sz}{extra})";
+                })
+                .ToList();
+
+            if (fields.Count == 0)
+                return string.Empty;
+
+            var sb = new StringBuilder();
+            sb.AppendLine(";");
+            sb.AppendLine("; Inferred 'this' Struct Table (best-effort, aggregated field access stats)");
+            sb.AppendLine($"; STRUCT this: {string.Join(", ", fields)}");
+            sb.AppendLine(";");
+            return sb.ToString();
+        }
+
         private static string RewriteFieldOperands(string insText, Dictionary<string, string> aliases)
         {
             if (string.IsNullOrEmpty(insText) || aliases == null || aliases.Count == 0)
@@ -5160,10 +5209,12 @@ namespace DOSRE.Dasm
                 // Per-function field summaries (insights)
                 Dictionary<uint, string> funcFieldSummaries = null;
                 Dictionary<string, Dictionary<uint, FieldAccessStats>> ptrFieldStatsGlobal = null;
+                Dictionary<string, Dictionary<uint, FieldAccessStats>> thisFieldStatsGlobal = null;
                 if (leInsights && functionStarts != null && functionStarts.Count > 0)
                 {
                     funcFieldSummaries = new Dictionary<uint, string>();
                     ptrFieldStatsGlobal = new Dictionary<string, Dictionary<uint, FieldAccessStats>>(StringComparer.Ordinal);
+                    thisFieldStatsGlobal = new Dictionary<string, Dictionary<uint, FieldAccessStats>>(StringComparer.Ordinal);
                     var sortedStarts = functionStarts.OrderBy(x => x).ToList();
                     for (var si = 0; si < sortedStarts.Count; si++)
                     {
@@ -5177,6 +5228,7 @@ namespace DOSRE.Dasm
 
                         CollectFieldAccessesForFunction(instructions, startIdx, endIdx, out var stats, inferredPtrSymbols);
                         MergeFieldStats(ptrFieldStatsGlobal, stats, b => b.StartsWith("ptr_", StringComparison.OrdinalIgnoreCase));
+                        MergeFieldStats(thisFieldStatsGlobal, stats, b => string.Equals(b, "this", StringComparison.OrdinalIgnoreCase));
                         var summary = FormatFieldSummary(stats);
                         if (!string.IsNullOrEmpty(summary))
                             funcFieldSummaries[startAddr] = summary;
@@ -5416,13 +5468,20 @@ namespace DOSRE.Dasm
                     if (inferredPtrSymbols.Count > 64)
                         sb.AppendLine($";   (ptr symbol table truncated: {inferredPtrSymbols.Count} entries)");
                     sb.AppendLine(";");
+                }
 
-                    if (ptrFieldStatsGlobal != null && ptrFieldStatsGlobal.Count > 0)
-                    {
-                        var table = FormatPointerStructTable(ptrFieldStatsGlobal);
-                        if (!string.IsNullOrWhiteSpace(table))
-                            sb.Append(table);
-                    }
+                if (leInsights && ptrFieldStatsGlobal != null && ptrFieldStatsGlobal.Count > 0)
+                {
+                    var table = FormatPointerStructTable(ptrFieldStatsGlobal);
+                    if (!string.IsNullOrWhiteSpace(table))
+                        sb.Append(table);
+                }
+
+                if (leInsights && thisFieldStatsGlobal != null && thisFieldStatsGlobal.Count > 0)
+                {
+                    var table = FormatThisStructTable(thisFieldStatsGlobal);
+                    if (!string.IsNullOrWhiteSpace(table))
+                        sb.Append(table);
                 }
 
                 // Live alias tracking for operand rewriting during rendering.
