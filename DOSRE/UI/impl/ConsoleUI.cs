@@ -173,37 +173,55 @@ namespace DOSRE.UI.impl
             {
                 //Command Line Values
 
+                static string NormalizeOpt(string arg)
+                {
+                    if (string.IsNullOrWhiteSpace(arg))
+                        return string.Empty;
+
+                    var a = arg.Trim();
+
+                    // Support common switch prefixes: -foo, --foo, /foo
+                    while (a.Length > 0 && (a[0] == '-' || a[0] == '/'))
+                        a = a.Substring(1);
+
+                    // Normalize separators: le-insights, le_insights => LEINSIGHTS
+                    a = a.Replace("-", string.Empty).Replace("_", string.Empty);
+
+                    return a.ToUpperInvariant();
+                }
+
                 for (var i = 0; i < _args.Length; i++)
                 {
-                    switch (_args[i].ToUpper())
+                    var opt = NormalizeOpt(_args[i]);
+                    switch (opt)
                     {
-                        case "-I":
+                        case "I":
                             _sInputFile = _args[i + 1];
                             i++;
                             break;
-                        case "-O":
+                        case "O":
                             _sOutputFile = _args[i + 1];
                             i++;
                             break;
-                        case "-MINIMAL":
+                        case "MINIMAL":
                             _bMinimal = true;
                             break;
-                        case "-ANALYSIS":
+                        case "ANALYSIS":
                             _bAnalysis = true;
                             break;
-                        case "-STRINGS":
+                        case "STRINGS":
                             _bStrings = true;
                             break;
-                        case "-DOSVER":
+                        case "DOSVER":
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -DOSVER requires a value (example: 6.22)");
                             _dosVersion = _args[i + 1];
                             i++;
                             break;
-                        case "-LEFULL":
+                        case "LEFULL":
                             _bLeFull = true;
                             break;
-                        case "-LEBYTES":
+                        case "LEBYTES":
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -LEBYTES requires a value");
                             if (!int.TryParse(_args[i + 1], out var bytesLimit) || bytesLimit <= 0)
@@ -211,16 +229,16 @@ namespace DOSRE.UI.impl
                             _leBytesLimit = bytesLimit;
                             i++;
                             break;
-                        case "-LEFIXUPS":
+                        case "LEFIXUPS":
                             _bLeFixups = true;
                             break;
-                        case "-LEGLOBALS":
+                        case "LEGLOBALS":
                             _bLeGlobals = true;
                             break;
-                        case "-LEINSIGHTS":
+                        case "LEINSIGHTS":
                             _bLeInsights = true;
                             break;
-                        case "-LEFIXDUMP":
+                        case "LEFIXDUMP":
                             _bLeFixDump = true;
                             if (i + 1 < _args.Length && int.TryParse(_args[i + 1], out var maxPages) && maxPages > 0)
                             {
@@ -228,10 +246,10 @@ namespace DOSRE.UI.impl
                                 i++;
                             }
                             break;
-                        case "-MZFULL":
+                        case "MZFULL":
                             _bMzFull = true;
                             break;
-                        case "-MZBYTES":
+                        case "MZBYTES":
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -MZBYTES requires a value");
                             if (!int.TryParse(_args[i + 1], out var mzBytesLimit) || mzBytesLimit <= 0)
@@ -239,20 +257,20 @@ namespace DOSRE.UI.impl
                             _mzBytesLimit = mzBytesLimit;
                             i++;
                             break;
-                        case "-MZINSIGHTS":
+                        case "MZINSIGHTS":
                             _bMzInsights = true;
                             break;
-                        case "-BORLAND":
+                        case "BORLAND":
                             if (_toolchainHint != EnumToolchainHint.None && _toolchainHint != EnumToolchainHint.Borland)
                                 throw new Exception("Error: -BORLAND and -WATCOM are mutually exclusive");
                             _toolchainHint = EnumToolchainHint.Borland;
                             break;
-                        case "-WATCOM":
+                        case "WATCOM":
                             if (_toolchainHint != EnumToolchainHint.None && _toolchainHint != EnumToolchainHint.Watcom)
                                 throw new Exception("Error: -BORLAND and -WATCOM are mutually exclusive");
                             _toolchainHint = EnumToolchainHint.Watcom;
                             break;
-                        case "-INTSKELETON":
+                        case "INTSKELETON":
                             // Generate an editable JSON skeleton from dosre.unknown-ints.txt.
                             // Usage:
                             //   -intskeleton <out.json>
@@ -281,7 +299,7 @@ namespace DOSRE.UI.impl
                             UnknownInterruptSkeletonGenerator.Generate(inPath, outPath);
                             _logger.Info($"Wrote interrupt skeleton to {outPath}");
                             return;
-                        case "-SPLITKB":
+                        case "SPLITKB":
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -SPLITKB requires a value");
                             if (!int.TryParse(_args[i + 1], out var splitKb) || splitKb <= 0)
@@ -289,14 +307,12 @@ namespace DOSRE.UI.impl
                             _splitKb = splitKb;
                             i++;
                             break;
-                        case "-MACROS":
+                        case "MACROS":
                             _bMacros = true;
                             break;
-                        case "-?":
-                        case "-H":
-                        case "-HELP":
-                        case "--HELP":
-                        case "/?":
+                        case "?":
+                        case "H":
+                        case "HELP":
                             Console.WriteLine("-I <file> -- Input File to DisassembleSegment");
                             Console.WriteLine("-O <file> -- Output File for Disassembly (Default ConsoleUI)");
                             Console.WriteLine("-MINIMAL -- Minimal Disassembler Output");
