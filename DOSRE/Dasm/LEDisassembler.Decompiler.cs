@@ -44,7 +44,14 @@ namespace DOSRE.Dasm
                 return false;
             }
 
-            output = PseudoCFromLeAsm(asm);
+            var (ok, outText, errText) = PseudoCFromLeAsm(asm);
+            if (!ok)
+            {
+                error = errText;
+                return false;
+            }
+
+            output = outText;
             return true;
         }
 
@@ -64,7 +71,14 @@ namespace DOSRE.Dasm
             }
 
             var asm = File.ReadAllText(asmFile);
-            output = PseudoCFromLeAsm(asm, onlyFunction);
+            var (ok, outText, errText) = PseudoCFromLeAsm(asm, onlyFunction, strictOnlyFunction: !string.IsNullOrWhiteSpace(onlyFunction));
+            if (!ok)
+            {
+                error = errText;
+                return false;
+            }
+
+            output = outText;
             return true;
         }
 
@@ -83,20 +97,31 @@ namespace DOSRE.Dasm
                 return false;
             }
 
-            output = PseudoCFromLeAsm(asm, onlyFunction);
+            var (ok, outText, errText) = PseudoCFromLeAsm(asm, onlyFunction, strictOnlyFunction: !string.IsNullOrWhiteSpace(onlyFunction));
+            if (!ok)
+            {
+                error = errText;
+                return false;
+            }
+
+            output = outText;
             return true;
         }
 
-        private static string PseudoCFromLeAsm(string asm, string onlyFunction = null)
+        private static (bool ok, string output, string error) PseudoCFromLeAsm(string asm, string onlyFunction = null, bool strictOnlyFunction = false)
         {
             if (string.IsNullOrWhiteSpace(asm))
-                return string.Empty;
+                return (true, string.Empty, string.Empty);
 
             var lines = asm.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
 
             if (!string.IsNullOrWhiteSpace(onlyFunction))
             {
-                lines = TrySliceToSingleFunction(lines, onlyFunction);
+                var (sliceOk, sliced, sliceErr) = TrySliceToSingleFunction(lines, onlyFunction);
+                if (!sliceOk && strictOnlyFunction)
+                    return (false, string.Empty, sliceErr);
+
+                lines = sliced;
             }
 
             var labelByAddr = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -371,13 +396,13 @@ namespace DOSRE.Dasm
                 sb.AppendLine();
             }
 
-            return sb.ToString();
+            return (true, sb.ToString(), string.Empty);
         }
 
-        private static string[] TrySliceToSingleFunction(string[] lines, string onlyFunction)
+        private static (bool ok, string[] lines, string error) TrySliceToSingleFunction(string[] lines, string onlyFunction)
         {
             if (lines == null || lines.Length == 0)
-                return lines;
+                return (true, lines, string.Empty);
 
             var needle = onlyFunction.Trim();
             if (needle.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
@@ -405,7 +430,25 @@ namespace DOSRE.Dasm
             }
 
             if (start < 0)
-                return lines;
+            {
+                var available = new List<string>();
+                for (var i = 0; i < lines.Length; i++)
+                {
+                    var t = lines[i].Trim();
+                    var m = Regex.Match(t, @"^func_[0-9A-Fa-f]{8}:\s*$");
+                    if (m.Success)
+                    {
+                        available.Add(t.TrimEnd(':'));
+                        if (available.Count >= 15)
+                            break;
+                    }
+                }
+
+                var msg = $"Requested function '{needle}' not found in asm input.";
+                if (available.Count > 0)
+                    msg += " Available (first 15): " + string.Join(", ", available);
+                return (false, lines, msg);
+            }
 
             var end = lines.Length;
             for (var i = start + 1; i < lines.Length; i++)
@@ -418,9 +461,8 @@ namespace DOSRE.Dasm
                 }
             }
 
-            // Also keep a little prelude so label collection has a chance to see targets.
-            var preludeStart = Math.Max(0, start - 50);
-            return lines.Skip(preludeStart).Take(end - preludeStart).ToArray();
+            // Slice exactly to the function for speed.
+            return (true, lines.Skip(start).Take(end - start).ToArray(), string.Empty);
         }
 
         private static HashSet<string> CollectRegistersUsed(ParsedFunction fn)

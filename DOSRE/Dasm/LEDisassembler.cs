@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -3234,8 +3235,13 @@ namespace DOSRE.Dasm
                    !s.StartsWith("jmp", StringComparison.OrdinalIgnoreCase);
         }
 
-        private static Dictionary<uint, FunctionSummary> SummarizeFunctions(List<Instruction> instructions, HashSet<uint> functionStarts, HashSet<uint> blockStarts, List<LEFixup> sortedFixups,
-            Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols)
+        private static Dictionary<uint, FunctionSummary> SummarizeFunctions(
+            List<Instruction> instructions,
+            HashSet<uint> functionStarts,
+            HashSet<uint> blockStarts,
+            Dictionary<uint, List<LEFixup>> fixupsByInsAddr,
+            Dictionary<uint, string> globalSymbols,
+            Dictionary<uint, string> stringSymbols)
         {
             var summaries = new Dictionary<uint, FunctionSummary>();
             if (instructions == null || instructions.Count == 0 || functionStarts == null || functionStarts.Count == 0)
@@ -3243,7 +3249,24 @@ namespace DOSRE.Dasm
 
             // Sort function starts by address and use next start as boundary.
             var starts = functionStarts.OrderBy(x => x).ToList();
-            var insByAddr = instructions.ToDictionary(i => (uint)i.Offset, i => i);
+
+            // Precompute instruction start addresses for binary search.
+            var insStarts = new uint[instructions.Count];
+            for (var i = 0; i < instructions.Count; i++)
+                insStarts[i] = (uint)instructions[i].Offset;
+
+            // Optional: speed up block counts.
+            uint[] sortedBlocks = null;
+            if (blockStarts != null && blockStarts.Count > 0)
+                sortedBlocks = blockStarts.OrderBy(x => x).ToArray();
+
+            static int LowerBound(uint[] arr, uint value)
+            {
+                if (arr == null || arr.Length == 0)
+                    return 0;
+                var idx = Array.BinarySearch(arr, value);
+                return idx < 0 ? ~idx : idx;
+            }
 
             for (var si = 0; si < starts.Count; si++)
             {
@@ -3253,8 +3276,17 @@ namespace DOSRE.Dasm
                 var summary = new FunctionSummary { Start = start };
                 summaries[start] = summary;
 
-                // Walk linear instruction list from first instruction >= start until end.
-                for (var ii = 0; ii < instructions.Count; ii++)
+                // Walk the instruction slice [start, end).
+                var startIdx = LowerBound(insStarts, start);
+                var endIdx = end == uint.MaxValue ? instructions.Count : LowerBound(insStarts, end);
+                if (startIdx < 0)
+                    startIdx = 0;
+                if (endIdx > instructions.Count)
+                    endIdx = instructions.Count;
+                if (startIdx > endIdx)
+                    (startIdx, endIdx) = (endIdx, startIdx);
+
+                for (var ii = startIdx; ii < endIdx; ii++)
                 {
                     var ins = instructions[ii];
                     var addr = (uint)ins.Offset;
@@ -3268,18 +3300,10 @@ namespace DOSRE.Dasm
                     if (TryGetRelativeBranchTarget(ins, out var target, out var isCall) && isCall)
                         summary.Calls.Add(target);
 
-                    if (sortedFixups != null)
+                    if (fixupsByInsAddr != null && fixupsByInsAddr.TryGetValue(addr, out var fx) && fx != null && fx.Count > 0)
                     {
-                        // Very cheap: look for fixups that land within this instruction.
-                        // (We don't want to advance a shared index here.)
-                        var insStart = addr;
-                        var insEnd = addr + (uint)ins.Length;
-                        foreach (var f in sortedFixups)
+                        foreach (var f in fx)
                         {
-                            if (f.SiteLinear < insStart)
-                                continue;
-                            if (f.SiteLinear >= insEnd)
-                                break;
                             if (!f.Value32.HasValue)
                                 continue;
 
@@ -3291,8 +3315,12 @@ namespace DOSRE.Dasm
                     }
                 }
 
-                if (blockStarts != null && blockStarts.Count > 0)
-                    summary.BlockCount = blockStarts.Count(a => a >= start && a < end);
+                if (sortedBlocks != null && sortedBlocks.Length > 0)
+                {
+                    var b0 = LowerBound(sortedBlocks, start);
+                    var b1 = end == uint.MaxValue ? sortedBlocks.Length : LowerBound(sortedBlocks, end);
+                    summary.BlockCount = Math.Max(0, b1 - b0);
+                }
             }
 
             return summaries;
@@ -4974,6 +5002,8 @@ namespace DOSRE.Dasm
             output = string.Empty;
             error = string.Empty;
 
+            var swTotal = Stopwatch.StartNew();
+
             if (!File.Exists(inputFile))
             {
                 error = "Input file not found";
@@ -5055,15 +5085,22 @@ namespace DOSRE.Dasm
             sb.AppendLine(";");
 
             // Reconstruct all object bytes once so we can scan data objects (strings) and map xrefs.
+            var swObjRebuild = Stopwatch.StartNew();
+            _logger.Info("LE: Reconstructing object bytes...");
             var objBytesByIndex = new Dictionary<int, byte[]>();
+            long objBytesTotal = 0;
             foreach (var o in objects)
             {
                 if (o.VirtualSize == 0 || o.PageCount == 0)
                     continue;
                 var bytes = ReconstructObjectBytes(fileBytes, header, pageMap, dataPagesBase, o);
                 if (bytes != null && bytes.Length > 0)
+                {
                     objBytesByIndex[o.Index] = bytes;
+                    objBytesTotal += bytes.Length;
+                }
             }
+            _logger.Info($"LE: Reconstructed {objBytesByIndex.Count}/{objects.Count} objects ({objBytesTotal} bytes) in {swObjRebuild.ElapsedMilliseconds} ms");
 
             // String symbol table (linear address -> symbol)
             Dictionary<uint, string> stringSymbols = null;
@@ -5075,7 +5112,10 @@ namespace DOSRE.Dasm
             Dictionary<uint, string> dispatchTableSymbols = null;
             if (leInsights)
             {
+                var swStrings = Stopwatch.StartNew();
+                _logger.Info("LE: Scanning strings (insights)...");
                 ScanStrings(objects, objBytesByIndex, out stringSymbols, out stringPreview);
+                _logger.Info($"LE: String scan complete: {stringSymbols?.Count ?? 0} strings in {swStrings.ElapsedMilliseconds} ms");
                 resourceSymbols = new Dictionary<uint, string>();
                 vtblSymbols = new Dictionary<uint, string>();
                 vtblSlots = new Dictionary<uint, Dictionary<uint, uint>>();
@@ -5151,6 +5191,10 @@ namespace DOSRE.Dasm
                     continue;
                 }
 
+                _logger.Info($"LE: Disassembling object {obj.Index}/{objects.Count} (base=0x{obj.BaseAddress:X8} pages={obj.PageCount} vsize=0x{obj.VirtualSize:X})");
+
+                var swObjTotal = Stopwatch.StartNew();
+
                 var codeLen = maxLen - startOffsetWithinObject;
                 if (!leFull && leBytesLimit.HasValue)
                     codeLen = Math.Min(codeLen, leBytesLimit.Value);
@@ -5185,13 +5229,19 @@ namespace DOSRE.Dasm
                 }
 
                 // First pass: disassemble and collect basic xrefs and function/label targets.
+                var swDis = Stopwatch.StartNew();
                 var dis = new SharpDisasm.Disassembler(code, ArchitectureMode.x86_32, startLinear, true);
                 var instructions = dis.Disassemble().ToList();
+                swDis.Stop();
+                var objDecodeMs = swDis.ElapsedMilliseconds;
+                _logger.Info($"LE: Object {obj.Index} decoded {instructions.Count} instructions in {objDecodeMs} ms");
 
                 // Address->instruction index for fast lookups.
                 var insIndexByAddr = new Dictionary<uint, int>(instructions.Count);
                 for (var ii = 0; ii < instructions.Count; ii++)
                     insIndexByAddr[(uint)instructions[ii].Offset] = ii;
+
+                var swObjInsights = leInsights ? Stopwatch.StartNew() : null;
 
                 var functionStarts = new HashSet<uint>();
                 var labelTargets = new HashSet<uint>();
@@ -5325,7 +5375,10 @@ namespace DOSRE.Dasm
                 Dictionary<uint, FunctionSummary> funcSummaries = null;
                 if (leInsights)
                 {
-                    funcSummaries = SummarizeFunctions(instructions, functionStarts, blockStarts, sortedFixups, globalSymbols, stringSymbols);
+                    var swSumm = Stopwatch.StartNew();
+                    _logger.Info($"LE: Summarizing {functionStarts.Count} functions (insights)...");
+                    funcSummaries = SummarizeFunctions(instructions, functionStarts, blockStarts, fixupsByInsAddr, globalSymbols, stringSymbols);
+                    _logger.Info($"LE: Function summaries complete in {swSumm.ElapsedMilliseconds} ms");
                 }
 
                 // Infer common pointer globals (absolute addresses frequently loaded into a register and used as a base).
@@ -5344,6 +5397,8 @@ namespace DOSRE.Dasm
                     var sortedStarts = functionStarts.OrderBy(x => x).ToList();
                     for (var si = 0; si < sortedStarts.Count; si++)
                     {
+                        if ((si % 250) == 0 && si > 0)
+                            _logger.Info($"LE: Field summaries... {si}/{sortedStarts.Count}");
                         var startAddr = sortedStarts[si];
                         if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
                             continue;
@@ -5369,6 +5424,8 @@ namespace DOSRE.Dasm
                     var sortedStarts = functionStarts.OrderBy(x => x).ToList();
                     for (var si = 0; si < sortedStarts.Count; si++)
                     {
+                        if ((si % 500) == 0 && si > 0)
+                            _logger.Info($"LE: FPU summaries... {si}/{sortedStarts.Count}");
                         var startAddr = sortedStarts[si];
                         if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
                             continue;
@@ -5392,6 +5449,8 @@ namespace DOSRE.Dasm
                     var sortedStarts = functionStarts.OrderBy(x => x).ToList();
                     for (var si = 0; si < sortedStarts.Count; si++)
                     {
+                        if ((si % 500) == 0 && si > 0)
+                            _logger.Info($"LE: IO summaries... {si}/{sortedStarts.Count}");
                         var startAddr = sortedStarts[si];
                         if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
                             continue;
@@ -5415,6 +5474,8 @@ namespace DOSRE.Dasm
                     var sortedStarts = functionStarts.OrderBy(x => x).ToList();
                     for (var si = 0; si < sortedStarts.Count; si++)
                     {
+                        if ((si % 500) == 0 && si > 0)
+                            _logger.Info($"LE: Flag summaries... {si}/{sortedStarts.Count}");
                         var startAddr = sortedStarts[si];
                         if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
                             continue;
@@ -5457,6 +5518,8 @@ namespace DOSRE.Dasm
                     var sortedStarts = functionStarts.OrderBy(x => x).ToList();
                     for (var si = 0; si < sortedStarts.Count; si++)
                     {
+                        if ((si % 250) == 0 && si > 0)
+                            _logger.Info($"LE: Proto/loop/alias hints... {si}/{sortedStarts.Count}");
                         var startAddr = sortedStarts[si];
                         if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
                             continue;
@@ -5625,6 +5688,16 @@ namespace DOSRE.Dasm
                 // Per-function local aliasing (best-effort). Keys are like "local_1C".
                 var localAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
+                if (swObjInsights != null)
+                {
+                    swObjInsights.Stop();
+                    _logger.Info($"LE: Object {obj.Index} insights complete in {swObjInsights.ElapsedMilliseconds} ms");
+                }
+
+                _logger.Info($"LE: Rendering object {obj.Index} ({instructions.Count} instructions)...");
+
+                var swObjRender = Stopwatch.StartNew();
+
                 uint currentFunctionStart = 0;
 
                 ushort? lastDxImm16 = null;
@@ -5639,6 +5712,9 @@ namespace DOSRE.Dasm
 
                 for (var insLoopIndex = 0; insLoopIndex < instructions.Count; insLoopIndex++)
                 {
+                    if (leInsights && (insLoopIndex % 50000) == 0 && insLoopIndex > 0)
+                        _logger.Info($"LE: Rendering object {obj.Index}... {insLoopIndex}/{instructions.Count} ins");
+
                     var ins = instructions[insLoopIndex];
                     var addr = (uint)ins.Offset;
 
@@ -6099,6 +6175,11 @@ namespace DOSRE.Dasm
                         sb.AppendLine($";   (xref table truncated: {symXrefs.Count} symbols)");
                 }
 
+                swObjRender.Stop();
+                swObjTotal.Stop();
+                _logger.Info(
+                    $"LE: Object {obj.Index} timings: decode={objDecodeMs} ms, insights={(swObjInsights?.ElapsedMilliseconds ?? 0)} ms, render={swObjRender.ElapsedMilliseconds} ms, total={swObjTotal.ElapsedMilliseconds} ms");
+
                 sb.AppendLine();
             }
 
@@ -6171,6 +6252,7 @@ namespace DOSRE.Dasm
             }
 
             output = sb.ToString();
+            _logger.Info($"LE: Disassembly complete in {swTotal.ElapsedMilliseconds} ms");
             return true;
         }
 
