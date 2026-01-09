@@ -3850,6 +3850,9 @@ namespace DOSRE.Dasm
             if (t.Equals("stc", StringComparison.OrdinalIgnoreCase))
                 return "FLAGS: CF=1 (failure?)";
 
+            if (t.Equals("pop esp", StringComparison.OrdinalIgnoreCase))
+                return "NOTE: pop esp (stack pivot / unusual; may indicate misdecode)";
+
             // Flag-bit tests like: test dword [0xBAB6C], 0x4
             var m = Regex.Match(t, @"^test\s+(?:byte|word|dword)\s+\[(?<abs>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\]\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?|\d+)\s*$", RegexOptions.IgnoreCase);
             if (m.Success)
@@ -5962,6 +5965,26 @@ namespace DOSRE.Dasm
 
                     if (leInsights)
                     {
+                        var stHint = TryAnnotateStackAlloc(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(stHint))
+                            insText += $" ; {stHint}";
+
+                        var qHint = TryAnnotateScale8TableLoad(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(qHint))
+                            insText += $" ; {qHint}";
+
+                        var u16Hint = TryAnnotateUnalignedU16LoadViaShr(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(u16Hint))
+                            insText += $" ; {u16Hint}";
+
+                        var mod4Hint = TryAnnotateIncAndMod4(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(mod4Hint))
+                            insText += $" ; {mod4Hint}";
+
+                        var ptr8Hint = TryAnnotateScale8PtrAdd(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(ptr8Hint))
+                            insText += $" ; {ptr8Hint}";
+
                         var arHint = TryAnnotateArithmeticIdioms(instructions, insLoopIndex);
                         if (!string.IsNullOrEmpty(arHint))
                             insText += $" ; {arHint}";

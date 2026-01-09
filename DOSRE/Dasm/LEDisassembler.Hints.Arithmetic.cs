@@ -12,7 +12,18 @@ namespace DOSRE.Dasm
             if (instructions == null || idx < 0 || idx >= instructions.Count)
                 return string.Empty;
 
-            if (TryAnnotateMulByConstShort(instructions, idx, out var hint))
+            string hint;
+
+            if (TryAnnotateMovEaxFromAbsScaled4(instructions, idx, out hint))
+                return hint;
+            if (TryAnnotateShift16Add8000FlatPtr(instructions, idx, out hint))
+                return hint;
+
+            if (TryAnnotateImulImplicitEax64(instructions, idx, out hint))
+                return hint;
+            if (TryAnnotateFixedPointDivShift16(instructions, idx, out hint))
+                return hint;
+            if (TryAnnotateMulByConstShort(instructions, idx, out hint))
                 return hint;
             if (TryAnnotateMulByConst171(instructions, idx, out hint))
                 return hint;
@@ -22,6 +33,102 @@ namespace DOSRE.Dasm
                 return hint;
 
             return string.Empty;
+        }
+
+        private static bool TryAnnotateMovEaxFromAbsScaled4(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return false;
+
+            // Pattern: mov eax, [eax*4+0xF00D]
+            // Interpretable as a 32-bit lookup table indexed by eax.
+            var cur = instructions[idx].ToString().Trim();
+            var m = Regex.Match(cur, @"^mov\s+eax\s*,\s*\[eax\*4\+(?<abs>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?)\]\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            var tok = m.Groups["abs"].Value.Trim().TrimEnd('h', 'H');
+            if (!TryParseHexOrDecUInt32(tok, out var abs))
+                return false;
+
+            hint = $"HINT: eax = table32[ eax ] @0x{abs:X}";
+            return true;
+        }
+
+        private static bool TryAnnotateShift16Add8000FlatPtr(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 1 || idx >= instructions.Count)
+                return false;
+
+            // Common DOS4GW LE idiom:
+            //   shl reg, 0x10
+            //   add reg, 0x8000
+            // Interpretable as building a flat pointer from a 16:16-ish value.
+            var cur = instructions[idx].ToString().Trim();
+            var mAdd = Regex.Match(cur, @"^add\s+(?<reg>e[a-z]{2})\s*,\s*(?:0x)?8000\s*$", RegexOptions.IgnoreCase);
+            if (!mAdd.Success)
+                return false;
+
+            var reg = mAdd.Groups["reg"].Value.ToLowerInvariant();
+
+            var prev = instructions[idx - 1].ToString().Trim();
+            if (!Regex.IsMatch(prev, $@"^(shl|sal)\s+{Regex.Escape(reg)}\s*,\s*(?:0x)?10\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            hint = $"HINT: build flat ptr: ({reg}<<16)+0x8000";
+            return true;
+        }
+
+        private static bool TryAnnotateImulImplicitEax64(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return false;
+
+            // One-operand IMUL form (implicit EAX):
+            //   imul r/m32
+            // Semantics: EDX:EAX = EAX * r/m32 (signed 64-bit result)
+            var cur = instructions[idx].ToString().Trim();
+            var m = Regex.Match(cur, @"^imul\s+(?<op>(?:dword\s+)?\[[^\]]+\]|e[a-z]{2})\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return false;
+
+            var op = m.Groups["op"].Value.Trim();
+            hint = $"HINT: edx:eax = eax * {op} (signed 64-bit)";
+            return true;
+        }
+
+        private static bool TryAnnotateFixedPointDivShift16(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 3 || idx >= instructions.Count)
+                return false;
+
+            // Pattern:
+            //   shl edx, 0x10
+            //   mov eax, edx
+            //   sar edx, 0x1f
+            //   idiv ecx
+            // Semantics: EAX ~= (value<<16) / ECX (signed), common 16.16 fixed-point ratio.
+            var i0 = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(i0, @"^idiv\s+ecx\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i1 = instructions[idx - 1].ToString().Trim();
+            var i2 = instructions[idx - 2].ToString().Trim();
+            var i3 = instructions[idx - 3].ToString().Trim();
+
+            if (!Regex.IsMatch(i1, @"^sar\s+edx\s*,\s*(?:0x)?1f\s*$", RegexOptions.IgnoreCase))
+                return false;
+            if (!Regex.IsMatch(i2, @"^mov\s+eax\s*,\s*edx\s*$", RegexOptions.IgnoreCase))
+                return false;
+            if (!Regex.IsMatch(i3, @"^(shl|sal)\s+edx\s*,\s*(?:0x)?10\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            hint = "HINT: fixed-point div: eax = (value<<16)/ecx (16.16); edx=rem";
+            return true;
         }
 
         private static bool TryParseMovClFromIndexByte(string insText, out string indexReg, out int scale, out uint disp)
@@ -149,8 +256,27 @@ namespace DOSRE.Dasm
             if (instructions == null || idx < 0 || idx >= instructions.Count)
                 return string.Empty;
 
-            static bool IsAddEaxEax(string t)
-                => t != null && t.Trim().Equals("add [eax], eax", StringComparison.OrdinalIgnoreCase);
+            static bool IsLikelyEaxMemNoise(string t)
+            {
+                if (string.IsNullOrWhiteSpace(t))
+                    return false;
+
+                var s = t.Trim().ToLowerInvariant();
+
+                // Common "all zeros" / low-entropy patterns when decoding data as code.
+                if (s == "add [eax], al" || s == "add [eax], eax")
+                    return true;
+                if (s == "or [eax], al" || s == "and [eax], al" || s == "sub [eax], al" || s == "adc [eax], al" || s == "sbb [eax], al")
+                    return true;
+                if (s == "or [eax], cl" || s == "and [eax], cl" || s == "adc [eax], cl" || s == "sbb [eax], cl")
+                    return true;
+
+                // Generalize a bit (still quite strict): ops on [eax] with a byte reg.
+                if (Regex.IsMatch(s, @"^(add|or|and|sub|adc|sbb|cmp|test|xor)\s+\[eax\],\s*(al|cl|dl|bl|ah|ch|dh|bh)\s*$", RegexOptions.IgnoreCase))
+                    return true;
+
+                return false;
+            }
 
             static bool IsWeirdPrivOrSeg(string t)
             {
@@ -174,22 +300,24 @@ namespace DOSRE.Dasm
             const int window = 48;
             var lo = Math.Max(0, idx - window);
             var hi = Math.Min(instructions.Count - 1, idx + window);
-            var add0100 = 0;
+            var noise = 0;
             var weird = 0;
 
             for (var i = lo; i <= hi; i++)
             {
                 var t = instructions[i].ToString();
-                if (IsAddEaxEax(t)) add0100++;
+                if (IsLikelyEaxMemNoise(t)) noise++;
                 if (IsWeirdPrivOrSeg(t)) weird++;
             }
 
-            if (add0100 < 8 && (add0100 < 5 || weird < 3))
+            // Trigger if we see a lot of low-entropy [eax],reg8 noise, or lots of privileged/segment-ish ops.
+            // This catches common data regions that disassemble into "add/or/and [eax], xx" plus rare ops.
+            if (!(noise >= 8 || (noise >= 5 && weird >= 2) || weird >= 6))
                 return string.Empty;
 
             var cur = instructions[idx].ToString();
-            if (IsAddEaxEax(cur))
-                return "NOTE: suspicious decode (repeated 0x0100 pattern) — likely data, not code";
+            if (IsLikelyEaxMemNoise(cur))
+                return "NOTE: suspicious decode (low-entropy [eax] ops) — likely data, not code";
 
             if (IsWeirdPrivOrSeg(cur))
                 return "NOTE: suspicious decode (rare/privileged op) — likely data, not code";

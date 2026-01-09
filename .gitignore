@@ -333,3 +333,4 @@ EUROBLST.entry-insights14.full.disasm.txt
 *.txt
 *.disasm
 *.pre_split
+tools/comment_sparse_runs.py
