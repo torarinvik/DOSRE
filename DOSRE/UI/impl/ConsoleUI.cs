@@ -23,6 +23,14 @@ namespace DOSRE.UI.impl
         /// <summary>
 
     /// <summary>
+    ///     Optional: cache the intermediate LE .asm (next to -O) and reuse it on subsequent runs.
+    ///     Enabled with -LEDECOMPCACHEASM.
+    /// </summary>
+    private bool _bLeDecompCacheAsm;
+
+        /// <summary>
+
+    /// <summary>
     ///     Optional: decompile from an already generated .asm file (skips LE disassembly)
     /// </summary>
     private string _leDecompileAsmFile;
@@ -305,6 +313,10 @@ namespace DOSRE.UI.impl
                             _leDecompileAsmFile = _args[i + 1];
                             i++;
                             break;
+                        case "LEDECOMPCACHEASM":
+                            _bLeDecompile = true;
+                            _bLeDecompCacheAsm = true;
+                            break;
                         case "LEFUNC":
                         case "LEONLYFUNC":
                             if (i + 1 >= _args.Length)
@@ -416,6 +428,8 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LEDECOMPASM <file.asm> -- Decompile from an existing LE .asm output (fast iteration; skips LE disassembly)");
                             Console.WriteLine(
+                                "-LEDECOMPCACHEASM -- (LE inputs) Cache rendered LE .asm next to -O and reuse it on future -LEDECOMP runs (much faster after first run; requires -O)");
+                            Console.WriteLine(
                                 "-LEFUNC <func_XXXXXXXX|XXXXXXXX|0xXXXXXXXX> -- Only emit a single function (useful with -LEDECOMPASM)");
                             Console.WriteLine(
                                 "-LEFIXDUMP [maxPages] -- (LE inputs) Dump raw fixup pages + decoding hints (writes <out>.fixups.txt if -O is used)");
@@ -453,6 +467,9 @@ namespace DOSRE.UI.impl
                         throw new Exception("Error: Please specify a valid input file");
                 }
 
+                if (_bLeDecompCacheAsm && string.IsNullOrWhiteSpace(_sOutputFile))
+                    throw new Exception("Error: -LEDECOMPCACHEASM requires -O <out> so the cache .asm path can be derived");
+
                 // Apply DOS version selection globally for interrupt DB lookups.
                 DosInterruptDatabase.SetCurrentDosVersionGlobal(_dosVersion);
 
@@ -468,6 +485,51 @@ namespace DOSRE.UI.impl
                 if (_bLeDecompile && !string.IsNullOrWhiteSpace(_leDecompileAsmFile))
                 {
                     leOk = LEDisassembler.TryDecompileAsmFileToString(_leDecompileAsmFile, _leOnlyFunction, out leOutput, out leError);
+                }
+                else if (_bLeDecompile && _bLeDecompCacheAsm)
+                {
+                    var cacheAsmPath = Path.ChangeExtension(_sOutputFile, ".asm");
+                    var cacheDir = Path.GetDirectoryName(cacheAsmPath);
+                    if (!string.IsNullOrWhiteSpace(cacheDir))
+                        Directory.CreateDirectory(cacheDir);
+
+                    if (File.Exists(cacheAsmPath))
+                    {
+                        _logger.Info($"LE decompile: using cached asm {cacheAsmPath}");
+                        leOk = LEDisassembler.TryDecompileAsmFileToString(cacheAsmPath, _leOnlyFunction, out leOutput, out leError);
+                    }
+                    else
+                    {
+                        if (_leRenderLimit.HasValue)
+                            _logger.Warn("Warning: -LERENDERLIMIT is ignored for -LEDECOMPCACHEASM (needs full rendered .asm)");
+
+                        _logger.Info($"LE decompile: generating asm cache {cacheAsmPath} (first run)");
+
+                        // We need a fully rendered .asm to feed the pseudo-C parser.
+                        var asmOk = LEDisassembler.TryDisassembleToString(
+                            _sInputFile,
+                            _bLeFull,
+                            _leBytesLimit,
+                            leRenderLimit: null,
+                            leJobs: _leJobs,
+                            leFixups: _bLeFixups,
+                            leGlobals: _bLeGlobals,
+                            leInsights: true,
+                            _toolchainHint,
+                            out var asm,
+                            out leError);
+
+                        if (!asmOk)
+                        {
+                            leOk = false;
+                            leOutput = string.Empty;
+                        }
+                        else
+                        {
+                            File.WriteAllText(cacheAsmPath, asm);
+                            leOk = LEDisassembler.TryDecompileAsmToString(asm, _leOnlyFunction, out leOutput, out leError);
+                        }
+                    }
                 }
                 else
                 {

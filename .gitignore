@@ -337,3 +337,5 @@ tools/comment_sparse_runs.py
 EXES/disasm_le/FIDEMO.le.pseudo.c
 .playwright-mcp/memory.md
 EXES/disasm_le/FIDEMO.func_000100DC.pseudo.c
+.vscode/tasks.json
+*.c
