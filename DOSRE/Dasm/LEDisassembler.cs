@@ -5,6 +5,8 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using DOSRE.Analysis;
 using DOSRE.Enums;
 using DOSRE.Logging;
@@ -27,6 +29,31 @@ namespace DOSRE.Dasm
     public static partial class LEDisassembler
     {
         private static readonly Logger _logger = LogManager.GetCurrentClassLogger(typeof(CustomLogger));
+
+        // SharpDisasm's default Instruction.ToString() path uses shared translator state.
+        // For parallel insights passes, use a per-thread translator instance.
+        private static readonly ThreadLocal<SharpDisasm.Translators.Translator> _tlsIntelTranslator =
+            new ThreadLocal<SharpDisasm.Translators.Translator>(() => new SharpDisasm.Translators.IntelTranslator());
+
+        private static string InsText(Instruction ins)
+        {
+            if (ins == null)
+                return string.Empty;
+
+            try
+            {
+                var tr = _tlsIntelTranslator.Value;
+                if (tr != null)
+                    return tr.Translate(ins) ?? string.Empty;
+            }
+            catch
+            {
+                // Fallback for any unexpected translator failure.
+            }
+
+            // Avoid Instruction.ToString() here (not thread-safe under parallel insights).
+            return string.Empty;
+        }
 
         private const ushort LE_OBJECT_ENTRY_SIZE = 24;
 
@@ -611,7 +638,7 @@ namespace DOSRE.Dasm
                 }
                 for (var j = idx - 1; j >= lo; j--)
                 {
-                    var t = insList[j].ToString().Trim();
+                    var t = InsText(insList[j]).Trim();
                     if (t.Length == 0)
                         continue;
 
@@ -847,7 +874,7 @@ namespace DOSRE.Dasm
 
             for (var i = startIdx; i < endIdxExclusive; i++)
             {
-                var insText = instructions[i].ToString().Trim();
+                var insText = InsText(instructions[i]).Trim();
 
                 // Update aliases first so we model dataflow forward.
                 UpdatePointerAliases(insText, aliases, ptrSymbols);
@@ -1217,7 +1244,7 @@ namespace DOSRE.Dasm
 
             for (var i = startIdx; i < endIdx; i++)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (string.IsNullOrEmpty(t))
                     continue;
 
@@ -1282,7 +1309,7 @@ namespace DOSRE.Dasm
 
             for (var i = startIdx; i < cliSearchLimit; i++)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (t.Equals("cli", StringComparison.OrdinalIgnoreCase))
                 {
                     cliIdx = i;
@@ -1296,7 +1323,7 @@ namespace DOSRE.Dasm
             var stiSearchLimit = Math.Min(instructions.Count, cliIdx + 256);
             for (var i = cliIdx + 1; i < stiSearchLimit; i++)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (t.Equals("sti", StringComparison.OrdinalIgnoreCase))
                 {
                     stiIdx = i;
@@ -1312,7 +1339,7 @@ namespace DOSRE.Dasm
 
             for (var i = cliIdx + 1; i < stiIdx; i++)
             {
-                var t = instructions[i].ToString();
+                var t = InsText(instructions[i]);
                 if (TryParseMovDxImmediate(t, out var dxImm))
                     lastDxImm16 = dxImm;
 
@@ -1538,7 +1565,7 @@ namespace DOSRE.Dasm
                 var scanHeaderMax = Math.Min(headerStopIdx, headerIdx + 24);
                 for (var i = headerIdx; i < scanHeaderMax; i++)
                 {
-                    var cooked = RewriteStackFrameOperands(instructions[i].ToString()).Trim();
+                    var cooked = RewriteStackFrameOperands(InsText(instructions[i])).Trim();
                     var mCmpMem = Regex.Match(cooked, @"^cmp\s+(?:byte|word|dword)?\s*\[(?<var>local_[0-9A-Fa-f]+)\]\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$", RegexOptions.IgnoreCase);
                     var mCmpReg = Regex.Match(cooked, @"^cmp\s+(?<reg>e?(ax|bx|cx|dx|si|di|bp|sp))\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$", RegexOptions.IgnoreCase);
                     if (mCmpMem.Success)
@@ -1559,7 +1586,7 @@ namespace DOSRE.Dasm
                     // Look ahead for the branch that uses this cmp.
                     for (var j = i + 1; j < Math.Min(scanHeaderMax, i + 4); j++)
                     {
-                        var t = RewriteStackFrameOperands(instructions[j].ToString()).Trim();
+                        var t = RewriteStackFrameOperands(InsText(instructions[j])).Trim();
                         var sp = t.IndexOf(' ');
                         var mn = (sp > 0 ? t.Substring(0, sp) : t).Trim().ToLowerInvariant();
                         if (!mn.StartsWith("j", StringComparison.OrdinalIgnoreCase) || mn == "jmp")
@@ -1586,7 +1613,7 @@ namespace DOSRE.Dasm
                         var scanLatchMax = Math.Min(latchStopIdx, latchIdx + 20);
                         for (var i = latchIdx; i < scanLatchMax; i++)
                         {
-                            var cooked = RewriteStackFrameOperands(instructions[i].ToString()).Trim();
+                            var cooked = RewriteStackFrameOperands(InsText(instructions[i])).Trim();
 
                             if (cmpVar.StartsWith("local_", StringComparison.OrdinalIgnoreCase))
                             {
@@ -1673,7 +1700,7 @@ namespace DOSRE.Dasm
                         if (!insIndexByAddr.TryGetValue(latch, out var latchIdx))
                             continue;
 
-                        var latchText = RewriteStackFrameOperands(instructions[latchIdx].ToString()).Trim();
+                        var latchText = RewriteStackFrameOperands(InsText(instructions[latchIdx])).Trim();
                         var sp = latchText.IndexOf(' ');
                         var latchMn = (sp > 0 ? latchText.Substring(0, sp) : latchText).Trim().ToLowerInvariant();
 
@@ -1718,7 +1745,7 @@ namespace DOSRE.Dasm
                                 // Find the closest cmp in a small window before the latch.
                                 for (var k = Math.Max(startIdx, latchIdx - 4); k < latchIdx; k++)
                                 {
-                                    var prev = RewriteStackFrameOperands(instructions[k].ToString()).Trim();
+                                    var prev = RewriteStackFrameOperands(InsText(instructions[k])).Trim();
                                     var mCmpReg = Regex.Match(prev, @"^cmp\s+(?<lhs>e?(ax|bx|cx|dx|si|di|bp|sp))\s*,\s*(?<rhs>0x[0-9A-Fa-f]+|[0-9]+|e?(ax|bx|cx|dx|si|di|bp|sp))\s*$", RegexOptions.IgnoreCase);
                                     var mCmpMem = Regex.Match(prev, @"^cmp\s+(?:byte|word|dword)?\s*\[(?<lhs>local_[0-9A-Fa-f]+)\]\s*,\s*(?<rhs>0x[0-9A-Fa-f]+|[0-9]+|e?(ax|bx|cx|dx|si|di|bp|sp))\s*$", RegexOptions.IgnoreCase);
                                     if (mCmpReg.Success)
@@ -1743,7 +1770,7 @@ namespace DOSRE.Dasm
                                     var updateStop = (cmpIdx >= 0 ? cmpIdx : latchIdx);
                                     for (var k = Math.Max(startIdx, updateStop - 12); k < updateStop; k++)
                                     {
-                                        var prev = RewriteStackFrameOperands(instructions[k].ToString()).Trim();
+                                        var prev = RewriteStackFrameOperands(InsText(instructions[k])).Trim();
 
                                         if (cmpLhs.StartsWith("local_", StringComparison.OrdinalIgnoreCase))
                                         {
@@ -1814,7 +1841,7 @@ namespace DOSRE.Dasm
 
                             for (var k = Math.Max(startIdx, latchIdx - 3); k < latchIdx; k++)
                             {
-                                var prev = RewriteStackFrameOperands(instructions[k].ToString()).Trim();
+                                var prev = RewriteStackFrameOperands(InsText(instructions[k])).Trim();
 
                                 // dec/inc reg
                                 var mDecReg = Regex.Match(prev, @"^(?<op>dec|inc)\s+(?<reg>e?(ax|bx|cx|dx|si|di|bp|sp))\s*$", RegexOptions.IgnoreCase);
@@ -1925,7 +1952,7 @@ namespace DOSRE.Dasm
             var max = Math.Min(instructions.Count, endIdxExclusive);
             for (var i = startIdx; i < max; i++)
             {
-                var cooked = RewriteStackFrameOperands(instructions[i].ToString()).Trim();
+                var cooked = RewriteStackFrameOperands(InsText(instructions[i])).Trim();
 
                 // Far-pointer loads: lgs/les/lfs reg, [arg_N]
                 var fp = Regex.Match(cooked, @"^(?<op>les|lfs|lgs)\s+\w+\s*,\s*\[(?<tok>arg_(?<idx>[0-9]+))\]\s*$", RegexOptions.IgnoreCase);
@@ -1976,7 +2003,7 @@ namespace DOSRE.Dasm
             var max = Math.Min(instructions.Count, endIdxExclusive);
             for (var i = startIdx; i < max; i++)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (!t.StartsWith("int ", StringComparison.OrdinalIgnoreCase))
                     continue;
 
@@ -2127,7 +2154,7 @@ namespace DOSRE.Dasm
             var max = Math.Min(instructions.Count, idx + 28);
             for (var i = idx; i < max; i++)
             {
-                var raw = instructions[i].ToString();
+                var raw = InsText(instructions[i]);
                 var cooked = RewriteStackFrameOperands(raw);
 
                 // Lightweight local/flag setup detection (common in switch case handlers).
@@ -2219,7 +2246,7 @@ namespace DOSRE.Dasm
                 return string.Empty;
 
             // Guard: only annotate at decision-tree nodes that actually start with the canonical compare.
-            if (!TryParseCmpReg8Imm8(instructions[startIdx].ToString(), out _, out _))
+            if (!TryParseCmpReg8Imm8(InsText(instructions[startIdx]), out _, out _))
                 return string.Empty;
 
             // First, try to stabilize the "chain start" by scanning backwards for nearby cmp+je patterns.
@@ -2235,11 +2262,11 @@ namespace DOSRE.Dasm
                 if (i + 1 >= instructions.Count)
                     continue;
 
-                var a = instructions[i].ToString();
+                var a = InsText(instructions[i]);
                 if (!TryParseCmpReg8Imm8(a, out var r8, out _))
                     continue;
 
-                if (!IsEqualityJumpMnemonic(instructions[i + 1].ToString()))
+                if (!IsEqualityJumpMnemonic(InsText(instructions[i + 1])))
                     continue;
 
                 if (chainReg == null)
@@ -2258,7 +2285,7 @@ namespace DOSRE.Dasm
 
             for (var i = chainStart; i + 1 < maxScan; i++)
             {
-                var a = instructions[i].ToString();
+                var a = InsText(instructions[i]);
                 if (!TryParseCmpReg8Imm8(a, out var r8, out var imm8))
                     continue;
 
@@ -2268,7 +2295,7 @@ namespace DOSRE.Dasm
                     continue;
 
                 var b = instructions[i + 1];
-                if (!IsEqualityJumpMnemonic(b.ToString()))
+                if (!IsEqualityJumpMnemonic(InsText(b)))
                     continue;
 
                 if (TryGetRelativeBranchTarget(b, out var target, out var isCall) && !isCall)
@@ -2519,7 +2546,7 @@ namespace DOSRE.Dasm
             var max = Math.Min(instructions.Count, endIdx);
             for (var i = startIdx; i < max; i++)
             {
-                var cooked = RewriteStackFrameOperands(instructions[i].ToString());
+                var cooked = RewriteStackFrameOperands(InsText(instructions[i]));
                 var t = cooked.Trim();
 
                 // mov [local_XX], reg
@@ -2687,7 +2714,7 @@ namespace DOSRE.Dasm
             if (instructions == null || idx < 0 || idx >= instructions.Count)
                 return false;
 
-            var t = instructions[idx].ToString().Trim();
+            var t = InsText(instructions[idx]).Trim();
 
             // Classic: push ebp; mov ebp, esp
             if (t.Equals("mov ebp, esp", StringComparison.OrdinalIgnoreCase))
@@ -2695,7 +2722,7 @@ namespace DOSRE.Dasm
                 var back = Math.Max(0, idx - 4);
                 for (var i = back; i < idx; i++)
                 {
-                    if (instructions[i].ToString().Trim().Equals("push ebp", StringComparison.OrdinalIgnoreCase))
+                    if (InsText(instructions[i]).Trim().Equals("push ebp", StringComparison.OrdinalIgnoreCase))
                         return true;
                 }
             }
@@ -2722,7 +2749,7 @@ namespace DOSRE.Dasm
             var max = Math.Min(instructions.Count, endIdx);
             for (var i = startIdx; i < max; i++)
             {
-                var cooked = RewriteStackFrameOperands(instructions[i].ToString());
+                var cooked = RewriteStackFrameOperands(InsText(instructions[i]));
 
                 // Far-pointer loads imply the argument/local represents a pointer value (ES:reg etc).
                 // Examples: "les edi, [arg_1]", "lgs eax, [arg_3]".
@@ -2846,7 +2873,7 @@ namespace DOSRE.Dasm
             var max = Math.Min(instructions.Count, endIdx);
             for (var i = startIdx; i < max; i++)
             {
-                var raw = instructions[i].ToString();
+                var raw = InsText(instructions[i]);
                 var cooked = RewriteStackFrameOperands(raw);
 
                 if (TryParseLeaRegOfLocal(cooked, out var leaReg, out var localName))
@@ -2875,7 +2902,7 @@ namespace DOSRE.Dasm
                 var back = Math.Max(startIdx, i - 10);
                 for (var j = back; j < i; j++)
                 {
-                    var prev = RewriteStackFrameOperands(instructions[j].ToString());
+                    var prev = RewriteStackFrameOperands(InsText(instructions[j]));
                     if (TryParsePushReg(prev, out var pr))
                         pushedRegs.Add(pr);
                 }
@@ -2952,7 +2979,7 @@ namespace DOSRE.Dasm
             var max = Math.Min(instructions.Count, endIdx);
             for (var i = startIdx; i < max; i++)
             {
-                var cooked = RewriteStackFrameOperands(instructions[i].ToString());
+                var cooked = RewriteStackFrameOperands(InsText(instructions[i]));
                 var t = cooked.Trim();
 
                 // Update arg usage (fast scan for arg_N).
@@ -3093,7 +3120,7 @@ namespace DOSRE.Dasm
             // Determine calling convention / ret imm.
             for (var i = Math.Min(max, instructions.Count) - 1; i >= startIdx; i--)
             {
-                var rt = instructions[i].ToString().Trim();
+                var rt = InsText(instructions[i]).Trim();
                 if (!rt.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
                     continue;
 
@@ -3219,7 +3246,7 @@ namespace DOSRE.Dasm
             var usedArgMax = -1;
             for (var i = startIdx; i < max; i++)
             {
-                var cooked = RewriteStackFrameOperands(instructions[i].ToString());
+                var cooked = RewriteStackFrameOperands(InsText(instructions[i]));
                 foreach (Match m in Regex.Matches(cooked, @"\barg_(?<idx>[0-9]+)\b", RegexOptions.IgnoreCase))
                 {
                     if (int.TryParse(m.Groups["idx"].Value, out var idx))
@@ -3230,7 +3257,7 @@ namespace DOSRE.Dasm
             // Find the last ret in the function range.
             for (var i = max - 1; i >= startIdx; i--)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (!t.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
                     continue;
 
@@ -3313,7 +3340,7 @@ namespace DOSRE.Dasm
             // Find the last ret in the function range.
             for (var i = max - 1; i >= startIdx; i--)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (!t.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
                     continue;
 
@@ -3669,7 +3696,7 @@ namespace DOSRE.Dasm
             if (ins == null)
                 return false;
             // Cheap heuristic based on mnemonic text
-            var s = ins.ToString();
+            var s = InsText(ins);
             return s.StartsWith("j", StringComparison.OrdinalIgnoreCase) &&
                    !s.StartsWith("jmp", StringComparison.OrdinalIgnoreCase);
         }
@@ -3772,7 +3799,7 @@ namespace DOSRE.Dasm
                 return string.Empty;
 
             // Only for call instructions.
-            var text = ins.ToString();
+            var text = InsText(ins);
             if (!text.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
                 return string.Empty;
 
@@ -3783,7 +3810,7 @@ namespace DOSRE.Dasm
             var pushes = 0;
             for (var i = idx - 1; i >= 0 && i >= idx - 8; i--)
             {
-                var t = instructions[i].ToString();
+                var t = InsText(instructions[i]);
                 if (t.StartsWith("push ", StringComparison.OrdinalIgnoreCase))
                 {
                     pushes++;
@@ -3800,7 +3827,7 @@ namespace DOSRE.Dasm
             var retUsed = false;
             if (idx + 1 < instructions.Count)
             {
-                var next = instructions[idx + 1].ToString();
+                var next = InsText(instructions[idx + 1]);
                 if (next.IndexOf("eax", StringComparison.OrdinalIgnoreCase) >= 0)
                     retUsed = true;
             }
@@ -3810,7 +3837,7 @@ namespace DOSRE.Dasm
             var regArgNotes = new List<string>();
             for (var i = idx - 1; i >= 0 && i >= idx - 6; i--)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (TryParseSimpleRegSetup(t, "edx", out var rhsEdx))
                 {
                     regArgNotes.Add($"edx={rhsEdx}");
@@ -3821,7 +3848,7 @@ namespace DOSRE.Dasm
             }
             for (var i = idx - 1; i >= 0 && i >= idx - 6; i--)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (TryParseSimpleRegSetup(t, "eax", out var rhsEax))
                 {
                     regArgNotes.Add($"eax={rhsEax}");
@@ -3832,7 +3859,7 @@ namespace DOSRE.Dasm
             }
             for (var i = idx - 1; i >= 0 && i >= idx - 6; i--)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (TryParseSimpleRegSetup(t, "ecx", out var rhsEcx))
                 {
                     regArgNotes.Add($"ecx={rhsEcx}");
@@ -4005,8 +4032,8 @@ namespace DOSRE.Dasm
 
             for (var i = startIdx; i + 1 < scanLimit; i++)
             {
-                var a = instructions[i].ToString().Trim();
-                var b = instructions[i + 1].ToString().Trim();
+                var a = InsText(instructions[i]).Trim();
+                var b = InsText(instructions[i + 1]).Trim();
 
                 if (!TryParseMovRegFromEsiDisp(a, out var reg, out var disp))
                     continue;
@@ -4084,14 +4111,14 @@ namespace DOSRE.Dasm
             if (instructions == null || idx < 0 || idx >= instructions.Count)
                 return string.Empty;
 
-            var t = instructions[idx].ToString().Trim();
+            var t = InsText(instructions[idx]).Trim();
             if (!TryParseCmpAbsImm(t, out var abs, out var immCmp))
                 return string.Empty;
 
             var scanLimit = Math.Min(instructions.Count, idx + 12);
             for (var j = idx + 1; j < scanLimit; j++)
             {
-                var u = instructions[j].ToString().Trim();
+                var u = InsText(instructions[j]).Trim();
                 if (!TryParseMovAbsImm(u, out var abs2, out var immMov))
                     continue;
                 if (abs2 != abs)
@@ -4143,7 +4170,7 @@ namespace DOSRE.Dasm
 
             for (var i = startIdx; i < endIdx; i++)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (!TryParseAbsBitTest(t, out var abs, out var mask))
                     continue;
 
@@ -4203,8 +4230,8 @@ namespace DOSRE.Dasm
 
             for (var i = startIdx; i + 1 < scanLimit; i++)
             {
-                var a = instructions[i].ToString().Trim();
-                var b = instructions[i + 1].ToString().Trim();
+                var a = InsText(instructions[i]).Trim();
+                var b = InsText(instructions[i + 1]).Trim();
 
                 if (!TryParseMovRegFromAbs(a, out var reg, out var abs))
                     continue;
@@ -4490,7 +4517,7 @@ namespace DOSRE.Dasm
                     continue;
 
                 // Barrier on control flow.
-                var t = ins.ToString();
+                var t = InsText(ins);
                 if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
                     t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) || (t.StartsWith("j", StringComparison.OrdinalIgnoreCase) && !t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase)))
                 {
@@ -4532,7 +4559,7 @@ namespace DOSRE.Dasm
                 if (b == null || b.Length == 0)
                     continue;
 
-                var t = ins.ToString();
+                var t = InsText(ins);
                 if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
                     t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) || (t.StartsWith("j", StringComparison.OrdinalIgnoreCase) && !t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase)))
                 {
@@ -5433,10 +5460,20 @@ namespace DOSRE.Dasm
 
         public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, bool leFixups, bool leGlobals, bool leInsights, out string output, out string error)
         {
-            return TryDisassembleToString(inputFile, leFull, leBytesLimit, leFixups, leGlobals, leInsights, EnumToolchainHint.None, out output, out error);
+            return TryDisassembleToString(inputFile, leFull, leBytesLimit, leRenderLimit: null, leJobs: 1, leFixups, leGlobals, leInsights, EnumToolchainHint.None, out output, out error);
         }
 
         public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, bool leFixups, bool leGlobals, bool leInsights, EnumToolchainHint toolchainHint, out string output, out string error)
+        {
+            return TryDisassembleToString(inputFile, leFull, leBytesLimit, leRenderLimit: null, leJobs: 1, leFixups, leGlobals, leInsights, toolchainHint, out output, out error);
+        }
+
+        public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, int? leRenderLimit, bool leFixups, bool leGlobals, bool leInsights, EnumToolchainHint toolchainHint, out string output, out string error)
+        {
+            return TryDisassembleToString(inputFile, leFull, leBytesLimit, leRenderLimit, leJobs: 1, leFixups, leGlobals, leInsights, toolchainHint, out output, out error);
+        }
+
+        public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, int? leRenderLimit, int leJobs, bool leFixups, bool leGlobals, bool leInsights, EnumToolchainHint toolchainHint, out string output, out string error)
         {
             output = string.Empty;
             error = string.Empty;
@@ -5508,6 +5545,15 @@ namespace DOSRE.Dasm
                 AppendWrappedDisasmLine(sb, string.Empty, " ; NOTE: LE globals enabled (disp32 fixups become g_XXXXXXXX symbols)", commentColumn: 0, maxWidth: 160);
             if (leInsights)
                 AppendWrappedDisasmLine(sb, string.Empty, " ; NOTE: LE insights enabled (best-effort function/CFG/xref/stack-var/string analysis)", commentColumn: 0, maxWidth: 160);
+            if (leInsights)
+                AppendWrappedDisasmLine(sb, string.Empty, $" ; NOTE: LE insights jobs: {Math.Max(1, leJobs)}", commentColumn: 0, maxWidth: 160);
+            if (leRenderLimit.HasValue)
+            {
+                if (leRenderLimit.Value == 0)
+                    AppendWrappedDisasmLine(sb, string.Empty, " ; NOTE: LE render disabled (-lerenderlimit 0): insights-only output (no instruction listing)", commentColumn: 0, maxWidth: 160);
+                else
+                    AppendWrappedDisasmLine(sb, string.Empty, $" ; NOTE: LE render limit enabled: {leRenderLimit.Value} instructions/object", commentColumn: 0, maxWidth: 160);
+            }
             AppendWrappedDisasmLine(sb, string.Empty, " ; XREFS: derived from relative CALL/JMP/Jcc only", commentColumn: 0, maxWidth: 160);
             if (leFull)
                 AppendWrappedDisasmLine(sb, string.Empty, " ; LE mode: FULL (disassemble from object start)", commentColumn: 0, maxWidth: 160);
@@ -5680,6 +5726,9 @@ namespace DOSRE.Dasm
                 for (var ii = 0; ii < instructions.Count; ii++)
                     insIndexByAddr[(uint)instructions[ii].Offset] = ii;
 
+                var jobs = Math.Max(1, leJobs);
+                var useParallelInsights = leInsights && jobs > 1;
+
                 var swObjInsights = leInsights ? Stopwatch.StartNew() : null;
 
                 var functionStarts = new HashSet<uint>();
@@ -5710,6 +5759,12 @@ namespace DOSRE.Dasm
                             functionStarts.Add((uint)instructions[i].Offset);
                     }
                 }
+
+                // Pre-sorted function list for per-function insight passes.
+                // IMPORTANT: filter to decoded instruction addresses to avoid pathological endIdx slicing.
+                var sortedStartsForInsights = leInsights && functionStarts != null && functionStarts.Count > 0
+                    ? functionStarts.Where(a => insIndexByAddr.ContainsKey(a)).OrderBy(x => x).ToList()
+                    : new List<uint>();
 
                 foreach (var ins in instructions)
                 {
@@ -5833,25 +5888,60 @@ namespace DOSRE.Dasm
                     funcFieldSummaries = new Dictionary<uint, string>();
                     ptrFieldStatsGlobal = new Dictionary<string, Dictionary<uint, FieldAccessStats>>(StringComparer.Ordinal);
                     thisFieldStatsGlobal = new Dictionary<string, Dictionary<uint, FieldAccessStats>>(StringComparer.Ordinal);
-                    var sortedStarts = functionStarts.Where(a => insIndexByAddr.ContainsKey(a)).OrderBy(x => x).ToList();
-                    for (var si = 0; si < sortedStarts.Count; si++)
+                    var sortedStarts = sortedStartsForInsights;
+                    if (!useParallelInsights)
                     {
-                        if ((si % 250) == 0 && si > 0)
-                            _logger.Info($"LE: Field summaries... {si}/{sortedStarts.Count}");
-                        var startAddr = sortedStarts[si];
-                        if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
-                            continue;
+                        for (var si = 0; si < sortedStarts.Count; si++)
+                        {
+                            if ((si % 250) == 0 && si > 0)
+                                _logger.Info($"LE: Field summaries... {si}/{sortedStarts.Count}");
+                            var startAddr = sortedStarts[si];
+                            if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                                continue;
 
-                        var endIdx = instructions.Count;
-                        if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
-                            endIdx = nextIdx;
+                            var endIdx = instructions.Count;
+                            if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                                endIdx = nextIdx;
 
-                        CollectFieldAccessesForFunction(instructions, startIdx, endIdx, out var stats, inferredPtrSymbols);
-                        MergeFieldStats(ptrFieldStatsGlobal, stats, b => b.StartsWith("ptr_", StringComparison.OrdinalIgnoreCase));
-                        MergeFieldStats(thisFieldStatsGlobal, stats, b => string.Equals(b, "this", StringComparison.OrdinalIgnoreCase));
-                        var summary = FormatFieldSummary(stats);
-                        if (!string.IsNullOrEmpty(summary))
-                            funcFieldSummaries[startAddr] = summary;
+                            CollectFieldAccessesForFunction(instructions, startIdx, endIdx, out var stats, inferredPtrSymbols);
+                            MergeFieldStats(ptrFieldStatsGlobal, stats, b => b.StartsWith("ptr_", StringComparison.OrdinalIgnoreCase));
+                            MergeFieldStats(thisFieldStatsGlobal, stats, b => string.Equals(b, "this", StringComparison.OrdinalIgnoreCase));
+                            var summary = FormatFieldSummary(stats);
+                            if (!string.IsNullOrEmpty(summary))
+                                funcFieldSummaries[startAddr] = summary;
+                        }
+                    }
+                    else
+                    {
+                        _logger.Info($"LE: Field summaries (parallel jobs={jobs})... {sortedStarts.Count} functions");
+                        var progress = 0;
+                        var mergeLock = new object();
+
+                        Parallel.For(0, sortedStarts.Count, new ParallelOptions { MaxDegreeOfParallelism = jobs }, si =>
+                        {
+                            var startAddr = sortedStarts[si];
+                            if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                                return;
+
+                            var endIdx = instructions.Count;
+                            if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                                endIdx = nextIdx;
+
+                            CollectFieldAccessesForFunction(instructions, startIdx, endIdx, out var stats, inferredPtrSymbols);
+                            var summary = FormatFieldSummary(stats);
+
+                            lock (mergeLock)
+                            {
+                                MergeFieldStats(ptrFieldStatsGlobal, stats, b => b.StartsWith("ptr_", StringComparison.OrdinalIgnoreCase));
+                                MergeFieldStats(thisFieldStatsGlobal, stats, b => string.Equals(b, "this", StringComparison.OrdinalIgnoreCase));
+                                if (!string.IsNullOrEmpty(summary))
+                                    funcFieldSummaries[startAddr] = summary;
+                            }
+
+                            var done = Interlocked.Increment(ref progress);
+                            if ((done % 500) == 0)
+                                _logger.Info($"LE: Field summaries... {done}/{sortedStarts.Count}");
+                        });
                     }
                 }
 
@@ -5860,23 +5950,53 @@ namespace DOSRE.Dasm
                 if (leInsights && functionStarts != null && functionStarts.Count > 0)
                 {
                     funcFpuSummaries = new Dictionary<uint, string>();
-                    var sortedStarts = functionStarts.Where(a => insIndexByAddr.ContainsKey(a)).OrderBy(x => x).ToList();
-                    for (var si = 0; si < sortedStarts.Count; si++)
+                    var sortedStarts = sortedStartsForInsights;
+                    if (!useParallelInsights)
                     {
-                        if ((si % 500) == 0 && si > 0)
-                            _logger.Info($"LE: FPU summaries... {si}/{sortedStarts.Count}");
-                        var startAddr = sortedStarts[si];
-                        if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
-                            continue;
+                        for (var si = 0; si < sortedStarts.Count; si++)
+                        {
+                            if ((si % 500) == 0 && si > 0)
+                                _logger.Info($"LE: FPU summaries... {si}/{sortedStarts.Count}");
+                            var startAddr = sortedStarts[si];
+                            if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                                continue;
 
-                        var endIdx = instructions.Count;
-                        if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
-                            endIdx = nextIdx;
+                            var endIdx = instructions.Count;
+                            if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                                endIdx = nextIdx;
 
-                        CollectFpuOpsForFunction(instructions, startIdx, endIdx, out var st);
-                        var summary = FormatFpuSummary(st);
-                        if (!string.IsNullOrEmpty(summary))
-                            funcFpuSummaries[startAddr] = summary;
+                            CollectFpuOpsForFunction(instructions, startIdx, endIdx, out var st);
+                            var summary = FormatFpuSummary(st);
+                            if (!string.IsNullOrEmpty(summary))
+                                funcFpuSummaries[startAddr] = summary;
+                        }
+                    }
+                    else
+                    {
+                        _logger.Info($"LE: FPU summaries (parallel jobs={jobs})... {sortedStarts.Count} functions");
+                        var progress = 0;
+                        var dictLock = new object();
+                        Parallel.For(0, sortedStarts.Count, new ParallelOptions { MaxDegreeOfParallelism = jobs }, si =>
+                        {
+                            var startAddr = sortedStarts[si];
+                            if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                                return;
+                            var endIdx = instructions.Count;
+                            if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                                endIdx = nextIdx;
+
+                            CollectFpuOpsForFunction(instructions, startIdx, endIdx, out var st);
+                            var summary = FormatFpuSummary(st);
+                            if (!string.IsNullOrEmpty(summary))
+                            {
+                                lock (dictLock)
+                                    funcFpuSummaries[startAddr] = summary;
+                            }
+
+                            var done = Interlocked.Increment(ref progress);
+                            if ((done % 1000) == 0)
+                                _logger.Info($"LE: FPU summaries... {done}/{sortedStarts.Count}");
+                        });
                     }
                 }
 
@@ -5885,23 +6005,53 @@ namespace DOSRE.Dasm
                 if (leInsights && functionStarts != null && functionStarts.Count > 0)
                 {
                     funcIoSummaries = new Dictionary<uint, string>();
-                    var sortedStarts = functionStarts.Where(a => insIndexByAddr.ContainsKey(a)).OrderBy(x => x).ToList();
-                    for (var si = 0; si < sortedStarts.Count; si++)
+                    var sortedStarts = sortedStartsForInsights;
+                    if (!useParallelInsights)
                     {
-                        if ((si % 500) == 0 && si > 0)
-                            _logger.Info($"LE: IO summaries... {si}/{sortedStarts.Count}");
-                        var startAddr = sortedStarts[si];
-                        if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
-                            continue;
+                        for (var si = 0; si < sortedStarts.Count; si++)
+                        {
+                            if ((si % 500) == 0 && si > 0)
+                                _logger.Info($"LE: IO summaries... {si}/{sortedStarts.Count}");
+                            var startAddr = sortedStarts[si];
+                            if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                                continue;
 
-                        var endIdx = instructions.Count;
-                        if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
-                            endIdx = nextIdx;
+                            var endIdx = instructions.Count;
+                            if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                                endIdx = nextIdx;
 
-                        CollectIoPortsForFunction(instructions, startIdx, endIdx, out var ports);
-                        var summary = FormatIoPortSummary(ports);
-                        if (!string.IsNullOrEmpty(summary))
-                            funcIoSummaries[startAddr] = summary;
+                            CollectIoPortsForFunction(instructions, startIdx, endIdx, out var ports);
+                            var summary = FormatIoPortSummary(ports);
+                            if (!string.IsNullOrEmpty(summary))
+                                funcIoSummaries[startAddr] = summary;
+                        }
+                    }
+                    else
+                    {
+                        _logger.Info($"LE: IO summaries (parallel jobs={jobs})... {sortedStarts.Count} functions");
+                        var progress = 0;
+                        var dictLock = new object();
+                        Parallel.For(0, sortedStarts.Count, new ParallelOptions { MaxDegreeOfParallelism = jobs }, si =>
+                        {
+                            var startAddr = sortedStarts[si];
+                            if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                                return;
+                            var endIdx = instructions.Count;
+                            if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                                endIdx = nextIdx;
+
+                            CollectIoPortsForFunction(instructions, startIdx, endIdx, out var ports);
+                            var summary = FormatIoPortSummary(ports);
+                            if (!string.IsNullOrEmpty(summary))
+                            {
+                                lock (dictLock)
+                                    funcIoSummaries[startAddr] = summary;
+                            }
+
+                            var done = Interlocked.Increment(ref progress);
+                            if ((done % 1000) == 0)
+                                _logger.Info($"LE: IO summaries... {done}/{sortedStarts.Count}");
+                        });
                     }
                 }
 
@@ -5910,23 +6060,53 @@ namespace DOSRE.Dasm
                 if (leInsights && functionStarts != null && functionStarts.Count > 0)
                 {
                     funcFlagSummaries = new Dictionary<uint, string>();
-                    var sortedStarts = functionStarts.Where(a => insIndexByAddr.ContainsKey(a)).OrderBy(x => x).ToList();
-                    for (var si = 0; si < sortedStarts.Count; si++)
+                    var sortedStarts = sortedStartsForInsights;
+                    if (!useParallelInsights)
                     {
-                        if ((si % 500) == 0 && si > 0)
-                            _logger.Info($"LE: Flag summaries... {si}/{sortedStarts.Count}");
-                        var startAddr = sortedStarts[si];
-                        if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
-                            continue;
+                        for (var si = 0; si < sortedStarts.Count; si++)
+                        {
+                            if ((si % 500) == 0 && si > 0)
+                                _logger.Info($"LE: Flag summaries... {si}/{sortedStarts.Count}");
+                            var startAddr = sortedStarts[si];
+                            if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                                continue;
 
-                        var endIdx = instructions.Count;
-                        if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
-                            endIdx = nextIdx;
+                            var endIdx = instructions.Count;
+                            if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                                endIdx = nextIdx;
 
-                        CollectFlagBitTestsForFunction(instructions, startIdx, endIdx, out var st);
-                        var summary = FormatFlagBitSummary(st, null);
-                        if (!string.IsNullOrEmpty(summary))
-                            funcFlagSummaries[startAddr] = summary;
+                            CollectFlagBitTestsForFunction(instructions, startIdx, endIdx, out var st);
+                            var summary = FormatFlagBitSummary(st, null);
+                            if (!string.IsNullOrEmpty(summary))
+                                funcFlagSummaries[startAddr] = summary;
+                        }
+                    }
+                    else
+                    {
+                        _logger.Info($"LE: Flag summaries (parallel jobs={jobs})... {sortedStarts.Count} functions");
+                        var progress = 0;
+                        var dictLock = new object();
+                        Parallel.For(0, sortedStarts.Count, new ParallelOptions { MaxDegreeOfParallelism = jobs }, si =>
+                        {
+                            var startAddr = sortedStarts[si];
+                            if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                                return;
+                            var endIdx = instructions.Count;
+                            if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                                endIdx = nextIdx;
+
+                            CollectFlagBitTestsForFunction(instructions, startIdx, endIdx, out var st);
+                            var summary = FormatFlagBitSummary(st, null);
+                            if (!string.IsNullOrEmpty(summary))
+                            {
+                                lock (dictLock)
+                                    funcFlagSummaries[startAddr] = summary;
+                            }
+
+                            var done = Interlocked.Increment(ref progress);
+                            if ((done % 1000) == 0)
+                                _logger.Info($"LE: Flag summaries... {done}/{sortedStarts.Count}");
+                        });
                     }
                 }
 
@@ -5954,7 +6134,7 @@ namespace DOSRE.Dasm
                     funcLoopHeaderHints = new Dictionary<uint, Dictionary<uint, string>>();
                     funcLoopLatchHints = new Dictionary<uint, Dictionary<uint, string>>();
 
-                    var sortedStarts = functionStarts.Where(a => insIndexByAddr.ContainsKey(a)).OrderBy(x => x).ToList();
+                    var sortedStarts = sortedStartsForInsights;
                     var sortedBlockStarts = blockStarts != null && blockStarts.Count > 0
                         ? blockStarts.OrderBy(x => x).ToList()
                         : null;
@@ -5974,98 +6154,195 @@ namespace DOSRE.Dasm
                             worst = worst.OrderByDescending(x => x.totalTicks).Take(6).ToList();
                     }
 
-                    for (var si = 0; si < sortedStarts.Count; si++)
+                    if (!useParallelInsights)
                     {
-                        if ((si % 250) == 0 && si > 0)
+                        for (var si = 0; si < sortedStarts.Count; si++)
                         {
-                            var protoMs = protoTicks * 1000.0 / freq;
-                            var loopMs = loopTicks * 1000.0 / freq;
-                            var totMs = (protoTicks + loopTicks) * 1000.0 / freq;
-
-                            var worstText = string.Empty;
-                            if (worst.Count > 0)
+                            if ((si % 250) == 0 && si > 0)
                             {
-                                var top = worst.OrderByDescending(x => x.totalTicks).Take(3).ToList();
-                                worstText = " ; worst=" + string.Join(", ", top.Select(w =>
+                                var protoMs = protoTicks * 1000.0 / freq;
+                                var loopMs = loopTicks * 1000.0 / freq;
+                                var totMs = (protoTicks + loopTicks) * 1000.0 / freq;
+
+                                var worstText = string.Empty;
+                                if (worst.Count > 0)
                                 {
-                                    var ms = w.totalTicks * 1000.0 / freq;
-                                    return $"func_{w.start:X8}({w.insCount} ins) {ms:0}ms";
-                                }));
+                                    var top = worst.OrderByDescending(x => x.totalTicks).Take(3).ToList();
+                                    worstText = " ; worst=" + string.Join(", ", top.Select(w =>
+                                    {
+                                        var ms = w.totalTicks * 1000.0 / freq;
+                                        return $"func_{w.start:X8}({w.insCount} ins) {ms:0}ms";
+                                    }));
+                                }
+
+                                _logger.Info($"LE: Proto/loop/alias hints... {si}/{sortedStarts.Count} (proto {protoMs:0}ms, loops {loopMs:0}ms, total {totMs:0}ms){worstText}");
+                                protoTicks = 0;
+                                loopTicks = 0;
+                                worst.Clear();
                             }
 
-                            _logger.Info($"LE: Proto/loop/alias hints... {si}/{sortedStarts.Count} (proto {protoMs:0}ms, loops {loopMs:0}ms, total {totMs:0}ms){worstText}");
-                            protoTicks = 0;
-                            loopTicks = 0;
-                            worst.Clear();
-                        }
+                            var startAddr = sortedStarts[si];
+                            if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                                continue;
 
-                        var startAddr = sortedStarts[si];
-                        if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
-                            continue;
+                            var endIdx = instructions.Count;
+                            if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                                endIdx = nextIdx;
 
-                        var endIdx = instructions.Count;
-                        if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
-                            endIdx = nextIdx;
+                            var funcInsCount = Math.Max(0, endIdx - startIdx);
 
-                        var funcInsCount = Math.Max(0, endIdx - startIdx);
+                            var p0 = Stopwatch.GetTimestamp();
+                            InferProtoHintsForFunction(instructions, startIdx, endIdx, out var aliases, out var hints, out var bitsByLocal, out var argCount, out var cc, out var retImm);
+                            var p1 = Stopwatch.GetTimestamp();
+                            var pt = p1 - p0;
+                            if (pt > 0)
+                                protoTicks += pt;
+                            if (aliases != null && aliases.Count > 0)
+                                funcOutLocalAliases[startAddr] = aliases;
+                            if (hints != null && hints.Count > 0)
+                                funcOutLocalAliasHints[startAddr] = hints;
 
-                        var p0 = Stopwatch.GetTimestamp();
-                        InferProtoHintsForFunction(instructions, startIdx, endIdx, out var aliases, out var hints, out var bitsByLocal, out var argCount, out var cc, out var retImm);
-                        var p1 = Stopwatch.GetTimestamp();
-                        var pt = p1 - p0;
-                        if (pt > 0)
-                            protoTicks += pt;
-                        if (aliases != null && aliases.Count > 0)
-                            funcOutLocalAliases[startAddr] = aliases;
-                        if (hints != null && hints.Count > 0)
-                            funcOutLocalAliasHints[startAddr] = hints;
+                            if (bitsByLocal != null && bitsByLocal.Count > 0)
+                                funcLocalBitWidths[startAddr] = bitsByLocal;
 
-                        if (bitsByLocal != null && bitsByLocal.Count > 0)
-                            funcLocalBitWidths[startAddr] = bitsByLocal;
-
-                        if (argCount > 0 || !string.IsNullOrWhiteSpace(cc) || (retImm.HasValue && retImm.Value > 0))
-                        {
-                            var args = FormatProtoArgs(argCount, maxArgs: 12);
-                            var proto = $"PROTO: func_{startAddr:X8}({args})";
-                            var ccSuffix = string.IsNullOrWhiteSpace(cc) ? string.Empty : $" ; CC: {cc}";
-                            var retSuffix = retImm.HasValue && retImm.Value > 0 ? $" (ret 0x{retImm.Value:X})" : string.Empty;
-                            funcProtoHints[startAddr] = proto + ccSuffix + retSuffix;
-                        }
-
-                        // Loop/back-edge summaries (best-effort)
-                        if (blockStarts != null)
-                        {
-                            var endAddr = (si + 1 < sortedStarts.Count) ? sortedStarts[si + 1] : uint.MaxValue;
-                            var l0 = Stopwatch.GetTimestamp();
-                            InferLoopsForFunction(instructions, insIndexByAddr, sortedBlockStarts, startAddr, endAddr, startIdx, endIdx, out var loops);
-                            var l1 = Stopwatch.GetTimestamp();
-                            var lt = l1 - l0;
-                            if (lt > 0)
-                                loopTicks += lt;
-
-                            RecordWorst(startAddr, funcInsCount, pt + lt, pt, lt);
-
-                            var loopSum = FormatLoopSummaryForFunction(loops);
-                            if (!string.IsNullOrEmpty(loopSum))
-                                funcLoopSummaries[startAddr] = loopSum;
-
-                            if (loops != null && loops.Count > 0)
+                            if (argCount > 0 || !string.IsNullOrWhiteSpace(cc) || (retImm.HasValue && retImm.Value > 0))
                             {
-                                var byHdr = new Dictionary<uint, string>();
-                                var byLatch = new Dictionary<uint, string>();
-                                foreach (var l in loops)
-                                {
-                                    var hint = FormatLoopHeaderHint(l);
-                                    if (!string.IsNullOrWhiteSpace(hint))
-                                        byHdr[l.Header] = hint;
+                                var args = FormatProtoArgs(argCount, maxArgs: 12);
+                                var proto = $"PROTO: func_{startAddr:X8}({args})";
+                                var ccSuffix = string.IsNullOrWhiteSpace(cc) ? string.Empty : $" ; CC: {cc}";
+                                var retSuffix = retImm.HasValue && retImm.Value > 0 ? $" (ret 0x{retImm.Value:X})" : string.Empty;
+                                funcProtoHints[startAddr] = proto + ccSuffix + retSuffix;
+                            }
 
-                                    if (l.Latches != null && l.Latches.Count > 0)
+                            // Loop/back-edge summaries (best-effort)
+                            if (blockStarts != null)
+                            {
+                                var endAddr = (si + 1 < sortedStarts.Count) ? sortedStarts[si + 1] : uint.MaxValue;
+                                var l0 = Stopwatch.GetTimestamp();
+                                InferLoopsForFunction(instructions, insIndexByAddr, sortedBlockStarts, startAddr, endAddr, startIdx, endIdx, out var loops);
+                                var l1 = Stopwatch.GetTimestamp();
+                                var lt = l1 - l0;
+                                if (lt > 0)
+                                    loopTicks += lt;
+
+                                RecordWorst(startAddr, funcInsCount, pt + lt, pt, lt);
+
+                                var loopSum = FormatLoopSummaryForFunction(loops);
+                                if (!string.IsNullOrEmpty(loopSum))
+                                    funcLoopSummaries[startAddr] = loopSum;
+
+                                if (loops != null && loops.Count > 0)
+                                {
+                                    var byHdr = new Dictionary<uint, string>();
+                                    var byLatch = new Dictionary<uint, string>();
+                                    foreach (var l in loops)
                                     {
-                                        foreach (var la in l.Latches)
+                                        var hint = FormatLoopHeaderHint(l);
+                                        if (!string.IsNullOrWhiteSpace(hint))
+                                            byHdr[l.Header] = hint;
+
+                                        if (l.Latches != null && l.Latches.Count > 0)
                                         {
-                                            // Prefer the first-seen header if multiple loops share a latch (rare).
-                                            if (!byLatch.ContainsKey(la))
+                                            foreach (var la in l.Latches)
                                             {
+                                                // Prefer the first-seen header if multiple loops share a latch (rare).
+                                                if (!byLatch.ContainsKey(la))
+                                                {
+                                                    var latchHint = $"LOOPLATCH: hdr=0x{l.Header:X8}";
+                                                    if (!string.IsNullOrWhiteSpace(l.InductionVar))
+                                                        latchHint += $" iv={l.InductionVar}";
+                                                    if (l.Step.HasValue)
+                                                        latchHint += $" step={(l.Step.Value >= 0 ? "+" : string.Empty)}{l.Step.Value}";
+                                                    if (!string.IsNullOrWhiteSpace(l.Bound))
+                                                        latchHint += $" bound={l.Bound}";
+                                                    if (!string.IsNullOrWhiteSpace(l.Cond))
+                                                        latchHint += $" cond={l.Cond}";
+                                                    byLatch[la] = latchHint;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (byHdr.Count > 0)
+                                        funcLoopHeaderHints[startAddr] = byHdr;
+                                    if (byLatch.Count > 0)
+                                        funcLoopLatchHints[startAddr] = byLatch;
+                                }
+
+                                // C sketch header (best-effort)
+                                var ptrArgs = InferPointerishArgSummaryForFunction(instructions, startIdx, endIdx);
+                                var intSum = CollectInterruptSummaryForFunction(instructions, startIdx, endIdx, stringSymbols, stringPreview, objects, objBytesByIndex);
+                                FunctionSummary fs = null;
+                                string ioSum = null;
+                                string protoHint = null;
+                                Dictionary<string, int> bw = null;
+                                if (funcSummaries != null)
+                                    funcSummaries.TryGetValue(startAddr, out fs);
+                                if (funcIoSummaries != null)
+                                    funcIoSummaries.TryGetValue(startAddr, out ioSum);
+                                if (funcProtoHints != null)
+                                    funcProtoHints.TryGetValue(startAddr, out protoHint);
+                                if (funcLocalBitWidths != null)
+                                    funcLocalBitWidths.TryGetValue(startAddr, out bw);
+                                var csk = FormatCSketchHeader(startAddr, protoHint, aliases, bw, ptrArgs, fs, ioSum, intSum, loopSum);
+                                if (!string.IsNullOrWhiteSpace(csk))
+                                    funcCSketchHints[startAddr] = csk;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        _logger.Info($"LE: Proto/loop/alias hints (parallel jobs={jobs})... {sortedStarts.Count} functions");
+                        var dictLock = new object();
+                        var progress = 0;
+                        var swProtoLoop = Stopwatch.StartNew();
+
+                        Parallel.For(0, sortedStarts.Count, new ParallelOptions { MaxDegreeOfParallelism = jobs }, si =>
+                        {
+                            var startAddr = sortedStarts[si];
+                            if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                                return;
+
+                            var endIdx = instructions.Count;
+                            if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                                endIdx = nextIdx;
+
+                            InferProtoHintsForFunction(instructions, startIdx, endIdx, out var aliases, out var hints, out var bitsByLocal, out var argCount, out var cc, out var retImm);
+
+                            string protoHintOut = null;
+                            if (argCount > 0 || !string.IsNullOrWhiteSpace(cc) || (retImm.HasValue && retImm.Value > 0))
+                            {
+                                var args = FormatProtoArgs(argCount, maxArgs: 12);
+                                protoHintOut = $"PROTO: func_{startAddr:X8}({args})";
+                                var ccSuffix = string.IsNullOrWhiteSpace(cc) ? string.Empty : $" ; CC: {cc}";
+                                var retSuffix = retImm.HasValue && retImm.Value > 0 ? $" (ret 0x{retImm.Value:X})" : string.Empty;
+                                protoHintOut += ccSuffix + retSuffix;
+                            }
+
+                            string loopSum = null;
+                            Dictionary<uint, string> byHdr = null;
+                            Dictionary<uint, string> byLatch = null;
+                            if (blockStarts != null)
+                            {
+                                var endAddr = (si + 1 < sortedStarts.Count) ? sortedStarts[si + 1] : uint.MaxValue;
+                                InferLoopsForFunction(instructions, insIndexByAddr, sortedBlockStarts, startAddr, endAddr, startIdx, endIdx, out var loops);
+                                loopSum = FormatLoopSummaryForFunction(loops);
+
+                                if (loops != null && loops.Count > 0)
+                                {
+                                    byHdr = new Dictionary<uint, string>();
+                                    byLatch = new Dictionary<uint, string>();
+                                    foreach (var l in loops)
+                                    {
+                                        var hint = FormatLoopHeaderHint(l);
+                                        if (!string.IsNullOrWhiteSpace(hint))
+                                            byHdr[l.Header] = hint;
+
+                                        if (l.Latches != null && l.Latches.Count > 0)
+                                        {
+                                            foreach (var la in l.Latches)
+                                            {
+                                                if (byLatch.ContainsKey(la))
+                                                    continue;
                                                 var latchHint = $"LOOPLATCH: hdr=0x{l.Header:X8}";
                                                 if (!string.IsNullOrWhiteSpace(l.InductionVar))
                                                     latchHint += $" iv={l.InductionVar}";
@@ -6080,52 +6357,104 @@ namespace DOSRE.Dasm
                                         }
                                     }
                                 }
-                                if (byHdr.Count > 0)
-                                    funcLoopHeaderHints[startAddr] = byHdr;
-                                if (byLatch.Count > 0)
-                                    funcLoopLatchHints[startAddr] = byLatch;
                             }
 
-                            // C sketch header (best-effort)
-                            var ptrArgs = InferPointerishArgSummaryForFunction(instructions, startIdx, endIdx);
-                            var intSum = CollectInterruptSummaryForFunction(instructions, startIdx, endIdx, stringSymbols, stringPreview, objects, objBytesByIndex);
-                            FunctionSummary fs = null;
-                            string ioSum = null;
-                            string protoHint = null;
-                            Dictionary<string, int> bw = null;
-                            if (funcSummaries != null)
-                                funcSummaries.TryGetValue(startAddr, out fs);
-                            if (funcIoSummaries != null)
-                                funcIoSummaries.TryGetValue(startAddr, out ioSum);
-                            if (funcProtoHints != null)
-                                funcProtoHints.TryGetValue(startAddr, out protoHint);
-                            if (funcLocalBitWidths != null)
-                                funcLocalBitWidths.TryGetValue(startAddr, out bw);
-                            var csk = FormatCSketchHeader(startAddr, protoHint, aliases, bw, ptrArgs, fs, ioSum, intSum, loopSum);
-                            if (!string.IsNullOrWhiteSpace(csk))
-                                funcCSketchHints[startAddr] = csk;
-                        }
+                            string csk = null;
+                            if (blockStarts != null)
+                            {
+                                var ptrArgs = InferPointerishArgSummaryForFunction(instructions, startIdx, endIdx);
+                                var intSum = CollectInterruptSummaryForFunction(instructions, startIdx, endIdx, stringSymbols, stringPreview, objects, objBytesByIndex);
+                                FunctionSummary fs = null;
+                                string ioSum = null;
+                                Dictionary<string, int> bw = null;
+                                if (funcSummaries != null)
+                                    funcSummaries.TryGetValue(startAddr, out fs);
+                                if (funcIoSummaries != null)
+                                    funcIoSummaries.TryGetValue(startAddr, out ioSum);
+                                if (bitsByLocal != null && bitsByLocal.Count > 0)
+                                    bw = bitsByLocal;
+
+                                csk = FormatCSketchHeader(startAddr, protoHintOut, aliases, bw, ptrArgs, fs, ioSum, intSum, loopSum);
+                            }
+
+                            lock (dictLock)
+                            {
+                                if (aliases != null && aliases.Count > 0)
+                                    funcOutLocalAliases[startAddr] = aliases;
+                                if (hints != null && hints.Count > 0)
+                                    funcOutLocalAliasHints[startAddr] = hints;
+                                if (bitsByLocal != null && bitsByLocal.Count > 0)
+                                    funcLocalBitWidths[startAddr] = bitsByLocal;
+                                if (!string.IsNullOrWhiteSpace(protoHintOut))
+                                    funcProtoHints[startAddr] = protoHintOut;
+                                if (!string.IsNullOrWhiteSpace(loopSum))
+                                    funcLoopSummaries[startAddr] = loopSum;
+                                if (byHdr != null && byHdr.Count > 0)
+                                    funcLoopHeaderHints[startAddr] = byHdr;
+                                if (byLatch != null && byLatch.Count > 0)
+                                    funcLoopLatchHints[startAddr] = byLatch;
+                                if (!string.IsNullOrWhiteSpace(csk))
+                                    funcCSketchHints[startAddr] = csk;
+                            }
+
+                            var done = Interlocked.Increment(ref progress);
+                            if ((done % 500) == 0)
+                                _logger.Info($"LE: Proto/loop/alias hints... {done}/{sortedStarts.Count} (elapsed {swProtoLoop.ElapsedMilliseconds} ms)");
+                        });
+
+                        swProtoLoop.Stop();
+                        _logger.Info($"LE: Proto/loop/alias hints complete in {swProtoLoop.ElapsedMilliseconds} ms");
                     }
                 }
 
                 // Re-format per-function flag summaries using the inferred symbols (when available).
                 if (leInsights && funcFlagSummaries != null && funcFlagSummaries.Count > 0 && inferredFlagSymbols.Count > 0)
                 {
-                    var sortedStarts = functionStarts.OrderBy(x => x).ToList();
-                    for (var si = 0; si < sortedStarts.Count; si++)
+                    var sortedStarts = sortedStartsForInsights;
+                    if (!useParallelInsights)
                     {
-                        var startAddr = sortedStarts[si];
-                        if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
-                            continue;
+                        for (var si = 0; si < sortedStarts.Count; si++)
+                        {
+                            var startAddr = sortedStarts[si];
+                            if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                                continue;
 
-                        var endIdx = instructions.Count;
-                        if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
-                            endIdx = nextIdx;
+                            var endIdx = instructions.Count;
+                            if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                                endIdx = nextIdx;
 
-                        CollectFlagBitTestsForFunction(instructions, startIdx, endIdx, out var st);
-                        var summary = FormatFlagBitSummary(st, inferredFlagSymbols);
-                        if (!string.IsNullOrEmpty(summary))
-                            funcFlagSummaries[startAddr] = summary;
+                            CollectFlagBitTestsForFunction(instructions, startIdx, endIdx, out var st);
+                            var summary = FormatFlagBitSummary(st, inferredFlagSymbols);
+                            if (!string.IsNullOrEmpty(summary))
+                                funcFlagSummaries[startAddr] = summary;
+                        }
+                    }
+                    else
+                    {
+                        _logger.Info($"LE: Reformatting flag summaries (parallel jobs={jobs})... {sortedStarts.Count} functions");
+                        var progress = 0;
+                        var dictLock = new object();
+                        Parallel.For(0, sortedStarts.Count, new ParallelOptions { MaxDegreeOfParallelism = jobs }, si =>
+                        {
+                            var startAddr = sortedStarts[si];
+                            if (!insIndexByAddr.TryGetValue(startAddr, out var startIdx))
+                                return;
+                            var endIdx = instructions.Count;
+                            if (si + 1 < sortedStarts.Count && insIndexByAddr.TryGetValue(sortedStarts[si + 1], out var nextIdx))
+                                endIdx = nextIdx;
+
+                            CollectFlagBitTestsForFunction(instructions, startIdx, endIdx, out var st);
+                            var summary = FormatFlagBitSummary(st, inferredFlagSymbols);
+                            if (!string.IsNullOrEmpty(summary))
+                            {
+                                lock (dictLock)
+                                    funcFlagSummaries[startAddr] = summary;
+                            }
+
+                            var done = Interlocked.Increment(ref progress);
+                            if ((done % 1000) == 0)
+                                _logger.Info($"LE: Flag reformat... {done}/{sortedStarts.Count}");
+                        });
                     }
                 }
 
@@ -6186,6 +6515,16 @@ namespace DOSRE.Dasm
                     _logger.Info($"LE: Object {obj.Index} insights complete in {swObjInsights.ElapsedMilliseconds} ms");
                 }
 
+                var renderLimit = leRenderLimit.HasValue ? Math.Max(0, leRenderLimit.Value) : int.MaxValue;
+
+                if (renderLimit == 0)
+                {
+                    _logger.Info($"LE: Rendering object {obj.Index} skipped (render disabled) ({instructions.Count} instructions)");
+                    AppendWrappedDisasmLine(sb, string.Empty, $" ; (Rendering skipped: -lerenderlimit 0) ; decoded {instructions.Count} instructions ; functions {functionStarts.Count}", commentColumn: 0, maxWidth: 160);
+                    sb.AppendLine();
+                    continue;
+                }
+
                 _logger.Info($"LE: Rendering object {obj.Index} ({instructions.Count} instructions)...");
 
                 var swObjRender = Stopwatch.StartNew();
@@ -6202,7 +6541,8 @@ namespace DOSRE.Dasm
                 int lastSwitchIdx = int.MinValue;
                 var emittedSwitchSigs = new HashSet<string>(StringComparer.Ordinal);
 
-                for (var insLoopIndex = 0; insLoopIndex < instructions.Count; insLoopIndex++)
+                var maxToRender = Math.Min(instructions.Count, renderLimit);
+                for (var insLoopIndex = 0; insLoopIndex < maxToRender; insLoopIndex++)
                 {
                     if (leInsights && (insLoopIndex % 50000) == 0 && insLoopIndex > 0)
                         _logger.Info($"LE: Rendering object {obj.Index}... {insLoopIndex}/{instructions.Count} ins");
@@ -6406,7 +6746,7 @@ namespace DOSRE.Dasm
                     }
 
                     var bytes = BitConverter.ToString(ins.Bytes).Replace("-", string.Empty);
-                    var rawInsText = ins.ToString();
+                    var rawInsText = InsText(ins);
                     var insText = rawInsText;
 
                     // Update DX immediate tracking before appending any '; ...' annotations.
@@ -6652,6 +6992,13 @@ namespace DOSRE.Dasm
                     AppendWrappedDisasmLine(sb, prefix, insText, commentColumn: 56, maxWidth: 160);
                 }
 
+                if (maxToRender < instructions.Count)
+                {
+                    sb.AppendLine();
+                    AppendWrappedDisasmLine(sb, string.Empty, $" ; (Render limit reached: rendered {maxToRender}/{instructions.Count} instructions; skipped {instructions.Count - maxToRender})", commentColumn: 0, maxWidth: 160);
+                    sb.AppendLine();
+                }
+
                 if (leInsights && symXrefs != null && symXrefs.Count > 0)
                 {
                     sb.AppendLine(";");
@@ -6719,6 +7066,7 @@ namespace DOSRE.Dasm
                             sb.AppendLine($";   (slots truncated: {slots.Count} total)");
                     }
                 }
+
                 if (vtblSymbols.Count > 128)
                     sb.AppendLine($"; (vtables truncated: {vtblSymbols.Count} total)");
                 sb.AppendLine(";");
@@ -6884,7 +7232,7 @@ namespace DOSRE.Dasm
             if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
                 return string.Empty;
 
-            var callText = instructions[callIdx].ToString().Trim();
+            var callText = InsText(instructions[callIdx]).Trim();
             var mc = Regex.Match(callText, @"^call\s+(?:dword\s+)?\[(?<base>e[a-z]{2})(?:\+0x(?<disp>[0-9a-fA-F]+))?\]$", RegexOptions.IgnoreCase);
             if (!mc.Success)
                 return string.Empty;
@@ -6900,7 +7248,7 @@ namespace DOSRE.Dasm
             // (We mainly care about a constant base because that implies a dispatch table.)
             for (var i = callIdx - 1; i >= 0 && i >= callIdx - 6; i--)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
 
                 // stop at barriers
                 if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
@@ -7009,7 +7357,7 @@ namespace DOSRE.Dasm
 
             for (var i = idx - 1; i >= 0 && i >= idx - 12; i--)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (t.Length == 0) continue;
 
                 if (t.StartsWith(movPrefix, StringComparison.OrdinalIgnoreCase) || t.StartsWith(leaPrefix, StringComparison.OrdinalIgnoreCase))
@@ -7161,7 +7509,7 @@ namespace DOSRE.Dasm
             if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
                 return false;
 
-            var callText = instructions[callIdx].ToString().Trim();
+            var callText = InsText(instructions[callIdx]).Trim();
             var m = Regex.Match(callText, @"^call\s+(?:dword\s+)?\[(?<base>e[a-z]{2})(?:\+0x(?<disp>[0-9a-fA-F]+))?\]$", RegexOptions.IgnoreCase);
             if (!m.Success)
                 return false;
@@ -7177,7 +7525,7 @@ namespace DOSRE.Dasm
             // Look back for: mov vtblReg, [thisReg]
             for (var i = callIdx - 1; i >= 0 && i >= callIdx - 8; i--)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
                     t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) || (t.StartsWith("j", StringComparison.OrdinalIgnoreCase) && !t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase)))
                 {
@@ -7220,7 +7568,7 @@ namespace DOSRE.Dasm
             // We mainly want: mov reg, [abs] (global pointer) or mov reg, imm32.
             for (var i = callIdx - 1; i >= 0 && i >= callIdx - 16; i--)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
 
                 // stop at barriers
                 if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
@@ -7288,7 +7636,7 @@ namespace DOSRE.Dasm
             // Typical ctor: mov dword [ecx], 0xXXXXXXXX
             for (var i = callIdx - 1; i >= 0 && i >= callIdx - 64; i--)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
                     break;
 
@@ -7474,7 +7822,7 @@ namespace DOSRE.Dasm
                 return string.Empty;
 
             var callIns = instructions[callIdx];
-            var callText = callIns.ToString();
+            var callText = InsText(callIns);
             if (!callText.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
                 return string.Empty;
 
@@ -7483,7 +7831,7 @@ namespace DOSRE.Dasm
             var pushedOperands = new List<string>();
             for (var i = callIdx - 1; i >= 0 && i >= callIdx - 16; i--)
             {
-                var t = instructions[i].ToString();
+                var t = InsText(instructions[i]);
 
                 // stop at barriers
                 if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
@@ -7551,14 +7899,14 @@ namespace DOSRE.Dasm
             if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
                 return string.Empty;
 
-            var callText = instructions[callIdx].ToString();
+            var callText = InsText(instructions[callIdx]);
             if (!callText.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
                 return string.Empty;
 
             if (callIdx + 1 >= instructions.Count)
                 return string.Empty;
 
-            var next = instructions[callIdx + 1].ToString().Trim();
+            var next = InsText(instructions[callIdx + 1]).Trim();
 
             // Common cdecl cleanup: add esp, 0xNN
             var m = Regex.Match(next, @"^add\s+esp,\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
@@ -7583,7 +7931,7 @@ namespace DOSRE.Dasm
             if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
                 return string.Empty;
 
-            var callText = instructions[callIdx].ToString().Trim();
+            var callText = InsText(instructions[callIdx]).Trim();
             if (!callText.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
                 return string.Empty;
 
@@ -7606,7 +7954,7 @@ namespace DOSRE.Dasm
             string thisReg = null;
             for (var i = callIdx - 1; i >= 0 && i >= callIdx - 6; i--)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
                     t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) || (t.StartsWith("j", StringComparison.OrdinalIgnoreCase) && !t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase)))
                 {
@@ -7659,7 +8007,7 @@ namespace DOSRE.Dasm
             if (stringPreview == null)
                 return string.Empty;
 
-            var callText = instructions[callIdx].ToString();
+            var callText = InsText(instructions[callIdx]);
             if (!callText.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
                 return string.Empty;
 
@@ -7681,7 +8029,7 @@ namespace DOSRE.Dasm
 
             for (var i = callIdx - 1; i >= 0 && i >= callIdx - 12; i--)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
 
                 // Stop at control-flow barriers
                 if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
@@ -7782,7 +8130,7 @@ namespace DOSRE.Dasm
             if (instructions == null || insIdx < 0 || insIdx >= instructions.Count)
                 return string.Empty;
 
-            var raw = instructions[insIdx].ToString();
+            var raw = InsText(instructions[insIdx]);
             if (TryResolveStringFromInstruction(instructions, insIdx, raw, stringSymbols, stringPreview, objects, objBytesByIndex, resourceGetterTargets, out var p1))
                 return $"STR: \"{p1}\"";
 
@@ -8100,7 +8448,7 @@ namespace DOSRE.Dasm
 
             for (var i = stop; i <= start; i++)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (string.IsNullOrEmpty(t))
                     continue;
 
@@ -8227,7 +8575,7 @@ namespace DOSRE.Dasm
 
             for (var i = callIdx - 1; i >= 0 && i >= callIdx - 12; i--)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 if (string.IsNullOrEmpty(t))
                     continue;
 
@@ -8298,7 +8646,7 @@ namespace DOSRE.Dasm
 
             for (var i = 0; i < instructions.Count; i++)
             {
-                var t = instructions[i].ToString().Trim();
+                var t = InsText(instructions[i]).Trim();
                 var mcall = Regex.Match(t, @"^call\s+(?<target>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
                 if (!mcall.Success)
                     continue;
@@ -8311,7 +8659,7 @@ namespace DOSRE.Dasm
 
                 for (var k = i - 1; k >= 0 && k >= i - 10; k--)
                 {
-                    var back = instructions[k].ToString().Trim();
+                    var back = InsText(instructions[k]).Trim();
                     if (back.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || back.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
                         break;
 

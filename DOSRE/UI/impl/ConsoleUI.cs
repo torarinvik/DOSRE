@@ -95,6 +95,20 @@ namespace DOSRE.UI.impl
         private int? _leBytesLimit;
 
         /// <summary>
+        ///     LE render limit (max instructions per object)
+        ///     Specified with the -lerenderlimit <n> argument
+        ///     0 disables instruction rendering entirely (insights-only output).
+        /// </summary>
+        private int? _leRenderLimit;
+
+        /// <summary>
+        ///     LE insights parallelism (jobs)
+        ///     Specified with the -lejobs <n> argument
+        ///     Defaults to 1 (no parallelism).
+        /// </summary>
+        private int _leJobs = 1;
+
+        /// <summary>
         ///     Output slicing (KB)
         ///     Specified with the -splitkb <n> argument
         ///     When used with -o, splits output into multiple numbered files about n KB each.
@@ -212,6 +226,14 @@ namespace DOSRE.UI.impl
                     var opt = NormalizeOpt(_args[i]);
                     switch (opt)
                     {
+                        case "LE":
+                            // Convenience: allow `-LE <file>` as an alias for `-I <file>`.
+                            // Users often read this as "LE input".
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LE requires a <file>");
+                            _sInputFile = _args[i + 1];
+                            i++;
+                            break;
                         case "I":
                             _sInputFile = _args[i + 1];
                             i++;
@@ -254,6 +276,22 @@ namespace DOSRE.UI.impl
                             break;
                         case "LEINSIGHTS":
                             _bLeInsights = true;
+                            break;
+                        case "LERENDERLIMIT":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LERENDERLIMIT requires a value");
+                            if (!int.TryParse(_args[i + 1], out var renderLimit) || renderLimit < 0)
+                                throw new Exception("Error: -LERENDERLIMIT must be a non-negative integer (0 = no render)");
+                            _leRenderLimit = renderLimit;
+                            i++;
+                            break;
+                        case "LEJOBS":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LEJOBS requires a value");
+                            if (!int.TryParse(_args[i + 1], out var jobs) || jobs <= 0)
+                                throw new Exception("Error: -LEJOBS must be a positive integer");
+                            _leJobs = jobs;
+                            i++;
                             break;
                         case "LEDECOMP":
                         case "LEDECOMPILE":
@@ -349,6 +387,7 @@ namespace DOSRE.UI.impl
                         case "?":
                         case "H":
                         case "HELP":
+                            Console.WriteLine("-LE <file> -- Input File (alias for -I; commonly used for LE/DOS4GW EXEs)");
                             Console.WriteLine("-I <file> -- Input File to DisassembleSegment");
                             Console.WriteLine("-O <file> -- Output File for Disassembly (Default ConsoleUI)");
                             Console.WriteLine("-MINIMAL -- Minimal Disassembler Output");
@@ -368,6 +407,10 @@ namespace DOSRE.UI.impl
                                 "-LEGLOBALS -- (LE inputs) Emit g_XXXXXXXX EQU 0xXXXXXXXX from disp32 fixups + rewrite operands (LLM-friendly)");
                             Console.WriteLine(
                                 "-LEINSIGHTS -- (LE inputs) Best-effort function/CFG/xref/stack-var/string analysis (more LLM-friendly)");
+                            Console.WriteLine(
+                                "-LERENDERLIMIT <n> -- (LE inputs) Max instructions per object to emit (0 = no instruction render; insights-only)");
+                            Console.WriteLine(
+                                "-LEJOBS <n> -- (LE inputs) Parallel jobs for insights passes (default 1; try 8 on an 8-core machine)");
                             Console.WriteLine(
                                 "-LEDECOMP -- (LE inputs) Emit best-effort pseudo-C (builds on LE insights/symbolization)");
                             Console.WriteLine(
@@ -430,7 +473,7 @@ namespace DOSRE.UI.impl
                 {
                     leOk = _bLeDecompile
                         ? LEDisassembler.TryDecompileToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out leOutput, out leError)
-                        : LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out leOutput, out leError);
+                        : LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _leRenderLimit, _leJobs, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out leOutput, out leError);
                 }
 
                 if (leOk)
@@ -451,6 +494,17 @@ namespace DOSRE.UI.impl
                         _logger.Warn("Warning: -leglobals works best with -lefixups (globals are derived from fixups)");
                     if (_bLeInsights && !_bLeFixups)
                         _logger.Warn("Warning: -leinsights works best with -lefixups (many xrefs/symbols are derived from fixups)");
+
+                    if (_leRenderLimit.HasValue)
+                    {
+                        if (_leRenderLimit.Value == 0)
+                            _logger.Info("LE render disabled (-lerenderlimit 0): insights still computed, instruction listing is skipped");
+                        else
+                            _logger.Info($"LE render limit enabled: {_leRenderLimit.Value} instructions/object");
+                    }
+
+                    if (_bLeInsights)
+                        _logger.Info($"LE insights jobs: {_leJobs}");
 
                     if (_bLeFixDump)
                     {
