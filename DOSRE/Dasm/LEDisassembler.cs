@@ -571,7 +571,7 @@ namespace DOSRE.Dasm
                     return null;
 
                 // Most bounds checks happen before the indexed access; scan backward a bit.
-                var lo = Math.Max(start, idx - 64);
+                var lo = Math.Max(start, idx - 96);
                 var candidateRegs = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { indexReg };
                 var candidateStackSyms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -1019,6 +1019,15 @@ namespace DOSRE.Dasm
                         {
                             stDst.IndexScaleCounts.TryGetValue(sc.Key, out var c);
                             stDst.IndexScaleCounts[sc.Key] = c + sc.Value;
+                        }
+                    }
+
+                    if (stSrc.ArrayBoundCounts != null && stSrc.ArrayBoundCounts.Count > 0)
+                    {
+                        foreach (var bc in stSrc.ArrayBoundCounts)
+                        {
+                            stDst.ArrayBoundCounts.TryGetValue(bc.Key, out var c);
+                            stDst.ArrayBoundCounts[bc.Key] = c + bc.Value;
                         }
                     }
 
