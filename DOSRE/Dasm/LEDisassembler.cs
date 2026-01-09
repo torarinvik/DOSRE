@@ -970,14 +970,17 @@ namespace DOSRE.Dasm
                 return string.Empty;
 
             var parts = new List<string>();
+            var idx = 0;
             foreach (var l in loops.Take(3))
             {
-                var latch = l.Latches.Count > 0 ? $" latch=0x{l.Latches.Min():X8}" : string.Empty;
-                var iv = !string.IsNullOrWhiteSpace(l.InductionVar) ? $" iv={l.InductionVar}" : string.Empty;
-                var step = l.Step.HasValue ? $" step={(l.Step.Value >= 0 ? "+" : string.Empty)}{l.Step.Value}" : string.Empty;
+                // Keep the first loop detailed; subsequent loops are compact to avoid line wrap.
+                var latch = (idx == 0 && l.Latches.Count > 0) ? $" latch=0x{l.Latches.Min():X8}" : string.Empty;
+                var iv = (idx == 0 && !string.IsNullOrWhiteSpace(l.InductionVar)) ? $" iv={l.InductionVar}" : string.Empty;
+                var step = (idx == 0 && l.Step.HasValue) ? $" step={(l.Step.Value >= 0 ? "+" : string.Empty)}{l.Step.Value}" : string.Empty;
                 var bound = !string.IsNullOrWhiteSpace(l.Bound) ? $" bound={l.Bound}" : string.Empty;
                 var cond = !string.IsNullOrWhiteSpace(l.Cond) ? $" cond={l.Cond}" : string.Empty;
                 parts.Add($"hdr=0x{l.Header:X8}{latch}{iv}{step}{bound}{cond}");
+                idx++;
             }
 
             var more = loops.Count > 3 ? $", ... (+{loops.Count - 3})" : string.Empty;
@@ -1148,9 +1151,9 @@ namespace DOSRE.Dasm
             if (summary != null)
             {
                 if (summary.Globals != null && summary.Globals.Count > 0)
-                    parts.Add($"globals={string.Join(",", summary.Globals.OrderBy(x => x).Take(4))}{(summary.Globals.Count > 4 ? ",..." : string.Empty)}");
+                    parts.Add($"globals={string.Join(",", summary.Globals.OrderBy(x => x).Take(3))}{(summary.Globals.Count > 3 ? ",..." : string.Empty)}");
                 if (summary.Strings != null && summary.Strings.Count > 0)
-                    parts.Add($"strings={string.Join(",", summary.Strings.OrderBy(x => x).Take(3))}{(summary.Strings.Count > 3 ? ",..." : string.Empty)}");
+                    parts.Add($"strings={string.Join(",", summary.Strings.OrderBy(x => x).Take(2))}{(summary.Strings.Count > 2 ? ",..." : string.Empty)}");
             }
 
             if (!string.IsNullOrWhiteSpace(loopSummary))
