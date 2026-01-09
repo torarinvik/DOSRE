@@ -38,7 +38,7 @@ A practical “disassembly → C” workflow looks like:
 
 ### 4) Struct / field recovery
 - Group inferred pointer bases into per-type structs (best-effort field table aggregation for `ptr_XXXXXXXX` is implemented).
-- Field type inference (ptr/int/flags/array) based on access width and usage.
+- Field type inference (partial): infer access width (byte/word/dword) and mark some fields as pointer-like (`ptr`) based on usage.
 - Detect array strides (`base + idx*scale + disp`).
 - Improve vtable detection and slot labelling.
 

@@ -187,6 +187,49 @@ namespace DOSRE.Dasm
             public int ReadCount;
             public int WriteCount;
             public string Size = string.Empty;
+            public int PointerUseCount;
+        }
+
+        private static string BitWidthToMemSize(int bits)
+        {
+            return bits switch
+            {
+                8 => "byte",
+                16 => "word",
+                32 => "dword",
+                _ => string.Empty
+            };
+        }
+
+        private static string InferMemOperandSize(string insText, string memOperandText)
+        {
+            if (string.IsNullOrWhiteSpace(insText) || string.IsNullOrWhiteSpace(memOperandText))
+                return string.Empty;
+
+            // Prefer explicit size tokens close to the memory operand.
+            var m = Regex.Match(insText, $@"\b(?<sz>byte|word|dword)\s*{Regex.Escape(memOperandText)}\b", RegexOptions.IgnoreCase);
+            if (m.Success)
+                return m.Groups["sz"].Value.ToLowerInvariant();
+
+            // Best-effort: infer from register operand width for common ops.
+            var t = insText.Trim();
+            var sp = t.IndexOf(' ');
+            var mnemonic = sp > 0 ? t.Substring(0, sp).ToLowerInvariant() : t.ToLowerInvariant();
+
+            // movzx/movsx source width should be explicit; don't guess.
+            if (mnemonic == "movzx" || mnemonic == "movsx")
+                return string.Empty;
+
+            var ops = sp > 0 ? t.Substring(sp + 1) : string.Empty;
+            var parts = ops.Split(',').Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+            if (parts.Count < 2)
+                return string.Empty;
+
+            var op0 = parts[0];
+            var memIsDest = op0.Contains(memOperandText, StringComparison.OrdinalIgnoreCase);
+            var other = memIsDest ? parts[1] : parts[0];
+            var bits = GetRegBitWidth(other);
+            return bits.HasValue ? BitWidthToMemSize(bits.Value) : string.Empty;
         }
 
         private static bool TryParseEbpArgIndex(string hex, out int argIndex)
@@ -297,11 +340,30 @@ namespace DOSRE.Dasm
 
             if (!string.IsNullOrEmpty(size) && string.IsNullOrEmpty(st.Size))
                 st.Size = size;
+            else if (!string.IsNullOrEmpty(size) && !string.IsNullOrEmpty(st.Size) && !string.Equals(st.Size, size, StringComparison.OrdinalIgnoreCase))
+                st.Size = string.Empty;
 
             if (readInc > 0)
                 st.ReadCount += readInc;
             if (writeInc > 0)
                 st.WriteCount += writeInc;
+        }
+
+        private static void RecordFieldPointerUse(
+            Dictionary<string, Dictionary<uint, FieldAccessStats>> statsByBase,
+            string baseAlias,
+            uint disp)
+        {
+            if (statsByBase == null || string.IsNullOrWhiteSpace(baseAlias))
+                return;
+
+            if (!statsByBase.TryGetValue(baseAlias, out var byDisp))
+                statsByBase[baseAlias] = byDisp = new Dictionary<uint, FieldAccessStats>();
+
+            if (!byDisp.TryGetValue(disp, out var st))
+                byDisp[disp] = st = new FieldAccessStats();
+
+            st.PointerUseCount++;
         }
 
         private static void GetMemAccessRW(string insText, string memOperandText, out int reads, out int writes)
@@ -391,6 +453,8 @@ namespace DOSRE.Dasm
                 ["ecx"] = "this"
             };
 
+            var regFromField = new Dictionary<string, (string baseAlias, uint disp)>(StringComparer.OrdinalIgnoreCase);
+
             for (var i = startIdx; i < endIdxExclusive; i++)
             {
                 var insText = instructions[i].ToString().Trim();
@@ -398,17 +462,52 @@ namespace DOSRE.Dasm
                 // Update aliases first so we model dataflow forward.
                 UpdatePointerAliases(insText, aliases, ptrSymbols);
 
-                // Prefer size when present (byte/word/dword).
-                var size = string.Empty;
-                var ms = MemOpWithSizeRegex.Match(insText);
-                if (ms.Success)
-                    size = ms.Groups["size"].Value.ToLowerInvariant();
+                // If instruction writes to a register in some other way, drop reg->field provenance.
+                var wr = WritesRegRegex.Match(insText);
+                if (wr.Success)
+                {
+                    var dst = wr.Groups["dst"].Value.ToLowerInvariant();
+                    regFromField.Remove(dst);
+                }
+
+                // Seed provenance on simple loads: mov reg32, [base+disp]
+                var mLoad = Regex.Match(insText, @"^mov\s+(?<dst>e?(ax|bx|cx|dx|si|di|bp|sp))\s*,\s*(?<mem>\[[^\]]+\])\s*$", RegexOptions.IgnoreCase);
+                if (mLoad.Success)
+                {
+                    var dst = mLoad.Groups["dst"].Value.ToLowerInvariant();
+                    if (GetRegBitWidth(dst).GetValueOrDefault() == 32)
+                    {
+                        var mem = mLoad.Groups["mem"].Value;
+                        var mm = MemOpRegex.Match(mem);
+                        if (mm.Success)
+                        {
+                            var baseReg = mm.Groups["base"].Value.ToLowerInvariant();
+                            if (baseReg != "esp" && baseReg != "ebp")
+                            {
+                                if (!aliases.TryGetValue(baseReg, out var baseAlias))
+                                    baseAlias = baseReg == "ecx" ? "this" : null;
+
+                                if (!string.IsNullOrEmpty(baseAlias))
+                                {
+                                    var disp = 0u;
+                                    if (mm.Groups["disp"].Success)
+                                        disp = Convert.ToUInt32(mm.Groups["disp"].Value, 16);
+                                    if (disp <= 0x4000)
+                                        regFromField[dst] = (baseAlias, disp);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 foreach (Match m in MemOpRegex.Matches(insText))
                 {
                     var baseReg = m.Groups["base"].Value.ToLowerInvariant();
                     if (baseReg == "esp" || baseReg == "ebp")
                         continue;
+
+                    if (regFromField.TryGetValue(baseReg, out var srcField))
+                        RecordFieldPointerUse(statsByBase, srcField.baseAlias, srcField.disp);
 
                     if (!aliases.TryGetValue(baseReg, out var baseAlias))
                     {
@@ -430,6 +529,7 @@ namespace DOSRE.Dasm
                     // Best-effort per-operand read/write classification.
                     var memText = m.Value; // e.g. [ecx+0x10]
                     GetMemAccessRW(insText, memText, out var r, out var w);
+                    var size = InferMemOperandSize(insText, memText);
                     RecordFieldAccess(statsByBase, baseAlias, disp, r, w, size);
                 }
             }
@@ -466,8 +566,9 @@ namespace DOSRE.Dasm
                         var disp = k.Key;
                         var st = k.Value;
                         var rw = $"r{st.ReadCount}/w{st.WriteCount}";
+                        var ptr = (st.PointerUseCount > 0 && (string.IsNullOrEmpty(st.Size) || string.Equals(st.Size, "dword", StringComparison.OrdinalIgnoreCase))) ? " ptr" : "";
                         var sz = string.IsNullOrEmpty(st.Size) ? "" : $" {st.Size}";
-                        return $"+0x{disp:X}({rw}{sz})";
+                        return $"+0x{disp:X}({rw}{sz}{ptr})";
                     });
                 parts.Add($"{baseAlias}: {string.Join(", ", fields)}");
             }
@@ -503,6 +604,7 @@ namespace DOSRE.Dasm
                     var stSrc = dispKvp.Value;
                     stDst.ReadCount += stSrc.ReadCount;
                     stDst.WriteCount += stSrc.WriteCount;
+                    stDst.PointerUseCount += stSrc.PointerUseCount;
 
                     if (string.IsNullOrEmpty(stDst.Size))
                     {
@@ -564,8 +666,9 @@ namespace DOSRE.Dasm
                         var disp = k.Key;
                         var st = k.Value;
                         var rw = $"r{st.ReadCount}/w{st.WriteCount}";
+                        var ptr = (st.PointerUseCount > 0 && (string.IsNullOrEmpty(st.Size) || string.Equals(st.Size, "dword", StringComparison.OrdinalIgnoreCase))) ? " ptr" : "";
                         var sz = string.IsNullOrEmpty(st.Size) ? "" : $" {st.Size}";
-                        return $"+0x{disp:X}({rw}{sz})";
+                        return $"+0x{disp:X}({rw}{sz}{ptr})";
                     })
                     .ToList();
 
