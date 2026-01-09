@@ -13,7 +13,6 @@ using SharpDisasm.Udis86;
 
 namespace DOSRE.Dasm
 {
-    /// <summary>
     /// Minimal disassembler for DOS4GW Linear Executable (LE) format.
     ///
     /// This is intentionally "minimal" compared to the NE pipeline:
@@ -334,9 +333,9 @@ namespace DOSRE.Dasm
                 return;
             }
 
-            // Read-modify-write when memory is destination.
             switch (mnemonic)
             {
+                // Read-modify-write when memory is destination.
                 case "add":
                 case "sub":
                 case "and":
@@ -363,28 +362,16 @@ namespace DOSRE.Dasm
                         reads = 1;
                     }
                     return;
+
                 case "cmp":
                 case "test":
-                case "push":
-                case "call":
+                    reads = 1;
+                    return;
+
+                default:
                     reads = 1;
                     return;
             }
-
-            // FP memory ops: fstp writes; fld reads. Others default to read.
-            if (mnemonic.StartsWith("fst", StringComparison.OrdinalIgnoreCase))
-            {
-                writes = 1;
-                return;
-            }
-            if (mnemonic.StartsWith("fld", StringComparison.OrdinalIgnoreCase))
-            {
-                reads = 1;
-                return;
-            }
-
-            // Default: assume read.
-            reads = 1;
         }
 
         private static void CollectFieldAccessesForFunction(
@@ -767,6 +754,382 @@ namespace DOSRE.Dasm
                 t = t.Substring(0, 42) + "...";
 
             return t;
+        }
+
+        private sealed class LoopSummary
+        {
+            public uint Header;
+            public readonly HashSet<uint> Latches = new HashSet<uint>();
+            public string InductionVar;
+            public int? Step;
+            public string Bound;
+            public string Cond;
+        }
+
+        private static void InferLoopsForFunction(
+            List<Instruction> instructions,
+            Dictionary<uint, int> insIndexByAddr,
+            HashSet<uint> blockStarts,
+            uint startAddr,
+            uint endAddrExclusive,
+            int startIdx,
+            int endIdxExclusive,
+            out List<LoopSummary> loops)
+        {
+            loops = new List<LoopSummary>();
+            if (instructions == null || insIndexByAddr == null)
+                return;
+            if (startIdx < 0 || endIdxExclusive <= startIdx)
+                return;
+
+            var loopByHeader = new Dictionary<uint, LoopSummary>();
+
+            // Back-edges: any branch/cjump to an earlier address within the same function.
+            for (var i = startIdx; i < endIdxExclusive; i++)
+            {
+                var ins = instructions[i];
+                var addr = (uint)ins.Offset;
+                if (addr < startAddr || addr >= endAddrExclusive)
+                    continue;
+
+                if (!TryGetRelativeBranchTarget(ins, out var target, out var isCall) || isCall)
+                    continue;
+
+                if (target < startAddr || target >= endAddrExclusive)
+                    continue;
+
+                if (target >= addr)
+                    continue;
+
+                if (!loopByHeader.TryGetValue(target, out var ls))
+                    loopByHeader[target] = ls = new LoopSummary { Header = target };
+                ls.Latches.Add(addr);
+            }
+
+            if (loopByHeader.Count == 0)
+                return;
+
+            // Helper: find the end of a basic block starting at blockStart.
+            uint FindBlockEnd(uint blockStart)
+            {
+                if (blockStarts == null || blockStarts.Count == 0)
+                    return endAddrExclusive;
+                var next = blockStarts.Where(b => b > blockStart && b < endAddrExclusive).OrderBy(b => b).FirstOrDefault();
+                return next == 0 ? endAddrExclusive : next;
+            }
+
+            // Induction-var heuristic: look for cmp [local_X], imm near header and inc/add/sub/dec of same local near a latch.
+            foreach (var kv in loopByHeader.OrderBy(k => k.Key).Take(8))
+            {
+                var ls = kv.Value;
+                var headerStart = ls.Header;
+                var headerEnd = FindBlockEnd(headerStart);
+                if (!insIndexByAddr.TryGetValue(headerStart, out var headerIdx))
+                    continue;
+
+                var headerStopIdx = endIdxExclusive;
+                if (insIndexByAddr.TryGetValue(headerEnd, out var he))
+                    headerStopIdx = Math.Min(endIdxExclusive, he);
+
+                string cmpVar = null;
+                string cmpImm = null;
+                string cmpCond = null;
+
+                // Scan a small window at loop header.
+                var scanHeaderMax = Math.Min(headerStopIdx, headerIdx + 24);
+                for (var i = headerIdx; i < scanHeaderMax; i++)
+                {
+                    var cooked = RewriteStackFrameOperands(instructions[i].ToString()).Trim();
+                    var mCmpMem = Regex.Match(cooked, @"^cmp\s+(?:byte|word|dword)?\s*\[(?<var>local_[0-9A-Fa-f]+)\]\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$", RegexOptions.IgnoreCase);
+                    var mCmpReg = Regex.Match(cooked, @"^cmp\s+(?<reg>e?(ax|bx|cx|dx|si|di|bp|sp))\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$", RegexOptions.IgnoreCase);
+                    if (mCmpMem.Success)
+                    {
+                        cmpVar = mCmpMem.Groups["var"].Value;
+                        cmpImm = mCmpMem.Groups["imm"].Value;
+                    }
+                    else if (mCmpReg.Success)
+                    {
+                        cmpVar = mCmpReg.Groups["reg"].Value.ToLowerInvariant();
+                        cmpImm = mCmpReg.Groups["imm"].Value;
+                    }
+                    else
+                    {
+                        continue;
+                    }
+
+                    // Look ahead for the branch that uses this cmp.
+                    for (var j = i + 1; j < Math.Min(scanHeaderMax, i + 4); j++)
+                    {
+                        var t = RewriteStackFrameOperands(instructions[j].ToString()).Trim();
+                        var sp = t.IndexOf(' ');
+                        var mn = (sp > 0 ? t.Substring(0, sp) : t).Trim().ToLowerInvariant();
+                        if (!mn.StartsWith("j", StringComparison.OrdinalIgnoreCase) || mn == "jmp")
+                            continue;
+                        cmpCond = mn;
+                        break;
+                    }
+                    break;
+                }
+
+                if (!string.IsNullOrWhiteSpace(cmpVar))
+                {
+                    // Scan latches for updates.
+                    foreach (var latch in ls.Latches.OrderBy(x => x))
+                    {
+                        if (!insIndexByAddr.TryGetValue(latch, out var latchIdx))
+                            continue;
+
+                        var latchEnd = FindBlockEnd(latch);
+                        var latchStopIdx = endIdxExclusive;
+                        if (insIndexByAddr.TryGetValue(latchEnd, out var le))
+                            latchStopIdx = Math.Min(endIdxExclusive, le);
+
+                        var scanLatchMax = Math.Min(latchStopIdx, latchIdx + 20);
+                        for (var i = latchIdx; i < scanLatchMax; i++)
+                        {
+                            var cooked = RewriteStackFrameOperands(instructions[i].ToString()).Trim();
+
+                            if (cmpVar.StartsWith("local_", StringComparison.OrdinalIgnoreCase))
+                            {
+                                if (Regex.IsMatch(cooked, $@"^inc\s+(?:byte|word|dword)?\s*\[{Regex.Escape(cmpVar)}\]\s*$", RegexOptions.IgnoreCase))
+                                {
+                                    ls.InductionVar = cmpVar;
+                                    ls.Step = 1;
+                                    break;
+                                }
+                                if (Regex.IsMatch(cooked, $@"^dec\s+(?:byte|word|dword)?\s*\[{Regex.Escape(cmpVar)}\]\s*$", RegexOptions.IgnoreCase))
+                                {
+                                    ls.InductionVar = cmpVar;
+                                    ls.Step = -1;
+                                    break;
+                                }
+
+                                var mAddMem = Regex.Match(cooked, $@"^(?<op>add|sub)\s+(?:byte|word|dword)?\s*\[{Regex.Escape(cmpVar)}\]\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$", RegexOptions.IgnoreCase);
+                                if (mAddMem.Success)
+                                {
+                                    if (TryParseHexOrDecUInt32(mAddMem.Groups["imm"].Value, out var u) && u <= 0x100)
+                                    {
+                                        var step = (int)u;
+                                        if (mAddMem.Groups["op"].Value.Equals("sub", StringComparison.OrdinalIgnoreCase))
+                                            step = -step;
+                                        ls.InductionVar = cmpVar;
+                                        ls.Step = step;
+                                        break;
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                if (Regex.IsMatch(cooked, $@"^inc\s+{Regex.Escape(cmpVar)}\s*$", RegexOptions.IgnoreCase))
+                                {
+                                    ls.InductionVar = cmpVar;
+                                    ls.Step = 1;
+                                    break;
+                                }
+                                if (Regex.IsMatch(cooked, $@"^dec\s+{Regex.Escape(cmpVar)}\s*$", RegexOptions.IgnoreCase))
+                                {
+                                    ls.InductionVar = cmpVar;
+                                    ls.Step = -1;
+                                    break;
+                                }
+
+                                var mAddReg = Regex.Match(cooked, $@"^(?<op>add|sub)\s+{Regex.Escape(cmpVar)}\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$", RegexOptions.IgnoreCase);
+                                if (mAddReg.Success)
+                                {
+                                    if (TryParseHexOrDecUInt32(mAddReg.Groups["imm"].Value, out var u) && u <= 0x100)
+                                    {
+                                        var step = (int)u;
+                                        if (mAddReg.Groups["op"].Value.Equals("sub", StringComparison.OrdinalIgnoreCase))
+                                            step = -step;
+                                        ls.InductionVar = cmpVar;
+                                        ls.Step = step;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (!string.IsNullOrWhiteSpace(ls.InductionVar))
+                                break;
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(ls.InductionVar))
+                            break;
+                    }
+
+                    ls.Bound = cmpImm;
+                    ls.Cond = cmpCond;
+                }
+
+                loops.Add(ls);
+            }
+        }
+
+        private static string FormatLoopSummaryForFunction(List<LoopSummary> loops)
+        {
+            if (loops == null || loops.Count == 0)
+                return string.Empty;
+
+            var parts = new List<string>();
+            foreach (var l in loops.Take(3))
+            {
+                var latch = l.Latches.Count > 0 ? $" latch=0x{l.Latches.Min():X8}" : string.Empty;
+                var iv = !string.IsNullOrWhiteSpace(l.InductionVar) ? $" iv={l.InductionVar}" : string.Empty;
+                var step = l.Step.HasValue ? $" step={(l.Step.Value >= 0 ? "+" : string.Empty)}{l.Step.Value}" : string.Empty;
+                var bound = !string.IsNullOrWhiteSpace(l.Bound) ? $" bound={l.Bound}" : string.Empty;
+                var cond = !string.IsNullOrWhiteSpace(l.Cond) ? $" cond={l.Cond}" : string.Empty;
+                parts.Add($"hdr=0x{l.Header:X8}{latch}{iv}{step}{bound}{cond}");
+            }
+
+            var more = loops.Count > 3 ? $", ... (+{loops.Count - 3})" : string.Empty;
+            return $"LOOPS: {string.Join(", ", parts)}{more}";
+        }
+
+        private static string InferPointerishArgSummaryForFunction(
+            List<Instruction> instructions,
+            int startIdx,
+            int endIdxExclusive)
+        {
+            if (instructions == null || startIdx < 0 || endIdxExclusive <= startIdx)
+                return string.Empty;
+
+            var ptrArgs = new HashSet<int>();
+            var regSource = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            var max = Math.Min(instructions.Count, endIdxExclusive);
+            for (var i = startIdx; i < max; i++)
+            {
+                var cooked = RewriteStackFrameOperands(instructions[i].ToString()).Trim();
+
+                // Far-pointer loads: lgs/les/lfs reg, [arg_N]
+                var fp = Regex.Match(cooked, @"^(?<op>les|lfs|lgs)\s+\w+\s*,\s*\[(?<tok>arg_(?<idx>[0-9]+))\]\s*$", RegexOptions.IgnoreCase);
+                if (fp.Success && int.TryParse(fp.Groups["idx"].Value, out var fpIdx))
+                    ptrArgs.Add(fpIdx);
+
+                // Track reg <- [arg_N]
+                var m = Regex.Match(cooked, @"^mov\s+(?<reg>e[a-z]{2})\s*,\s*\[arg_(?<idx>[0-9]+)\]\s*$", RegexOptions.IgnoreCase);
+                if (m.Success && int.TryParse(m.Groups["idx"].Value, out var argIdx))
+                {
+                    regSource[m.Groups["reg"].Value.ToLowerInvariant()] = argIdx;
+                    continue;
+                }
+
+                foreach (var kv in regSource.ToList())
+                {
+                    var reg = kv.Key;
+                    var srcIdx = kv.Value;
+                    if (InsTextUsesRegAsMemBase(cooked, reg))
+                        ptrArgs.Add(srcIdx);
+                    if (InstructionWritesReg(cooked, reg))
+                        regSource.Remove(reg);
+                }
+            }
+
+            if (ptrArgs.Count == 0)
+                return string.Empty;
+
+            var shown = ptrArgs.OrderBy(x => x).Take(8).Select(x => $"ptr_arg_{x}").ToList();
+            var more = ptrArgs.Count > 8 ? $", ... (+{ptrArgs.Count - 8})" : string.Empty;
+            return string.Join(", ", shown) + more;
+        }
+
+        private static string CollectInterruptSummaryForFunction(
+            List<Instruction> instructions,
+            int startIdx,
+            int endIdxExclusive,
+            Dictionary<uint, string> stringSymbols,
+            Dictionary<uint, string> stringPreview,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex)
+        {
+            if (instructions == null || startIdx < 0 || endIdxExclusive <= startIdx)
+                return string.Empty;
+
+            var uniq = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var ordered = new List<string>();
+            var max = Math.Min(instructions.Count, endIdxExclusive);
+            for (var i = startIdx; i < max; i++)
+            {
+                var t = instructions[i].ToString().Trim();
+                if (!t.StartsWith("int ", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var hint = TryAnnotateInterrupt(instructions, i, stringSymbols, stringPreview, objects, objBytesByIndex);
+                var shortHint = ShortenInterruptHintForCase(hint);
+                if (string.IsNullOrWhiteSpace(shortHint))
+                    continue;
+                if (uniq.Add(shortHint))
+                    ordered.Add(shortHint);
+                if (ordered.Count >= 6)
+                    break;
+            }
+
+            if (ordered.Count == 0)
+                return string.Empty;
+            return string.Join(", ", ordered);
+        }
+
+        private static string FormatCSketchHeader(
+            uint startAddr,
+            string protoHint,
+            Dictionary<string, string> outLocalAliases,
+            Dictionary<string, int> localBitWidths,
+            string ptrArgSummary,
+            FunctionSummary summary,
+            string ioSummary,
+            string intSummary,
+            string loopSummary)
+        {
+            var parts = new List<string>();
+
+            if (!string.IsNullOrWhiteSpace(protoHint))
+            {
+                var p = protoHint.Trim();
+                if (p.StartsWith("PROTO:", StringComparison.OrdinalIgnoreCase))
+                    p = p.Substring("PROTO:".Length).Trim();
+                var semi = p.IndexOf(';');
+                if (semi >= 0)
+                    p = p.Substring(0, semi).Trim();
+                parts.Add($"proto={p}");
+            }
+            else
+            {
+                    parts.Add($"proto=func_{startAddr:X8}()");
+            }
+
+            if (outLocalAliases != null && outLocalAliases.Count > 0)
+            {
+                var vals = new List<string>();
+                foreach (var kv in outLocalAliases.OrderBy(k => k.Key).Take(10))
+                {
+                    var alias = kv.Value;
+                    if (localBitWidths != null && localBitWidths.TryGetValue(kv.Key, out var bits))
+                        alias = UpgradeOutpAliasWithBitWidth(alias, bits);
+                    if (!string.IsNullOrWhiteSpace(alias))
+                        vals.Add(alias);
+                }
+                if (vals.Count > 0)
+                    parts.Add($"out={string.Join(",", vals)}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(ptrArgSummary))
+                parts.Add($"args={ptrArgSummary}");
+
+            if (summary != null)
+            {
+                if (summary.Globals != null && summary.Globals.Count > 0)
+                    parts.Add($"globals={string.Join(",", summary.Globals.OrderBy(x => x).Take(6))}{(summary.Globals.Count > 6 ? ",..." : string.Empty)}");
+                if (summary.Strings != null && summary.Strings.Count > 0)
+                    parts.Add($"strings={string.Join(",", summary.Strings.OrderBy(x => x).Take(4))}{(summary.Strings.Count > 4 ? ",..." : string.Empty)}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(ioSummary))
+                parts.Add($"io={ioSummary}");
+            if (!string.IsNullOrWhiteSpace(intSummary))
+                parts.Add($"int={intSummary}");
+            if (!string.IsNullOrWhiteSpace(loopSummary))
+                parts.Add(loopSummary);
+
+            return parts.Count == 0 ? string.Empty : $"C: {string.Join(" | ", parts)}";
         }
 
         private static string TrySummarizeCaseTargetRole(
@@ -3988,12 +4351,16 @@ namespace DOSRE.Dasm
                 Dictionary<uint, List<string>> funcOutLocalAliasHints = null;
                 Dictionary<uint, Dictionary<string, int>> funcLocalBitWidths = null;
                 Dictionary<uint, string> funcProtoHints = null;
+                Dictionary<uint, string> funcLoopSummaries = null;
+                Dictionary<uint, string> funcCSketchHints = null;
                 if (leInsights && functionStarts != null && functionStarts.Count > 0)
                 {
                     funcOutLocalAliases = new Dictionary<uint, Dictionary<string, string>>();
                     funcOutLocalAliasHints = new Dictionary<uint, List<string>>();
                     funcLocalBitWidths = new Dictionary<uint, Dictionary<string, int>>();
                     funcProtoHints = new Dictionary<uint, string>();
+                    funcLoopSummaries = new Dictionary<uint, string>();
+                    funcCSketchHints = new Dictionary<uint, string>();
 
                     var sortedStarts = functionStarts.OrderBy(x => x).ToList();
                     for (var si = 0; si < sortedStarts.Count; si++)
@@ -4024,6 +4391,35 @@ namespace DOSRE.Dasm
                             var ccSuffix = string.IsNullOrWhiteSpace(cc) ? string.Empty : $" ; CC: {cc}";
                             var retSuffix = retImm.HasValue && retImm.Value > 0 ? $" (ret 0x{retImm.Value:X})" : string.Empty;
                             funcProtoHints[startAddr] = proto + ccSuffix + retSuffix;
+                        }
+
+                        // Loop/back-edge summaries (best-effort)
+                        if (blockStarts != null)
+                        {
+                            var endAddr = (si + 1 < sortedStarts.Count) ? sortedStarts[si + 1] : uint.MaxValue;
+                            InferLoopsForFunction(instructions, insIndexByAddr, blockStarts, startAddr, endAddr, startIdx, endIdx, out var loops);
+                            var loopSum = FormatLoopSummaryForFunction(loops);
+                            if (!string.IsNullOrEmpty(loopSum))
+                                funcLoopSummaries[startAddr] = loopSum;
+
+                            // C sketch header (best-effort)
+                            var ptrArgs = InferPointerishArgSummaryForFunction(instructions, startIdx, endIdx);
+                            var intSum = CollectInterruptSummaryForFunction(instructions, startIdx, endIdx, stringSymbols, stringPreview, objects, objBytesByIndex);
+                            FunctionSummary fs = null;
+                            string ioSum = null;
+                            string protoHint = null;
+                            Dictionary<string, int> bw = null;
+                            if (funcSummaries != null)
+                                funcSummaries.TryGetValue(startAddr, out fs);
+                            if (funcIoSummaries != null)
+                                funcIoSummaries.TryGetValue(startAddr, out ioSum);
+                            if (funcProtoHints != null)
+                                funcProtoHints.TryGetValue(startAddr, out protoHint);
+                            if (funcLocalBitWidths != null)
+                                funcLocalBitWidths.TryGetValue(startAddr, out bw);
+                            var csk = FormatCSketchHeader(startAddr, protoHint, aliases, bw, ptrArgs, fs, ioSum, intSum, loopSum);
+                            if (!string.IsNullOrWhiteSpace(csk))
+                                funcCSketchHints[startAddr] = csk;
                         }
                     }
                 }
@@ -4152,6 +4548,9 @@ namespace DOSRE.Dasm
 
                         if (leInsights && funcProtoHints != null && funcProtoHints.TryGetValue(addr, out var protoHint) && !string.IsNullOrWhiteSpace(protoHint))
                             AppendWrappedDisasmLine(sb, string.Empty, $" ; {protoHint}", commentColumn: 0, maxWidth: 160);
+
+                        if (leInsights && funcCSketchHints != null && funcCSketchHints.TryGetValue(addr, out var csk) && !string.IsNullOrWhiteSpace(csk))
+                            AppendWrappedDisasmLine(sb, string.Empty, $" ; {csk}", commentColumn: 0, maxWidth: 160);
 
                         if (leInsights && funcSummaries != null && funcSummaries.TryGetValue(addr, out var summary))
                             AppendWrappedDisasmLine(sb, string.Empty, $" {summary.ToComment()}", commentColumn: 0, maxWidth: 160);

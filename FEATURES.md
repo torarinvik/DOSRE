@@ -44,7 +44,7 @@ A practical “disassembly → C” workflow looks like:
 
 ### 5) Control-flow structuring
 - Normalize decision trees into a single `switch(var)` summary (cases + default + ranges).
-- Loop detection (`while`/`do`/`for`) and induction variable hints.
+- Loop detection (`while`/`do`/`for`) and induction variable hints. (implemented: back-edge + basic induction heuristic)
 - State-machine recognition (dispatch on a state variable, transition summaries).
 
 ### 6) Role naming (functions/blocks/variables)
@@ -62,7 +62,7 @@ A practical “disassembly → C” workflow looks like:
 - Emit table summaries (element size, count, consumers).
 
 ### 9) Output format tuned for C
-- Per-function “C sketch header”: guessed prototype, locals/args, key globals/strings, ports/interrupts.
+- Per-function “C sketch header”: guessed prototype, locals/args, key globals/strings, ports/interrupts. (implemented: compact `C:` line)
 - Stable per-function variable mapping (register role stabilization: `ebx=cursor`, etc.).
 - Def-use summaries for key variables.
 
