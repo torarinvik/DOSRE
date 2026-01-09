@@ -571,7 +571,7 @@ namespace DOSRE.Dasm
                     return null;
 
                 // Most bounds checks happen before the indexed access; scan backward a bit.
-                var lo = Math.Max(start, idx - 32);
+                var lo = Math.Max(start, idx - 128);
                 var candidateRegs = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { indexReg };
                 var candidateStackSyms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -592,6 +592,43 @@ namespace DOSRE.Dasm
                     // Don't scan across clear control-flow boundaries.
                     if (t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) || t.StartsWith("jmp ", StringComparison.OrdinalIgnoreCase))
                         break;
+
+                    // Bounds by bitmask: `and idx, (2^k-1)` implies idx in [0..(2^k-1)], so n = 2^k.
+                    // This is common when indexing fixed-size tables.
+                    static bool TryMaskToBound(uint mask, out uint bound)
+                    {
+                        bound = 0;
+                        if (mask == 0)
+                            return false;
+                        // mask is (2^k - 1) iff mask & (mask+1) == 0
+                        var plus = mask + 1;
+                        if ((mask & plus) != 0)
+                            return false;
+                        bound = plus;
+                        return true;
+                    }
+
+                    var andRegImm = Regex.Match(
+                        t,
+                        @"^and\s+(?:(?:byte|word|dword)\s+)?(?<reg>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$",
+                        RegexOptions.IgnoreCase);
+                    if (andRegImm.Success)
+                    {
+                        var rr = CanonReg(andRegImm.Groups["reg"].Value);
+                        if (candidateRegs.Contains(rr) && TryParseHexOrDecUInt32(andRegImm.Groups["imm"].Value, out var mask) && TryMaskToBound(mask, out var b) && b > 0)
+                            return b;
+                    }
+
+                    var andStackImm = Regex.Match(
+                        t,
+                        @"^and\s+(?:(?:byte|word|dword)\s+)?\[(?<sym>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\]\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$",
+                        RegexOptions.IgnoreCase);
+                    if (andStackImm.Success)
+                    {
+                        var sym = andStackImm.Groups["sym"].Value;
+                        if (candidateStackSyms.Contains(sym) && TryParseHexOrDecUInt32(andStackImm.Groups["imm"].Value, out var mask) && TryMaskToBound(mask, out var b) && b > 0)
+                            return b;
+                    }
 
                     // Stack slot constants.
                     var movStackImm = Regex.Match(
