@@ -573,6 +573,7 @@ namespace DOSRE.Dasm
                 // Most bounds checks happen before the indexed access; scan backward a bit.
                 var lo = Math.Max(start, idx - 32);
                 var candidateRegs = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { indexReg };
+                var candidateStackSyms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 for (var j = idx - 1; j >= lo; j--)
                 {
                     var t = insList[j].ToString().Trim();
@@ -582,6 +583,32 @@ namespace DOSRE.Dasm
                     // Don't scan across clear control-flow boundaries.
                     if (t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) || t.StartsWith("jmp ", StringComparison.OrdinalIgnoreCase))
                         break;
+
+                    // Track reg <-> [local_X]/[arg_Y] so we can match cmp [local_X], imm style bounds checks.
+                    // Keep this conservative: only stack symbols (locals/args), not arbitrary memory.
+                    var movRegFromStack = Regex.Match(
+                        t,
+                        @"^(?:mov|movsx|movzx)\s+(?<dst>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*,\s*(?:(?:byte|word|dword)\s+)?\[(?<sym>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\]\s*$",
+                        RegexOptions.IgnoreCase);
+                    if (movRegFromStack.Success)
+                    {
+                        var dst = CanonReg(movRegFromStack.Groups["dst"].Value);
+                        var sym = movRegFromStack.Groups["sym"].Value;
+                        if (candidateRegs.Contains(dst))
+                            candidateStackSyms.Add(sym);
+                    }
+
+                    var movStackFromReg = Regex.Match(
+                        t,
+                        @"^mov\s+\[(?<sym>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\]\s*,\s*(?<src>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*$",
+                        RegexOptions.IgnoreCase);
+                    if (movStackFromReg.Success)
+                    {
+                        var src = CanonReg(movStackFromReg.Groups["src"].Value);
+                        var sym = movStackFromReg.Groups["sym"].Value;
+                        if (candidateRegs.Contains(src))
+                            candidateStackSyms.Add(sym);
+                    }
 
                     // Track simple register-to-register moves so we can match a cmp against a source reg.
                     var mv = Regex.Match(
@@ -600,15 +627,28 @@ namespace DOSRE.Dasm
                         t,
                         @"^cmp\s+(?:(?:byte|word|dword)\s+)?(?<reg>e?[abcd]x|[abcd][hl]|[abcd]x|e?[sd]i|[sd]i)\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$",
                         RegexOptions.IgnoreCase);
-                    if (!m.Success)
+
+                    if (m.Success)
+                    {
+                        var reg = CanonReg(m.Groups["reg"].Value);
+                        if (candidateRegs.Contains(reg) && TryParseHexOrDecUInt32(m.Groups["imm"].Value, out var u) && u > 0)
+                            return u;
+                        continue;
+                    }
+
+                    var m2 = Regex.Match(
+                        t,
+                        @"^cmp\s+(?:(?:byte|word|dword)\s+)?\[(?<sym>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\]\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$",
+                        RegexOptions.IgnoreCase);
+                    if (!m2.Success)
                         continue;
 
-                    var reg = CanonReg(m.Groups["reg"].Value);
-                    if (!candidateRegs.Contains(reg))
+                    var sym2 = m2.Groups["sym"].Value;
+                    if (!candidateStackSyms.Contains(sym2))
                         continue;
 
-                    if (TryParseHexOrDecUInt32(m.Groups["imm"].Value, out var u) && u > 0)
-                        return u;
+                    if (TryParseHexOrDecUInt32(m2.Groups["imm"].Value, out var u2) && u2 > 0)
+                        return u2;
                 }
                 return null;
             }
