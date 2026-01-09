@@ -1,9 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using DOSRE.Enums;
+
+using System.Security.Cryptography;
 
 namespace DOSRE.Dasm
 {
@@ -45,12 +48,56 @@ namespace DOSRE.Dasm
             return true;
         }
 
-        private static string PseudoCFromLeAsm(string asm)
+        public static bool TryDecompileAsmFileToString(
+            string asmFile,
+            string onlyFunction,
+            out string output,
+            out string error)
+        {
+            output = string.Empty;
+            error = string.Empty;
+
+            if (string.IsNullOrWhiteSpace(asmFile) || !File.Exists(asmFile))
+            {
+                error = "Invalid asm file";
+                return false;
+            }
+
+            var asm = File.ReadAllText(asmFile);
+            output = PseudoCFromLeAsm(asm, onlyFunction);
+            return true;
+        }
+
+        public static bool TryDecompileAsmToString(
+            string asm,
+            string onlyFunction,
+            out string output,
+            out string error)
+        {
+            output = string.Empty;
+            error = string.Empty;
+
+            if (string.IsNullOrWhiteSpace(asm))
+            {
+                error = "Empty asm";
+                return false;
+            }
+
+            output = PseudoCFromLeAsm(asm, onlyFunction);
+            return true;
+        }
+
+        private static string PseudoCFromLeAsm(string asm, string onlyFunction = null)
         {
             if (string.IsNullOrWhiteSpace(asm))
                 return string.Empty;
 
             var lines = asm.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
+
+            if (!string.IsNullOrWhiteSpace(onlyFunction))
+            {
+                lines = TrySliceToSingleFunction(lines, onlyFunction);
+            }
 
             var labelByAddr = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var functions = new List<ParsedFunction>();
@@ -151,8 +198,24 @@ namespace DOSRE.Dasm
                 if (string.IsNullOrWhiteSpace(proto))
                     proto = $"void {fn.Name}(void)";
 
+                // Checksum calculation: hash of all raw instruction bytes in this function.
+                var allBytes = string.Join("", fn.Blocks.SelectMany(b => b.Lines).Where(l => l.Kind == ParsedLineKind.Instruction).Select(l => l.BytesHex));
+                var hashStr = string.Empty;
+                if (!string.IsNullOrEmpty(allBytes))
+                {
+                    using (var md5 = MD5.Create())
+                    {
+                        var hash = md5.ComputeHash(Encoding.ASCII.GetBytes(allBytes));
+                        hashStr = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+                    }
+                }
+
                 sb.AppendLine(proto + "");
                 sb.AppendLine("{");
+                if (!string.IsNullOrEmpty(hashStr))
+                {
+                    sb.AppendLine($"    // FIDELITY: {hashStr} (checksum of raw bytes)");
+                }
 
                 var regs = CollectRegistersUsed(fn);
                 if (regs.Any())
@@ -274,9 +337,9 @@ namespace DOSRE.Dasm
                         }
 
                         // Basic loop detection (do-while style)
-                        if (lineIdx == block.Lines.Count - 1 && IsJccLine(item, out var jccMn, out var jccTarget))
+                        if (lineIdx == block.Lines.Count - 1 && IsJccLine(item, out var loopMn, out var loopTarget))
                         {
-                             var targetLabel = labelByAddr.GetValueOrDefault(jccTarget);
+                             var loopTargetLabel = labelByAddr.GetValueOrDefault(loopTarget);
                              // If it jumps BACK to a label we've already seen in this function, it's a loop.
                              // For now, we don't 'structure' it as a while() but we can comment it.
                         }
@@ -311,6 +374,55 @@ namespace DOSRE.Dasm
             return sb.ToString();
         }
 
+        private static string[] TrySliceToSingleFunction(string[] lines, string onlyFunction)
+        {
+            if (lines == null || lines.Length == 0)
+                return lines;
+
+            var needle = onlyFunction.Trim();
+            if (needle.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                needle = needle.Substring(2);
+            needle = needle.Trim();
+
+            if (Regex.IsMatch(needle, @"^[0-9A-Fa-f]{1,8}$"))
+            {
+                needle = needle.PadLeft(8, '0').ToUpperInvariant();
+                needle = "func_" + needle;
+            }
+
+            if (!needle.StartsWith("func_", StringComparison.OrdinalIgnoreCase))
+                needle = "func_" + needle;
+
+            var start = -1;
+            for (var i = 0; i < lines.Length; i++)
+            {
+                var t = lines[i].Trim();
+                if (t.StartsWith(needle + ":", StringComparison.OrdinalIgnoreCase))
+                {
+                    start = i;
+                    break;
+                }
+            }
+
+            if (start < 0)
+                return lines;
+
+            var end = lines.Length;
+            for (var i = start + 1; i < lines.Length; i++)
+            {
+                var t = lines[i].Trim();
+                if (Regex.IsMatch(t, @"^func_[0-9A-Fa-f]{8}:\s*$"))
+                {
+                    end = i;
+                    break;
+                }
+            }
+
+            // Also keep a little prelude so label collection has a chance to see targets.
+            var preludeStart = Math.Max(0, start - 50);
+            return lines.Skip(preludeStart).Take(end - preludeStart).ToArray();
+        }
+
         private static HashSet<string> CollectRegistersUsed(ParsedFunction fn)
         {
             var res = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -322,8 +434,7 @@ namespace DOSRE.Dasm
                 ["dl"] = "edx", ["dh"] = "edx", ["dx"] = "edx", ["edx"] = "edx",
                 ["si"] = "esi", ["esi"] = "esi",
                 ["di"] = "edi", ["edi"] = "edi",
-                ["bp"] = "ebp", ["ebp"] = "ebp",
-                ["sp"] = "esp", ["esp"] = "esp"
+                ["bp"] = "ebp", ["ebp"] = "ebp"
             };
 
             foreach (var block in fn.Blocks)
@@ -340,7 +451,6 @@ namespace DOSRE.Dasm
                     }
                 }
             }
-            res.Remove("esp");
             return res;
         }
 
@@ -350,27 +460,37 @@ namespace DOSRE.Dasm
 
             string ResolveCallTarget(string opText)
             {
-                var mm = Regex.Match(opText, @"0x(?<addr>[0-9A-Fa-f]{1,8})");
+                // If it's already a symbol like func_XXXXXXXX, keep it but sanitize.
+                if (opText.StartsWith("func_", StringComparison.OrdinalIgnoreCase) || 
+                    opText.StartsWith("loc_", StringComparison.OrdinalIgnoreCase) || 
+                    opText.StartsWith("bb_", StringComparison.OrdinalIgnoreCase))
+                {
+                    return SanitizeLabel(opText);
+                }
+
+                var mm = Regex.Match(opText.Trim(), @"(?:0x)?(?<addr>[0-9A-Fa-f]{1,8})");
                 if (mm.Success)
                 {
-                    var a = mm.Groups["addr"].Value.PadLeft(8, '0').ToUpperInvariant();
+                    var a = mm.Groups["addr"].Value.ToUpperInvariant().PadLeft(8, '0');
                     if (labelByAddr.TryGetValue(a, out var lab))
                         return SanitizeLabel(lab);
-                    return "0x" + a;
+                    return "func_" + a;
                 }
-                return opText;
+                return SanitizeLabel(opText);
             }
 
             var target = ResolveCallTarget(targetRaw);
 
             var argsMatch = Regex.Match(hint, @"args~(?<count>\d+)");
             var retMatch = Regex.Match(hint, @"ret=(?<ret>[^\s,)]+)");
-            var regHints = Regex.Matches(hint, @"reg~(?<reg>[a-z]{2,3})=(?<val>[^,\s]+)");
+            var regHints = Regex.Matches(hint, @"reg~(?<reg>[a-z]{2,3})=(?<val>\[[^\]]+\]|[^\s,]+)");
 
             var argList = new List<string>();
             foreach (Match rm in regHints)
             {
-                argList.Add(NormalizeAsmOperandToC(rm.Groups["val"].Value.Trim(), false));
+                var v = rm.Groups["val"].Value.Trim();
+                if (v.EndsWith(",")) v = v.Substring(0, v.Length - 1);
+                argList.Add(NormalizeAsmOperandToC(v, false));
             }
 
             var retVar = string.Empty;
@@ -384,15 +504,22 @@ namespace DOSRE.Dasm
 
         private static string ResolveTarget(string opText, Dictionary<string, string> labelByAddr)
         {
-            var mm = Regex.Match(opText, @"0x(?<addr>[0-9A-Fa-f]{1,8})");
+            if (opText.StartsWith("func_", StringComparison.OrdinalIgnoreCase) || 
+                opText.StartsWith("loc_", StringComparison.OrdinalIgnoreCase) || 
+                opText.StartsWith("bb_", StringComparison.OrdinalIgnoreCase))
+            {
+                return SanitizeLabel(opText);
+            }
+
+            var mm = Regex.Match(opText.Trim(), @"(?:0x)?(?<addr>[0-9A-Fa-f]{1,8})");
             if (mm.Success)
             {
-                var a = mm.Groups["addr"].Value.PadLeft(8, '0').ToUpperInvariant();
+                var a = mm.Groups["addr"].Value.ToUpperInvariant().PadLeft(8, '0');
                 if (labelByAddr.TryGetValue(a, out var lab))
                     return SanitizeLabel(lab);
-                return "0x" + a;
+                return "loc_" + a;
             }
-            return opText;
+            return SanitizeLabel(opText);
         }
 
         private static string InvertCondition(string jcc, PendingFlags pending)
@@ -442,6 +569,7 @@ namespace DOSRE.Dasm
             public string Raw;
 
             public string AddrHex;
+            public string BytesHex;
             public string Asm;
             public string Comment;
         }
@@ -536,9 +664,10 @@ namespace DOSRE.Dasm
 
             // Example:
             // 0007E06Bh C6061B          mov byte [ptr_...], 0x1b              ; HINT: ...
+            // Pattern: addr 'h' space bytes space asm (trimmed) ';' comment
             var m = Regex.Match(
                 line,
-                @"^(?<addr>[0-9A-Fa-f]{8})h\s+[0-9A-Fa-f]{2,}\s+(?<asm>.+?)\s*(?:;\s*(?<c>.*))?$",
+                @"^(?<addr>[0-9A-Fa-f]{8})h\s+(?<bytes>[0-9A-Fa-f]+)\s+(?<asm>.+?)\s*(?:;\s*(?<c>.*))?$",
                 RegexOptions.None);
 
             if (!m.Success)
@@ -549,6 +678,7 @@ namespace DOSRE.Dasm
                 Kind = ParsedLineKind.Instruction,
                 Raw = line,
                 AddrHex = m.Groups["addr"].Value.ToUpperInvariant(),
+                BytesHex = m.Groups["bytes"].Value.ToUpperInvariant(),
                 Asm = m.Groups["asm"].Value.Trim(),
                 Comment = m.Groups["c"].Value.Trim()
             };
@@ -563,7 +693,7 @@ namespace DOSRE.Dasm
             if (string.IsNullOrWhiteSpace(asm))
                 return string.Empty;
 
-            var commentSuffix = string.IsNullOrWhiteSpace(ins.Comment) ? string.Empty : " // " + ins.Comment;
+            var commentSuffix = (string.IsNullOrWhiteSpace(ins.Comment) ? string.Empty : " // " + ins.Comment) + (string.IsNullOrWhiteSpace(ins.BytesHex) ? string.Empty : $" /* RAW: {ins.BytesHex} */");
 
             // Split mnemonic and operands.
             var m = Regex.Match(asm, @"^(?<mn>[a-zA-Z]+)\s*(?<ops>.*)$");
@@ -839,7 +969,7 @@ namespace DOSRE.Dasm
             }
 
             // Bare [expr] => assume dword in 32-bit mode.
-            var bare = Regex.Match(t, @"^\[(?<expr>.+)\]$", RegexOptions.None);
+            var bare = Regex.Match(t, @"^\[(?<expr>.+?)\]$", RegexOptions.None);
             if (bare.Success)
             {
                 var expr = bare.Groups["expr"].Value.Trim();

@@ -21,6 +21,16 @@ namespace DOSRE.UI.impl
     public class ConsoleUI : IUserInterface
     {
         /// <summary>
+
+    /// <summary>
+    ///     Optional: decompile from an already generated .asm file (skips LE disassembly)
+    /// </summary>
+    private string _leDecompileAsmFile;
+
+    /// <summary>
+    ///     Optional: only emit a single function (func_XXXXXXXX or hex address)
+    /// </summary>
+    private string _leOnlyFunction;
         ///     Logger Implementation
         /// </summary>
         protected static readonly Logger _logger = LogManager.GetCurrentClassLogger(typeof(CustomLogger));
@@ -249,6 +259,21 @@ namespace DOSRE.UI.impl
                         case "LEDECOMPILE":
                             _bLeDecompile = true;
                             break;
+                        case "LEDECOMPASM":
+                        case "LEDECOMPILEASM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LEDECOMPASM requires a <file.asm>");
+                            _bLeDecompile = true;
+                            _leDecompileAsmFile = _args[i + 1];
+                            i++;
+                            break;
+                        case "LEFUNC":
+                        case "LEONLYFUNC":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LEFUNC requires a function label or hex address");
+                            _leOnlyFunction = _args[i + 1];
+                            i++;
+                            break;
                         case "LEFIXDUMP":
                             _bLeFixDump = true;
                             if (i + 1 < _args.Length && int.TryParse(_args[i + 1], out var maxPages) && maxPages > 0)
@@ -346,6 +371,10 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LEDECOMP -- (LE inputs) Emit best-effort pseudo-C (builds on LE insights/symbolization)");
                             Console.WriteLine(
+                                "-LEDECOMPASM <file.asm> -- Decompile from an existing LE .asm output (fast iteration; skips LE disassembly)");
+                            Console.WriteLine(
+                                "-LEFUNC <func_XXXXXXXX|XXXXXXXX|0xXXXXXXXX> -- Only emit a single function (useful with -LEDECOMPASM)");
+                            Console.WriteLine(
                                 "-LEFIXDUMP [maxPages] -- (LE inputs) Dump raw fixup pages + decoding hints (writes <out>.fixups.txt if -O is used)");
                             Console.WriteLine(
                                 "-MZFULL -- (MZ inputs) Disassemble from entrypoint to end of load module");
@@ -369,9 +398,17 @@ namespace DOSRE.UI.impl
                     }
                 }
 
-                //Verify Input File is Valid
-                if (string.IsNullOrEmpty(_sInputFile) || !File.Exists(_sInputFile))
-                    throw new Exception("Error: Please specify a valid input file");
+                //Verify Input File is Valid (unless decompiling from an asm file)
+                if (!string.IsNullOrWhiteSpace(_leDecompileAsmFile))
+                {
+                    if (!File.Exists(_leDecompileAsmFile))
+                        throw new Exception("Error: Please specify a valid -LEDECOMPASM file");
+                }
+                else
+                {
+                    if (string.IsNullOrEmpty(_sInputFile) || !File.Exists(_sInputFile))
+                        throw new Exception("Error: Please specify a valid input file");
+                }
 
                 // Apply DOS version selection globally for interrupt DB lookups.
                 DosInterruptDatabase.SetCurrentDosVersionGlobal(_dosVersion);
@@ -381,9 +418,20 @@ namespace DOSRE.UI.impl
 
                 //LE/DOS4GW support (minimal): bypass NE-specific pipeline
                 //NOTE: This tool was originally NE-only; LE support does not include relocations/import analysis.
-                var leOk = _bLeDecompile
-                    ? LEDisassembler.TryDecompileToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out var leOutput, out var leError)
-                    : LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out leOutput, out leError);
+                bool leOk;
+                string leOutput;
+                string leError;
+
+                if (_bLeDecompile && !string.IsNullOrWhiteSpace(_leDecompileAsmFile))
+                {
+                    leOk = LEDisassembler.TryDecompileAsmFileToString(_leDecompileAsmFile, _leOnlyFunction, out leOutput, out leError);
+                }
+                else
+                {
+                    leOk = _bLeDecompile
+                        ? LEDisassembler.TryDecompileToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out leOutput, out leError)
+                        : LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out leOutput, out leError);
+                }
 
                 if (leOk)
                 {

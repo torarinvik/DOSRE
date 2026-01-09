@@ -335,3 +335,4 @@ EUROBLST.entry-insights14.full.disasm.txt
 *.pre_split
 tools/comment_sparse_runs.py
 EXES/disasm_le/FIDEMO.le.pseudo.c
+.playwright-mcp/memory.md
