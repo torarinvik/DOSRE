@@ -243,10 +243,12 @@ namespace DOSRE.UI.impl
                             i++;
                             break;
                         case "I":
+                            if (i + 1 >= _args.Length) throw new Exception("Error: -I requires a <file>");
                             _sInputFile = _args[i + 1];
                             i++;
                             break;
                         case "O":
+                            if (i + 1 >= _args.Length) throw new Exception("Error: -O requires a <file>");
                             _sOutputFile = _args[i + 1];
                             i++;
                             break;

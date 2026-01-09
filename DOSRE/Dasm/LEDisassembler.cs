@@ -1212,12 +1212,12 @@ namespace DOSRE.Dasm
                     return m.Value;
 
                 // Use field_0 for vptr-like deref.
-                // For inferred pointer globals (ptr_XXXXXXXX), prefer dotted form: [ptr_XXXXXXXX.field_0030]
+                // For inferred pointer globals (ptr_XXXXXXXX), prefer addition form: [ptr_XXXXXXXX+field_0030]
                 if (a.StartsWith("ptr_", StringComparison.OrdinalIgnoreCase))
                 {
                     return disp == 0
-                        ? $"[{a}.field_0000]"
-                        : $"[{a}.field_{disp:X4}]";
+                        ? $"[{a}+field_0000]"
+                        : $"[{a}+field_{disp:X4}]";
                 }
 
                 return disp == 0

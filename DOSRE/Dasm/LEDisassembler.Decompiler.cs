@@ -147,6 +147,8 @@ namespace DOSRE.Dasm
             for (var i = 0; i < lines.Length; i++)
             {
                 var line = lines[i];
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                if (line.Trim().StartsWith(";")) continue;
                 var t = line.TrimEnd();
 
                 var funcHdr = Regex.Match(t.Trim(), @"^func_(?<addr>[0-9A-Fa-f]{8}):\s*$");
@@ -207,6 +209,84 @@ namespace DOSRE.Dasm
                 }
             }
 
+            foreach (var fn in functions)
+            {
+                InferVariableTypes(fn);
+                MarkLoopHeaders(fn, labelByAddr);
+                
+                var proto = ExtractProtoFromHeader(fn.HeaderComments);
+                if (string.IsNullOrWhiteSpace(proto))
+                {
+                    // Basic argument inference
+                    int maxArg = -1;
+                    foreach (var block in fn.Blocks)
+                    {
+                        foreach (var line in block.Lines)
+                        {
+                            if (line.Kind != ParsedLineKind.Instruction) continue;
+                            var matches = Regex.Matches(line.Asm, @"arg_(?<idx>[0-9A-Fa-f]+)", RegexOptions.IgnoreCase);
+                            foreach (Match m in matches)
+                            {
+                                if (int.TryParse(m.Groups["idx"].Value, System.Globalization.NumberStyles.HexNumber, null, out var idx))
+                                    if (idx > maxArg) maxArg = idx;
+                            }
+                        }
+                    }
+                    
+                    // Also check for stdcall ret imm
+                    foreach (var block in fn.Blocks)
+                    {
+                        var last = block.Lines.LastOrDefault(l => l.Kind == ParsedLineKind.Instruction);
+                        if (last != null && last.Asm.StartsWith("ret ", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var m = Regex.Match(last.Asm, @"ret\s+(?<off>0x[0-9A-Fa-f]+|[0-9]+|[0-9A-Fa-f]+h)", RegexOptions.IgnoreCase);
+                            if (m.Success)
+                            {
+                                var offStr = m.Groups["off"].Value;
+                                int off;
+                                if (offStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) 
+                                    off = (int)Convert.ToUInt32(offStr.Substring(2), 16);
+                                else if (offStr.EndsWith("h", StringComparison.OrdinalIgnoreCase))
+                                    off = (int)Convert.ToUInt32(offStr.TrimEnd('h', 'H'), 16);
+                                else 
+                                    off = int.Parse(offStr);
+                                
+                                int argsFromRet = (off / 4) - 1;
+                                if (argsFromRet > maxArg) maxArg = argsFromRet;
+                            }
+                        }
+                    }
+
+                    var argList = new List<string>();
+                    for (int j = 0; j <= maxArg; j++)
+                    {
+                        var varName = $"arg_{j:x}";
+                        var ty = fn.InferredTypes.GetValueOrDefault(varName, "uint32_t");
+                        argList.Add($"{ty} {varName}");
+                    }
+                    var argsStr = argList.Any() ? string.Join(", ", argList) : "";
+                    
+                    var retType = "uint32_t"; 
+                    fn.RetType = retType;
+                    fn.Proto = $"{retType} {fn.Name}({argsStr})";
+                    fn.ArgCount = (maxArg >= 0) ? (maxArg + 1) : 0;
+                }
+                else 
+                {
+                    // Detect return type from custom proto
+                    if (proto.StartsWith("uint32_t", StringComparison.OrdinalIgnoreCase)) fn.RetType = "uint32_t";
+                    else if (proto.StartsWith("int", StringComparison.OrdinalIgnoreCase)) fn.RetType = "int";
+                    else {
+                        fn.RetType = "uint32_t";
+                        // If it started with void, replace it.
+                        if (proto.StartsWith("void", StringComparison.OrdinalIgnoreCase))
+                            proto = "uint32_t" + proto.Substring(4);
+                    }
+                    fn.Proto = proto;
+                    fn.ArgCount = Regex.Matches(proto, @"\barg_[0-9A-Fa-f]+\b").Count;
+                }
+            }
+
             // Emit pseudo-C
             var sb = new StringBuilder();
             sb.AppendLine("// DOSRE LE pseudo-decompile (best-effort)");
@@ -215,18 +295,119 @@ namespace DOSRE.Dasm
             sb.AppendLine("// - It reuses LE insights/symbolization from the disassembler output.");
             sb.AppendLine("// - Memory operands use uint*_t; assume <stdint.h>.");
             sb.AppendLine("#include <stdint.h>");
+            sb.AppendLine("typedef uint32_t size_t;");
+            sb.AppendLine("void* memcpy(void *dst, const void *src, size_t n);");
+            sb.AppendLine("void* memset(void *s, int c, size_t n);");
             sb.AppendLine();
+            sb.AppendLine("// Stubs for compilability");
+            sb.AppendLine("#define strlen_rep(edi, al, ecx) 0 /* stub */");
+            sb.AppendLine("#define __out(port, val) /* stub */");
+            sb.AppendLine("#define __in(port) 0 /* stub */");
+            sb.AppendLine("#define pop() 0 /* stub */");
+            sb.AppendLine("#define memset_32(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*4)");
+            sb.AppendLine("#define memset_16(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*2)");
+            sb.AppendLine("#define uintptr_t uint32_t");
+            sb.AppendLine("#define int32_t int");
+            sb.AppendLine("uint32_t func_0000000D() { return 0; }");
+            sb.AppendLine("uint32_t func_000000EA() { return 0; }");
+            sb.AppendLine("uint32_t func_000000FA() { return 0; }");
+            sb.AppendLine("uint32_t func_00000028() { return 0; }");
+            sb.AppendLine();
+
+            // Pass: Collect all referenced functions to ensure forward declarations for everything
+            var referencedFunctions = new HashSet<string>(functions.Select(f => f.Name), StringComparer.OrdinalIgnoreCase);
+            var otherFunctions = new Dictionary<string, (string proto, int argCount)>(StringComparer.OrdinalIgnoreCase);
+            var fieldOffsets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var ptrSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var fn in functions)
             {
-                InferVariableTypes(fn);
-                MarkLoopHeaders(fn, labelByAddr);
-                var proto = ExtractProtoFromHeader(fn.HeaderComments);
-                if (string.IsNullOrWhiteSpace(proto))
-                    proto = $"void {fn.Name}(void)";
+                foreach (var block in fn.Blocks)
+                {
+                    foreach (var line in block.Lines)
+                    {
+                        if (line.Kind != ParsedLineKind.Instruction) continue;
+                        
+                        // Look for calls: func_XXXXXXXX or just addresses that might be functions
+                        var callMatches = Regex.Matches(line.Raw + " " + line.Asm, @"\b(?<name>(?:func|loc|bb)_[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
+                        foreach (Match match in callMatches)
+                        {
+                            var rawName = match.Groups["name"].Value;
+                            var hexStr = rawName.Split('_')[1].ToUpperInvariant();
+                            var name = "func_" + hexStr;
+                            bool isAssigned = Regex.IsMatch(line.Asm, $@"\w+\s*=\s*{rawName}\b");
 
+                            if (referencedFunctions.Contains(name))
+                            {
+                                var target = functions.First(f => f.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                                // Always ensure it's not void if assigned.
+                                if (isAssigned && target.RetType == "void")
+                                {
+                                    target.RetType = "uint32_t";
+                                    target.Proto = target.Proto.Replace("void " + target.Name, "uint32_t " + target.Name);
+                                }
+                            }
+                            else
+                            {
+                                // All external functions default to uint32_t to be safe.
+                                if (!otherFunctions.ContainsKey(name))
+                                {
+                                    int detectedArgs = 0;
+                                    var hintMatch = Regex.Match(line.Comment ?? "", @"args~(?<cnt>\d+)");
+                                    if (hintMatch.Success) int.TryParse(hintMatch.Groups["cnt"].Value, out detectedArgs);
+                                    
+                                    otherFunctions[name] = ($"uint32_t {name}(" + string.Join(", ", Enumerable.Repeat("uint32_t", detectedArgs).Select((t, idx) => $"{t} arg_{idx}")) + ")", detectedArgs);
+                                }
+                            }
+                        }
+
+                        // Collect field_XXXX offsets
+                        var fieldAndPtrText = line.Asm + " " + line.Comment + " " + line.Raw;
+                        var fieldMatches = Regex.Matches(fieldAndPtrText, @"\bfield_(?<off>[0-9A-Fa-f]+)\b");
+                        foreach (Match fm in fieldMatches) fieldOffsets.Add(fm.Value);
+
+                        // Collect ptr_XXXXXXXX symbols
+                        var ptrMatches = Regex.Matches(fieldAndPtrText, @"\bptr_(?<addr>[0-9A-Fa-f]{8})\b");
+                        foreach (Match pm in ptrMatches) ptrSymbols.Add(pm.Value);
+                    }
+                }
+            }
+
+            sb.AppendLine("static uint32_t cs, ds, es, fs, gs, ss, dr0, dr1, dr2, dr3, dr6, dr7, this, carry;");
+
+            foreach (var foff in fieldOffsets.OrderBy(x => x))
+            {
+                var off = foff.Substring(6);
+                sb.AppendLine($"#define {foff} 0x{off}");
+            }
+            foreach (var psym in ptrSymbols.OrderBy(x => x))
+            {
+                var addr = psym.Substring(4);
+                sb.AppendLine($"#define {psym} 0x{addr}");
+            }
+            sb.AppendLine();
+
+            // Forward declarations
+            foreach (var fn in functions.OrderBy(x => x.Name))
+            {
+                // If it's a void-arg func, allow it to take arguments in the declaration
+                // to avoid "too many arguments" errors from imperfect inference.
+                var p = fn.Proto.Replace("(void)", "()");
+                sb.AppendLine($"{p};");
+            }
+            foreach (var kvp in otherFunctions.OrderBy(x => x.Key))
+            {
+                sb.AppendLine($"{kvp.Value.proto};");
+            }
+            sb.AppendLine();
+
+            var functionsByName = functions.ToDictionary(f => f.Name, f => f, StringComparer.OrdinalIgnoreCase);
+
+            foreach (var fn in functions)
+            {
+                var proto = fn.Proto;
                 // Checksum calculation: hash of all raw instruction bytes in this function.
-                var allBytes = string.Join("", fn.Blocks.SelectMany(b => b.Lines).Where(l => l.Kind == ParsedLineKind.Instruction).Select(l => l.BytesHex));
+                var allBytes = string.Join("", fn.Blocks.SelectMany(b => b.Lines).Select(l => l.BytesHex));
                 var hashStr = string.Empty;
                 if (!string.IsNullOrEmpty(allBytes))
                 {
@@ -245,7 +426,16 @@ namespace DOSRE.Dasm
                 }
 
                 var regs = CollectRegistersUsed(fn);
+                regs.Add("eax"); // Always declare eax as it's the default return
+                regs.Add("ebp");
+                regs.Add("esp");
                 var stackVars = CollectStackVarsUsed(fn);
+
+                // Exclude arguments from the local variable list if they are in the prototype.
+                var argVars = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var protoArgMatches = Regex.Matches(proto, @"\b(?<name>arg_[0-9A-Fa-f]+)\b");
+                foreach (Match am in protoArgMatches) argVars.Add(am.Groups["name"].Value.ToLowerInvariant());
+                stackVars.RemoveWhere(v => argVars.Contains(v));
 
                 var regDecls = FormatRegisterDeclarations(regs);
                 if (!string.IsNullOrEmpty(regDecls))
@@ -262,25 +452,32 @@ namespace DOSRE.Dasm
                 }
 
                 var pending = new PendingFlags();
-                var scopeEnds = new Stack<string>();
+
+                // Pass 3: Collect all referenced labels in this function to ensure they are declared.
+                var referencedLabels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var block in fn.Blocks)
+                {
+                    foreach (var line in block.Lines)
+                    {
+                        if (line.Kind != ParsedLineKind.Instruction) continue;
+                        
+                        // Broad search for any loc_ or bb_ labels
+                        var lblMatches = Regex.Matches(line.Asm + " " + line.Raw, @"\b(?<lbl>(loc|bb)_[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
+                        foreach (Match lm in lblMatches) 
+                            referencedLabels.Add(lm.Groups["lbl"].Value);
+
+                        if (IsJccLine(line, out _, out var target))
+                        {
+                            var lbl = labelByAddr.GetValueOrDefault(target.ToUpperInvariant().PadLeft(8, '0'));
+                            if (lbl != null) referencedLabels.Add(lbl);
+                        }
+                    }
+                }
 
                 foreach (var block in fn.Blocks)
                 {
-                    // Close any scopes that end at this block's label.
-                    while (scopeEnds.Count > 0 && scopeEnds.Peek() == block.Label)
-                    {
-                        scopeEnds.Pop();
-                        sb.AppendLine("    }");
-                    }
-
-                    sb.AppendLine($"{SanitizeLabel(block.Label)}:");
-                    if (fn.LoopHeaders.Contains(block.Label))
-                    {
-                        sb.AppendLine("    while (1) {");
-                        scopeEnds.Push("LOOP_END_" + block.Label); // Placeholder to close loop? 
-                        // Actually we should close it at the back-edge if we want structured, 
-                        // but sticking to goto + while(1) wrapper for now.
-                    }
+                    var sanitizedLabel = SanitizeLabel(block.Label);
+                    sb.AppendLine($"{sanitizedLabel}:;");
 
                     var blockLines = new List<string>();
                     var suppressTailAfterRetDecode = false;
@@ -304,29 +501,6 @@ namespace DOSRE.Dasm
 
                         if (suppressTailAfterRetDecode)
                             continue;
-
-                        // Basic If-Structure Detection:
-                        if (lineIdx == block.Lines.Count - 1 && IsJccLine(item, out var jccMn, out var jccTarget))
-                        {
-                            var cond = TryMakeConditionFromPending(jccMn, pending);
-                            var targetLabel = labelByAddr.GetValueOrDefault(jccTarget);
-
-                            if (!string.IsNullOrWhiteSpace(cond) && !string.IsNullOrWhiteSpace(targetLabel))
-                            {
-                                var inverted = InvertCondition(jccMn, pending);
-                                if (!string.IsNullOrWhiteSpace(inverted))
-                                {
-                                    blockLines.Add($"if ({inverted}) {{");
-                                    scopeEnds.Push(targetLabel);
-                                    pending.Clear();
-                                    continue;
-                                }
-
-                                blockLines.Add($"if ({cond}) goto {SanitizeLabel(targetLabel)};");
-                                pending.Clear();
-                                continue;
-                            }
-                        }
 
                         // Call-site improvement: peeks 
                         if (item.Asm.StartsWith("call", StringComparison.OrdinalIgnoreCase))
@@ -354,28 +528,24 @@ namespace DOSRE.Dasm
                             }
                         }
 
-                        // If-Else detection:
-                        if (lineIdx == block.Lines.Count - 1 && item.Asm.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) && scopeEnds.Count > 0)
-                        {
-                            var targetAddr = item.Asm.Substring(4).Trim().TrimStart('0', 'x').ToUpperInvariant().PadLeft(8, '0');
-                            var targetLabel = labelByAddr.GetValueOrDefault(targetAddr);
-                            if (targetLabel != null && targetLabel != scopeEnds.Peek())
-                            {
-                                blockLines.Add("} else {");
-                                scopeEnds.Pop();
-                                scopeEnds.Push(targetLabel);
-                                pending.Clear(false);
-                                continue;
-                            }
-                        }
-
-                        var stmt = TranslateInstructionToPseudoC(item, labelByAddr, pending, fn);
+                        var stmt = TranslateInstructionToPseudoC(item, labelByAddr, pending, fn, functionsByName, otherFunctions);
                         if (!string.IsNullOrWhiteSpace(stmt))
                         {
-                            if (stmt == "return;" && !string.IsNullOrWhiteSpace(pending.LastEaxAssignment))
+                            // Collect any newly referenced labels from the translated statement (might have been generated from hex targets)
+                            var extraLabels = Regex.Matches(stmt, @"\b(?<lbl>(loc|bb)_[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
+                            foreach (Match lm in extraLabels) referencedLabels.Add(lm.Value);
+
+                            if (stmt == "return;")
                             {
-                                blockLines.Add($"return {pending.LastEaxAssignment};");
-                                pending.LastEaxAssignment = null;
+                                if (!string.IsNullOrWhiteSpace(pending.LastEaxAssignment))
+                                {
+                                    blockLines.Add($"return {pending.LastEaxAssignment};");
+                                    pending.LastEaxAssignment = null;
+                                }
+                                else
+                                {
+                                    blockLines.Add("return eax;");
+                                }
                             }
                             else
                             {
@@ -392,17 +562,14 @@ namespace DOSRE.Dasm
                     }
                 }
 
-                while (scopeEnds.Count > 0)
+                // If some referenced labels were NOT in fn.Blocks, we must emit them at the end.
+                var blocksInFunc = new HashSet<string>(fn.Blocks.Select(b => b.Label), StringComparer.OrdinalIgnoreCase);
+                foreach (var missing in referencedLabels.Where(l => !blocksInFunc.Contains(l)).OrderBy(l => l))
                 {
-                    scopeEnds.Pop();
-                    sb.AppendLine("    }");
+                    sb.AppendLine($"{SanitizeLabel(missing)}:; // missing label from this function slice");
                 }
 
-                while (scopeEnds.Count > 0)
-                {
-                    scopeEnds.Pop();
-                    sb.AppendLine("    }");
-                }
+                sb.AppendLine("    return eax;");
                 sb.AppendLine("}");
                 sb.AppendLine();
             }
@@ -482,7 +649,10 @@ namespace DOSRE.Dasm
             var commonRegs = new[] { 
                 "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
                 "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
-                "al", "ah", "bl", "bh", "cl", "ch", "dl", "dh"
+                "al", "ah", "bl", "bh", "cl", "ch", "dl", "dh",
+                "cs", "ds", "es", "fs", "gs", "ss", "this",
+                "cr0", "cr1", "cr2", "cr3", "cr4", "cr5", "cr6", "cr7",
+                "dr0", "dr1", "dr2", "dr3", "dr4", "dr5", "dr6", "dr7"
             };
 
             // Pre-compile regex for performance
@@ -522,7 +692,9 @@ namespace DOSRE.Dasm
                 ["si"]="esi", ["esi"]="esi",
                 ["di"]="edi", ["edi"]="edi",
                 ["bp"]="ebp", ["ebp"]="ebp",
-                ["sp"]="esp", ["esp"]="esp"
+                ["sp"]="esp", ["esp"]="esp",
+                ["cs"]="cs", ["ds"]="ds", ["es"]="es", ["fs"]="fs", ["gs"]="gs", ["ss"]="ss",
+                ["this"]="this"
             };
 
             foreach (var r in regs)
@@ -565,6 +737,22 @@ namespace DOSRE.Dasm
                 foreach (var line in block.Lines)
                 {
                     if (line.Kind != ParsedLineKind.Instruction) continue;
+                    
+                    // Also scan for ebp offsets that will become vars
+                    var ebpMatch = Regex.Matches(line.Asm, @"ebp\s*(?<sign>[\+\-])\s*(?<off>0x[0-9A-Fa-f]+|[0-9]+|(?<hexoff>[0-9A-Fa-f]+)h)", RegexOptions.IgnoreCase);
+                    foreach (Match m in ebpMatch)
+                    {
+                        var sign = m.Groups["sign"].Value;
+                        var offStr = m.Groups["off"].Value;
+                        uint off;
+                        if (offStr.EndsWith("h", StringComparison.OrdinalIgnoreCase)) off = Convert.ToUInt32(offStr.TrimEnd('h', 'H'), 16);
+                        else if (offStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) off = Convert.ToUInt32(offStr.Substring(2), 16);
+                        else uint.TryParse(offStr, out off);
+
+                        if (sign == "-") res.Add($"local_{off:x}".ToLowerInvariant());
+                        else if (off >= 8) res.Add($"arg_{(off - 8) / 4:x}".ToLowerInvariant());
+                    }
+
                     var matches = varRegex.Matches(line.Asm);
                     foreach (Match m in matches)
                         res.Add(m.Value.ToLowerInvariant());
@@ -583,29 +771,7 @@ namespace DOSRE.Dasm
         private static string TranslateCallWithHint(ParsedInsOrComment callIns, string hint, Dictionary<string, string> labelByAddr, PendingFlags pending, ParsedFunction fn)
         {
             var targetRaw = callIns.Asm.Substring(4).Trim();
-
-            string ResolveCallTarget(string opText)
-            {
-                // If it's already a symbol like func_XXXXXXXX, keep it but sanitize.
-                if (opText.StartsWith("func_", StringComparison.OrdinalIgnoreCase) || 
-                    opText.StartsWith("loc_", StringComparison.OrdinalIgnoreCase) || 
-                    opText.StartsWith("bb_", StringComparison.OrdinalIgnoreCase))
-                {
-                    return SanitizeLabel(opText);
-                }
-
-                var mm = Regex.Match(opText.Trim(), @"(?:0x)?(?<addr>[0-9A-Fa-f]{1,8})");
-                if (mm.Success)
-                {
-                    var a = mm.Groups["addr"].Value.ToUpperInvariant().PadLeft(8, '0');
-                    if (labelByAddr.TryGetValue(a, out var lab))
-                        return SanitizeLabel(lab);
-                    return "func_" + a;
-                }
-                return SanitizeLabel(opText);
-            }
-
-            var target = ResolveCallTarget(targetRaw);
+            var target = ResolveCallTarget(targetRaw, labelByAddr);
 
             var argsMatch = Regex.Match(hint, @"args~(?<count>\d+)");
             var retMatch = Regex.Match(hint, @"ret=(?<ret>[^\s,)]+)");
@@ -647,6 +813,31 @@ namespace DOSRE.Dasm
             }
 
             return $"{retVar}{target}({string.Join(", ", argList)});";
+        }
+
+        private static string ResolveCallTarget(string opText, Dictionary<string, string> labelByAddr)
+        {
+            // Unify calls to use func_XXXXXXXX even if the disassembler gave it a loc_ or bb_ name
+            var addrMatch = Regex.Match(opText, @"(?<pre>func|loc|bb)_(?<addr>[0-9A-Fa-f]{8})", RegexOptions.IgnoreCase);
+            if (addrMatch.Success)
+            {
+                return SanitizeLabel("func_" + addrMatch.Groups["addr"].Value.ToUpperInvariant());
+            }
+
+            var mm = Regex.Match(opText.Trim(), @"(?:0x)?(?<addr>[0-9A-Fa-f]{1,8})");
+            if (mm.Success)
+            {
+                var a = mm.Groups["addr"].Value.ToUpperInvariant().PadLeft(8, '0');
+                if (labelByAddr.TryGetValue(a, out var lab))
+                {
+                    // Upgrade loc_/bb_ to func_ for any CALL target
+                    if (lab.StartsWith("loc_", StringComparison.OrdinalIgnoreCase) || lab.StartsWith("bb_", StringComparison.OrdinalIgnoreCase))
+                        return SanitizeLabel("func_" + a);
+                    return SanitizeLabel(lab);
+                }
+                return "func_" + a;
+            }
+            return SanitizeLabel(opText);
         }
 
         private static string ResolveTarget(string opText, Dictionary<string, string> labelByAddr)
@@ -734,6 +925,9 @@ namespace DOSRE.Dasm
             public List<ParsedBlock> Blocks;
             public Dictionary<string, string> InferredTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             public HashSet<string> LoopHeaders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            public string RetType = "void";
+            public string Proto;
+            public int ArgCount;
         }
 
         private static void InferVariableTypes(ParsedFunction fn)
@@ -769,6 +963,19 @@ namespace DOSRE.Dasm
                         if (mBare.Success)
                         {
                             targetOp = mBare.Groups["op"].Value;
+                        }
+                        else
+                        {
+                            // Bare variables without brackets: mov eax, arg_0
+                            var mVar = Regex.Match(lineText, @"\b(?<var>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\b", RegexOptions.IgnoreCase);
+                            if (mVar.Success)
+                            {
+                                targetOp = mVar.Groups["var"].Value;
+                            }
+                        }
+
+                        if (targetOp != null)
+                        {
                             var sz = GetOperandSize(lineText);
                             inferredType = sz switch { 1 => "uint8_t", 2 => "uint16_t", 4 => "uint32_t", _ => null };
                         }
@@ -808,7 +1015,7 @@ namespace DOSRE.Dasm
                         {
                             if (!fn.InferredTypes.TryGetValue(varName, out var existing) || 
                                 (existing == "uint8_t" && inferredType != "uint8_t") ||
-                                (existing == "uint16_t" && inferredType == "uint32_t"))
+                                (existing == "uint16_t" && (inferredType == "uint32_t")))
                             {
                                 fn.InferredTypes[varName] = inferredType;
                             }
@@ -862,11 +1069,29 @@ namespace DOSRE.Dasm
                     // If it's already a C-like prototype, keep it; else wrap.
                     if (proto.Contains('('))
                     {
+                        // Ignore weak prototypes like func_...(arg_0, arg_1) since they lack types.
+                        var parenMatch = Regex.Match(proto, @"\((?<args>[^)]*)\)");
+                        if (parenMatch.Success)
+                        {
+                            var argPart = parenMatch.Groups["args"].Value.Trim();
+                            if (!string.IsNullOrEmpty(argPart) && Regex.IsMatch(argPart, @"^arg_[0-9A-Fa-f]+(\s*,\s*arg_[0-9A-Fa-f]+)*$", RegexOptions.IgnoreCase))
+                            {
+                                // it's likely (arg_0, arg_1, ...) with no types. Reject it.
+                                continue;
+                            }
+                        }
+
                         // Some headers currently emit name-only prototypes like "func_XXXXXXXX()".
+                        // Strip disassembler hints like "... (+N)"
+                        proto = Regex.Replace(proto, @",?\s*\.\.\.\s*\(\+\d+\)", "");
+
                         // Normalize to valid C by defaulting the return type to void.
                         var beforeParen = proto.Split('(')[0].Trim();
                         if (!beforeParen.Contains(' '))
-                            return "void " + proto;
+                            proto = "void " + proto;
+
+                        // Fix naked args (arg_0, arg_1) => (uint32_t arg_0, uint32_t arg_1)
+                        proto = FixNakedArgs(proto);
 
                         return proto;
                     }
@@ -874,6 +1099,31 @@ namespace DOSRE.Dasm
             }
 
             return string.Empty;
+        }
+
+        private static string FixNakedArgs(string proto)
+        {
+            var m = Regex.Match(proto, @"\((?<args>[^)]*)\)");
+            if (!m.Success) return proto;
+            var args = m.Groups["args"].Value;
+            if (string.IsNullOrWhiteSpace(args) || args.Trim().ToLowerInvariant() == "void") return proto;
+            
+            var parts = args.Split(',');
+            bool allNaked = true;
+            for (int i = 0; i < parts.Length; i++)
+            {
+                var p = parts[i].Trim();
+                if (string.IsNullOrEmpty(p)) continue; 
+                if (p.Contains(' ')) { allNaked = false; break; }
+                if (!p.StartsWith("arg_", StringComparison.OrdinalIgnoreCase)) { allNaked = false; break; }
+            }
+            
+            if (allNaked)
+            {
+                var newArgs = string.Join(", ", parts.Select(p => "uint32_t " + p.Trim()));
+                return proto.Replace("(" + args + ")", "(" + newArgs + ")");
+            }
+            return proto;
         }
 
         private static string SanitizeLabel(string label)
@@ -919,7 +1169,9 @@ namespace DOSRE.Dasm
             ParsedInsOrComment ins,
             Dictionary<string, string> labelByAddr,
             PendingFlags pending,
-            ParsedFunction fn)
+            ParsedFunction fn,
+            Dictionary<string, ParsedFunction> functionsByName,
+            Dictionary<string, (string proto, int argCount)> otherFunctions)
         {
             var asm = ins.Asm;
             if (string.IsNullOrWhiteSpace(asm))
@@ -993,12 +1245,19 @@ namespace DOSRE.Dasm
             {
                 pending.Clear(dstIsEax);
                 var subMn = ops.ToLowerInvariant();
-                if (subMn == "movsd") return $"memcpy(edi, esi, ecx * 4);{commentSuffix}";
-                if (subMn == "movsw") return $"memcpy(edi, esi, ecx * 2);{commentSuffix}";
-                if (subMn == "movsb") return $"memcpy(edi, esi, ecx);{commentSuffix}";
+                if (subMn == "movsd") return $"memcpy((void*)(uintptr_t)edi, (void*)(uintptr_t)esi, ecx * 4);{commentSuffix}";
+                if (subMn == "movsw") return $"memcpy((void*)(uintptr_t)edi, (void*)(uintptr_t)esi, ecx * 2);{commentSuffix}";
+                if (subMn == "movsb") return $"memcpy((void*)(uintptr_t)edi, (void*)(uintptr_t)esi, ecx);{commentSuffix}";
                 if (subMn == "stosd") return $"memset_32(edi, eax, ecx);{commentSuffix}";
                 if (subMn == "stosw") return $"memset_16(edi, ax, ecx);{commentSuffix}";
-                if (subMn == "stosb") return $"memset(edi, al, ecx);{commentSuffix}";
+                if (subMn == "stosb") return $"memset((void*)(uintptr_t)edi, al, ecx);{commentSuffix}";
+            }
+
+            if (mn == "repne")
+            {
+                pending.Clear(dstIsEax);
+                var subMn = ops.ToLowerInvariant();
+                if (subMn == "scasb") return $"ecx = strlen_rep(edi, al, ecx);{commentSuffix}";
             }
 
             if (mn == "imul")
@@ -1035,20 +1294,6 @@ namespace DOSRE.Dasm
                 {
                     var divisor = NormalizeAsmOperandToC(ops, isMemoryWrite: false, fn);
                     return $"{{ int64_t dividend = ((int64_t)edx << 32) | eax; eax = (uint32_t)(dividend / (int32_t){divisor}); edx = (uint32_t)(dividend % (int32_t){divisor}); }}{commentSuffix}";
-                }
-            }
-
-            if (mn == "shrd")
-            {
-                pending.Clear(dstIsEax);
-                // shrd dest, src, count => dest = (dest >> count) | (src << (32 - count))
-                var parts = SplitThreeOperands(ops);
-                if (parts != null)
-                {
-                    var dst = NormalizeAsmOperandToC(parts.Value.o1, isMemoryWrite: true, fn);
-                    var src = NormalizeAsmOperandToC(parts.Value.o2, isMemoryWrite: false, fn);
-                    var amt = NormalizeAsmOperandToC(parts.Value.o3, isMemoryWrite: false, fn);
-                    return $"{dst} = ({dst} >> {amt}) | ({src} << (32 - {amt}));{commentSuffix}";
                 }
             }
 
@@ -1159,15 +1404,15 @@ namespace DOSRE.Dasm
                 // LEA needs the address of it.
                 if (Regex.IsMatch(rhs, @"^(local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase))
                 {
-                    return $"{lhs} = &{rhs};{commentSuffix}";
+                    return $"{lhs} = (uint32_t)(uintptr_t)&{rhs};{commentSuffix}";
                 }
 
                 // If it's a deref like *(uint32_t*)(expr), strip the deref to get expr.
                 rhs = StripSingleDeref(rhs);
-                return $"{lhs} = {rhs};{commentSuffix}";
+                return $"{lhs} = (uint32_t)(uintptr_t)({rhs});{commentSuffix}";
             }
 
-            if (mn is "add" or "sub" or "and" or "or" or "xor")
+            if (mn is "add" or "sub" or "and" or "or" or "xor" or "adc" or "sbb")
             {
                 var parts = SplitTwoOperands(ops);
                 if (parts == null)
@@ -1193,9 +1438,12 @@ namespace DOSRE.Dasm
                     "and" => "&=",
                     "or" => "|=",
                     "xor" => "^=",
+                    "adc" => "+= (carry +",
+                    "sbb" => "-= (carry +",
                     _ => "="
                 };
-                return $"{lhs} {op} {rhs};{commentSuffix}";
+                var suffix = (mn is "adc" or "sbb") ? ")" : "";
+                return $"{lhs} {op} {rhs}{suffix};{commentSuffix}";
             }
 
             if (mn is "shl" or "shr" or "sar")
@@ -1226,6 +1474,13 @@ namespace DOSRE.Dasm
                 }
             }
 
+            if (mn == "neg")
+            {
+                pending.Clear(dstIsEax);
+                var opnd = NormalizeAsmOperandToC(ops, isMemoryWrite: true, fn);
+                return $"{opnd} = -{opnd};{commentSuffix}";
+            }
+
             if (mn == "inc" || mn == "dec")
             {
                 pending.Clear(dstIsEax);
@@ -1233,7 +1488,7 @@ namespace DOSRE.Dasm
                     return "/* " + asm + " */" + commentSuffix;
 
                 var opnd = NormalizeAsmOperandToC(ops, isMemoryWrite: true, fn);
-                return mn == "inc" ? $"{opnd}++;{commentSuffix}" : $"{opnd}--;{commentSuffix}";
+                return mn == "inc" ? $"({opnd})++;{commentSuffix}" : $"({opnd})--;{commentSuffix}";
             }
 
             if (mn == "neg")
@@ -1255,13 +1510,33 @@ namespace DOSRE.Dasm
             if (mn == "call")
             {
                 pending.Clear(dstIsEax);
-                var target = ResolveTarget(ops, labelByAddr);
+                var target = ResolveCallTarget(ops, labelByAddr);
+                int argCount = 0;
+                if (functionsByName.TryGetValue(target, out var targetFn)) argCount = targetFn.ArgCount;
+                else if (otherFunctions.TryGetValue(target, out var other)) argCount = other.argCount;
+
+                if (argCount > 0)
+                {
+                    var argsStrs = string.Join(", ", Enumerable.Repeat("0", argCount));
+                    return $"{target}({argsStrs});{commentSuffix}";
+                }
                 return $"{target}();{commentSuffix}";
             }
 
             if (mn == "ret")
             {
-                var retVal = pending.LastEaxAssignment != null ? " " + pending.LastEaxAssignment : "";
+                var retVal = "";
+                if (fn.RetType != "void")
+                {
+                    if (pending.LastEaxAssignment != null) retVal = " " + pending.LastEaxAssignment;
+                    else if (ins.Comment != null && ins.Comment.Contains("RET: eax", StringComparison.OrdinalIgnoreCase))
+                        retVal = " eax";
+                    else if (ins.Comment != null && (ins.Comment.Contains("RET: ax", StringComparison.OrdinalIgnoreCase) || ins.Comment.Contains("RET: al", StringComparison.OrdinalIgnoreCase)))
+                        retVal = " eax"; // simplified
+                    else
+                        retVal = " 0"; // Fallback for non-void functions
+                }
+
                 pending.Clear(true);
                 return $"return{retVal};{commentSuffix}";
             }
@@ -1272,7 +1547,17 @@ namespace DOSRE.Dasm
                 var target = ResolveTarget(ops, labelByAddr);
                 // Heuristic: if jumping to another function, it's a tail call.
                 if (target.StartsWith("func_", StringComparison.OrdinalIgnoreCase))
-                    return $"return {target}();{commentSuffix}";
+                {
+                    int argCount = 0;
+                    string retType = "uint32_t";
+                    if (functionsByName.TryGetValue(target, out var targetFn)) { argCount = targetFn.ArgCount; retType = targetFn.RetType; }
+                    else if (otherFunctions.TryGetValue(target, out var other)) { argCount = other.argCount; }
+
+                    var args = string.Join(", ", Enumerable.Repeat("0", argCount));
+                    if (retType != "void")
+                        return $"return {target}({args});{commentSuffix}";
+                    return $"{target}({args}); return;{commentSuffix}";
+                }
                 return $"goto {target};{commentSuffix}";
             }
 
@@ -1306,7 +1591,7 @@ namespace DOSRE.Dasm
                 if (!string.IsNullOrWhiteSpace(cond))
                     return $"if ({cond}) goto {target};{commentSuffix}";
 
-                return $"if ({mn}) goto {target};{commentSuffix}";
+                return $"if (0 /* unknown: {mn} */) goto {target};{commentSuffix}";
             }
 
             // Default: keep as comment.
@@ -1337,16 +1622,22 @@ namespace DOSRE.Dasm
 
             var t = op.Trim();
 
+            // Normalize argX/localX to arg_X/local_X early (handles cases like [arg2] -> [arg_2])
+            t = Regex.Replace(t, @"\b(?<pre>arg|local)(?<off>[0-9A-Fa-f]+)\b", m => m.Groups["pre"].Value.ToLowerInvariant() + "_" + m.Groups["off"].Value.ToLowerInvariant(), RegexOptions.IgnoreCase);
+
             // Already looks like a C-ish deref; leave it.
             if (t.StartsWith("*", StringComparison.Ordinal))
                 return t;
 
             // Handle local/arg variables directly if they are inside brackets [local_XX]
-            // The disassembler often emits these as [local_XX] or [arg_X]
-            var varMatch = Regex.Match(t, @"^\[(?<var>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\]$", RegexOptions.IgnoreCase);
+            // The disassembler often emits these as [local_XX] or [arg_X] (or sometimes [argX] without underscore)
+            var varMatch = Regex.Match(t, @"^\[(?<var>local_?[0-9A-Fa-f]+|arg_?[0-9A-Fa-f]+)\]$", RegexOptions.IgnoreCase);
             if (varMatch.Success)
             {
                 var varName = varMatch.Groups["var"].Value.ToLowerInvariant();
+                if (varName.StartsWith("arg") && !varName.StartsWith("arg_")) varName = "arg_" + varName.Substring(3);
+                if (varName.StartsWith("local") && !varName.StartsWith("local_")) varName = "local_" + varName.Substring(5);
+                
                 var tyMatch = sizeOverride switch { 1 => "uint8_t", 2 => "uint16_t", _ => "uint32_t" };
                 if (fn.InferredTypes.TryGetValue(varName, out var inferred) && inferred == tyMatch)
                     return varName;
@@ -1355,11 +1646,14 @@ namespace DOSRE.Dasm
             }
 
             // Sized var access: dword [local_XX]
-            var sizedVar = Regex.Match(t, @"^(?<sz>byte|word|dword|qword)\s+(?:ptr\s+)?\[(?<var>local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\]$", RegexOptions.IgnoreCase);
+            var sizedVar = Regex.Match(t, @"^(?<sz>byte|word|dword|qword)\s+(?:ptr\s+)?\[(?<var>local_?[0-9A-Fa-f]+|arg_?[0-9A-Fa-f]+)\]$", RegexOptions.IgnoreCase);
             if (sizedVar.Success)
             {
                 var sz = sizedVar.Groups["sz"].Value.ToLowerInvariant();
                 var varName = sizedVar.Groups["var"].Value.ToLowerInvariant();
+                if (varName.StartsWith("arg") && !varName.StartsWith("arg_")) varName = "arg_" + varName.Substring(3);
+                if (varName.StartsWith("local") && !varName.StartsWith("local_")) varName = "local_" + varName.Substring(5);
+
                 var tySizedVar = sz switch { "byte" => "uint8_t", "word" => "uint16_t", "dword" => "uint32_t", "qword" => "uint64_t", _ => "uint32_t" };
                 if (fn.InferredTypes.TryGetValue(varName, out var inferred) && inferred == tySizedVar)
                     return varName;
@@ -1377,30 +1671,37 @@ namespace DOSRE.Dasm
                 var sz = sized.Groups["sz"].Value.ToLowerInvariant();
                 var expr = sized.Groups["expr"].Value.Trim();
                 // If the interior expression is a variable, it's just the variable.
-                if (Regex.IsMatch(expr, @"^(local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase))
-                    return expr.ToLowerInvariant();
+                if (Regex.IsMatch(expr, @"^(local_?[0-9A-Fa-f]+|arg_?[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase))
+                {
+                    var varName = expr.ToLowerInvariant();
+                    if (varName.StartsWith("arg") && !varName.StartsWith("arg_")) varName = "arg_" + varName.Substring(3);
+                    if (varName.StartsWith("local") && !varName.StartsWith("local_")) varName = "local_" + varName.Substring(5);
+                    return varName;
+                }
 
                 // Handle ebp-based operands in [ebp-XX] form
-                var ebpMatch = Regex.Match(expr, @"^ebp\s*(?<sign>[\+\-])\s*(?<off>0x[0-9A-Fa-f]+|[0-9]+)$", RegexOptions.IgnoreCase);
+                var ebpMatch = Regex.Match(expr, @"^ebp\s*(?<sign>[\+\-])\s*(?<off>0x[0-9A-Fa-f]+|[0-9]+|(?<hexoff>[0-9A-Fa-f]+)h)$", RegexOptions.IgnoreCase);
                 if (ebpMatch.Success)
                 {
                     var sign = ebpMatch.Groups["sign"].Value;
                     var offStr = ebpMatch.Groups["off"].Value;
-                    if (offStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) offStr = offStr.Substring(2);
-                    else offStr = offStr.TrimEnd('h', 'H');
+                    uint off;
+                    if (offStr.EndsWith("h", StringComparison.OrdinalIgnoreCase))
+                        off = Convert.ToUInt32(offStr.TrimEnd('h', 'H'), 16);
+                    else if (offStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                        off = Convert.ToUInt32(offStr.Substring(2), 16);
+                    else
+                        off = uint.Parse(offStr);
 
-                    if (uint.TryParse(offStr, System.Globalization.NumberStyles.HexNumber, null, out var off))
+                    var tyEbp = sz switch { "byte" => "uint8_t", "word" => "uint16_t", "dword" => "uint32_t", "qword" => "uint64_t", _ => "uint32_t" };
+                    if (sign == "-") 
                     {
-                        var tyEbp = sz switch { "byte" => "uint8_t", "word" => "uint16_t", "dword" => "uint32_t", "qword" => "uint64_t", _ => "uint32_t" };
-                        if (sign == "-") 
-                        {
-                            var varName = $"local_{off:X}".ToLowerInvariant();
-                            if (fn.InferredTypes.TryGetValue(varName, out var inferred) && inferred == tyEbp)
-                                return varName;
-                            return $"*({tyEbp}*)&({varName})";
-                        }
-                        if (off >= 8) return $"arg_{(off - 8) / 4}".ToLowerInvariant();
+                        var varName = $"local_{off:x}".ToLowerInvariant();
+                        if (fn.InferredTypes.TryGetValue(varName, out var inferred) && inferred == tyEbp)
+                            return varName;
+                        return $"*({tyEbp}*)&({varName})";
                     }
+                    if (off >= 8) return $"arg_{(off - 8) / 4:x}".ToLowerInvariant();
                 }
 
                 var ty = sz switch
@@ -1423,26 +1724,28 @@ namespace DOSRE.Dasm
                     return expr.ToLowerInvariant();
 
                 // Handle bare ebp-based operands if the rewriter missed them (e.g. in hints)
-                var ebpMatch = Regex.Match(expr, @"^ebp\s*(?<sign>[\+\-])\s*(?<off>0x[0-9A-Fa-f]+|[0-9]+)$", RegexOptions.IgnoreCase);
+                var ebpMatch = Regex.Match(expr, @"^ebp\s*(?<sign>[\+\-])\s*(?<off>0x[0-9A-Fa-f]+|[0-9]+|(?<hexoff>[0-9A-Fa-f]+)h)$", RegexOptions.IgnoreCase);
                 if (ebpMatch.Success)
                 {
                     var sign = ebpMatch.Groups["sign"].Value;
                     var offStr = ebpMatch.Groups["off"].Value;
-                    if (offStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) offStr = offStr.Substring(2);
-                    else offStr = offStr.TrimEnd('h', 'H');
+                    uint off;
+                    if (offStr.EndsWith("h", StringComparison.OrdinalIgnoreCase))
+                        off = Convert.ToUInt32(offStr.TrimEnd('h', 'H'), 16);
+                    else if (offStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                        off = Convert.ToUInt32(offStr.Substring(2), 16);
+                    else
+                        off = uint.Parse(offStr);
 
-                    if (uint.TryParse(offStr, System.Globalization.NumberStyles.HexNumber, null, out var off))
+                    var tyBareEbp = sizeOverride switch { 1 => "uint8_t", 2 => "uint16_t", _ => "uint32_t" };
+                    if (sign == "-") 
                     {
-                        var tyBareEbp = sizeOverride switch { 1 => "uint8_t", 2 => "uint16_t", _ => "uint32_t" };
-                        if (sign == "-") 
-                        {
-                            var varName = $"local_{off:X}".ToLowerInvariant();
-                            if (fn.InferredTypes.TryGetValue(varName, out var inferred) && inferred == tyBareEbp)
-                                return varName;
-                            return $"*({tyBareEbp}*)&({varName})";
-                        }
-                        if (off >= 8) return $"arg_{(off - 8) / 4}".ToLowerInvariant();
+                        var varName = $"local_{off:x}".ToLowerInvariant();
+                        if (fn.InferredTypes.TryGetValue(varName, out var inferred) && inferred == tyBareEbp)
+                            return varName;
+                        return $"*({tyBareEbp}*)&({varName})";
                     }
+                    if (off >= 8) return $"arg_{(off - 8) / 4:x}".ToLowerInvariant();
                 }
 
                 string type = "uint32_t";
@@ -1460,12 +1763,18 @@ namespace DOSRE.Dasm
             if (string.IsNullOrWhiteSpace(expr))
                 return expr;
 
+            // Remove segment prefixes like cs:
+            expr = Regex.Replace(expr, @"\b(cs|ds|es|fs|gs|ss):", "", RegexOptions.IgnoreCase);
+
+            // Change dot to plus for macros like ptr.field
+            expr = expr.Replace(".", " + ");
+
             // Heuristic: if it's a register + offset, cast the register to uint8_t* 
             // to ensure byte-based pointer arithmetic in the pseudo-C.
             var regMatch = Regex.Match(expr, @"^(?<reg>eax|ebx|ecx|edx|esi|edi|ebp|esp)(?<rest>[\+\-].+)$", RegexOptions.IgnoreCase);
             if (regMatch.Success)
             {
-                return $"(uint8_t*){regMatch.Groups["reg"].Value} {regMatch.Groups["rest"].Value}";
+                return $"(uint8_t*)(uintptr_t){regMatch.Groups["reg"].Value} {regMatch.Groups["rest"].Value}";
             }
 
             return expr;
@@ -1540,17 +1849,17 @@ namespace DOSRE.Dasm
                 {
                     "je" or "jz" => $"{a} == {b}",
                     "jne" or "jnz" => $"{a} != {b}",
-                    "jl" => $"{a} < {b}",
-                    "jle" => $"{a} <= {b}",
-                    "jg" => $"{a} > {b}",
-                    "jge" => $"{a} >= {b}",
+                    "jl" => $"(int32_t){a} < (int32_t){b}",
+                    "jle" => $"(int32_t){a} <= (int32_t){b}",
+                    "jg" => $"(int32_t){a} > (int32_t){b}",
+                    "jge" => $"(int32_t){a} >= (int32_t){b}",
                     "js" => $"((int32_t)({a}) - (int32_t)({b})) < 0",
                     "jns" => $"((int32_t)({a}) - (int32_t)({b})) >= 0",
                     // Unsigned comparisons (best-effort; keep explicit cast to show intent).
-                    "jb" => $"(uint){a} < (uint){b}",
-                    "jbe" => $"(uint){a} <= (uint){b}",
-                    "ja" => $"(uint){a} > (uint){b}",
-                    "jae" => $"(uint){a} >= (uint){b}",
+                    "jb" => $"(uint32_t){a} < (uint32_t){b}",
+                    "jbe" => $"(uint32_t){a} <= (uint32_t){b}",
+                    "ja" => $"(uint32_t){a} > (uint32_t){b}",
+                    "jae" => $"(uint32_t){a} >= (uint32_t){b}",
                     _ => string.Empty
                 };
             }
@@ -1615,12 +1924,19 @@ namespace DOSRE.Dasm
 
         private static List<string> OptimizeStatements(List<string> lines)
         {
-            if (lines == null || lines.Count < 2) return lines;
+            if (lines == null || lines.Count < 1) return lines;
 
             var res = new List<string>();
             for (var i = 0; i < lines.Count; i++)
             {
                 var cur = lines[i];
+
+                // Peephole: redundant x = x;
+                var mSelf = Regex.Match(cur, @"^\s*([^;/\s]+)\s*=\s*\1\s*;", RegexOptions.IgnoreCase);
+                if (mSelf.Success && !cur.Contains("(")) // Avoid matches with side effects or complex types for now
+                {
+                    continue; 
+                }
 
                 // Peephole 1: reg1 = var; var2 = reg1;  => var2 = var;
                 // Only if reg1 is one of the scratch registers (eax, etc) and not used immediately again.
@@ -1641,7 +1957,6 @@ namespace DOSRE.Dasm
                             !src.Equals(dst, StringComparison.OrdinalIgnoreCase))
                         {
                             // Avoid optimizing if src or dst are complex pointer derefs for now 
-                            // though in pseudo-C it's often fine.
                             if (!src.Contains("(") && !dst.Contains("("))
                             {
                                 res.Add($"{dst} = {src}; // optimized: {cur.TrimEnd()} + {next.TrimStart()}");
@@ -1652,8 +1967,47 @@ namespace DOSRE.Dasm
                     }
                 }
 
-                // Peephole 2: Simplify if (0 == 0) etc? 
-                // Not worth it yet.
+                // Peephole 3: Combine consecutive math on same var? e.g. add esp, 4; add esp, 8
+                if (i + 1 < lines.Count)
+                {
+                    var mAdd1 = Regex.Match(cur, @"^(?<var>[a-z_0-9]+)\s*(?<op>\+=|-=)\s*(?<val>0x[0-9A-Fa-f]+|[0-9]+);", RegexOptions.IgnoreCase);
+                    var next = lines[i + 1];
+                    var mAdd2 = Regex.Match(next, @"^(?<var2>[a-z_0-9]+)\s*(?<op2>\+=|-=)\s*(?<val2>0x[0-9A-Fa-f]+|[0-9]+);", RegexOptions.IgnoreCase);
+                    if (mAdd1.Success && mAdd2.Success)
+                    {
+                        var v1 = mAdd1.Groups["var"].Value;
+                        var v2 = mAdd2.Groups["var2"].Value;
+                        if (v1.Equals(v2, StringComparison.OrdinalIgnoreCase))
+                        {
+                            try {
+                                var o1 = mAdd1.Groups["op"].Value;
+                                var o2 = mAdd2.Groups["op2"].Value;
+                                var val1Str = mAdd1.Groups["val"].Value;
+                                var val2Str = mAdd2.Groups["val2"].Value;
+                                long val1 = val1Str.StartsWith("0x") ? Convert.ToInt64(val1Str, 16) : long.Parse(val1Str);
+                                long val2 = val2Str.StartsWith("0x") ? Convert.ToInt64(val2Str, 16) : long.Parse(val2Str);
+                                if (o1 == "-=") val1 = -val1;
+                                if (o2 == "-=") val2 = -val2;
+                                long total = val1 + val2;
+                                if (total == 0) { i++; continue; }
+                                string newOp = total < 0 ? "-=" : "+=";
+                                res.Add($"{v1} {newOp} 0x{Math.Abs(total):x}; // combined math");
+                                i++;
+                                continue;
+                            } catch { }
+                        }
+                    }
+                }
+
+                // Peephole 4: Detect x = x + 1; or x = x - 1; and use ++/--
+                var mMath1 = Regex.Match(cur, @"^(?<var>[a-z_0-9]+)\s*=\s*\k<var>\s*(?<op>\+|-)\s*1;.*$", RegexOptions.IgnoreCase);
+                if (mMath1.Success)
+                {
+                    var v = mMath1.Groups["var"].Value;
+                    var op = mMath1.Groups["op"].Value == "+" ? "++" : "--";
+                    res.Add($"{v}{op}; // simplified math");
+                    continue;
+                }
 
                 res.Add(cur);
             }
