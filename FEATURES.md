@@ -37,7 +37,7 @@ A practical “disassembly → C” workflow looks like:
 - Lightweight alias tracking / memory SSA for "ptr + field" accesses.
 
 ### 4) Struct / field recovery
-- Group inferred pointer bases into per-type structs (e.g. `T_BAB74`), with a field table.
+- Group inferred pointer bases into per-type structs (best-effort field table aggregation for `ptr_XXXXXXXX` is implemented).
 - Field type inference (ptr/int/flags/array) based on access width and usage.
 - Detect array strides (`base + idx*scale + disp`).
 - Improve vtable detection and slot labelling.

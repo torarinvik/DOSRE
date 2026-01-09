@@ -422,6 +422,11 @@ namespace DOSRE.Dasm
                     if (m.Groups["disp"].Success)
                         disp = Convert.ToUInt32(m.Groups["disp"].Value, 16);
 
+                    // Avoid treating huge displacements as struct fields; these are often absolute tables
+                    // or misclassified addressing modes.
+                    if (disp > 0x4000)
+                        continue;
+
                     // Best-effort per-operand read/write classification.
                     var memText = m.Value; // e.g. [ecx+0x10]
                     GetMemAccessRW(insText, memText, out var r, out var w);
@@ -470,6 +475,107 @@ namespace DOSRE.Dasm
             if (parts.Count == 0)
                 return string.Empty;
             return $"FIELDS: {string.Join(" | ", parts)}";
+        }
+
+        private static void MergeFieldStats(
+            Dictionary<string, Dictionary<uint, FieldAccessStats>> dst,
+            Dictionary<string, Dictionary<uint, FieldAccessStats>> src,
+            Func<string, bool> baseFilter = null)
+        {
+            if (dst == null || src == null)
+                return;
+
+            foreach (var baseKvp in src)
+            {
+                if (string.IsNullOrWhiteSpace(baseKvp.Key))
+                    continue;
+                if (baseFilter != null && !baseFilter(baseKvp.Key))
+                    continue;
+
+                if (!dst.TryGetValue(baseKvp.Key, out var byDispDst))
+                    dst[baseKvp.Key] = byDispDst = new Dictionary<uint, FieldAccessStats>();
+
+                foreach (var dispKvp in baseKvp.Value)
+                {
+                    if (!byDispDst.TryGetValue(dispKvp.Key, out var stDst))
+                        byDispDst[dispKvp.Key] = stDst = new FieldAccessStats();
+
+                    var stSrc = dispKvp.Value;
+                    stDst.ReadCount += stSrc.ReadCount;
+                    stDst.WriteCount += stSrc.WriteCount;
+
+                    if (string.IsNullOrEmpty(stDst.Size))
+                    {
+                        stDst.Size = stSrc.Size;
+                    }
+                    else if (!string.IsNullOrEmpty(stSrc.Size) && !string.Equals(stDst.Size, stSrc.Size, StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Conflicting sizes across uses; leave blank to avoid misleading.
+                        stDst.Size = string.Empty;
+                    }
+                }
+            }
+        }
+
+        private static string FormatPointerStructTable(Dictionary<string, Dictionary<uint, FieldAccessStats>> statsByBase)
+        {
+            if (statsByBase == null || statsByBase.Count == 0)
+                return string.Empty;
+
+            var ptrBases = statsByBase
+                .Where(k => k.Key != null && k.Key.StartsWith("ptr_", StringComparison.OrdinalIgnoreCase))
+                .Select(k => new
+                {
+                    Base = k.Key,
+                    Total = k.Value.Sum(x => x.Value.ReadCount + x.Value.WriteCount),
+                    Fields = k.Value
+                })
+                .Where(x => x.Total > 0)
+                .OrderByDescending(x => x.Total)
+                .ThenBy(x => x.Base)
+                .Take(10)
+                .ToList();
+
+            if (ptrBases.Count == 0)
+                return string.Empty;
+
+            var sb = new StringBuilder();
+            sb.AppendLine(";");
+            sb.AppendLine("; Inferred Pointer Struct Tables (best-effort, aggregated field access stats)");
+            foreach (var b in ptrBases)
+            {
+                // Keep each struct compact: up to 10 fields, dropping +0 unless it looks important.
+                var fields = b.Fields
+                    .Where(k =>
+                    {
+                        if (k.Key != 0)
+                            return true;
+                        var st = k.Value;
+                        if (string.Equals(st.Size, "dword", StringComparison.OrdinalIgnoreCase))
+                            return true;
+                        var tot = st.ReadCount + st.WriteCount;
+                        return string.IsNullOrEmpty(st.Size) && tot <= 8;
+                    })
+                    .OrderByDescending(k => k.Value.ReadCount + k.Value.WriteCount)
+                    .ThenBy(k => k.Key)
+                    .Take(10)
+                    .Select(k =>
+                    {
+                        var disp = k.Key;
+                        var st = k.Value;
+                        var rw = $"r{st.ReadCount}/w{st.WriteCount}";
+                        var sz = string.IsNullOrEmpty(st.Size) ? "" : $" {st.Size}";
+                        return $"+0x{disp:X}({rw}{sz})";
+                    })
+                    .ToList();
+
+                if (fields.Count == 0)
+                    continue;
+
+                sb.AppendLine($"; STRUCT {b.Base}: {string.Join(", ", fields)}");
+            }
+            sb.AppendLine(";");
+            return sb.ToString();
         }
 
         private static string RewriteFieldOperands(string insText, Dictionary<string, string> aliases)
@@ -4525,9 +4631,11 @@ namespace DOSRE.Dasm
 
                 // Per-function field summaries (insights)
                 Dictionary<uint, string> funcFieldSummaries = null;
+                Dictionary<string, Dictionary<uint, FieldAccessStats>> ptrFieldStatsGlobal = null;
                 if (leInsights && functionStarts != null && functionStarts.Count > 0)
                 {
                     funcFieldSummaries = new Dictionary<uint, string>();
+                    ptrFieldStatsGlobal = new Dictionary<string, Dictionary<uint, FieldAccessStats>>(StringComparer.Ordinal);
                     var sortedStarts = functionStarts.OrderBy(x => x).ToList();
                     for (var si = 0; si < sortedStarts.Count; si++)
                     {
@@ -4540,6 +4648,7 @@ namespace DOSRE.Dasm
                             endIdx = nextIdx;
 
                         CollectFieldAccessesForFunction(instructions, startIdx, endIdx, out var stats, inferredPtrSymbols);
+                        MergeFieldStats(ptrFieldStatsGlobal, stats, b => b.StartsWith("ptr_", StringComparison.OrdinalIgnoreCase));
                         var summary = FormatFieldSummary(stats);
                         if (!string.IsNullOrEmpty(summary))
                             funcFieldSummaries[startAddr] = summary;
@@ -4779,6 +4888,13 @@ namespace DOSRE.Dasm
                     if (inferredPtrSymbols.Count > 64)
                         sb.AppendLine($";   (ptr symbol table truncated: {inferredPtrSymbols.Count} entries)");
                     sb.AppendLine(";");
+
+                    if (ptrFieldStatsGlobal != null && ptrFieldStatsGlobal.Count > 0)
+                    {
+                        var table = FormatPointerStructTable(ptrFieldStatsGlobal);
+                        if (!string.IsNullOrWhiteSpace(table))
+                            sb.Append(table);
+                    }
                 }
 
                 // Live alias tracking for operand rewriting during rendering.
