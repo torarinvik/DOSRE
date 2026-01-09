@@ -1014,6 +1014,7 @@ namespace DOSRE.Dasm
 
                                 string cmpLhs = null;
                                 string cmpRhs = null;
+                                var cmpIdx = -1;
 
                                 // Find the closest cmp in a small window before the latch.
                                 for (var k = Math.Max(startIdx, latchIdx - 4); k < latchIdx; k++)
@@ -1025,18 +1026,23 @@ namespace DOSRE.Dasm
                                     {
                                         cmpLhs = mCmpReg.Groups["lhs"].Value.ToLowerInvariant();
                                         cmpRhs = mCmpReg.Groups["rhs"].Value.ToLowerInvariant();
+                                        cmpIdx = k;
                                     }
                                     else if (mCmpMem.Success)
                                     {
                                         cmpLhs = mCmpMem.Groups["lhs"].Value;
                                         cmpRhs = mCmpMem.Groups["rhs"].Value.ToLowerInvariant();
+                                        cmpIdx = k;
                                     }
                                 }
 
                                 if (!string.IsNullOrWhiteSpace(cmpLhs))
                                 {
                                     // Find an update of cmpLhs shortly before the latch.
-                                    for (var k = Math.Max(startIdx, latchIdx - 8); k < latchIdx; k++)
+                                    // Prefer scanning before the cmp (not before the jcc), since some patterns have
+                                    // setup work between the update and the cmp (e.g. string ops between inc and cmp).
+                                    var updateStop = (cmpIdx >= 0 ? cmpIdx : latchIdx);
+                                    for (var k = Math.Max(startIdx, updateStop - 12); k < updateStop; k++)
                                     {
                                         var prev = RewriteStackFrameOperands(instructions[k].ToString()).Trim();
 
