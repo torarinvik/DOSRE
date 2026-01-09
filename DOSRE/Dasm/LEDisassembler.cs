@@ -5973,6 +5973,14 @@ namespace DOSRE.Dasm
                         if (!string.IsNullOrEmpty(pushArgsHint))
                             insText += $" ; {pushArgsHint}";
 
+                        var memsetHint = TryAnnotateRepStosbMemset(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(memsetHint))
+                            insText += $" ; {memsetHint}";
+
+                        var remIdxHint = TryAnnotateComputeRemainingIndexIn4(instructions, insLoopIndex);
+                        if (!string.IsNullOrEmpty(remIdxHint))
+                            insText += $" ; {remIdxHint}";
+
                         var qHint = TryAnnotateScale8TableLoad(instructions, insLoopIndex);
                         if (!string.IsNullOrEmpty(qHint))
                             insText += $" ; {qHint}";

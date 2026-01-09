@@ -24,6 +24,14 @@ namespace DOSRE.Dasm
                 return hint;
             if (TryAnnotateMulU8FromTwoMovzx(instructions, idx, out hint))
                 return hint;
+            if (TryAnnotateSar16BeforeImul(instructions, idx, out hint))
+                return hint;
+            if (TryAnnotateSar16ThenShlByCl(instructions, idx, out hint))
+                return hint;
+            if (TryAnnotateBitstreamExtractViaShr3AndShRD(instructions, idx, out hint))
+                return hint;
+            if (TryAnnotatePackStride4BytesIntoDword(instructions, idx, out hint))
+                return hint;
             if (TryAnnotateShift16Add8000FlatPtr(instructions, idx, out hint))
                 return hint;
 
@@ -43,6 +51,179 @@ namespace DOSRE.Dasm
                 return hint;
 
             return string.Empty;
+        }
+
+        private static bool TryAnnotateSar16ThenShlByCl(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return false;
+
+            // Pattern (e.g. loc_00080B86):
+            //   sar r32, 0x10
+            //   ...
+            //   shl r32, cl
+            // Often used as fixed-point scaling: ((x >> 16) << cl)
+            var i0 = instructions[idx].ToString().Trim();
+            var mSar = Regex.Match(i0, @"^sar\s+(?<reg>e[a-z]{2})\s*,\s*(?:0x)?10\s*$", RegexOptions.IgnoreCase);
+            if (!mSar.Success)
+                return false;
+
+            var reg = mSar.Groups["reg"].Value.ToLowerInvariant();
+
+            var sawMovCl = false;
+            for (var back = 1; back <= 3 && idx - back >= 0; back++)
+            {
+                var t = instructions[idx - back].ToString().Trim();
+                if (Regex.IsMatch(t, @"^mov\s+cl\s*,\s*[a-z]{2}\s*$", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(t, @"^mov\s+cl\s*,\s*\[.*\]\s*$", RegexOptions.IgnoreCase))
+                {
+                    sawMovCl = true;
+                    break;
+                }
+            }
+
+            for (var j = idx + 1; j < instructions.Count && j <= idx + 2; j++)
+            {
+                var t = instructions[j].ToString().Trim();
+                if (Regex.IsMatch(t, $@"^shl\s+{Regex.Escape(reg)}\s*,\s*cl\s*$", RegexOptions.IgnoreCase))
+                {
+                    hint = sawMovCl
+                        ? "HINT: fixed-point scale: (x>>16) << cl"
+                        : "HINT: (x>>16) << cl";
+                    return true;
+                }
+
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+            }
+
+            return false;
+        }
+
+        private static bool TryAnnotateBitstreamExtractViaShr3AndShRD(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 5 || idx >= instructions.Count)
+                return false;
+
+            // Pattern (e.g. loc_00089F94):
+            //   mov eax, <idx>
+            //   mov ecx, <idx>
+            //   shr eax, 0x3
+            //   and ecx, 0x7
+            //   mov eax, [eax+<base>]
+            //   shrd eax, eax, cl
+            // -> align bits from a packed bitstream (byteIndex=idx>>3, bitOffset=idx&7)
+            var i0 = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(i0, @"^shrd\s+eax\s*,\s*eax\s*,\s*cl\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var iPrev = instructions[idx - 1].ToString().Trim();
+            if (!Regex.IsMatch(iPrev, @"^mov\s+eax\s*,\s*\[eax\+(?<base>e[a-z]{2})\]\s*$", RegexOptions.IgnoreCase) &&
+                !Regex.IsMatch(iPrev, @"^mov\s+eax\s*,\s*\[eax\+(?<base>e[a-z]{2})\+0x[0-9a-f]+\]\s*$", RegexOptions.IgnoreCase))
+            {
+                return false;
+            }
+
+            var i2 = instructions[idx - 2].ToString().Trim();
+            if (!Regex.IsMatch(i2, @"^and\s+ecx\s*,\s*(?:0x)?7\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i3 = instructions[idx - 3].ToString().Trim();
+            if (!Regex.IsMatch(i3, @"^shr\s+eax\s*,\s*(?:0x)?3\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var i4 = instructions[idx - 4].ToString().Trim();
+            var i5 = instructions[idx - 5].ToString().Trim();
+            if (!Regex.IsMatch(i4, @"^mov\s+ecx\s*,\s*e[a-z]{2}\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var mMovEax = Regex.Match(i5, @"^mov\s+eax\s*,\s*(?<idx>e[a-z]{2})\s*$", RegexOptions.IgnoreCase);
+            var mMovEcx = Regex.Match(i4, @"^mov\s+ecx\s*,\s*(?<idx>e[a-z]{2})\s*$", RegexOptions.IgnoreCase);
+            if (!mMovEax.Success || !mMovEcx.Success)
+                return false;
+
+            if (!mMovEax.Groups["idx"].Value.Equals(mMovEcx.Groups["idx"].Value, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            hint = "HINT: bitstream extract (byte=idx>>3, bit=idx&7)";
+            return true;
+        }
+
+        private static bool TryAnnotatePackStride4BytesIntoDword(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 2 || idx + 3 >= instructions.Count)
+                return false;
+
+            // Pattern (e.g. loc_0008A163):
+            //   mov ch, [eax+0xC]
+            //   mov cl, [eax+0x8]
+            //   shl ecx, 0x10
+            //   mov ch, [eax+0x4]
+            //   mov cl, [eax]
+            //   mov [edx], ecx
+            // -> pack 4 bytes from an interleaved/strided source into one dword.
+            var i0 = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(i0, @"^shl\s+ecx\s*,\s*(?:0x)?10\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            var iM2 = instructions[idx - 2].ToString().Trim();
+            var iM1 = instructions[idx - 1].ToString().Trim();
+            var iP1 = instructions[idx + 1].ToString().Trim();
+            var iP2 = instructions[idx + 2].ToString().Trim();
+            var iP3 = instructions[idx + 3].ToString().Trim();
+
+            if (!Regex.IsMatch(iM2, @"^mov\s+ch\s*,\s*\[eax\+0x[0-9a-f]+\]\s*$", RegexOptions.IgnoreCase))
+                return false;
+            if (!Regex.IsMatch(iM1, @"^mov\s+cl\s*,\s*\[eax\+0x[0-9a-f]+\]\s*$", RegexOptions.IgnoreCase))
+                return false;
+            if (!Regex.IsMatch(iP1, @"^mov\s+ch\s*,\s*\[eax\+0x[0-9a-f]+\]\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            if (!Regex.IsMatch(iP2, @"^mov\s+cl\s*,\s*\[eax(?:\+0x[0-9a-f]+)?\]\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            if (!Regex.IsMatch(iP3, @"^mov\s+\[edx(?:\+0x[0-9a-f]+)?\]\s*,\s*ecx\s*$", RegexOptions.IgnoreCase))
+                return false;
+
+            hint = "HINT: pack 4 bytes (stride 4) into dword";
+            return true;
+        }
+
+        private static bool TryAnnotateSar16BeforeImul(List<Instruction> instructions, int idx, out string hint)
+        {
+            hint = null;
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return false;
+
+            // Pattern: sar r32, 0x10 followed shortly by imul using that value.
+            // Commonly used to convert fixed16.16 -> int before multiplication.
+            var i0 = instructions[idx].ToString().Trim();
+            var mSar = Regex.Match(i0, @"^sar\s+(?<reg>e[a-z]{2})\s*,\s*(?:0x)?10\s*$", RegexOptions.IgnoreCase);
+            if (!mSar.Success)
+                return false;
+
+            var reg = mSar.Groups["reg"].Value.ToLowerInvariant();
+
+            // Look ahead for an imul that consumes reg.
+            for (var j = idx + 1; j < instructions.Count && j <= idx + 3; j++)
+            {
+                var t = instructions[j].ToString().Trim();
+                if (Regex.IsMatch(t, $@"^imul\s+{Regex.Escape(reg)}\s*,\s*.+$", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(t, $@"^imul\s+.+\s*,\s*{Regex.Escape(reg)}\s*$", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(t, $@"^imul\s+.+\s*,\s*\[.*{Regex.Escape(reg)}.*\]\s*$", RegexOptions.IgnoreCase))
+                {
+                    hint = "HINT: fixed16.16 -> int (>>16)";
+                    return true;
+                }
+
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+            }
+
+            return false;
         }
 
         private static bool TryAnnotateMovEaxFromAbsScaled4(List<Instruction> instructions, int idx, out string hint)

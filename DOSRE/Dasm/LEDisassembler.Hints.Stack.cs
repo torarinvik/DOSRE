@@ -259,12 +259,82 @@ namespace DOSRE.Dasm
                     return string.Empty;
                 }
 
+                // Also catch direct calls with a lot of pushes (often a large argument pack).
+                if (Regex.IsMatch(t, @"^call\s+(?:0x[0-9A-Fa-f]+|[A-Za-z_][A-Za-z0-9_]*)(?:\s+;.*)?$", RegexOptions.IgnoreCase))
+                {
+                    if (pushes >= 5)
+                        return "HINT: build stack args for call";
+                    return string.Empty;
+                }
+
                 // Stop scanning if we hit another control-transfer; we only want local setup.
                 if (j != idx && Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
                     return string.Empty;
             }
 
             return string.Empty;
+        }
+
+        private static string TryAnnotateRepStosbMemset(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 0 || idx >= instructions.Count)
+                return string.Empty;
+
+            var cur = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(cur, @"^rep\s+stosb\s*$", RegexOptions.IgnoreCase))
+                return string.Empty;
+
+            // Look back for: mov ecx, <count> and xor eax, eax (zero-fill) and maybe mov edi, <dst>.
+            string countText = "ecx";
+            var isZeroFill = false;
+            for (var back = 1; back <= 6 && idx - back >= 0; back++)
+            {
+                var t = instructions[idx - back].ToString().Trim();
+
+                var mCount = Regex.Match(t, @"^mov\s+ecx\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h?|\d+)\s*$", RegexOptions.IgnoreCase);
+                if (mCount.Success)
+                    countText = mCount.Groups["imm"].Value;
+
+                if (Regex.IsMatch(t, @"^xor\s+eax\s*,\s*eax\s*$", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(t, @"^xor\s+al\s*,\s*al\s*$", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(t, @"^mov\s+al\s*,\s*0x0+\s*$", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(t, @"^mov\s+al\s*,\s*0\s*$", RegexOptions.IgnoreCase))
+                {
+                    isZeroFill = true;
+                }
+
+                if (Regex.IsMatch(t, @"^(?:call|jmp|ret)\b", RegexOptions.IgnoreCase))
+                    break;
+            }
+
+            if (!isZeroFill)
+                return "HINT: memset(dst=edi, value=al, count=ecx)";
+
+            return $"HINT: memset(dst=edi, 0, count={countText})";
+        }
+
+        private static string TryAnnotateComputeRemainingIndexIn4(List<Instruction> instructions, int idx)
+        {
+            if (instructions == null || idx < 2 || idx >= instructions.Count)
+                return string.Empty;
+
+            // Pattern (seen in loc_000770B3 / loc_00077B63):
+            //   mov edx, 0x3
+            //   or  eax, esi
+            //   sub edx, eax
+            var i0 = instructions[idx].ToString().Trim();
+            if (!Regex.IsMatch(i0, @"^sub\s+edx\s*,\s*eax\s*$", RegexOptions.IgnoreCase))
+                return string.Empty;
+
+            var i1 = instructions[idx - 1].ToString().Trim();
+            if (!Regex.IsMatch(i1, @"^or\s+eax\s*,\s*esi\s*$", RegexOptions.IgnoreCase))
+                return string.Empty;
+
+            var i2 = instructions[idx - 2].ToString().Trim();
+            if (!Regex.IsMatch(i2, @"^mov\s+edx\s*,\s*(?:0x)?3\s*$", RegexOptions.IgnoreCase))
+                return string.Empty;
+
+            return "HINT: compute remaining index in 0..3 (edx = 3 - (a|b))";
         }
 
         private static string TryAnnotateStructFieldStoreDlAtEaxAfterDefaults(List<Instruction> instructions, int idx)
