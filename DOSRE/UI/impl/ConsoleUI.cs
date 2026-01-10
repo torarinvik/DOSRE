@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -122,6 +123,12 @@ namespace DOSRE.UI.impl
         ///     When used with -o, splits output into multiple numbered files about n KB each.
         /// </summary>
         private int? _splitKb;
+
+        /// <summary>
+        ///     LE decompilation chunk size (number of functions per file)
+        ///     Specified with the -lechunks <n> argument
+        /// </summary>
+        private int _leChunks = 0;
 
         /// <summary>
         ///     Macro de-duplication
@@ -395,6 +402,14 @@ namespace DOSRE.UI.impl
                             _splitKb = splitKb;
                             i++;
                             break;
+                        case "LECHUNKS":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LECHUNKS requires a value");
+                            if (!int.TryParse(_args[i + 1], out var leChunks) || leChunks <= 0)
+                                throw new Exception("Error: -LECHUNKS must be a positive integer");
+                            _leChunks = leChunks;
+                            i++;
+                            break;
                         case "MACROS":
                             _bMacros = true;
                             break;
@@ -427,6 +442,8 @@ namespace DOSRE.UI.impl
                                 "-LEJOBS <n> -- (LE inputs) Parallel jobs for insights passes (default 1; try 8 on an 8-core machine)");
                             Console.WriteLine(
                                 "-LEDECOMP -- (LE inputs) Emit best-effort pseudo-C (builds on LE insights/symbolization)");
+                            Console.WriteLine(
+                                "-LECHUNKS <n> -- (LE inputs) Split decompile output into multiple translation units of n functions each (requires -O)");
                             Console.WriteLine(
                                 "-LEDECOMPASM <file.asm> -- Decompile from an existing LE .asm output (fast iteration; skips LE disassembly)");
                             Console.WriteLine(
@@ -484,9 +501,12 @@ namespace DOSRE.UI.impl
                 string leOutput;
                 string leError;
 
+                Dictionary<string, string> leDecompFiles = null;
+
                 if (_bLeDecompile && !string.IsNullOrWhiteSpace(_leDecompileAsmFile))
                 {
-                    leOk = LEDisassembler.TryDecompileAsmFileToString(_leDecompileAsmFile, _leOnlyFunction, out leOutput, out leError);
+                    leOk = LEDisassembler.TryDecompileToMultipartFromAsmFile(_leDecompileAsmFile, _leOnlyFunction, _leChunks, out leDecompFiles, out leError);
+                    leOutput = (leOk && leDecompFiles.Count > 0) ? leDecompFiles.Values.First() : string.Empty;
                 }
                 else if (_bLeDecompile && _bLeDecompCacheAsm)
                 {
@@ -498,7 +518,8 @@ namespace DOSRE.UI.impl
                     if (File.Exists(cacheAsmPath))
                     {
                         _logger.Info($"LE decompile: using cached asm {cacheAsmPath}");
-                        leOk = LEDisassembler.TryDecompileAsmFileToString(cacheAsmPath, _leOnlyFunction, out leOutput, out leError);
+                        leOk = LEDisassembler.TryDecompileToMultipartFromAsmFile(cacheAsmPath, _leOnlyFunction, _leChunks, out leDecompFiles, out leError);
+                        leOutput = (leOk && leDecompFiles.Count > 0) ? leDecompFiles.Values.First() : string.Empty;
                     }
                     else
                     {
@@ -529,19 +550,43 @@ namespace DOSRE.UI.impl
                         else
                         {
                             File.WriteAllText(cacheAsmPath, asm);
-                            leOk = LEDisassembler.TryDecompileAsmToString(asm, _leOnlyFunction, out leOutput, out leError);
+                            leOk = LEDisassembler.TryDecompileToMultipartFromAsm(asm, _leOnlyFunction, _leChunks, out leDecompFiles, out leError);
+                            leOutput = (leOk && leDecompFiles.Count > 0) ? leDecompFiles.Values.First() : string.Empty;
                         }
                     }
                 }
                 else
                 {
-                    leOk = _bLeDecompile
-                        ? LEDisassembler.TryDecompileToString(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out leOutput, out leError)
-                        : LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _leRenderLimit, _leJobs, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out leOutput, out leError);
+                    if (_bLeDecompile)
+                    {
+                        leOk = LEDisassembler.TryDecompileToMultipart(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, _leChunks, out leDecompFiles, out leError);
+                        leOutput = (leOk && leDecompFiles.Count > 0) ? leDecompFiles.Values.First() : string.Empty;
+                    }
+                    else
+                    {
+                        leOk = LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _leRenderLimit, _leJobs, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out leOutput, out leError);
+                    }
                 }
 
                 if (leOk)
                 {
+                    if (_bLeDecompile && _leChunks > 0 && leDecompFiles != null && leDecompFiles.Count > 0)
+                    {
+                        if (string.IsNullOrEmpty(_sOutputFile))
+                            throw new Exception("Error: -LECHUNKS requires -O <out.c>");
+
+                        var outDir = Path.GetDirectoryName(_sOutputFile);
+                        if (string.IsNullOrEmpty(outDir)) outDir = ".";
+
+                        foreach (var kvp in leDecompFiles)
+                        {
+                            var filePath = Path.Combine(outDir, kvp.Key);
+                            _logger.Info($"{DateTime.Now} Writing translation unit to {filePath}");
+                            File.WriteAllText(filePath, kvp.Value);
+                        }
+                        _logger.Info($"{DateTime.Now} Done! (Multi-file decompile)");
+                        return;
+                    }
                     if (_bAnalysis)
                         _logger.Warn("Warning: -analysis is not supported for LE inputs, ignoring");
                     if (_bStrings)

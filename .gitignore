@@ -25,11 +25,16 @@ bld/
 [Bb]in/
 [Oo]bj/
 [Ll]og/
-
+*.o
+*.obj
+*.lnk
 # Documents (often copyrighted / large)
 *.pdf
 *.PDF
 *.post_split
+*.bat
+*.c
+*.h
 # Local (untracked) interrupt database packs
 #DosInterrupts/
 #DosInterrupts/**
@@ -339,3 +344,6 @@ EXES/disasm_le/FIDEMO.le.pseudo.c
 EXES/disasm_le/FIDEMO.func_000100DC.pseudo.c
 .vscode/tasks.json
 *.c
+/Dosbox-Bridge
+*.o
+*.o

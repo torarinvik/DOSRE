@@ -23,13 +23,27 @@ namespace DOSRE.Dasm
             out string output,
             out string error)
         {
-            output = string.Empty;
+            return TryDecompileToMultipart(inputFile, leFull, leBytesLimit, leFixups, leGlobals, leInsights, toolchainHint, 0, out var files, out error)
+                ? (files.TryGetValue("blst.c", out output) || (output = files.Values.FirstOrDefault()) != null)
+                : (output = string.Empty) == string.Empty && false;
+        }
+
+        public static bool TryDecompileToMultipart(
+            string inputFile,
+            bool leFull,
+            int? leBytesLimit,
+            bool leFixups,
+            bool leGlobals,
+            bool leInsights,
+            EnumToolchainHint toolchainHint,
+            int chunkSize,
+            out Dictionary<string, string> files,
+            out string error)
+        {
+            files = new Dictionary<string, string>();
             error = string.Empty;
 
-            // Decompilation benefits heavily from insights (function labels, CFG labels, alias rewrites).
-            // Force it on regardless of the caller's flag.
             var useInsights = true;
-
             if (!TryDisassembleToString(
                     inputFile,
                     leFull,
@@ -44,24 +58,25 @@ namespace DOSRE.Dasm
                 return false;
             }
 
-            var (ok, outText, errText) = PseudoCFromLeAsm(asm);
+            var (ok, resultFiles, errText) = PseudoCFromLeAsm(asm.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n'), null, false, chunkSize);
             if (!ok)
             {
                 error = errText;
                 return false;
             }
 
-            output = outText;
+            files = resultFiles;
             return true;
         }
 
-        public static bool TryDecompileAsmFileToString(
+        public static bool TryDecompileToMultipartFromAsmFile(
             string asmFile,
             string onlyFunction,
-            out string output,
+            int chunkSize,
+            out Dictionary<string, string> files,
             out string error)
         {
-            output = string.Empty;
+            files = new Dictionary<string, string>();
             error = string.Empty;
 
             if (string.IsNullOrWhiteSpace(asmFile) || !File.Exists(asmFile))
@@ -71,24 +86,17 @@ namespace DOSRE.Dasm
             }
 
             var asm = File.ReadAllText(asmFile);
-            var (ok, outText, errText) = PseudoCFromLeAsm(asm, onlyFunction, strictOnlyFunction: !string.IsNullOrWhiteSpace(onlyFunction));
-            if (!ok)
-            {
-                error = errText;
-                return false;
-            }
-
-            output = outText;
-            return true;
+            return TryDecompileToMultipartFromAsm(asm, onlyFunction, chunkSize, out files, out error);
         }
 
-        public static bool TryDecompileAsmToString(
+        public static bool TryDecompileToMultipartFromAsm(
             string asm,
             string onlyFunction,
-            out string output,
+            int chunkSize,
+            out Dictionary<string, string> files,
             out string error)
         {
-            output = string.Empty;
+            files = new Dictionary<string, string>();
             error = string.Empty;
 
             if (string.IsNullOrWhiteSpace(asm))
@@ -97,36 +105,55 @@ namespace DOSRE.Dasm
                 return false;
             }
 
-            var (ok, outText, errText) = PseudoCFromLeAsm(asm, onlyFunction, strictOnlyFunction: !string.IsNullOrWhiteSpace(onlyFunction));
+            var (ok, resultFiles, errText) = PseudoCFromLeAsm(asm.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n'), onlyFunction, !string.IsNullOrWhiteSpace(onlyFunction), chunkSize);
             if (!ok)
             {
                 error = errText;
                 return false;
             }
 
-            output = outText;
+            files = resultFiles;
             return true;
         }
 
-        private static (bool ok, string output, string error) PseudoCFromLeAsm(string asm, string onlyFunction = null, bool strictOnlyFunction = false)
+        private static (bool ok, string output, string error) PseudoCFromLeAsm(string asm, string onlyFunction = null, bool strictOnlyFunction = false, int chunkSize = 0)
         {
             if (string.IsNullOrWhiteSpace(asm))
                 return (true, string.Empty, string.Empty);
 
             var lines = asm.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
 
-            if (!string.IsNullOrWhiteSpace(onlyFunction))
-            {
-                var (sliceOk, sliced, sliceErr) = TrySliceToSingleFunction(lines, onlyFunction);
-                if (!sliceOk && strictOnlyFunction)
-                    return (false, string.Empty, sliceErr);
+            var (ok, files, err) = PseudoCFromLeAsm(lines, onlyFunction, strictOnlyFunction: strictOnlyFunction, chunkSize: chunkSize);
+            if (!ok) return (false, string.Empty, err);
 
-                lines = sliced;
-            }
+            // If we have multiple files but the caller only wanted a string, join them or return the main one.
+            // For now, if chunkSize was 0, it should have only one file "blst.c".
+            if (files.ContainsKey("blst.c")) return (true, files["blst.c"], string.Empty);
+            if (files.Count > 0) return (true, files.Values.First(), string.Empty);
 
+            return (true, string.Empty, string.Empty);
+        }
+
+        public static (bool ok, Dictionary<string, string> files, string error) PseudoCMultiPartFromLeAsm(string asm, int chunkSize = 200)
+        {
+            if (string.IsNullOrWhiteSpace(asm))
+                return (true, new Dictionary<string, string>(), string.Empty);
+
+            var lines = asm.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
+            return PseudoCFromLeAsm(lines, null, strictOnlyFunction: false, chunkSize: chunkSize);
+        }
+
+        private static (bool ok, Dictionary<string, string> files, string error) PseudoCFromLeAsm(string[] lines, string onlyFunction = null, bool strictOnlyFunction = false, int chunkSize = 0)
+        {
+            if (chunkSize <= 0 && !strictOnlyFunction) chunkSize = 200;
+
+            var files = new Dictionary<string, string>();
             var labelByAddr = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var functions = new List<ParsedFunction>();
+            var otherFunctions = new Dictionary<string, (string proto, int argCount)>(StringComparer.OrdinalIgnoreCase);
+            uint? entryLinear = null;
             _addrToString.Clear();
+            _addrToStringLiteral.Clear();
             _addrToGlobal.Clear();
             _addrToFuncName.Clear();
             _addrToCallDecoration.Clear();
@@ -137,6 +164,17 @@ namespace DOSRE.Dasm
             {
                 var t = raw.Trim();
                 if (string.IsNullOrWhiteSpace(t)) continue;
+
+                if (!entryLinear.HasValue)
+                {
+                    var mEntry = Regex.Match(t, @"^;\s*Entry:\s*Obj\s+\d+\s*\+\s*0x[0-9A-Fa-f]+\s*\(Linear\s+0x(?<lin>[0-9A-Fa-f]+)\)\s*$", RegexOptions.IgnoreCase);
+                    if (mEntry.Success)
+                    {
+                        var linStr = mEntry.Groups["lin"].Value;
+                        if (uint.TryParse(linStr, System.Globalization.NumberStyles.HexNumber, null, out var lin))
+                            entryLinear = lin;
+                    }
+                }
 
                 var addrMatch = Regex.Match(t, @"^(?<addr>[0-9A-Fa-f]{8})h\s+");
                 if (addrMatch.Success)
@@ -165,11 +203,16 @@ namespace DOSRE.Dasm
                 // Strings: s_000C00A2 EQU 0x000C00A2 ; "users.ini"
                 if (t.Contains("EQU") && t.Contains(";"))
                 {
-                    var mStr = Regex.Match(t, @"[ps]_(?<addr>[0-9A-Fa-f]{8})\s+EQU\s+0x\k<addr>\s+;\s+""(?<str>.*)""");
+                    var mStr = Regex.Match(t, @"(?<sym>[ps]_(?<addr>[0-9A-Fa-f]{8}))\s+EQU\s+0x\k<addr>\s+;\s+""(?<str>.*)""");
                     if (mStr.Success)
                     {
                         var addr = mStr.Groups["addr"].Value.ToUpperInvariant();
-                        _addrToString[addr] = "\"" + mStr.Groups["str"].Value.Replace("\"", "\\\"") + "\"";
+                        var sym = mStr.Groups["sym"].Value;
+                        var lit = mStr.Groups["str"].Value;
+                        // Escape for C string literal.
+                        lit = lit.Replace("\\", "\\\\").Replace("\"", "\\\"");
+                        _addrToString[addr] = sym;
+                        _addrToStringLiteral[addr] = "\"" + lit + "\"";
                         continue;
                     }
                 }
@@ -399,29 +442,65 @@ namespace DOSRE.Dasm
             sb.AppendLine("// - It reuses LE insights/symbolization from the disassembler output.");
             sb.AppendLine("// - Memory operands use uint*_t; assume <stdint.h>.");
             sb.AppendLine("#include <stdint.h>");
-            sb.AppendLine("#if defined(__has_include) && __has_include(<memory.h>)");
-            sb.AppendLine("#include <memory.h>");
-            sb.AppendLine("#elif defined(__has_include) && __has_include(<string.h>)");
+            sb.AppendLine("#include <stddef.h>");
             sb.AppendLine("#include <string.h>");
-            sb.AppendLine("#else");
-            sb.AppendLine("#ifndef size_t");
-            sb.AppendLine("typedef __SIZE_TYPE__ size_t;");
-            sb.AppendLine("#endif");
-            sb.AppendLine("void* memcpy(void *dst, const void *src, size_t n);");
-            sb.AppendLine("void* memset(void *s, int c, size_t n);");
-            sb.AppendLine("#endif");
             sb.AppendLine();
             sb.AppendLine("// Stubs for compilability");
             sb.AppendLine("#define strlen_rep(edi, al, ecx) 0 /* stub */");
-            sb.AppendLine("#define __out(port, val) /* stub */");
-            sb.AppendLine("#define __in(port) 0 /* stub */");
-            sb.AppendLine("#define pop() 0 /* stub */");
+            sb.AppendLine();
+            sb.AppendLine("// Low-level hooks (port I/O + interrupts)");
+            sb.AppendLine("// - On DOS targets (DJGPP/Watcom) we provide best-effort real implementations.");
+            sb.AppendLine("// - On other hosts these are safe stubs so the file still compiles.");
+            sb.AppendLine("#if defined(__WATCOMC__) && defined(__386__)");
+            sb.AppendLine("#include <i86.h>");
+            sb.AppendLine("// Port I/O in 32-bit Watcom (DOS4GW): implement with pragma aux.");
+            sb.AppendLine("void __dos_out8(uint16_t port, uint8_t val);");
+            sb.AppendLine("#pragma aux __dos_out8 = \"out dx, al\" parm [dx] [al] modify exact []");
+            sb.AppendLine("uint8_t __dos_in8(uint16_t port);");
+            sb.AppendLine("#pragma aux __dos_in8 = \"in al, dx\" parm [dx] value [al] modify exact []");
+            sb.AppendLine("#define __out(port, val) __dos_out8((uint16_t)(port), (uint8_t)(val))");
+            sb.AppendLine("#define __in(port) __dos_in8((uint16_t)(port))");
+            sb.AppendLine("#elif (defined(__i386__) || defined(__x86_64__)) && (defined(__GNUC__) || defined(__clang__))");
+            sb.AppendLine("static inline void __dos_out8(uint16_t port, uint8_t val) { __asm__ volatile(\"outb %0, %1\" : : \"a\"(val), \"Nd\"(port)); }");
+            sb.AppendLine("static inline uint8_t __dos_in8(uint16_t port) { uint8_t ret; __asm__ volatile(\"inb %1, %0\" : \"=a\"(ret) : \"Nd\"(port)); return ret; }");
+            sb.AppendLine("#define __out(port, val) __dos_out8((uint16_t)(port), (uint8_t)(val))");
+            sb.AppendLine("#define __in(port) __dos_in8((uint16_t)(port))");
+            sb.AppendLine("#else");
+            sb.AppendLine("#define __out(port, val) ((void)(port), (void)(val))");
+            sb.AppendLine("#define __in(port) (0u)");
+            sb.AppendLine("#endif");
+            sb.AppendLine();
+            sb.AppendLine("#if defined(__DJGPP__)");
+            sb.AppendLine("#include <dpmi.h>");
+            sb.AppendLine("#define DOS_INT(intno) do { \\");
+            sb.AppendLine("    __dpmi_regs __r; memset(&__r, 0, sizeof(__r)); \\");
+            sb.AppendLine("    __r.x.eax = (unsigned long)eax; __r.x.ebx = (unsigned long)ebx; __r.x.ecx = (unsigned long)ecx; __r.x.edx = (unsigned long)edx; \\");
+            sb.AppendLine("    __r.x.esi = (unsigned long)esi; __r.x.edi = (unsigned long)edi; \\");
+            sb.AppendLine("    __dpmi_int((intno), &__r); \\");
+            sb.AppendLine("    eax = (uint32_t)__r.x.eax; ebx = (uint32_t)__r.x.ebx; ecx = (uint32_t)__r.x.ecx; edx = (uint32_t)__r.x.edx; \\");
+            sb.AppendLine("    esi = (uint32_t)__r.x.esi; edi = (uint32_t)__r.x.edi; \\");
+            sb.AppendLine("} while(0)");
+            sb.AppendLine("#elif defined(__WATCOMC__) && defined(__386__)");
+            sb.AppendLine("#include <i86.h>");
+            sb.AppendLine("#define DOS_INT(intno) do { \\");
+            sb.AppendLine("    union REGS __inr, __outr; memset(&__inr, 0, sizeof(__inr)); memset(&__outr, 0, sizeof(__outr)); \\");
+            sb.AppendLine("    __inr.x.eax = (unsigned long)eax; __inr.x.ebx = (unsigned long)ebx; __inr.x.ecx = (unsigned long)ecx; __inr.x.edx = (unsigned long)edx; \\");
+            sb.AppendLine("    __inr.x.esi = (unsigned long)esi; __inr.x.edi = (unsigned long)edi; \\");
+            sb.AppendLine("    int386((intno), &__inr, &__outr); \\");
+            sb.AppendLine("    eax = (uint32_t)__outr.x.eax; ebx = (uint32_t)__outr.x.ebx; ecx = (uint32_t)__outr.x.ecx; edx = (uint32_t)__outr.x.edx; \\");
+            sb.AppendLine("    esi = (uint32_t)__outr.x.esi; edi = (uint32_t)__outr.x.edi; \\");
+            sb.AppendLine("} while(0)");
+            sb.AppendLine("#elif defined(__WATCOMC__)");
+            sb.AppendLine("#define DOS_INT(intno) do { (void)(intno); } while(0)");
+            sb.AppendLine("#else");
+            sb.AppendLine("#define DOS_INT(intno) do { (void)(intno); /* stub */ } while(0)");
+            sb.AppendLine("#endif");
+            sb.AppendLine();
+            sb.AppendLine("// Best-effort stack pop: reads dword at esp and advances esp by 4.");
+            sb.AppendLine("static inline uint32_t __pop32(uint32_t *esp_) { uint32_t v = *(uint32_t*)(uintptr_t)(*esp_); *esp_ += 4; return v; }");
+            sb.AppendLine("#define pop() __pop32(&esp)");
             sb.AppendLine("#define memset_32(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*4)");
             sb.AppendLine("#define memset_16(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*2)");
-            sb.AppendLine("#ifndef uintptr_t");
-            sb.AppendLine("#define uintptr_t uint32_t");
-            sb.AppendLine("#endif");
-            sb.AppendLine("#define int32_t int");
             sb.AppendLine("#define __builtin_bswap32(x) ((((x) & 0xFF000000) >> 24) | (((x) & 0x00FF0000) >> 8) | (((x) & 0x0000FF00) << 8) | (((x) & 0x000000FF) << 24))");
             sb.AppendLine("uint32_t func_0000000D() { return 0; }");
             sb.AppendLine("uint32_t func_000000EA() { return 0; }");
@@ -431,10 +510,11 @@ namespace DOSRE.Dasm
 
             // Pass: Collect all referenced functions, globals, and ptrs to ensure forward declarations
             var referencedFunctions = new HashSet<string>(functions.Select(f => f.Name), StringComparer.OrdinalIgnoreCase);
-            var otherFunctions = new Dictionary<string, (string proto, int argCount)>(StringComparer.OrdinalIgnoreCase);
             var fieldOffsets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var ptrSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var globalSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var flagSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var pseudoStringSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var fn in functions)
             {
@@ -476,16 +556,46 @@ namespace DOSRE.Dasm
                         }
 
                         // Collect field_XXXX offsets
-                        var fieldMatches = Regex.Matches(text, @"\bfield_(?<off>[0-9A-Fa-f]+)\b");
-                        foreach (Match fm in fieldMatches) fieldOffsets.Add(fm.Value);
+                        var fieldMatches = Regex.Matches(text, @"\bfield_(?<off>[0-9A-Fa-f]+)\b", RegexOptions.IgnoreCase);
+                        foreach (Match fm in fieldMatches)
+                        {
+                            var off = fm.Groups["off"].Value.ToLowerInvariant();
+                            fieldOffsets.Add($"field_{off}");
+                        }
 
                         // Collect ptr_XXXXXXXX symbols
-                        var ptrMatches = Regex.Matches(text, @"\bptr_(?<addr>[0-9A-Fa-f]{8})\b");
-                        foreach (Match pm in ptrMatches) ptrSymbols.Add(pm.Value);
+                        var ptrMatches = Regex.Matches(text, @"\bptr_(?<addr>[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
+                        foreach (Match pm in ptrMatches)
+                        {
+                            var addr = pm.Groups["addr"].Value.ToUpperInvariant();
+                            ptrSymbols.Add($"ptr_{addr}");
+                        }
 
                         // Collect g_XXXXXXXX symbols
-                        var globalMatches = Regex.Matches(text, @"\bg_(?<addr>[0-9A-Fa-f]{8})\b");
-                        foreach (Match gm in globalMatches) globalSymbols.Add(gm.Value);
+                        var globalMatches = Regex.Matches(text, @"\bg_(?<addr>[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
+                        foreach (Match gm in globalMatches)
+                        {
+                            var addr = gm.Groups["addr"].Value.ToUpperInvariant();
+                            globalSymbols.Add($"g_{addr}");
+                        }
+
+                        // Collect flags_XXXXXXXX symbols (inferred flag storage)
+                        var flagsMatches = Regex.Matches(text, @"\bflags_(?<addr>[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
+                        foreach (Match fm in flagsMatches)
+                        {
+                            var addr = fm.Groups["addr"].Value.ToUpperInvariant();
+                            flagSymbols.Add($"flags_{addr}");
+                        }
+
+                        // Collect s_/p_ symbols referenced in code. Not all of these are guaranteed to appear in the
+                        // header string table; if missing, we still need a placeholder declaration for compilation.
+                        var spMatches = Regex.Matches(text, @"\b(?<pre>[ps])_(?<addr>[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
+                        foreach (Match sm in spMatches)
+                        {
+                            var pre = sm.Groups["pre"].Value.ToLowerInvariant();
+                            var addr = sm.Groups["addr"].Value.ToUpperInvariant();
+                            pseudoStringSymbols.Add($"{pre}_{addr}");
+                        }
                     }
                 }
             }
@@ -495,290 +605,843 @@ namespace DOSRE.Dasm
             sb.AppendLine();
 
             var allFoundGlobals = new HashSet<string>(_addrToGlobal.Values, StringComparer.OrdinalIgnoreCase);
-            foreach (var gsym in allFoundGlobals.OrderBy(x => x))
-            {
-                sb.AppendLine($"static uint8_t {gsym}[1];");
-            }
+            allFoundGlobals.UnionWith(globalSymbols);
+            allFoundGlobals.UnionWith(flagSymbols);
 
-            var allFoundStrings = new HashSet<string>(_addrToString.Values, StringComparer.OrdinalIgnoreCase);
-            foreach (var ssym in allFoundStrings.OrderBy(x => x))
+            var byteGlobals = new List<(uint addr, string sym)>();
+            var otherGlobals = new List<string>();
+            foreach (var gsym in allFoundGlobals)
             {
-                sb.AppendLine($"static char {ssym}[] = \"stub\";");
-            }
-
-            foreach (var foff in fieldOffsets.OrderBy(x => x))
-            {
-                var off = foff.Substring(6);
-                sb.AppendLine($"#define {foff} 0x{off}");
-            }
-            foreach (var psym in ptrSymbols.OrderBy(x => x))
-            {
-                sb.AppendLine($"static uint8_t {psym}[1];");
-                var addr = psym.Substring(4);
-                sb.AppendLine($"#define M_{psym} 0x{addr}");
-            }
-            sb.AppendLine();
-
-            // Forward declarations
-            foreach (var fn in functions.OrderBy(x => x.Name))
-            {
-                // If it's a void-arg func, allow it to take arguments in the declaration
-                // to avoid "too many arguments" errors from imperfect inference.
-                var p = fn.Proto.Replace("(void)", "()");
-                sb.AppendLine($"{p};");
-            }
-            foreach (var kvp in otherFunctions.OrderBy(x => x.Key))
-            {
-                sb.AppendLine($"{kvp.Value.proto};");
-            }
-            sb.AppendLine();
-
-            var functionsByName = functions.ToDictionary(f => f.Name, f => f, StringComparer.OrdinalIgnoreCase);
-
-            foreach (var fn in functions)
-            {
-                var proto = fn.Proto;
-                // Checksum calculation: hash of all raw instruction bytes in this function.
-                var allBytes = string.Join("", fn.Blocks.SelectMany(b => b.Lines).Select(l => l.BytesHex));
-                var hashStr = string.Empty;
-                if (!string.IsNullOrEmpty(allBytes))
+                var m = Regex.Match(gsym, @"^g_(?<addr>[0-9A-Fa-f]{8})$", RegexOptions.IgnoreCase);
+                if (m.Success)
                 {
-                    using (var md5 = MD5.Create())
+                    var addr = Convert.ToUInt32(m.Groups["addr"].Value, 16);
+                    byteGlobals.Add((addr, $"g_{m.Groups["addr"].Value.ToUpperInvariant()}"));
+                }
+                else
+                {
+                    otherGlobals.Add(gsym);
+                }
+            }
+
+            var pages = new SortedDictionary<uint, List<(uint addr, string sym)>>();
+            foreach (var bg in byteGlobals)
+            {
+                var baseAddr = bg.addr & 0xFFFFF000u;
+                if (!pages.TryGetValue(baseAddr, out var list))
+                {
+                    list = new List<(uint addr, string sym)>();
+                    pages[baseAddr] = list;
+                }
+                list.Add((bg.addr, bg.sym));
+            }
+
+            var knownStringSyms = new HashSet<string>(_addrToString.Values, StringComparer.OrdinalIgnoreCase);
+
+            // Determine how to enter the translated program.
+            // Prefer a direct function start at the LE entry; otherwise, jump to the nearest decoded instruction
+            // at/after the entry address within the containing function.
+            string entryDirectFunc = null;
+            string entryContainerFunc = null;
+            uint? entryJumpAddr = null;
+
+            if (entryLinear.HasValue)
+            {
+                var entryName = $"func_{entryLinear.Value:X8}";
+                if (functions.Any(f => string.Equals(f.Name, entryName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    entryDirectFunc = entryName;
+                }
+                else
+                {
+                    ParsedFunction best = null;
+                    uint bestStart = 0;
+                    var entry = entryLinear.Value;
+
+                    foreach (var fn in functions)
                     {
-                        var hash = md5.ComputeHash(Encoding.ASCII.GetBytes(allBytes));
-                        hashStr = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+                        uint min = uint.MaxValue;
+                        uint max = 0;
+                        var any = false;
+                        foreach (var b in fn.Blocks)
+                        {
+                            foreach (var l in b.Lines)
+                            {
+                                if (l.Kind != ParsedLineKind.Instruction) continue;
+                                var a = (uint)l.Address;
+                                any = true;
+                                if (a < min) min = a;
+                                if (a > max) max = a;
+                            }
+                        }
+                        if (!any) continue;
+                        if (entry < min || entry > max) continue;
+
+                        if (best == null || min > bestStart)
+                        {
+                            best = fn;
+                            bestStart = min;
+                        }
+                    }
+
+                    if (best != null)
+                    {
+                        entryContainerFunc = best.Name;
+
+                        var addrs = new List<uint>();
+                        foreach (var b in best.Blocks)
+                        {
+                            foreach (var l in b.Lines)
+                            {
+                                if (l.Kind != ParsedLineKind.Instruction) continue;
+                                addrs.Add((uint)l.Address);
+                            }
+                        }
+                        addrs.Sort();
+
+                        foreach (var a in addrs)
+                        {
+                            if (a >= entry)
+                            {
+                                entryJumpAddr = a;
+                                break;
+                            }
+                        }
+                        if (!entryJumpAddr.HasValue && addrs.Count > 0)
+                            entryJumpAddr = addrs[addrs.Count - 1];
                     }
                 }
+            }
 
-                sb.AppendLine(proto + "");
-                sb.AppendLine("{");
-                if (!string.IsNullOrEmpty(hashStr))
+            if (chunkSize <= 0)
+            {
+                var sbSingle = new StringBuilder();
+                sbSingle.AppendLine("#include <stdint.h>");
+                sbSingle.AppendLine("#include <stdio.h>");
+                sbSingle.AppendLine("#include <string.h>");
+                sbSingle.AppendLine();
+                sbSingle.AppendLine("#define ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))");
+                sbSingle.AppendLine("#define ROL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))");
+                sbSingle.AppendLine("#define ROR8(x, n) (uint8_t)(((x) >> (n)) | ((x) << (8 - (n))))");
+                sbSingle.AppendLine("#define ROL8(x, n) (uint8_t)(((x) << (n)) | ((x) >> (8 - (n))))");
+                sbSingle.AppendLine("#define ROR16(x, n) (uint16_t)(((x) >> (n)) | ((x) << (16 - (n))))");
+                sbSingle.AppendLine("#define ROL16(x, n) (uint16_t)(((x) << (n)) | ((x) >> (16 - (n))))");
+                sbSingle.AppendLine();
+                sbSingle.AppendLine("#ifdef __WATCOMC__");
+                sbSingle.AppendLine("#include <conio.h>");
+                sbSingle.AppendLine("void outportb(uint16_t port, uint8_t val);");
+                sbSingle.AppendLine("#pragma aux outportb = \"out dx, al\" parm [dx] [al];");
+                sbSingle.AppendLine("void outportw(uint16_t port, uint16_t val);");
+                sbSingle.AppendLine("#pragma aux outportw = \"out dx, ax\" parm [dx] [ax];");
+                sbSingle.AppendLine("void outportd(uint16_t port, uint32_t val);");
+                sbSingle.AppendLine("#pragma aux outportd = \"out dx, eax\" parm [dx] [eax];");
+                sbSingle.AppendLine("uint8_t inportb(uint16_t port);");
+                sbSingle.AppendLine("#pragma aux inportb = \"in al, dx\" parm [dx] value [al];");
+                sbSingle.AppendLine("uint16_t inportw(uint16_t port);");
+                sbSingle.AppendLine("#pragma aux inportw = \"in ax, dx\" parm [dx] value [ax];");
+                sbSingle.AppendLine("uint32_t inportd(uint16_t port);");
+                sbSingle.AppendLine("#pragma aux inportd = \"in eax, dx\" parm [dx] value [eax];");
+                sbSingle.AppendLine("#else");
+                sbSingle.AppendLine("#define outportb(p,v) (void)0");
+                sbSingle.AppendLine("#define inportb(p) 0");
+                sbSingle.AppendLine("#endif");
+                sbSingle.AppendLine();
+                sbSingle.AppendLine("#if defined(__DJGPP__)");
+                sbSingle.AppendLine("#include <dpmi.h>");
+                sbSingle.AppendLine("#define DOS_INT(intno) do { \\");
+                sbSingle.AppendLine("    __dpmi_regs __r; memset(&__r, 0, sizeof(__r)); \\");
+                sbSingle.AppendLine("    __r.x.eax = (unsigned long)eax; __r.x.ebx = (unsigned long)ebx; __r.x.ecx = (unsigned long)ecx; __r.x.edx = (unsigned long)edx; \\");
+                sbSingle.AppendLine("    __r.x.esi = (unsigned long)esi; __r.x.edi = (unsigned long)edi; \\");
+                sbSingle.AppendLine("    __dpmi_int((intno), &__r); \\");
+                sbSingle.AppendLine("    eax = (uint32_t)__r.x.eax; ebx = (uint32_t)__r.x.ebx; ecx = (uint32_t)__r.x.ecx; edx = (uint32_t)__r.x.edx; \\");
+                sbSingle.AppendLine("    esi = (uint32_t)__r.x.esi; edi = (uint32_t)__r.x.edi; \\");
+                sbSingle.AppendLine("} while(0)");
+                sbSingle.AppendLine("#elif defined(__WATCOMC__) && defined(__386__)");
+                sbSingle.AppendLine("#include <i86.h>");
+                sbSingle.AppendLine("#define DOS_INT(intno) do { \\");
+                sbSingle.AppendLine("    union REGS __inr, __outr; memset(&__inr, 0, sizeof(__inr)); memset(&__outr, 0, sizeof(__outr)); \\");
+                sbSingle.AppendLine("    __inr.x.eax = (unsigned long)eax; __inr.x.ebx = (unsigned long)ebx; __inr.x.ecx = (unsigned long)ecx; __inr.x.edx = (unsigned long)edx; \\");
+                sbSingle.AppendLine("    __inr.x.esi = (unsigned long)esi; __inr.x.edi = (unsigned long)edi; \\");
+                sbSingle.AppendLine("    int386((intno), &__inr, &__outr); \\");
+                sbSingle.AppendLine("    eax = (uint32_t)__outr.x.eax; ebx = (uint32_t)__outr.x.ebx; ecx = (uint32_t)__outr.x.ecx; edx = (uint32_t)__outr.x.edx; \\");
+                sbSingle.AppendLine("    esi = (uint32_t)__outr.x.esi; edi = (uint32_t)__outr.x.edi; \\");
+                sbSingle.AppendLine("} while(0)");
+                sbSingle.AppendLine("#elif defined(__WATCOMC__)");
+                sbSingle.AppendLine("#define DOS_INT(intno) do { (void)(intno); } while(0)");
+                sbSingle.AppendLine("#else");
+                sbSingle.AppendLine("#define DOS_INT(intno) do { (void)(intno); /* stub */ } while(0)");
+                sbSingle.AppendLine("#endif");
+                sbSingle.AppendLine();
+                sbSingle.AppendLine("// Best-effort stack pop: reads dword at esp and advances esp by 4.");
+                sbSingle.AppendLine("static inline uint32_t __pop32(uint32_t *esp_) { uint32_t v = *(uint32_t*)(uintptr_t)(*esp_); *esp_ += 4; return v; }");
+                sbSingle.AppendLine("#define pop() __pop32(&esp)");
+                sbSingle.AppendLine("#define memset_32(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*4)");
+                sbSingle.AppendLine("#define memset_16(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*2)");
+                sbSingle.AppendLine("#define __builtin_bswap32(x) ((((x) & 0xFF000000) >> 24) | (((x) & 0x00FF0000) >> 8) | (((x) & 0x0000FF00) << 8) | (((x) & 0x000000FF) << 24))");
+                sbSingle.AppendLine("uint32_t func_0000000D() { return 0; }");
+                sbSingle.AppendLine("uint32_t func_000000EA() { return 0; }");
+                sbSingle.AppendLine("uint32_t func_000000FA() { return 0; }");
+                sbSingle.AppendLine("uint32_t func_00000028() { return 0; }");
+                sbSingle.AppendLine();
+
+                sbSingle.AppendLine("static uint32_t cs, ds, es, fs, gs, ss, dr0, dr1, dr2, dr3, dr6, dr7, _this, carry;");
+                sbSingle.AppendLine("static int jz, jnz, je, jne, jg, jge, jl, jle, ja, jae, jb, jbe, jo, jno, js, jns; // status flags");
+                sbSingle.AppendLine("static uint32_t __entry_jump_enabled, __entry_jump_target, __entry_jump_addr;");
+                sbSingle.AppendLine();
+
+                foreach (var kvp in pages)
                 {
-                    sb.AppendLine($"    // FIDELITY: {hashStr} (checksum of raw bytes)");
+                    var baseAddr = kvp.Key;
+                    sbSingle.AppendLine($"static uint8_t g_page_{baseAddr:X8}[0x1000];");
                 }
-
-                var regs = CollectRegistersUsed(fn);
-                regs.Add("eax"); // Always declare eax as it's the default return
-                regs.Add("ebp");
-                regs.Add("esp");
-                var stackVars = CollectStackVarsUsed(fn);
-
-                // Exclude arguments from the local variable list if they are in the prototype.
-                var argVars = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                var protoArgMatches = Regex.Matches(proto, @"\b(?<name>arg_[0-9A-Fa-f]+)\b");
-                foreach (Match am in protoArgMatches) argVars.Add(am.Groups["name"].Value.ToLowerInvariant());
-                stackVars.RemoveWhere(v => argVars.Contains(v));
-
-                var regDecls = FormatRegisterDeclarations(regs);
-                if (!string.IsNullOrEmpty(regDecls))
-                    sb.Append(regDecls);
-
-                if (stackVars.Any())
+                if (pages.Count > 0)
                 {
-                    // Group by inferred type
-                    var byType = stackVars.GroupBy(v => fn.InferredTypes.GetValueOrDefault(v, "uint32_t"));
-                    foreach (var g in byType.OrderBy(x => x.Key))
+                    sbSingle.AppendLine("static inline uint8_t* G(uint32_t addr)");
+                    sbSingle.AppendLine("{");
+                    sbSingle.AppendLine("    switch (addr & 0xFFFFF000u)");
+                    sbSingle.AppendLine("    {");
+                    foreach (var kvp in pages)
                     {
-                        sb.AppendLine($"    {g.Key} " + string.Join(", ", g.OrderBy(v => v)) + ";");
+                        var baseAddr = kvp.Key;
+                        sbSingle.AppendLine($"        case 0x{baseAddr:X8}u: return &g_page_{baseAddr:X8}[addr & 0xFFFu];");
                     }
+                    sbSingle.AppendLine("        default: return (uint8_t*)0;");
+                    sbSingle.AppendLine("    }");
+                    sbSingle.AppendLine("}");
                 }
 
-                var pending = new PendingFlags();
-
-                // Pass 3: Collect all referenced labels in this function to ensure they are declared.
-                var referencedLabels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var block in fn.Blocks)
+                foreach (var gsym in otherGlobals.OrderBy(x => x))
                 {
-                    foreach (var line in block.Lines)
+                    sbSingle.AppendLine($"static uint8_t {gsym}[1];");
+                }
+
+                foreach (var kvp in _addrToString.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+                {
+                    var addr = kvp.Key;
+                    var sym = kvp.Value;
+                    var lit = _addrToStringLiteral.TryGetValue(addr, out var sLit) ? sLit : "\"\"";
+                    sbSingle.AppendLine($"static const char {sym}[] = {lit};");
+                }
+
+                foreach (var psym in pseudoStringSymbols.OrderBy(x => x))
+                {
+                    if (knownStringSyms.Contains(psym)) continue;
+                    sbSingle.AppendLine($"static uint8_t {psym}[1];");
+                }
+
+                foreach (var foff in fieldOffsets.OrderBy(x => x))
+                {
+                    var off = foff.Substring(6);
+                    sbSingle.AppendLine($"#define {foff} 0x{off}");
+                }
+                foreach (var psym in ptrSymbols.OrderBy(x => x))
+                {
+                    sbSingle.AppendLine($"static uint8_t {psym}[1];");
+                    var addr = psym.Substring(4);
+                    sbSingle.AppendLine($"#define M_{psym} 0x{addr}");
+                }
+                sbSingle.AppendLine();
+
+                foreach (var fn in functions.OrderBy(x => x.Name))
+                {
+                    var p = fn.Proto.Replace("(void)", "()");
+                    sbSingle.AppendLine($"{p};");
+                }
+                foreach (var kvp in otherFunctions.OrderBy(x => x.Key))
+                {
+                    sbSingle.AppendLine($"{kvp.Value.proto};");
+                }
+                sbSingle.AppendLine();
+
+                var functionsByName = functions.ToDictionary(f => f.Name, f => f, StringComparer.OrdinalIgnoreCase);
+
+                foreach (var fn in functions)
+                {
+                    sbSingle.Append(EmitFunctionBody(fn, labelByAddr, functionsByName, otherFunctions, entryLinear, entryContainerFunc, entryJumpAddr));
+                }
+
+                files["blst.c"] = sbSingle.ToString();
+            }
+            else
+            {
+                // Multi-file chunked output
+                var h = new StringBuilder();
+                h.AppendLine("#ifndef BLST_H");
+                h.AppendLine("#define BLST_H");
+                h.AppendLine("#include <stdint.h>");
+                h.AppendLine("#include <stdio.h>");
+                h.AppendLine("#include <string.h>");
+                h.AppendLine();
+                h.AppendLine("#define ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))");
+                h.AppendLine("#define ROL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))");
+                h.AppendLine("#define ROR8(x, n) (uint8_t)(((x) >> (n)) | ((x) << (8 - (n))))");
+                h.AppendLine("#define ROL8(x, n) (uint8_t)(((x) << (n)) | ((x) >> (8 - (n))))");
+                h.AppendLine("#define ROR16(x, n) (uint16_t)(((x) >> (n)) | ((x) << (16 - (n))))");
+                h.AppendLine("#define ROL16(x, n) (uint16_t)(((x) << (n)) | ((x) >> (16 - (n))))");
+                h.AppendLine();
+                h.AppendLine("#define __in(port) inportb((uint16_t)(port))");
+                h.AppendLine("#define __out(port, val) outportb((uint16_t)(port), (uint8_t)(val))");
+                h.AppendLine("#define __inw(port) inportw((uint16_t)(port))");
+                h.AppendLine("#define __outw(port, val) outportw((uint16_t)(port), (uint16_t)(val))");
+                h.AppendLine("#define __ind(port) inportd((uint16_t)(port))");
+                h.AppendLine("#define __outd(port, val) outportd((uint16_t)(port), (uint32_t)(val))");
+                h.AppendLine();
+                h.AppendLine("#ifdef __WATCOMC__");
+                h.AppendLine("#include <conio.h>");
+                h.AppendLine("void outportb(uint16_t port, uint8_t val);");
+                h.AppendLine("#pragma aux outportb = \"out dx, al\" parm [dx] [al];");
+                h.AppendLine("void outportw(uint16_t port, uint16_t val);");
+                h.AppendLine("#pragma aux outportw = \"out dx, ax\" parm [dx] [ax];");
+                h.AppendLine("void outportd(uint16_t port, uint32_t val);");
+                h.AppendLine("#pragma aux outportd = \"out dx, eax\" parm [dx] [eax];");
+                h.AppendLine("uint8_t inportb(uint16_t port);");
+                h.AppendLine("#pragma aux inportb = \"in al, dx\" parm [dx] value [al];");
+                h.AppendLine("uint16_t inportw(uint16_t port);");
+                h.AppendLine("#pragma aux inportw = \"in ax, dx\" parm [dx] value [ax];");
+                h.AppendLine("uint32_t inportd(uint16_t port);");
+                h.AppendLine("#pragma aux inportd = \"in eax, dx\" parm [dx] value [eax];");
+                h.AppendLine("#else");
+                h.AppendLine("#define outportb(p,v) (void)0");
+                h.AppendLine("#define inportb(p) 0");
+                h.AppendLine("#endif");
+                h.AppendLine();
+                h.AppendLine("#if defined(__DJGPP__)");
+                h.AppendLine("#include <dpmi.h>");
+                h.AppendLine("#define DOS_INT(intno) do { \\");
+                h.AppendLine("    __dpmi_regs __r; memset(&__r, 0, sizeof(__r)); \\");
+                h.AppendLine("    __r.x.eax = (unsigned long)eax; __r.x.ebx = (unsigned long)ebx; __r.x.ecx = (unsigned long)ecx; __r.x.edx = (unsigned long)edx; \\");
+                h.AppendLine("    __r.x.esi = (unsigned long)esi; __r.x.edi = (unsigned long)edi; \\");
+                h.AppendLine("    __dpmi_int((intno), &__r); \\");
+                h.AppendLine("    eax = (uint32_t)__r.x.eax; ebx = (uint32_t)__r.x.ebx; ecx = (uint32_t)__r.x.ecx; edx = (uint32_t)__r.x.edx; \\");
+                h.AppendLine("    esi = (uint32_t)__r.x.esi; edi = (uint32_t)__r.x.edi; \\");
+                h.AppendLine("} while(0)");
+                h.AppendLine("#elif defined(__WATCOMC__) && defined(__386__)");
+                h.AppendLine("#include <i86.h>");
+                h.AppendLine("#define DOS_INT(intno) do { \\");
+                h.AppendLine("    union REGS __inr, __outr; memset(&__inr, 0, sizeof(__inr)); memset(&__outr, 0, sizeof(__outr)); \\");
+                h.AppendLine("    __inr.x.eax = (unsigned long)eax; __inr.x.ebx = (unsigned long)ebx; __inr.x.ecx = (unsigned long)ecx; __inr.x.edx = (unsigned long)edx; \\");
+                h.AppendLine("    __inr.x.esi = (unsigned long)esi; __inr.x.edi = (unsigned long)edi; \\");
+                h.AppendLine("    int386((intno), &__inr, &__outr); \\");
+                h.AppendLine("    eax = (uint32_t)__outr.x.eax; ebx = (uint32_t)__outr.x.ebx; ecx = (uint32_t)__outr.x.ecx; edx = (uint32_t)__outr.x.edx; \\");
+                h.AppendLine("    esi = (uint32_t)__outr.x.esi; edi = (uint32_t)__outr.x.edi; \\");
+                h.AppendLine("} while(0)");
+                h.AppendLine("#else");
+                h.AppendLine("#define DOS_INT(intno) do { (void)(intno); } while(0)");
+                h.AppendLine("#endif");
+                h.AppendLine();
+                h.AppendLine("static inline uint32_t __pop32(uint32_t *esp_) { uint32_t v = *(uint32_t*)(uintptr_t)(*esp_); *esp_ += 4; return v; }");
+                h.AppendLine("extern uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp;");
+                h.AppendLine("#define ax (*(uint16_t*)&eax)");
+                h.AppendLine("#define al (*(uint8_t*)&eax)");
+                h.AppendLine("#define ah (*((uint8_t*)&eax + 1))");
+                h.AppendLine("#define bx (*(uint16_t*)&ebx)");
+                h.AppendLine("#define bl (*(uint8_t*)&ebx)");
+                h.AppendLine("#define bh (*((uint8_t*)&ebx + 1))");
+                h.AppendLine("#define cx (*(uint16_t*)&ecx)");
+                h.AppendLine("#define cl (*(uint8_t*)&ecx)");
+                h.AppendLine("#define ch (*((uint8_t*)&ecx + 1))");
+                h.AppendLine("#define dx (*(uint16_t*)&edx)");
+                h.AppendLine("#define dl (*(uint8_t*)&edx)");
+                h.AppendLine("#define dh (*((uint8_t*)&edx + 1))");
+                h.AppendLine("#define si (*(uint16_t*)&esi)");
+                h.AppendLine("#define di (*(uint16_t*)&edi)");
+                h.AppendLine("#define bp (*(uint16_t*)&ebp)");
+                h.AppendLine("#define sp (*(uint16_t*)&esp)");
+                h.AppendLine("extern uint32_t cs, ds, es, fs, gs, ss, dr0, dr1, dr2, dr3, dr6, dr7, _this, carry;");
+                h.AppendLine("extern int jz, jnz, je, jne, jg, jge, jl, jle, ja, jae, jb, jbe, jo, jno, js, jns;");
+                h.AppendLine("extern uint32_t __entry_jump_enabled, __entry_jump_target, __entry_jump_addr;");
+                h.AppendLine("#define pop() __pop32(&esp)");
+                h.AppendLine("#define strlen_rep(edi, al, ecx) __strlen_rep(edi, al, ecx)");
+                h.AppendLine("static inline uint32_t __strlen_rep(uint32_t edi_, uint8_t al_, uint32_t ecx_) {");
+                h.AppendLine("    uint32_t count = 0;");
+                h.AppendLine("    while (ecx_ != 0) {");
+                h.AppendLine("        if (*(uint8_t*)(uintptr_t)edi_ == al_) break;");
+                h.AppendLine("        edi_++; ecx_--; count++;");
+                h.AppendLine("    }");
+                h.AppendLine("    return count;");
+                h.AppendLine("}");
+                h.AppendLine("#define memset_32(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*4)");
+                h.AppendLine("#define memset_16(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*2)");
+                h.AppendLine("#define __builtin_bswap32(x) ((((x) & 0xFF000000) >> 24) | (((x) & 0x00FF0000) >> 8) | (((x) & 0x0000FF00) << 8) | (((x) & 0x000000FF) << 24))");
+                h.AppendLine();
+
+                foreach (var kvp in pages)
+                {
+                    var baseAddr = kvp.Key;
+                    h.AppendLine($"extern uint8_t g_page_{baseAddr:X8}[0x1000];");
+                }
+                if (pages.Count > 0)
+                {
+                    h.AppendLine("static inline uint8_t* G(uint32_t addr)");
+                    h.AppendLine("{");
+                    h.AppendLine("    switch (addr & 0xFFFFF000u)");
+                    h.AppendLine("    {");
+                    foreach (var kvp in pages)
                     {
-                        if (line.Kind != ParsedLineKind.Instruction) continue;
+                        var baseAddr = kvp.Key;
+                        h.AppendLine($"        case 0x{baseAddr:X8}u: return &g_page_{baseAddr:X8}[addr & 0xFFFu];");
+                    }
+                    h.AppendLine("        default: return (uint8_t*)0;");
+                    h.AppendLine("    }");
+                    h.AppendLine("}");
+                }
+
+                foreach (var gsym in otherGlobals.OrderBy(x => x))
+                    h.AppendLine($"extern uint8_t {gsym}[1];");
+
+                foreach (var kvp in _addrToString.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+                {
+                    var addr = kvp.Key;
+                    var sym = kvp.Value;
+                    h.AppendLine($"extern const char {sym}[];");
+                }
+
+                foreach (var psym in pseudoStringSymbols.OrderBy(x => x))
+                {
+                    if (knownStringSyms.Contains(psym)) continue;
+                    h.AppendLine($"extern uint8_t {psym}[1];");
+                }
+
+                foreach (var foff in fieldOffsets.OrderBy(x => x))
+                {
+                    var off = foff.Substring(6);
+                    h.AppendLine($"#define {foff} 0x{off}");
+                }
+                foreach (var psym in ptrSymbols.OrderBy(x => x))
+                {
+                    h.AppendLine($"extern uint8_t {psym}[1];");
+                    var addr = psym.Substring(4);
+                    h.AppendLine($"#define M_{psym} 0x{addr}");
+                }
+                h.AppendLine();
+
+                foreach (var fn in functions.OrderBy(x => x.Name))
+                {
+                    var p = fn.Proto.Replace("(void)", "()");
+                    h.AppendLine($"{p};");
+                }
+                foreach (var kvp in otherFunctions.OrderBy(x => x.Key))
+                    h.AppendLine($"{kvp.Value.proto};");
+
+                var functionsByName = functions.ToDictionary(f => f.Name, f => f, StringComparer.OrdinalIgnoreCase);
+                var sortedFuncs = functions.ToList();
+                
+                var buildBat = new StringBuilder();
+                buildBat.Append("@echo off\r\n");
+                buildBat.Append("call C:\\WATCOM\\OWSETENV.BAT\r\n");
+                buildBat.Append("echo Compiling data...\r\n");
+                buildBat.Append("wcc386 -6r -s -zq -fo=bdata.obj bdata.c\r\n");
+                buildBat.Append("echo Compiling main...\r\n");
+                buildBat.Append("wcc386 -6r -s -zq -fo=main.obj main.c\r\n");
+                
+                var linkerRsp = new StringBuilder();
+                linkerRsp.Append("name blst\r\n");
+                linkerRsp.Append("system dos4g\r\n");
+                linkerRsp.Append("option quiet\r\n");
+                linkerRsp.Append("option stack=0x8000\r\n");
+                linkerRsp.Append("option start=_cstart_\r\n");
+                linkerRsp.Append("libpath C:\\WATCOM\\LIB386\r\n");
+                linkerRsp.Append("libpath C:\\WATCOM\\LIB386\\DOS\r\n");
+                linkerRsp.Append("file main.obj\r\n");
+                linkerRsp.Append("file bdata.obj\r\n");
+
+                // Entry point: initialize an emulated guest stack for esp/pop() and transfer control into translated code.
+                var mainSb = new StringBuilder();
+                mainSb.AppendLine("#include \"blst.h\"");
+                mainSb.AppendLine();
+                mainSb.AppendLine("static uint8_t __guest_stack[0x40000];");
+                mainSb.AppendLine();
+                mainSb.AppendLine("int main(void)");
+                mainSb.AppendLine("{");
+                mainSb.AppendLine("    memset(__guest_stack, 0, sizeof(__guest_stack));");
+                mainSb.AppendLine("    esp = (uint32_t)(uintptr_t)(__guest_stack + sizeof(__guest_stack) - 4);");
+                mainSb.AppendLine("    ebp = esp;");
+                mainSb.AppendLine();
+                mainSb.AppendLine("    __entry_jump_enabled = 0;");
+                mainSb.AppendLine("    __entry_jump_target = 0;");
+                mainSb.AppendLine("    __entry_jump_addr = 0;");
+                mainSb.AppendLine();
+
+                if (!string.IsNullOrWhiteSpace(entryDirectFunc))
+                {
+                    mainSb.AppendLine($"    {SanitizeLabel(entryDirectFunc)}();");
+                }
+                else if (entryLinear.HasValue && !string.IsNullOrWhiteSpace(entryContainerFunc) && entryJumpAddr.HasValue)
+                {
+                    mainSb.AppendLine("    __entry_jump_enabled = 1;");
+                    mainSb.AppendLine($"    __entry_jump_target = 0x{entryLinear.Value:X8}u;");
+                    mainSb.AppendLine($"    __entry_jump_addr = 0x{entryJumpAddr.Value:X8}u;");
+                    mainSb.AppendLine($"    {SanitizeLabel(entryContainerFunc)}();");
+                }
+                else
+                {
+                    mainSb.AppendLine("    // NOTE: no LE entry address detected in disassembly header.");
+                }
+
+                mainSb.AppendLine("    return 0;");
+                mainSb.AppendLine("}");
+
+                files["main.c"] = mainSb.ToString().Replace("\n", "\r\n");
+
+                var calledFuncs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                for (int i = 0; i < sortedFuncs.Count; i += chunkSize)
+                {
+                    var partNum = i / chunkSize;
+                    var chunk = sortedFuncs.Skip(i).Take(chunkSize);
+                    var csb = new StringBuilder();
+                    csb.Append("#include \"blst.h\"\r\n");
+                    csb.Append("\r\n");
+                    foreach (var fn in chunk)
+                    {
+                        csb.Append(EmitFunctionBody(fn, labelByAddr, functionsByName, otherFunctions, entryLinear, entryContainerFunc, entryJumpAddr));
                         
-                        // Broad search for any loc_ or bb_ labels
-                        var lblMatches = Regex.Matches(line.Asm + " " + line.Raw, @"\b(?<lbl>(loc|bb)_[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
-                        foreach (Match lm in lblMatches) 
-                            referencedLabels.Add(lm.Groups["lbl"].Value);
-
-                        if (IsJccLine(line, out _, out var target))
+                        // Collect all function calls from this function to check for missing ones later
+                        foreach (var block in fn.Blocks)
                         {
-                            var lbl = labelByAddr.GetValueOrDefault(target.ToUpperInvariant().PadLeft(8, '0'));
-                            if (lbl != null) referencedLabels.Add(lbl);
+                            foreach (var line in block.Lines)
+                            {
+                                if (line.Kind != ParsedLineKind.Instruction) continue;
+                                // If the disassembly already contains func_XXXXXXXX, collect it.
+                                var m = Regex.Match(line.Asm + " " + (line.Raw ?? "") + " " + (line.Comment ?? ""), @"\bfunc_(?<addr>[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
+                                if (m.Success) calledFuncs.Add($"func_{m.Groups["addr"].Value.ToUpperInvariant()}");
+
+                                // Also collect numeric call targets (e.g. call 0Dh) which ResolveCallTarget
+                                // upgrades into func_XXXXXXXX in generated C.
+                                var asm = (line.Asm ?? string.Empty).TrimStart();
+                                if (asm.StartsWith("call", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    var ops = asm.Substring(4).Trim();
+                                    if (!string.IsNullOrWhiteSpace(ops))
+                                    {
+                                        var t = ResolveCallTarget(ops, labelByAddr);
+                                        if (t.StartsWith("func_", StringComparison.OrdinalIgnoreCase))
+                                            calledFuncs.Add(t);
+                                    }
+                                }
+                            }
                         }
+                    }
+                    files[$"b{partNum}.c"] = csb.ToString();
+                    
+                    buildBat.Append($"echo Compiling chunk {partNum}...\r\n");
+                    buildBat.Append($"wcc386 -6r -s -zq -fo=b{partNum}.obj b{partNum}.c\r\n");
+                    linkerRsp.Append($"file b{partNum}.obj\r\n");
+                }
+                
+                buildBat.Append("echo Linking...\r\n");
+                buildBat.Append("wlink @blst.lnk\r\n");
+                
+                linkerRsp.Append("library clib3r.lib\r\n");
+                linkerRsp.Append("library math3r.lib\r\n");
+
+                var definedFuncs = new HashSet<string>(functions.Select(f => f.Name), StringComparer.OrdinalIgnoreCase);
+                var neededStubs = calledFuncs.Where(f => !definedFuncs.Contains(f)).OrderBy(x => x).ToList();
+                
+                if (calledFuncs.Count > 0)
+                    Console.Error.WriteLine($"[DECOMP] Collected {calledFuncs.Count} potential function calls. {definedFuncs.Count} defined. {neededStubs.Count} stubs needed.");
+
+                // Add missing-call prototypes so Watcom doesn't implicitly-declare them (which can alter calling convention/name decoration).
+                foreach (var stub in neededStubs)
+                {
+                    var stubName = SanitizeLabel(stub);
+                    h.AppendLine($"uint32_t {stubName}();");
+                }
+
+                h.AppendLine("#endif");
+                files["blst.h"] = h.ToString();
+
+                files["build.bat"] = buildBat.ToString();
+                files["blst.lnk"] = linkerRsp.ToString();
+
+                var d = new StringBuilder();
+                d.AppendLine("#include \"blst.h\"");
+                d.AppendLine();
+                d.AppendLine("uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp;");
+                d.AppendLine("uint32_t cs, ds, es, fs, gs, ss, dr0, dr1, dr2, dr3, dr6, dr7, _this, carry;");
+                d.AppendLine("int jz, jnz, je, jne, jg, jge, jl, jle, ja, jae, jb, jbe, jo, jno, js, jns;");
+                d.AppendLine("uint32_t __entry_jump_enabled, __entry_jump_target, __entry_jump_addr;");
+                d.AppendLine();
+                foreach (var stub in neededStubs)
+                {
+                    var stubName = SanitizeLabel(stub);
+                    d.AppendLine($"uint32_t {stubName}() {{ return 0; }}");
+                }
+                d.AppendLine();
+
+                foreach (var kvp in pages)
+                {
+                    var baseAddr = kvp.Key;
+                    d.AppendLine($"uint8_t g_page_{baseAddr:X8}[0x1000];");
+                }
+                foreach (var gsym in otherGlobals.OrderBy(x => x))
+                    d.AppendLine($"uint8_t {gsym}[1];");
+
+                foreach (var kvp in _addrToString.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+                {
+                    var addr = kvp.Key;
+                    var sym = kvp.Value;
+                    var lit = _addrToStringLiteral.TryGetValue(addr, out var sLit) ? sLit : "\"\"";
+                    d.AppendLine($"const char {sym}[] = {lit};");
+                }
+
+                foreach (var psym in pseudoStringSymbols.OrderBy(x => x))
+                {
+                    if (knownStringSyms.Contains(psym)) continue;
+                    d.AppendLine($"uint8_t {psym}[1];");
+                }
+                foreach (var psym in ptrSymbols.OrderBy(x => x))
+                    d.AppendLine($"uint8_t {psym}[1];");
+
+                files["bdata.c"] = d.ToString();
+            }
+
+            return (true, files, string.Empty);
+        }
+
+        private static string EmitFunctionBody(
+            ParsedFunction fn,
+            Dictionary<string, string> labelByAddr,
+            Dictionary<string, ParsedFunction> functionsByName,
+            Dictionary<string, (string proto, int argCount)> otherFunctions,
+            uint? entryLinear,
+            string entryContainerFunc,
+            uint? entryJumpAddr)
+        {
+            var sb = new StringBuilder();
+            var proto = fn.Proto;
+            var allBytes = string.Join("", fn.Blocks.SelectMany(b => b.Lines).Select(l => l.BytesHex));
+            var hashStr = string.Empty;
+            if (!string.IsNullOrEmpty(allBytes))
+            {
+                using (var md5 = MD5.Create())
+                {
+                    var hash = md5.ComputeHash(Encoding.ASCII.GetBytes(allBytes));
+                    hashStr = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+                }
+            }
+
+            sb.AppendLine(proto + "");
+            sb.AppendLine("{");
+            if (!string.IsNullOrEmpty(hashStr))
+            {
+                sb.AppendLine($"    // FIDELITY: {hashStr} (checksum of raw bytes)");
+            }
+
+            var regs = CollectRegistersUsed(fn);
+            foreach (var r in new[] { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp" })
+                regs.Add(r);
+            var stackVars = CollectStackVarsUsed(fn);
+
+            var argVars = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var protoArgMatches = Regex.Matches(proto, @"\b(?<name>arg_[0-9A-Fa-f]+)\b");
+            foreach (Match am in protoArgMatches) argVars.Add(am.Groups["name"].Value.ToLowerInvariant());
+            stackVars.RemoveWhere(v => argVars.Contains(v));
+
+            var regDecls = FormatRegisterDeclarations(regs);
+            if (!string.IsNullOrEmpty(regDecls))
+                sb.Append(regDecls);
+
+            if (stackVars.Any())
+            {
+                var byType = stackVars.GroupBy(v => fn.InferredTypes.GetValueOrDefault(v, "uint32_t"));
+                foreach (var g in byType.OrderBy(x => x.Key))
+                {
+                    sb.AppendLine($"    {g.Key} " + string.Join(", ", g.OrderBy(v => v)) + ";");
+                }
+            }
+
+            var entryLabel = entryJumpAddr.HasValue ? $"__entry_{entryJumpAddr.Value:X8}" : null;
+            var shouldInjectEntryJump = entryLinear.HasValue
+                && entryJumpAddr.HasValue
+                && !string.IsNullOrWhiteSpace(entryContainerFunc)
+                && fn.Name.Equals(entryContainerFunc, StringComparison.OrdinalIgnoreCase);
+
+            if (shouldInjectEntryJump)
+            {
+                sb.AppendLine($"    if (__entry_jump_enabled && __entry_jump_target == 0x{entryLinear.Value:X8}u && __entry_jump_addr == 0x{entryJumpAddr.Value:X8}u) {{ __entry_jump_enabled = 0; goto {entryLabel}; }}");
+            }
+
+            var pending = new PendingFlags();
+            var referencedLabels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var block in fn.Blocks)
+            {
+                foreach (var line in block.Lines)
+                {
+                    if (line.Kind != ParsedLineKind.Instruction) continue;
+                    var lblMatches = Regex.Matches(line.Asm + " " + line.Raw, @"\b(?<lbl>(loc|bb)_[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
+                    foreach (Match lm in lblMatches) 
+                        referencedLabels.Add(lm.Groups["lbl"].Value);
+
+                    if (IsJccLine(line, out _, out var target))
+                    {
+                        var lbl = labelByAddr.GetValueOrDefault(target.ToUpperInvariant().PadLeft(8, '0'));
+                        if (lbl != null) referencedLabels.Add(lbl);
+                    }
+                }
+            }
+
+            IdentifySimpleStructures(fn);
+
+            int indent = 1;
+            var nestedFollows = new Stack<string>();
+            var emittedEntryLabel = false;
+            foreach (var block in fn.Blocks)
+            {
+                while (nestedFollows.Count > 0 && nestedFollows.Peek().Equals(block.Label, StringComparison.OrdinalIgnoreCase))
+                {
+                    var closed = nestedFollows.Pop();
+                    indent = Math.Max(1, indent - 1);
+                    var parentDiamond = fn.Blocks.FirstOrDefault(b => b.StructuredType == "diamond-header" && b.StructuredFollow != null && b.StructuredFollow.Equals(closed, StringComparison.OrdinalIgnoreCase));
+                    if (parentDiamond != null)
+                    {
+                        sb.AppendLine(new string(' ', indent * 4) + "} else {");
+                        indent++;
+                        nestedFollows.Push(parentDiamond.SecondaryFollow);
+                    }
+                    else
+                    {
+                        sb.AppendLine(new string(' ', indent * 4) + "}");
                     }
                 }
 
-                IdentifySimpleStructures(fn);
+                var state = fn.BlockEntryStates.GetValueOrDefault(block.Label)?.Clone() ?? new DecompilationState();
+                var sanitizedLabel = SanitizeLabel(block.Label);
+                sb.AppendLine($"{new string(' ', Math.Max(0, (indent - 1) * 4))}{sanitizedLabel}:;");
 
-                int indent = 1;
-                var nestedFollows = new Stack<string>();
-                foreach (var block in fn.Blocks)
+                if (block.StructuredType == "while-true")
                 {
-                    // Close nested structures
-                    while (nestedFollows.Count > 0 && nestedFollows.Peek().Equals(block.Label, StringComparison.OrdinalIgnoreCase))
+                    sb.AppendLine(new string(' ', indent * 4) + "while (1) {");
+                    indent++;
+                    var nextIdx = fn.Blocks.IndexOf(block) + 1;
+                    var nextLabel = (nextIdx < fn.Blocks.Count) ? fn.Blocks[nextIdx].Label : "___END_OF_FUNCTION___";
+                    nestedFollows.Push(nextLabel);
+                }
+                else if (block.StructuredType == "if-then" || block.StructuredType == "diamond-header")
+                {
+                    sb.AppendLine(new string(' ', indent * 4) + $"if ({block.StructuredCondition}) {{");
+                    indent++;
+                    nestedFollows.Push(block.StructuredFollow);
+                }
+
+                var blockLines = new List<string>();
+                var suppressTailAfterRetDecode = false;
+                for (var lineIdx = 0; lineIdx < block.Lines.Count; lineIdx++)
+                {
+                    var item = block.Lines[lineIdx];
+
+                    if (shouldInjectEntryJump && !emittedEntryLabel && item.Kind == ParsedLineKind.Instruction && (uint)item.Address == entryJumpAddr.Value)
                     {
-                        var closed = nestedFollows.Pop();
-                        indent = Math.Max(1, indent - 1);
-                        // If we just finished the 'then' of a diamond, start the 'else'
-                        var parentDiamond = fn.Blocks.FirstOrDefault(b => b.StructuredType == "diamond-header" && b.StructuredFollow != null && b.StructuredFollow.Equals(closed, StringComparison.OrdinalIgnoreCase));
-                        if (parentDiamond != null)
+                        blockLines.Add($"{entryLabel}:;");
+                        emittedEntryLabel = true;
+                    }
+
+                    if (item.Kind == ParsedLineKind.Comment)
+                    {
+                        blockLines.Add("// " + item.Raw.TrimStart(';').Trim());
+                        continue;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(item.Comment) &&
+                        item.Comment.Contains("decoded after RET", StringComparison.OrdinalIgnoreCase))
+                    {
+                        suppressTailAfterRetDecode = true;
+                        pending.Clear();
+                        blockLines.Add("// NOTE: omitted tail bytes decoded after RET (likely data/padding)");
+                        continue;
+                    }
+
+                    if (suppressTailAfterRetDecode)
+                        continue;
+
+                    if (lineIdx == block.Lines.Count - 1 && item.Kind == ParsedLineKind.Instruction && !string.IsNullOrEmpty(block.StructuredType))
+                    {
+                        if (item.Mnemonic?.Equals("jmp", StringComparison.OrdinalIgnoreCase) == true || IsJccLine(item, out _, out _))
                         {
-                            sb.AppendLine(new string(' ', indent * 4) + "} else {");
-                            indent++;
-                            nestedFollows.Push(parentDiamond.SecondaryFollow);
-                        }
-                        else
-                        {
-                            sb.AppendLine(new string(' ', indent * 4) + "}");
+                            continue;
                         }
                     }
 
-                    var state = fn.BlockEntryStates.GetValueOrDefault(block.Label)?.Clone() ?? new DecompilationState();
-                    var sanitizedLabel = SanitizeLabel(block.Label);
-                    sb.AppendLine($"{new string(' ', Math.Max(0, (indent - 1) * 4))}{sanitizedLabel}:;");
-
-                    if (block.StructuredType == "while-true")
+                    if (item.Kind == ParsedLineKind.Instruction && (item.Mnemonic?.Equals("call", StringComparison.OrdinalIgnoreCase) == true || item.Asm.TrimStart().StartsWith("call", StringComparison.OrdinalIgnoreCase)))
                     {
-                        sb.AppendLine(new string(' ', indent * 4) + "while (1) {");
-                        indent++;
-                        // Close this after the current block.
-                        var nextIdx = fn.Blocks.IndexOf(block) + 1;
-                        var nextLabel = (nextIdx < fn.Blocks.Count) ? fn.Blocks[nextIdx].Label : "___END_OF_FUNCTION___";
-                        nestedFollows.Push(nextLabel);
+                        var decoration = string.Empty;
+                        if (_addrToCallDecoration.TryGetValue(item.AddrHex, out var deco))
+                        {
+                            decoration = deco;
+                        }
+
+                        var hint = string.Empty;
+                        for (var j = lineIdx + 1; j < block.Lines.Count && j < lineIdx + 5; j++)
+                        {
+                            var peek = block.Lines[j];
+                            if (peek.Kind == ParsedLineKind.Comment && (peek.Raw.Contains("CALLHINT:") || peek.Raw.Contains("STRCALL:")))
+                            {
+                                hint = peek.Raw;
+                                break;
+                            }
+                            if (peek.Kind == ParsedLineKind.Instruction) break;
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(hint))
+                        {
+                            var callStmt = TranslateCallWithHint(item, hint, labelByAddr, pending, fn, state);
+                            if (callStmt != null)
+                            {
+                                blockLines.Add(callStmt);
+                            }
+                            continue;
+                        }
                     }
-                    else if (block.StructuredType == "if-then" || block.StructuredType == "diamond-header")
+
+                    var stmt = TranslateInstructionToPseudoC(item, labelByAddr, pending, fn, functionsByName, otherFunctions, state);
+                    if (!string.IsNullOrWhiteSpace(stmt))
                     {
-                        sb.AppendLine(new string(' ', indent * 4) + $"if ({block.StructuredCondition}) {{");
-                        indent++;
-                        nestedFollows.Push(block.StructuredFollow);
-                    }
+                        var extraLabels = Regex.Matches(stmt, @"\b(?<lbl>(loc|bb)_[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
+                        foreach (Match lm in extraLabels) referencedLabels.Add(lm.Value);
 
-                    var blockLines = new List<string>();
-                    var suppressTailAfterRetDecode = false;
-                    for (var lineIdx = 0; lineIdx < block.Lines.Count; lineIdx++)
-                    {
-                        var item = block.Lines[lineIdx];
-                        if (item.Kind == ParsedLineKind.Comment)
+                        if (stmt == "return;")
                         {
-                            blockLines.Add("// " + item.Raw.TrimStart(';').Trim());
-                            continue;
-                        }
-
-                        if (!string.IsNullOrWhiteSpace(item.Comment) &&
-                            item.Comment.Contains("decoded after RET", StringComparison.OrdinalIgnoreCase))
-                        {
-                            suppressTailAfterRetDecode = true;
-                            pending.Clear();
-                            blockLines.Add("// NOTE: omitted tail bytes decoded after RET (likely data/padding)");
-                            continue;
-                        }
-
-                        if (suppressTailAfterRetDecode)
-                            continue;
-
-                        // Skip the last instruction if it's the structural jump
-                        if (lineIdx == block.Lines.Count - 1 && item.Kind == ParsedLineKind.Instruction && !string.IsNullOrEmpty(block.StructuredType))
-                        {
-                            if (item.Mnemonic?.Equals("jmp", StringComparison.OrdinalIgnoreCase) == true || IsJccLine(item, out _, out _))
+                            if (!string.IsNullOrWhiteSpace(pending.LastEaxAssignment))
                             {
-                                continue;
-                            }
-                        }
-
-                        // Call-site improvement: peeks 
-                        if (item.Kind == ParsedLineKind.Instruction && (item.Mnemonic?.Equals("call", StringComparison.OrdinalIgnoreCase) == true || item.Asm.TrimStart().StartsWith("call", StringComparison.OrdinalIgnoreCase)))
-                        {
-                            var decoration = string.Empty;
-                            if (_addrToCallDecoration.TryGetValue(item.AddrHex, out var deco))
-                            {
-                                decoration = deco;
-                            }
-
-                            var hint = string.Empty;
-                            for (var j = lineIdx + 1; j < block.Lines.Count && j < lineIdx + 5; j++)
-                            {
-                                var peek = block.Lines[j];
-                                if (peek.Kind == ParsedLineKind.Comment && (peek.Raw.Contains("CALLHINT:") || peek.Raw.Contains("STRCALL:")))
-                                {
-                                    hint = peek.Raw;
-                                    break;
-                                }
-                                if (peek.Kind == ParsedLineKind.Instruction) break;
-                            }
-
-                            if (!string.IsNullOrWhiteSpace(decoration))
-                            {
-                                var target = item.Operands;
-                                target = NormalizeAsmOperandToC(target, false, fn);
-                                blockLines.Add($"{target}(\"{decoration.Replace("\"", "\\\"")}\"); // decorated");
-                                continue;
-                            }
-
-                            if (!string.IsNullOrWhiteSpace(hint))
-                            {
-                                var callStmt = TranslateCallWithHint(item, hint, labelByAddr, pending, fn, state);
-                                if (callStmt != null)
-                                {
-                                    blockLines.Add(callStmt);
-                                }
-                                // If null, it's captured in pending.LastEaxAssignment for a later return or assignment.
-                                continue;
-                            }
-                        }
-
-                        var stmt = TranslateInstructionToPseudoC(item, labelByAddr, pending, fn, functionsByName, otherFunctions, state);
-                        if (!string.IsNullOrWhiteSpace(stmt))
-                        {
-                            // Collect any newly referenced labels from the translated statement (might have been generated from hex targets)
-                            var extraLabels = Regex.Matches(stmt, @"\b(?<lbl>(loc|bb)_[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
-                            foreach (Match lm in extraLabels) referencedLabels.Add(lm.Value);
-
-                            if (stmt == "return;")
-                            {
-                                if (!string.IsNullOrWhiteSpace(pending.LastEaxAssignment))
-                                {
-                                    blockLines.Add($"return {pending.LastEaxAssignment};");
-                                    pending.LastEaxAssignment = null;
-                                }
-                                else
-                                {
-                                    blockLines.Add("return eax;");
-                                }
+                                blockLines.Add($"return {pending.LastEaxAssignment};");
+                                pending.LastEaxAssignment = null;
                             }
                             else
                             {
-                                blockLines.Add(stmt);
+                                blockLines.Add("return eax;");
                             }
                         }
-                    }
-
-                    // Apply peephole optimizations to blockLines
-                    var optimized = OptimizeStatements(blockLines);
-                    foreach (var s in optimized)
-                    {
-                        sb.AppendLine(new string(' ', indent * 4) + s);
+                        else
+                        {
+                            blockLines.Add(stmt);
+                        }
                     }
                 }
 
-                // Close any remaining nesting
-                while (nestedFollows.Count > 0)
+                var optimized = OptimizeStatements(blockLines);
+                foreach (var s in optimized)
                 {
-                    nestedFollows.Pop();
-                    indent = Math.Max(1, indent - 1);
-                    sb.AppendLine(new string(' ', indent * 4) + "}");
+                    sb.AppendLine(new string(' ', indent * 4) + s);
                 }
-
-                // If some referenced labels were NOT in fn.Blocks, we must emit them at the end.
-                var blocksInFunc = new HashSet<string>(fn.Blocks.Select(b => b.Label), StringComparer.OrdinalIgnoreCase);
-                foreach (var missing in referencedLabels.Where(l => !blocksInFunc.Contains(l)).OrderBy(l => l))
-                {
-                    sb.AppendLine($"{SanitizeLabel(missing)}:; // missing label from this function slice");
-                }
-
-                sb.AppendLine("    return eax;");
-                sb.AppendLine("}");
-                sb.AppendLine();
             }
 
-            return (true, sb.ToString(), string.Empty);
+            while (nestedFollows.Count > 0)
+            {
+                nestedFollows.Pop();
+                indent = Math.Max(1, indent - 1);
+                sb.AppendLine(new string(' ', indent * 4) + "}");
+            }
+
+            var blocksInFunc = new HashSet<string>(fn.Blocks.Select(b => b.Label), StringComparer.OrdinalIgnoreCase);
+            foreach (var missing in referencedLabels.Where(l => !blocksInFunc.Contains(l)).OrderBy(l => l))
+            {
+                sb.AppendLine($"{SanitizeLabel(missing)}:; // missing label from this function slice");
+            }
+
+            sb.AppendLine("    return eax;");
+            sb.AppendLine("}");
+            sb.AppendLine();
+            return sb.ToString();
         }
 
         private static (bool ok, string[] lines, string error) TrySliceToSingleFunction(string[] lines, string onlyFunction)
@@ -902,6 +1565,9 @@ namespace DOSRE.Dasm
             };
 
             var globals = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+                "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+                "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+                "al", "ah", "bl", "bh", "cl", "ch", "dl", "dh",
                 "cs", "ds", "es", "fs", "gs", "ss", "dr0", "dr1", "dr2", "dr3", "dr6", "dr7", "_this", "carry"
             };
 
@@ -943,7 +1609,7 @@ namespace DOSRE.Dasm
         private static HashSet<string> CollectStackVarsUsed(ParsedFunction fn)
         {
             var res = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var varRegex = new Regex(@"\b(local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)\b", RegexOptions.IgnoreCase);
+            var varRegex = new Regex(@"\b(local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+|out_[A-Za-z0-9]+|opt_[A-Za-z0-9]+|ptr_local_[0-9A-Fa-f]+|ptr_arg_[0-9A-Fa-f]+)\b", RegexOptions.IgnoreCase);
 
             foreach (var block in fn.Blocks)
             {
@@ -1161,6 +1827,7 @@ namespace DOSRE.Dasm
         }
 
         private static Dictionary<string, string> _addrToString = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private static Dictionary<string, string> _addrToStringLiteral = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private static Dictionary<string, string> _addrToGlobal = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private static Dictionary<string, string> _addrToFuncName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private static Dictionary<string, string> _addrToCallDecoration = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -1938,9 +2605,10 @@ namespace DOSRE.Dasm
             }
 
             if (mn == "cdq" || mn == "cltd") return $"edx = (uint32_t)((int32_t)eax >> 31);{commentSuffix}";
-            if (mn == "cwde") return $"eax = (uint32_t)(int16_t)ax;{commentSuffix}";
-            if (mn == "cwd") return $"dx = (uint16_t)((int16_t)ax >> 15);{commentSuffix}";
-            if (mn == "cbw") return $"ah = (uint8_t)((int8_t)al >> 7);{commentSuffix}";
+            // Avoid relying on sub-register locals (ax/al/ah); compute via masks on eax/edx.
+            if (mn == "cwde") return $"eax = (uint32_t)(int16_t)(eax & 0xFFFFu);{commentSuffix}";
+            if (mn == "cwd") return $"edx = (edx & 0xFFFF0000u) | (uint16_t)(((int16_t)(eax & 0xFFFFu)) >> 15);{commentSuffix}";
+            if (mn == "cbw") return $"eax = (eax & 0xFFFF0000u) | (uint16_t)(int8_t)(eax & 0xFFu);{commentSuffix}";
 
             if (mn == "call")
             {
@@ -2018,6 +2686,29 @@ namespace DOSRE.Dasm
                 return $"// FPU: {asm}{commentSuffix}";
             }
 
+            if (mn == "int")
+            {
+                pending.Clear(dstIsEax);
+                var mInt = Regex.Match(ops, @"^(?<imm>0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h|[0-9]+)\b");
+                if (mInt.Success)
+                {
+                    var imm = mInt.Groups["imm"].Value;
+                    int intNo = -1;
+                    try
+                    {
+                        if (imm.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) intNo = Convert.ToInt32(imm.Substring(2), 16);
+                        else if (imm.EndsWith("h", StringComparison.OrdinalIgnoreCase)) intNo = Convert.ToInt32(imm.TrimEnd('h', 'H'), 16);
+                        else intNo = int.Parse(imm);
+                    }
+                    catch { intNo = -1; }
+
+                    if (intNo >= 0 && intNo <= 0xFF)
+                        return $"DOS_INT(0x{intNo:X2});{commentSuffix}";
+                }
+
+                return "// " + asm + commentSuffix;
+            }
+
             if (IsJcc(mn))
             {
                 var target = ResolveTarget(ops, labelByAddr);
@@ -2057,17 +2748,63 @@ namespace DOSRE.Dasm
                 return string.Empty;
 
             var t = op.Trim();
-            if (t.Equals("this", StringComparison.OrdinalIgnoreCase)) return "_this";
 
-            // Replace any hex literal or symbolized address with its string/global name/func name
-            t = Regex.Replace(t, @"\b(?:0x|[psg]_)?(?<hex>[0-9A-Fa-f]{4,8})h?\b", m => {
+            // Normalize common symbol casing (C identifiers are case-sensitive).
+            t = Regex.Replace(
+                t,
+                @"\b(?<pre>(?:flags|g|ptr|s|p|func|loc|bb)_)(?<addr>[0-9A-Fa-f]{8})\b",
+                m => m.Groups["pre"].Value.ToLowerInvariant() + m.Groups["addr"].Value.ToUpperInvariant(),
+                RegexOptions.IgnoreCase);
+
+            // Treat g_XXXXXXXX as a numeric linear address literal.
+            // Memory access is done via G(addr) elsewhere in the emitter.
+            t = Regex.Replace(
+                t,
+                @"\bg_(?<addr>[0-9A-Fa-f]{8})\b",
+                m => $"0x{m.Groups["addr"].Value.ToUpperInvariant()}u",
+                RegexOptions.IgnoreCase);
+
+            // Some fixup rewriting can accidentally concatenate a symbol and a trailing byte (e.g. s_000E0792c1).
+            // Interpret this as pointer arithmetic on the symbol address.
+            t = Regex.Replace(
+                t,
+                @"\b(?<sym>[ps]_[0-9A-Fa-f]{8})(?<tail>[0-9A-Fa-f]{1,2})\b",
+                m => $"((uintptr_t){m.Groups["sym"].Value}+0x{m.Groups["tail"].Value})",
+                RegexOptions.IgnoreCase);
+
+            // Normalize field offsets.
+            t = Regex.Replace(t, @"\bfield_(?<off>[0-9A-Fa-f]+)\b", m => "field_" + m.Groups["off"].Value.ToLowerInvariant(), RegexOptions.IgnoreCase);
+
+            // Normalize arg/local names without underscore.
+            t = Regex.Replace(t, @"\barg(?<n>[0-9A-Fa-f]+)\b", m => "arg_" + m.Groups["n"].Value.ToLowerInvariant(), RegexOptions.IgnoreCase);
+            t = Regex.Replace(t, @"\blocal(?<n>[0-9A-Fa-f]+)\b", m => "local_" + m.Groups["n"].Value.ToLowerInvariant(), RegexOptions.IgnoreCase);
+
+            // Normalize pointer-to-stack aliases.
+            t = Regex.Replace(t, @"\bptr_local_(?<n>[0-9A-Fa-f]+)\b", m => "ptr_local_" + m.Groups["n"].Value.ToLowerInvariant(), RegexOptions.IgnoreCase);
+            t = Regex.Replace(t, @"\bptr_arg_(?<n>[0-9A-Fa-f]+)\b", m => "ptr_arg_" + m.Groups["n"].Value.ToLowerInvariant(), RegexOptions.IgnoreCase);
+
+            // Normalize VARALIAS-style names to a consistent case.
+            t = Regex.Replace(t, @"\bout_(?<n>[A-Za-z0-9]+)\b", m => "out_" + m.Groups["n"].Value.ToLowerInvariant(), RegexOptions.IgnoreCase);
+            t = Regex.Replace(t, @"\bopt_(?<n>[A-Za-z0-9]+)\b", m => "opt_" + m.Groups["n"].Value.ToLowerInvariant(), RegexOptions.IgnoreCase);
+
+            // Normalize any 'this' token to our global storage name.
+            t = Regex.Replace(t, @"\bthis\b", "_this", RegexOptions.IgnoreCase);
+
+            // Replace any hex literal or symbolized address with its string/global name/func name.
+            // IMPORTANT: do not rewrite immediate constants into g_XXXXXXXX identifiers; that breaks
+            // compares like `cmp ..., 0x4000` (and reintroduces g_ after we normalize it to 0x...).
+            t = Regex.Replace(t, @"\b(?:0x|[psg]_)?(?<hex>[0-9A-Fa-f]{4,16})h?\b", m => {
                 var val = m.Groups["hex"].Value;
                 if (_x86Registers.Contains(val)) return m.Value;
 
-                var hex = val.ToUpperInvariant().PadLeft(8, '0');
-                if (_addrToString.TryGetValue(hex, out var s)) return s;
-                if (_addrToGlobal.TryGetValue(hex, out var g)) return g;
-                if (_addrToFuncName.TryGetValue(hex, out var f)) return f;
+                // If the literal is wider than 32-bit in text form (e.g. 0x000E0792C1),
+                // only use the low 32-bit part for symbol lookup to avoid partial replacement.
+                var low = val.Length > 8 ? val.Substring(val.Length - 8) : val;
+                var hex = low.ToUpperInvariant().PadLeft(8, '0');
+                if (_addrToString.TryGetValue(hex, out var s)) return $"(uintptr_t){s}";
+                // Only map to a g_ symbol if the matched token itself was g_...
+                // (Otherwise this would rewrite plain constants into undeclared identifiers.)
+                if (m.Value.StartsWith("g_", StringComparison.OrdinalIgnoreCase) && _addrToGlobal.TryGetValue(hex, out var g)) return g;
                 return m.Value;
             }, RegexOptions.IgnoreCase);
 
@@ -2209,7 +2946,10 @@ namespace DOSRE.Dasm
             {
                 var hex = hexMatch.Groups["hex"].Value.ToUpperInvariant().PadLeft(8, '0');
                 if (_addrToString.TryGetValue(hex, out var s)) return s;
-                if (_addrToGlobal.TryGetValue(hex, out var g)) return $"(uintptr_t){g}";
+                // If this hex literal maps to a known global address, emit it as a numeric linear address.
+                // We intentionally don't emit thousands of g_XXXXXXXX declarations (to keep Watcom from OOMing),
+                // so returning a bare g_XXXXXXXX here would trigger E1011 (symbol not declared).
+                if (_addrToGlobal.TryGetValue(hex, out _)) return $"(uintptr_t)0x{hex}u";
             }
 
             if ((t.StartsWith("ptr_", StringComparison.OrdinalIgnoreCase) || t.StartsWith("s_", StringComparison.OrdinalIgnoreCase)))
@@ -2220,6 +2960,15 @@ namespace DOSRE.Dasm
                     var addr = ptrMatch.Groups["addr"].Value.ToUpperInvariant();
                     if (_addrToString.TryGetValue(addr, out var s)) return s;
                 }
+            }
+
+            // If a symbolized global/ptr token appears as a bare value (not dereferenced),
+            // treat it as an address. This avoids invalid C like `ebp = g_XXXXXXXX;` where
+            // g_XXXXXXXX is declared as a byte array placeholder.
+            if (!t.StartsWith("(uintptr_t)", StringComparison.OrdinalIgnoreCase)
+                && Regex.IsMatch(t, @"^(g_|ptr_|s_)[0-9A-Fa-f]{8}$", RegexOptions.IgnoreCase))
+            {
+                return $"(uintptr_t){t}";
             }
 
             return t;
@@ -2248,6 +2997,9 @@ namespace DOSRE.Dasm
             // Protect globals and pointers by casting them to uintptr_t if they are used in arithmetic or as bare values.
             // We use a negative lookbehind for '&' and a negative lookahead for '[' to avoid casting when taking address or indexing.
             expr = Regex.Replace(expr, @"(?<!&\s*)\b(?<sym>(g_|ptr_|s_)[0-9A-Fa-f]{8})\b(?!\s*\[)", "((uintptr_t)$0)");
+
+            // Convert any remaining g_XXXXXXXX tokens to numeric address literals.
+            expr = Regex.Replace(expr, @"\bg_(?<addr>[0-9A-Fa-f]{8})\b", m => $"0x{m.Groups["addr"].Value.ToUpperInvariant()}u", RegexOptions.IgnoreCase);
 
             // Heuristic: if it's a register + offset, cast the register to uint8_t* 
             // to ensure byte-based pointer arithmetic in the pseudo-C.

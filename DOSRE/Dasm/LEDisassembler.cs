@@ -5623,6 +5623,189 @@ namespace DOSRE.Dasm
                 }
             }
 
+            // Two-pass approach:
+            //  1) Decode executable objects once and collect cross-object CALL/JMP/Jcc xrefs.
+            //  2) Render each object using the global function-start set so that
+            //     `func_XXXXXXXX:` labels are emitted for call targets across objects.
+            var objByIndex = objects.ToDictionary(o => o.Index);
+            var execObjIndices = new HashSet<int>();
+            var execObjStartOffset = new Dictionary<int, int>();
+            var execObjStartLinear = new Dictionary<int, uint>();
+            var execObjEndLinear = new Dictionary<int, uint>();
+            var execObjInstructions = new Dictionary<int, List<Instruction>>();
+            var execObjInsIndexByAddr = new Dictionary<int, Dictionary<uint, int>>();
+            var execObjDecodeMs = new Dictionary<int, long>();
+
+            foreach (var obj in objects)
+            {
+                if (obj.VirtualSize == 0 || obj.PageCount == 0)
+                    continue;
+
+                var isExecutable = (obj.Flags & 0x0004) != 0;
+                if (!isExecutable)
+                    continue;
+
+                if (!objBytesByIndex.TryGetValue(obj.Index, out var objBytes))
+                    objBytes = null;
+                if (objBytes == null || objBytes.Length == 0)
+                    continue;
+
+                var maxLen = (int)Math.Min(obj.VirtualSize, (uint)objBytes.Length);
+                if (maxLen <= 0)
+                    continue;
+
+                var startOffsetWithinObject = 0;
+                if (!leFull)
+                {
+                    if (header.EntryEipObject == (uint)obj.Index && header.EntryEip < (uint)maxLen)
+                    {
+                        startOffsetWithinObject = (int)header.EntryEip;
+                    }
+                    else
+                    {
+                        for (var i = 0; i < maxLen; i++)
+                        {
+                            if (objBytes[i] != 0)
+                            {
+                                startOffsetWithinObject = i;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                var codeLen = maxLen - startOffsetWithinObject;
+                if (!leFull && leBytesLimit.HasValue)
+                    codeLen = Math.Min(codeLen, leBytesLimit.Value);
+                if (codeLen <= 0)
+                    continue;
+
+                var code = new byte[codeLen];
+                Buffer.BlockCopy(objBytes, startOffsetWithinObject, code, 0, codeLen);
+
+                var startLinear = obj.BaseAddress + (uint)startOffsetWithinObject;
+                var endLinear = startLinear + (uint)codeLen;
+
+                var swDis = Stopwatch.StartNew();
+                var dis = new SharpDisasm.Disassembler(code, ArchitectureMode.x86_32, startLinear, true);
+                var instructions = dis.Disassemble().ToList();
+                swDis.Stop();
+
+                // Address->instruction index for fast lookups.
+                var insIndexByAddr = new Dictionary<uint, int>(instructions.Count);
+                for (var ii = 0; ii < instructions.Count; ii++)
+                    insIndexByAddr[(uint)instructions[ii].Offset] = ii;
+
+                execObjIndices.Add(obj.Index);
+                execObjStartOffset[obj.Index] = startOffsetWithinObject;
+                execObjStartLinear[obj.Index] = startLinear;
+                execObjEndLinear[obj.Index] = endLinear;
+                execObjInstructions[obj.Index] = instructions;
+                execObjInsIndexByAddr[obj.Index] = insIndexByAddr;
+                execObjDecodeMs[obj.Index] = swDis.ElapsedMilliseconds;
+            }
+
+            var globalFunctionStarts = new HashSet<uint>();
+            var globalLabelTargets = new HashSet<uint>();
+            var globalCallXrefs = new Dictionary<uint, List<uint>>();
+            var globalJumpXrefs = new Dictionary<uint, List<uint>>();
+
+            var entryLinearGlobalU64 = ComputeEntryLinear(header, objects);
+            if (entryLinearGlobalU64 > 0 && entryLinearGlobalU64 <= uint.MaxValue)
+            {
+                var entryLinearGlobal = unchecked((uint)entryLinearGlobalU64);
+                if (TryMapLinearToObject(objects, entryLinearGlobal, out var entryObjIndex, out var _) &&
+                    execObjIndices.Contains(entryObjIndex))
+                {
+                    globalFunctionStarts.Add(entryLinearGlobal);
+                }
+            }
+
+            foreach (var obj in objects)
+            {
+                if (!execObjIndices.Contains(obj.Index))
+                    continue;
+
+                var startLinear = execObjStartLinear[obj.Index];
+                var endLinear = execObjEndLinear[obj.Index];
+                var instructions = execObjInstructions[obj.Index];
+                var insIndexByAddr = execObjInsIndexByAddr[obj.Index];
+
+                // Add obvious prologues as function starts (best-effort sequence scan).
+                if (leInsights)
+                {
+                    for (var i = 0; i + 1 < instructions.Count; i++)
+                    {
+                        var a = instructions[i]?.ToString() ?? string.Empty;
+                        if (!a.Equals("push ebp", StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        var b = instructions[i + 1]?.ToString() ?? string.Empty;
+                        if (b.Equals("mov ebp, esp", StringComparison.OrdinalIgnoreCase) || b.StartsWith("sub esp, ", StringComparison.OrdinalIgnoreCase))
+                            globalFunctionStarts.Add((uint)instructions[i].Offset);
+                    }
+                }
+
+                foreach (var ins in instructions)
+                {
+                    if (TryGetRelativeBranchTarget(ins, out var target, out var isCall))
+                    {
+                        // Map targets across objects; only keep ones that land in executable objects we decoded.
+                        if (TryMapLinearToObject(objects, target, out var targetObjIndex, out var _) && execObjIndices.Contains(targetObjIndex))
+                        {
+                            if (isCall)
+                            {
+                                globalFunctionStarts.Add(target);
+                                if (!globalCallXrefs.TryGetValue(target, out var callers))
+                                    globalCallXrefs[target] = callers = new List<uint>();
+                                callers.Add((uint)ins.Offset);
+                            }
+                            else
+                            {
+                                globalLabelTargets.Add(target);
+                                if (!globalJumpXrefs.TryGetValue(target, out var sources))
+                                    globalJumpXrefs[target] = sources = new List<uint>();
+                                sources.Add((uint)ins.Offset);
+                            }
+                        }
+                    }
+
+                    // Jump-table switches: add indirect case targets to global label/xref sets.
+                    if (leInsights)
+                    {
+                        if (insIndexByAddr.TryGetValue((uint)ins.Offset, out var insIdx))
+                        {
+                            var wantCases = 16;
+                            if (TryParseIndirectJmpTable(ins.Bytes, out var _, out var idxRegProbe, out var scaleProbe) && scaleProbe == 4)
+                            {
+                                if (TryInferJumpTableSwitchBound(instructions, insIdx, idxRegProbe, out var inferredCasesProbe, out var _))
+                                    wantCases = Math.Min(64, Math.Max(1, inferredCasesProbe));
+                            }
+
+                            if (TryGetJumpTableTargets(instructions, insIndexByAddr, insIdx, ins, objects, objBytesByIndex, maxEntries: wantCases, out var _, out var idxReg, out var jtTargets))
+                            {
+                                var maxCases = 32;
+                                var casesToAdd = jtTargets.Count;
+                                if (TryInferJumpTableSwitchBound(instructions, insIdx, idxReg, out var inferredCases, out var _))
+                                    casesToAdd = Math.Min(casesToAdd, Math.Max(1, inferredCases));
+                                casesToAdd = Math.Min(casesToAdd, maxCases);
+
+                                for (var ti = 0; ti < casesToAdd; ti++)
+                                {
+                                    var t = jtTargets[ti];
+                                    if (TryMapLinearToObject(objects, t, out var targetObjIndex, out var _) && execObjIndices.Contains(targetObjIndex))
+                                    {
+                                        globalLabelTargets.Add(t);
+                                        if (!globalJumpXrefs.TryGetValue(t, out var sources))
+                                            globalJumpXrefs[t] = sources = new List<uint>();
+                                        sources.Add((uint)ins.Offset);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             foreach (var obj in objects)
             {
                 if (obj.VirtualSize == 0 || obj.PageCount == 0)
@@ -5676,25 +5859,23 @@ namespace DOSRE.Dasm
                     continue;
                 }
 
-                _logger.Info($"LE: Disassembling object {obj.Index}/{objects.Count} (base=0x{obj.BaseAddress:X8} pages={obj.PageCount} vsize=0x{obj.VirtualSize:X})");
-
-                var swObjTotal = Stopwatch.StartNew();
-
-                var codeLen = maxLen - startOffsetWithinObject;
-                if (!leFull && leBytesLimit.HasValue)
-                    codeLen = Math.Min(codeLen, leBytesLimit.Value);
-                if (codeLen <= 0)
+                // If we failed to decode this executable object in the pre-pass, skip rendering.
+                if (!execObjIndices.Contains(obj.Index))
                 {
-                    AppendWrappedDisasmLine(sb, string.Empty, " ; (No bytes to disassemble)", commentColumn: 0, maxWidth: 160);
+                    AppendWrappedDisasmLine(sb, string.Empty, " ; Skipping executable object (no decoded instructions available)", commentColumn: 0, maxWidth: 160);
                     sb.AppendLine();
                     continue;
                 }
 
-                var code = new byte[codeLen];
-                Buffer.BlockCopy(objBytes, startOffsetWithinObject, code, 0, codeLen);
+                _logger.Info($"LE: Disassembling object {obj.Index}/{objects.Count} (base=0x{obj.BaseAddress:X8} pages={obj.PageCount} vsize=0x{obj.VirtualSize:X})");
 
-                var startLinear = obj.BaseAddress + (uint)startOffsetWithinObject;
-                var endLinear = startLinear + (uint)codeLen;
+                var swObjTotal = Stopwatch.StartNew();
+
+                // Use the pre-pass decode window to keep xref/function labeling consistent.
+                startOffsetWithinObject = execObjStartOffset[obj.Index];
+                var startLinear = execObjStartLinear[obj.Index];
+                var endLinear = execObjEndLinear[obj.Index];
+                var objDecodeMs = execObjDecodeMs.TryGetValue(obj.Index, out var dms) ? dms : 0;
 
                 List<LEFixup> objFixups = null;
                 if (leFixups && fixupRecordStream != null && fixupPageOffsets != null)
@@ -5713,51 +5894,31 @@ namespace DOSRE.Dasm
                         endLinear);
                 }
 
-                // First pass: disassemble and collect basic xrefs and function/label targets.
-                var swDis = Stopwatch.StartNew();
-                var dis = new SharpDisasm.Disassembler(code, ArchitectureMode.x86_32, startLinear, true);
-                var instructions = dis.Disassemble().ToList();
-                swDis.Stop();
-                var objDecodeMs = swDis.ElapsedMilliseconds;
-                _logger.Info($"LE: Object {obj.Index} decoded {instructions.Count} instructions in {objDecodeMs} ms");
-
-                // Address->instruction index for fast lookups.
-                var insIndexByAddr = new Dictionary<uint, int>(instructions.Count);
-                for (var ii = 0; ii < instructions.Count; ii++)
-                    insIndexByAddr[(uint)instructions[ii].Offset] = ii;
+                var instructions = execObjInstructions[obj.Index];
+                var insIndexByAddr = execObjInsIndexByAddr[obj.Index];
+                _logger.Info($"LE: Object {obj.Index} decoded {instructions.Count} instructions (cached)");
 
                 var jobs = Math.Max(1, leJobs);
                 var useParallelInsights = leInsights && jobs > 1;
 
                 var swObjInsights = leInsights ? Stopwatch.StartNew() : null;
 
-                var functionStarts = new HashSet<uint>();
-                var labelTargets = new HashSet<uint>();
+                var functionStarts = new HashSet<uint>(
+                    globalFunctionStarts.Where(a => a >= startLinear && a < endLinear));
+                var labelTargets = new HashSet<uint>(
+                    globalLabelTargets.Where(a => a >= startLinear && a < endLinear));
                 var callXrefs = new Dictionary<uint, List<uint>>();
                 var jumpXrefs = new Dictionary<uint, List<uint>>();
 
-                if (header.EntryEipObject == (uint)obj.Index)
+                foreach (var kv in globalCallXrefs)
                 {
-                    var entryLinear = obj.BaseAddress + header.EntryEip;
-                    if (entryLinear >= startLinear && entryLinear < endLinear)
-                        functionStarts.Add(entryLinear);
+                    if (kv.Key >= startLinear && kv.Key < endLinear)
+                        callXrefs[kv.Key] = kv.Value;
                 }
-
-                if (leInsights)
+                foreach (var kv in globalJumpXrefs)
                 {
-                    // Add obvious prologues as function starts (best-effort sequence scan).
-                    // Common forms:
-                    //   push ebp; mov ebp, esp
-                    //   push ebp; sub esp, imm
-                    for (var i = 0; i + 1 < instructions.Count; i++)
-                    {
-                        var a = instructions[i]?.ToString() ?? string.Empty;
-                        if (!a.Equals("push ebp", StringComparison.OrdinalIgnoreCase))
-                            continue;
-                        var b = instructions[i + 1]?.ToString() ?? string.Empty;
-                        if (b.Equals("mov ebp, esp", StringComparison.OrdinalIgnoreCase) || b.StartsWith("sub esp, ", StringComparison.OrdinalIgnoreCase))
-                            functionStarts.Add((uint)instructions[i].Offset);
-                    }
+                    if (kv.Key >= startLinear && kv.Key < endLinear)
+                        jumpXrefs[kv.Key] = kv.Value;
                 }
 
                 // Pre-sorted function list for per-function insight passes.
@@ -5766,62 +5927,7 @@ namespace DOSRE.Dasm
                     ? functionStarts.Where(a => insIndexByAddr.ContainsKey(a)).OrderBy(x => x).ToList()
                     : new List<uint>();
 
-                foreach (var ins in instructions)
-                {
-                    if (TryGetRelativeBranchTarget(ins, out var target, out var isCall))
-                    {
-                        if (target >= startLinear && target < endLinear)
-                        {
-                            if (isCall)
-                            {
-                                functionStarts.Add(target);
-                                if (!callXrefs.TryGetValue(target, out var callers))
-                                    callXrefs[target] = callers = new List<uint>();
-                                callers.Add((uint)ins.Offset);
-                            }
-                            else
-                            {
-                                labelTargets.Add(target);
-                                if (!jumpXrefs.TryGetValue(target, out var sources))
-                                    jumpXrefs[target] = sources = new List<uint>();
-                                sources.Add((uint)ins.Offset);
-                            }
-                        }
-                    }
-
-                    // Jump-table switches: add indirect case targets to label/xref sets.
-                    // This enables loc_XXXXXXXX labels and XREF headers for compiler-generated switch dispatches.
-                    if (leInsights)
-                    {
-                        if (insIndexByAddr.TryGetValue((uint)ins.Offset, out var insIdx))
-                        {
-                            var wantCases = 16;
-                            if (TryParseIndirectJmpTable(ins.Bytes, out var _, out var idxRegProbe, out var scaleProbe) && scaleProbe == 4)
-                            {
-                                if (TryInferJumpTableSwitchBound(instructions, insIdx, idxRegProbe, out var inferredCasesProbe, out var _))
-                                    wantCases = Math.Min(64, Math.Max(1, inferredCasesProbe));
-                            }
-
-                            if (TryGetJumpTableTargets(instructions, insIndexByAddr, insIdx, ins, objects, objBytesByIndex, maxEntries: wantCases, out var _, out var idxReg, out var jtTargets))
-                            {
-                                var maxCases = 32;
-                                var casesToAdd = jtTargets.Count;
-                                if (TryInferJumpTableSwitchBound(instructions, insIdx, idxReg, out var inferredCases, out var _))
-                                    casesToAdd = Math.Min(casesToAdd, Math.Max(1, inferredCases));
-                                casesToAdd = Math.Min(casesToAdd, maxCases);
-
-                                for (var ti = 0; ti < casesToAdd; ti++)
-                                {
-                                    var t = jtTargets[ti];
-                                    labelTargets.Add(t);
-                                    if (!jumpXrefs.TryGetValue(t, out var sources))
-                                        jumpXrefs[t] = sources = new List<uint>();
-                                    sources.Add((uint)ins.Offset);
-                                }
-                            }
-                        }
-                    }
-                }
+                // NOTE: xrefs/targets are collected globally in the pre-pass.
 
                 // Basic-block starts (for insights mode)
                 HashSet<uint> blockStarts = null;
@@ -9030,12 +9136,37 @@ namespace DOSRE.Dasm
 
         private static bool TryFindLEHeaderOffset(byte[] fileBytes, out int offset)
         {
-            // Prefer the canonical LE signature + byte/word order fields.
-            // For DOS4GW-produced LEs this tends to be unique.
+            offset = 0;
+            if (fileBytes == null || fileBytes.Length < 0x40)
+                return false;
+
+            // First: if this is an MZ container, prefer e_lfanew.
+            // This avoids false positives where an "LE\0\0" byte sequence appears in the stub or data.
+            if (fileBytes[0] == (byte)'M' && fileBytes[1] == (byte)'Z')
+            {
+                var lfanew = (int)ReadUInt32(fileBytes, 0x3C);
+                if (lfanew > 0 && lfanew + 4 <= fileBytes.Length)
+                {
+                    if (fileBytes[lfanew] == (byte)'L' && fileBytes[lfanew + 1] == (byte)'E' && fileBytes[lfanew + 2] == 0x00 &&
+                        fileBytes[lfanew + 3] == 0x00)
+                    {
+                        if (TryParseHeader(fileBytes, lfanew, out var _, out var _))
+                        {
+                            offset = lfanew;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // Fallback: scan for a plausible LE signature and validate by parsing.
+            // (Still needed for raw LE images or malformed MZ headers.)
             for (var i = 0; i <= fileBytes.Length - 4; i++)
             {
-                if (fileBytes[i] == (byte)'L' && fileBytes[i + 1] == (byte)'E' && fileBytes[i + 2] == 0x00 &&
-                    fileBytes[i + 3] == 0x00)
+                if (fileBytes[i] != (byte)'L' || fileBytes[i + 1] != (byte)'E' || fileBytes[i + 2] != 0x00 || fileBytes[i + 3] != 0x00)
+                    continue;
+
+                if (TryParseHeader(fileBytes, i, out var _, out var _))
                 {
                     offset = i;
                     return true;
