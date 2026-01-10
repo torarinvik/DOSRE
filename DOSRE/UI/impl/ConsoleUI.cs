@@ -166,6 +166,14 @@ namespace DOSRE.UI.impl
         private bool _bLeDecompile;
 
         /// <summary>
+        ///     LE unwrap helper for MZ containers with BW overlay headers.
+        ///     Specified with the -leunwrap argument.
+        ///     Some games ship as an MZ stub with a BW overlay header that points at an embedded bound MZ+LE.
+        ///     When enabled, DOSRE extracts the embedded bound EXE and runs the LE pipeline on that instead.
+        /// </summary>
+        private bool _bLeUnwrap;
+
+        /// <summary>
         ///     LE (DOS4GW) fixup dump
         ///     Specified with the -lefixdump [maxPages] argument
         ///     For LE inputs, emits a raw per-page fixup table dump to help reverse the record layout.
@@ -326,6 +334,9 @@ namespace DOSRE.UI.impl
                             _bLeDecompile = true;
                             _bLeDecompCacheAsm = true;
                             break;
+                        case "LEUNWRAP":
+                            _bLeUnwrap = true;
+                            break;
                         case "LEFUNC":
                         case "LEONLYFUNC":
                             if (i + 1 >= _args.Length)
@@ -449,6 +460,8 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LEDECOMPCACHEASM -- (LE inputs) Cache rendered LE .asm next to -O and reuse it on future -LEDECOMP runs (much faster after first run; requires -O)");
                             Console.WriteLine(
+                                "-LEUNWRAP -- (EURO96/EUROBLST-style) If input is an MZ stub with a BW overlay header, unwrap the embedded bound MZ+LE and run the LE pipeline on that payload");
+                            Console.WriteLine(
                                 "-LEFUNC <func_XXXXXXXX|XXXXXXXX|0xXXXXXXXX> -- Only emit a single function (useful with -LEDECOMPASM)");
                             Console.WriteLine(
                                 "-LEFIXDUMP [maxPages] -- (LE inputs) Dump raw fixup pages + decoding hints (writes <out>.fixups.txt if -O is used)");
@@ -494,6 +507,21 @@ namespace DOSRE.UI.impl
 
                 // Apply toolchain hint globally so toolchain-specific interrupt overlays can be selected.
                 DosInterruptDatabase.SetCurrentToolchainHintGlobal(_toolchainHint);
+
+                // Optional: unwrap BW overlay containers (MZ stub + BW overlay header pointing at an embedded bound MZ+LE).
+                // This is useful for executables where the *real* protected-mode payload is not directly at e_lfanew.
+                if (_bLeUnwrap && string.IsNullOrWhiteSpace(_leDecompileAsmFile))
+                {
+                    if (TryUnwrapBwBoundExecutable(_sInputFile, _sOutputFile, out var unwrappedPath, out var unwrapNote, out var unwrapError))
+                    {
+                        _logger.Info(unwrapNote);
+                        _sInputFile = unwrappedPath;
+                    }
+                    else if (!string.IsNullOrWhiteSpace(unwrapError))
+                    {
+                        _logger.Warn($"-LEUNWRAP requested but unwrap failed: {unwrapError}");
+                    }
+                }
 
                 //LE/DOS4GW support (minimal): bypass NE-specific pipeline
                 //NOTE: This tool was originally NE-only; LE support does not include relocations/import analysis.
@@ -851,6 +879,141 @@ namespace DOSRE.UI.impl
             }
 
             FlushPart();
+        }
+
+        private static bool TryUnwrapBwBoundExecutable(
+            string inputPath,
+            string outputPath,
+            out string unwrappedPath,
+            out string note,
+            out string error)
+        {
+            unwrappedPath = null;
+            note = null;
+            error = null;
+
+            if (string.IsNullOrWhiteSpace(inputPath) || !File.Exists(inputPath))
+            {
+                error = "input file not found";
+                return false;
+            }
+
+            byte[] bytes;
+            try
+            {
+                bytes = File.ReadAllBytes(inputPath);
+            }
+            catch (Exception e)
+            {
+                error = $"failed to read input: {e.Message}";
+                return false;
+            }
+
+            if (bytes.Length < 0x40 || bytes[0] != (byte)'M' || bytes[1] != (byte)'Z')
+            {
+                error = "not an MZ executable";
+                return false;
+            }
+
+            static ushort ReadU16(byte[] b, int o) => (ushort)(b[o] | (b[o + 1] << 8));
+            static uint ReadU32(byte[] b, int o) => (uint)(b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24));
+
+            static int ComputeMzSizeBytes(byte[] b)
+            {
+                var eCp = ReadU16(b, 0x04);
+                var eCblp = ReadU16(b, 0x02);
+                if (eCp == 0)
+                    return b.Length;
+                var size = (eCp - 1) * 512;
+                size += (eCblp == 0) ? 512 : eCblp;
+                return size;
+            }
+
+            // If the file is already a normal bound MZ+LE (LE at e_lfanew), do nothing.
+            var eLfanew = bytes.Length >= 0x40 ? (int)ReadU32(bytes, 0x3C) : 0;
+            if (eLfanew >= 0x40 && eLfanew + 2 < bytes.Length && bytes[eLfanew] == (byte)'L' && bytes[eLfanew + 1] == (byte)'E')
+            {
+                unwrappedPath = inputPath;
+                note = $"-LEUNWRAP: input already appears to be a bound MZ+LE (LE header at 0x{eLfanew:X})";
+                return true;
+            }
+
+            var overlayBase = ComputeMzSizeBytes(bytes);
+            if (overlayBase < 0x40 || overlayBase + 4 > bytes.Length)
+            {
+                error = $"overlay base out of range (computed 0x{overlayBase:X})";
+                return false;
+            }
+
+            // BW overlay header
+            if (bytes[overlayBase] != (byte)'B' || bytes[overlayBase + 1] != (byte)'W')
+            {
+                error = "BW overlay header not found at MZ overlay base";
+                return false;
+            }
+
+            var bwHeaderLen = (int)ReadU16(bytes, overlayBase + 2);
+            if (bwHeaderLen <= 0 || bwHeaderLen > 64 * 1024 || overlayBase + bwHeaderLen > bytes.Length)
+            {
+                error = $"invalid BW header length 0x{bwHeaderLen:X}";
+                return false;
+            }
+
+            // Heuristic: scan BW header u32 fields for a relative pointer to an embedded MZ which itself is bound to LE.
+            var foundInnerMzOff = -1;
+            var foundInnerLeOff = -1;
+            for (var fieldOff = 0; fieldOff + 4 <= bwHeaderLen; fieldOff += 4)
+            {
+                var rel = (int)ReadU32(bytes, overlayBase + fieldOff);
+                if (rel <= 0)
+                    continue;
+                var innerMzOff = overlayBase + rel;
+                if (innerMzOff < 0 || innerMzOff + 0x40 > bytes.Length)
+                    continue;
+                if (bytes[innerMzOff] != (byte)'M' || bytes[innerMzOff + 1] != (byte)'Z')
+                    continue;
+
+                var innerLfanew = (int)ReadU32(bytes, innerMzOff + 0x3C);
+                var innerLeOff = innerMzOff + innerLfanew;
+                if (innerLfanew >= 0x40 && innerLeOff + 2 < bytes.Length && bytes[innerLeOff] == (byte)'L' && bytes[innerLeOff + 1] == (byte)'E')
+                {
+                    foundInnerMzOff = innerMzOff;
+                    foundInnerLeOff = innerLeOff;
+                    break;
+                }
+            }
+
+            if (foundInnerMzOff < 0)
+            {
+                error = "BW header present, but no embedded bound MZ+LE was found";
+                return false;
+            }
+
+            var outDir = !string.IsNullOrWhiteSpace(outputPath) ? Path.GetDirectoryName(outputPath) : Path.GetDirectoryName(inputPath);
+            if (string.IsNullOrWhiteSpace(outDir))
+                outDir = Directory.GetCurrentDirectory();
+            Directory.CreateDirectory(outDir);
+
+            var baseName = Path.GetFileNameWithoutExtension(inputPath);
+            if (string.IsNullOrWhiteSpace(baseName))
+                baseName = "unwrapped";
+            unwrappedPath = Path.Combine(outDir, baseName + ".unwrapped.exe");
+
+            try
+            {
+                // We write from the embedded bound EXE start to the end of the file.
+                // This is sufficient for DOS extenders that keep the protected-mode payload in the appended region.
+                File.WriteAllBytes(unwrappedPath, bytes.Skip(foundInnerMzOff).ToArray());
+            }
+            catch (Exception e)
+            {
+                error = $"failed to write unwrapped file: {e.Message}";
+                unwrappedPath = null;
+                return false;
+            }
+
+            note = $"-LEUNWRAP: BW overlay at 0x{overlayBase:X} (len 0x{bwHeaderLen:X}) -> embedded bound EXE at 0x{foundInnerMzOff:X} (LE at 0x{foundInnerLeOff:X}); wrote {unwrappedPath}";
+            return true;
         }
     }
 }

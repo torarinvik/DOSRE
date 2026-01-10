@@ -9142,7 +9142,8 @@ namespace DOSRE.Dasm
 
             // First: if this is an MZ container, prefer e_lfanew.
             // This avoids false positives where an "LE\0\0" byte sequence appears in the stub or data.
-            if (fileBytes[0] == (byte)'M' && fileBytes[1] == (byte)'Z')
+            var isMz = fileBytes[0] == (byte)'M' && fileBytes[1] == (byte)'Z';
+            if (isMz)
             {
                 var lfanew = (int)ReadUInt32(fileBytes, 0x3C);
                 if (lfanew > 0 && lfanew + 4 <= fileBytes.Length)
@@ -9157,10 +9158,17 @@ namespace DOSRE.Dasm
                         }
                     }
                 }
+
+                // If the input is an MZ container but doesn't have a valid LE header at e_lfanew,
+                // do NOT fall back to scanning for "LE\0\0" within the file.
+                // Many large 16-bit MZ binaries (often with overlays) may contain that byte pattern
+                // in data, leading to false-positive LE detections.
+                offset = 0;
+                return false;
             }
 
             // Fallback: scan for a plausible LE signature and validate by parsing.
-            // (Still needed for raw LE images or malformed MZ headers.)
+            // (Used for raw LE images without an MZ container.)
             for (var i = 0; i <= fileBytes.Length - 4; i++)
             {
                 if (fileBytes[i] != (byte)'L' || fileBytes[i + 1] != (byte)'E' || fileBytes[i + 2] != 0x00 || fileBytes[i + 3] != 0x00)
