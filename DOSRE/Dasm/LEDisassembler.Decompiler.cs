@@ -40,6 +40,22 @@ namespace DOSRE.Dasm
             out Dictionary<string, string> files,
             out string error)
         {
+            return TryDecompileToMultipart(inputFile, leFull, leBytesLimit, leFixups, leGlobals, leInsights, toolchainHint, chunkSize, chunkSizeIsCount: false, out files, out error);
+        }
+
+        public static bool TryDecompileToMultipart(
+            string inputFile,
+            bool leFull,
+            int? leBytesLimit,
+            bool leFixups,
+            bool leGlobals,
+            bool leInsights,
+            EnumToolchainHint toolchainHint,
+            int chunkSize,
+            bool chunkSizeIsCount,
+            out Dictionary<string, string> files,
+            out string error)
+        {
             files = new Dictionary<string, string>();
             error = string.Empty;
 
@@ -58,7 +74,12 @@ namespace DOSRE.Dasm
                 return false;
             }
 
-            var (ok, resultFiles, errText) = PseudoCFromLeAsm(asm.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n'), null, false, chunkSize);
+            var (ok, resultFiles, errText) = PseudoCFromLeAsm(
+                asm.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n'),
+                onlyFunction: null,
+                strictOnlyFunction: false,
+                chunkSize: chunkSize,
+                chunkSizeIsCount: chunkSizeIsCount);
             if (!ok)
             {
                 error = errText;
@@ -76,6 +97,17 @@ namespace DOSRE.Dasm
             out Dictionary<string, string> files,
             out string error)
         {
+            return TryDecompileToMultipartFromAsmFile(asmFile, onlyFunction, chunkSize, chunkSizeIsCount: false, out files, out error);
+        }
+
+        public static bool TryDecompileToMultipartFromAsmFile(
+            string asmFile,
+            string onlyFunction,
+            int chunkSize,
+            bool chunkSizeIsCount,
+            out Dictionary<string, string> files,
+            out string error)
+        {
             files = new Dictionary<string, string>();
             error = string.Empty;
 
@@ -86,13 +118,24 @@ namespace DOSRE.Dasm
             }
 
             var asm = File.ReadAllText(asmFile);
-            return TryDecompileToMultipartFromAsm(asm, onlyFunction, chunkSize, out files, out error);
+            return TryDecompileToMultipartFromAsm(asm, onlyFunction, chunkSize, chunkSizeIsCount, out files, out error);
         }
 
         public static bool TryDecompileToMultipartFromAsm(
             string asm,
             string onlyFunction,
             int chunkSize,
+            out Dictionary<string, string> files,
+            out string error)
+        {
+            return TryDecompileToMultipartFromAsm(asm, onlyFunction, chunkSize, chunkSizeIsCount: false, out files, out error);
+        }
+
+        public static bool TryDecompileToMultipartFromAsm(
+            string asm,
+            string onlyFunction,
+            int chunkSize,
+            bool chunkSizeIsCount,
             out Dictionary<string, string> files,
             out string error)
         {
@@ -105,7 +148,12 @@ namespace DOSRE.Dasm
                 return false;
             }
 
-            var (ok, resultFiles, errText) = PseudoCFromLeAsm(asm.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n'), onlyFunction, !string.IsNullOrWhiteSpace(onlyFunction), chunkSize);
+            var (ok, resultFiles, errText) = PseudoCFromLeAsm(
+                asm.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n'),
+                onlyFunction: onlyFunction,
+                strictOnlyFunction: !string.IsNullOrWhiteSpace(onlyFunction),
+                chunkSize: chunkSize,
+                chunkSizeIsCount: chunkSizeIsCount);
             if (!ok)
             {
                 error = errText;
@@ -116,14 +164,14 @@ namespace DOSRE.Dasm
             return true;
         }
 
-        private static (bool ok, string output, string error) PseudoCFromLeAsm(string asm, string onlyFunction = null, bool strictOnlyFunction = false, int chunkSize = 0)
+        private static (bool ok, string output, string error) PseudoCFromLeAsm(string asm, string onlyFunction = null, bool strictOnlyFunction = false, int chunkSize = 0, bool chunkSizeIsCount = false)
         {
             if (string.IsNullOrWhiteSpace(asm))
                 return (true, string.Empty, string.Empty);
 
             var lines = asm.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
 
-            var (ok, files, err) = PseudoCFromLeAsm(lines, onlyFunction, strictOnlyFunction: strictOnlyFunction, chunkSize: chunkSize);
+            var (ok, files, err) = PseudoCFromLeAsm(lines, onlyFunction, strictOnlyFunction: strictOnlyFunction, chunkSize: chunkSize, chunkSizeIsCount: chunkSizeIsCount);
             if (!ok) return (false, string.Empty, err);
 
             // If we have multiple files but the caller only wanted a string, join them or return the main one.
@@ -140,10 +188,10 @@ namespace DOSRE.Dasm
                 return (true, new Dictionary<string, string>(), string.Empty);
 
             var lines = asm.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
-            return PseudoCFromLeAsm(lines, null, strictOnlyFunction: false, chunkSize: chunkSize);
+            return PseudoCFromLeAsm(lines, null, strictOnlyFunction: false, chunkSize: chunkSize, chunkSizeIsCount: false);
         }
 
-        private static (bool ok, Dictionary<string, string> files, string error) PseudoCFromLeAsm(string[] lines, string onlyFunction = null, bool strictOnlyFunction = false, int chunkSize = 0)
+        private static (bool ok, Dictionary<string, string> files, string error) PseudoCFromLeAsm(string[] lines, string onlyFunction = null, bool strictOnlyFunction = false, int chunkSize = 0, bool chunkSizeIsCount = false)
         {
             if (chunkSize <= 0 && !strictOnlyFunction) chunkSize = 200;
 
@@ -1025,6 +1073,18 @@ namespace DOSRE.Dasm
 
                 var functionsByName = functions.ToDictionary(f => f.Name, f => f, StringComparer.OrdinalIgnoreCase);
                 var sortedFuncs = functions.ToList();
+
+                // Chunking semantics:
+                // - Historical behavior: chunkSize == functions-per-chunk.
+                // - CLI behavior: chunkSize is desired chunk count (chunkSizeIsCount=true).
+                var functionsPerChunk = chunkSize;
+                if (chunkSizeIsCount && chunkSize > 0)
+                {
+                    var desiredChunks = Math.Max(1, chunkSize);
+                    functionsPerChunk = (int)Math.Ceiling(sortedFuncs.Count / (double)desiredChunks);
+                }
+                if (functionsPerChunk <= 0)
+                    functionsPerChunk = 200;
                 
                 var buildBat = new StringBuilder();
                 buildBat.Append("@echo off\r\n");
@@ -1085,10 +1145,10 @@ namespace DOSRE.Dasm
 
                 var calledFuncs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-                for (int i = 0; i < sortedFuncs.Count; i += chunkSize)
+                for (int i = 0; i < sortedFuncs.Count; i += functionsPerChunk)
                 {
-                    var partNum = i / chunkSize;
-                    var chunk = sortedFuncs.Skip(i).Take(chunkSize);
+                    var partNum = i / functionsPerChunk;
+                    var chunk = sortedFuncs.Skip(i).Take(functionsPerChunk);
                     var csb = new StringBuilder();
                     csb.Append("#include \"blst.h\"\r\n");
                     csb.Append("\r\n");

@@ -125,7 +125,7 @@ namespace DOSRE.UI.impl
         private int? _splitKb;
 
         /// <summary>
-        ///     LE decompilation chunk size (number of functions per file)
+        ///     LE decompilation chunk count (desired number of C chunk files)
         ///     Specified with the -lechunks <n> argument
         /// </summary>
         private int _leChunks = 0;
@@ -443,7 +443,7 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LEDECOMP -- (LE inputs) Emit best-effort pseudo-C (builds on LE insights/symbolization)");
                             Console.WriteLine(
-                                "-LECHUNKS <n> -- (LE inputs) Split decompile output into multiple translation units of n functions each (requires -O)");
+                                  "-LECHUNKS <n> -- (LE inputs) Split decompile output into ~n translation units (b0.c..bN.c) (requires -O)");
                             Console.WriteLine(
                                 "-LEDECOMPASM <file.asm> -- Decompile from an existing LE .asm output (fast iteration; skips LE disassembly)");
                             Console.WriteLine(
@@ -518,7 +518,7 @@ namespace DOSRE.UI.impl
                     if (File.Exists(cacheAsmPath))
                     {
                         _logger.Info($"LE decompile: using cached asm {cacheAsmPath}");
-                        leOk = LEDisassembler.TryDecompileToMultipartFromAsmFile(cacheAsmPath, _leOnlyFunction, _leChunks, out leDecompFiles, out leError);
+                        leOk = LEDisassembler.TryDecompileToMultipartFromAsmFile(cacheAsmPath, _leOnlyFunction, _leChunks, chunkSizeIsCount: true, out leDecompFiles, out leError);
                         leOutput = (leOk && leDecompFiles.Count > 0) ? leDecompFiles.Values.First() : string.Empty;
                     }
                     else
@@ -550,7 +550,7 @@ namespace DOSRE.UI.impl
                         else
                         {
                             File.WriteAllText(cacheAsmPath, asm);
-                            leOk = LEDisassembler.TryDecompileToMultipartFromAsm(asm, _leOnlyFunction, _leChunks, out leDecompFiles, out leError);
+                            leOk = LEDisassembler.TryDecompileToMultipartFromAsm(asm, _leOnlyFunction, _leChunks, chunkSizeIsCount: true, out leDecompFiles, out leError);
                             leOutput = (leOk && leDecompFiles.Count > 0) ? leDecompFiles.Values.First() : string.Empty;
                         }
                     }
@@ -559,7 +559,7 @@ namespace DOSRE.UI.impl
                 {
                     if (_bLeDecompile)
                     {
-                        leOk = LEDisassembler.TryDecompileToMultipart(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, _leChunks, out leDecompFiles, out leError);
+                        leOk = LEDisassembler.TryDecompileToMultipart(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, _leChunks, chunkSizeIsCount: true, out leDecompFiles, out leError);
                         leOutput = (leOk && leDecompFiles.Count > 0) ? leDecompFiles.Values.First() : string.Empty;
                     }
                     else
