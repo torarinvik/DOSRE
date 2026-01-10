@@ -175,26 +175,22 @@ namespace DOSRE.Dasm
                 }
                 
                 // Globals in hints or code: [0x0000AC34]
-                var mHintGlob = Regex.Match(t, @"\[0x(?<addr>[0-9A-Fa-f]{1,8})\]");
-                if (mHintGlob.Success)
+                foreach (Match mHintGlob in Regex.Matches(t, @"\[0x(?<addr>[0-9A-Fa-f]{1,8})\]"))
                 {
                     var addr = mHintGlob.Groups["addr"].Value.ToUpperInvariant().PadLeft(8, '0');
                     if (!_addrToGlobal.ContainsKey(addr))
                         _addrToGlobal[addr] = $"g_{addr}";
-                    continue;
                 }
 
                 // Globals also in SUMMARY or other comments
-                var mGlobAlt = Regex.Match(t, @"\b(?<name>g_[0-9A-Fa-f]{8})\b");
-                if (mGlobAlt.Success)
+                foreach (Match mGlobAlt in Regex.Matches(t, @"\b(g_|ptr_)(?<addr>[0-9A-Fa-f]{8})\b"))
                 {
-                     var name = mGlobAlt.Groups["name"].Value;
-                     var addr = name.Substring(2).ToUpperInvariant();
-                     _addrToGlobal[addr] = name;
+                     var addr = mGlobAlt.Groups["addr"].Value.ToUpperInvariant();
+                     _addrToGlobal[addr] = $"g_{addr}";
                 }
             }
             if (_addrToString.Count > 0 || _addrToGlobal.Count > 0 || _addrToFuncName.Count > 0)
-                Console.WriteLine($"[DECOMP] Found {_addrToString.Count} strings, {_addrToGlobal.Count} globals and {_addrToFuncName.Count} functions.");
+                Console.Error.WriteLine($"[DECOMP] Found {_addrToString.Count} strings, {_addrToGlobal.Count} globals and {_addrToFuncName.Count} functions.");
 
             // Pass 2: parse functions and instructions
             ParsedFunction currentFunc = null;
@@ -422,19 +418,23 @@ namespace DOSRE.Dasm
             sb.AppendLine("#define pop() 0 /* stub */");
             sb.AppendLine("#define memset_32(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*4)");
             sb.AppendLine("#define memset_16(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*2)");
+            sb.AppendLine("#ifndef uintptr_t");
             sb.AppendLine("#define uintptr_t uint32_t");
+            sb.AppendLine("#endif");
             sb.AppendLine("#define int32_t int");
+            sb.AppendLine("#define __builtin_bswap32(x) ((((x) & 0xFF000000) >> 24) | (((x) & 0x00FF0000) >> 8) | (((x) & 0x0000FF00) << 8) | (((x) & 0x000000FF) << 24))");
             sb.AppendLine("uint32_t func_0000000D() { return 0; }");
             sb.AppendLine("uint32_t func_000000EA() { return 0; }");
             sb.AppendLine("uint32_t func_000000FA() { return 0; }");
             sb.AppendLine("uint32_t func_00000028() { return 0; }");
             sb.AppendLine();
 
-            // Pass: Collect all referenced functions to ensure forward declarations for everything
+            // Pass: Collect all referenced functions, globals, and ptrs to ensure forward declarations
             var referencedFunctions = new HashSet<string>(functions.Select(f => f.Name), StringComparer.OrdinalIgnoreCase);
             var otherFunctions = new Dictionary<string, (string proto, int argCount)>(StringComparer.OrdinalIgnoreCase);
             var fieldOffsets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var ptrSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var globalSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var fn in functions)
             {
@@ -442,10 +442,10 @@ namespace DOSRE.Dasm
                 {
                     foreach (var line in block.Lines)
                     {
-                        if (line.Kind != ParsedLineKind.Instruction) continue;
+                        var text = line.Asm + " " + line.Comment + " " + line.Raw;
                         
                         // Look for calls: func_XXXXXXXX or just addresses that might be functions
-                        var callMatches = Regex.Matches(line.Raw + " " + line.Asm, @"\b(?<name>(?:func|loc|bb)_[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
+                        var callMatches = Regex.Matches(text, @"\b(?<name>(?:func|loc|bb)_[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
                         foreach (Match match in callMatches)
                         {
                             var rawName = match.Groups["name"].Value;
@@ -456,7 +456,6 @@ namespace DOSRE.Dasm
                             if (referencedFunctions.Contains(name))
                             {
                                 var target = functions.First(f => f.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
-                                // Always ensure it's not void if assigned.
                                 if (isAssigned && target.RetType == "void")
                                 {
                                     target.RetType = "uint32_t";
@@ -465,7 +464,6 @@ namespace DOSRE.Dasm
                             }
                             else
                             {
-                                // All external functions default to uint32_t to be safe.
                                 if (!otherFunctions.ContainsKey(name))
                                 {
                                     int detectedArgs = 0;
@@ -478,18 +476,35 @@ namespace DOSRE.Dasm
                         }
 
                         // Collect field_XXXX offsets
-                        var fieldAndPtrText = line.Asm + " " + line.Comment + " " + line.Raw;
-                        var fieldMatches = Regex.Matches(fieldAndPtrText, @"\bfield_(?<off>[0-9A-Fa-f]+)\b");
+                        var fieldMatches = Regex.Matches(text, @"\bfield_(?<off>[0-9A-Fa-f]+)\b");
                         foreach (Match fm in fieldMatches) fieldOffsets.Add(fm.Value);
 
                         // Collect ptr_XXXXXXXX symbols
-                        var ptrMatches = Regex.Matches(fieldAndPtrText, @"\bptr_(?<addr>[0-9A-Fa-f]{8})\b");
+                        var ptrMatches = Regex.Matches(text, @"\bptr_(?<addr>[0-9A-Fa-f]{8})\b");
                         foreach (Match pm in ptrMatches) ptrSymbols.Add(pm.Value);
+
+                        // Collect g_XXXXXXXX symbols
+                        var globalMatches = Regex.Matches(text, @"\bg_(?<addr>[0-9A-Fa-f]{8})\b");
+                        foreach (Match gm in globalMatches) globalSymbols.Add(gm.Value);
                     }
                 }
             }
 
-            sb.AppendLine("static uint32_t cs, ds, es, fs, gs, ss, dr0, dr1, dr2, dr3, dr6, dr7, this, carry;");
+            sb.AppendLine("static uint32_t cs, ds, es, fs, gs, ss, dr0, dr1, dr2, dr3, dr6, dr7, _this, carry;");
+            sb.AppendLine("static int jz, jnz, je, jne, jg, jge, jl, jle, ja, jae, jb, jbe, jo, jno, js, jns; // status flags");
+            sb.AppendLine();
+
+            var allFoundGlobals = new HashSet<string>(_addrToGlobal.Values, StringComparer.OrdinalIgnoreCase);
+            foreach (var gsym in allFoundGlobals.OrderBy(x => x))
+            {
+                sb.AppendLine($"static uint8_t {gsym}[1];");
+            }
+
+            var allFoundStrings = new HashSet<string>(_addrToString.Values, StringComparer.OrdinalIgnoreCase);
+            foreach (var ssym in allFoundStrings.OrderBy(x => x))
+            {
+                sb.AppendLine($"static char {ssym}[] = \"stub\";");
+            }
 
             foreach (var foff in fieldOffsets.OrderBy(x => x))
             {
@@ -498,8 +513,9 @@ namespace DOSRE.Dasm
             }
             foreach (var psym in ptrSymbols.OrderBy(x => x))
             {
+                sb.AppendLine($"static uint8_t {psym}[1];");
                 var addr = psym.Substring(4);
-                sb.AppendLine($"#define {psym} 0x{addr}");
+                sb.AppendLine($"#define M_{psym} 0x{addr}");
             }
             sb.AppendLine();
 
@@ -590,11 +606,50 @@ namespace DOSRE.Dasm
                     }
                 }
 
+                IdentifySimpleStructures(fn);
+
+                int indent = 1;
+                var nestedFollows = new Stack<string>();
                 foreach (var block in fn.Blocks)
                 {
+                    // Close nested structures
+                    while (nestedFollows.Count > 0 && nestedFollows.Peek().Equals(block.Label, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var closed = nestedFollows.Pop();
+                        indent = Math.Max(1, indent - 1);
+                        // If we just finished the 'then' of a diamond, start the 'else'
+                        var parentDiamond = fn.Blocks.FirstOrDefault(b => b.StructuredType == "diamond-header" && b.StructuredFollow != null && b.StructuredFollow.Equals(closed, StringComparison.OrdinalIgnoreCase));
+                        if (parentDiamond != null)
+                        {
+                            sb.AppendLine(new string(' ', indent * 4) + "} else {");
+                            indent++;
+                            nestedFollows.Push(parentDiamond.SecondaryFollow);
+                        }
+                        else
+                        {
+                            sb.AppendLine(new string(' ', indent * 4) + "}");
+                        }
+                    }
+
                     var state = fn.BlockEntryStates.GetValueOrDefault(block.Label)?.Clone() ?? new DecompilationState();
                     var sanitizedLabel = SanitizeLabel(block.Label);
-                    sb.AppendLine($"{sanitizedLabel}:;");
+                    sb.AppendLine($"{new string(' ', Math.Max(0, (indent - 1) * 4))}{sanitizedLabel}:;");
+
+                    if (block.StructuredType == "while-true")
+                    {
+                        sb.AppendLine(new string(' ', indent * 4) + "while (1) {");
+                        indent++;
+                        // Close this after the current block.
+                        var nextIdx = fn.Blocks.IndexOf(block) + 1;
+                        var nextLabel = (nextIdx < fn.Blocks.Count) ? fn.Blocks[nextIdx].Label : "___END_OF_FUNCTION___";
+                        nestedFollows.Push(nextLabel);
+                    }
+                    else if (block.StructuredType == "if-then" || block.StructuredType == "diamond-header")
+                    {
+                        sb.AppendLine(new string(' ', indent * 4) + $"if ({block.StructuredCondition}) {{");
+                        indent++;
+                        nestedFollows.Push(block.StructuredFollow);
+                    }
 
                     var blockLines = new List<string>();
                     var suppressTailAfterRetDecode = false;
@@ -618,6 +673,15 @@ namespace DOSRE.Dasm
 
                         if (suppressTailAfterRetDecode)
                             continue;
+
+                        // Skip the last instruction if it's the structural jump
+                        if (lineIdx == block.Lines.Count - 1 && item.Kind == ParsedLineKind.Instruction && !string.IsNullOrEmpty(block.StructuredType))
+                        {
+                            if (item.Mnemonic?.Equals("jmp", StringComparison.OrdinalIgnoreCase) == true || IsJccLine(item, out _, out _))
+                            {
+                                continue;
+                            }
+                        }
 
                         // Call-site improvement: peeks 
                         if (item.Kind == ParsedLineKind.Instruction && (item.Mnemonic?.Equals("call", StringComparison.OrdinalIgnoreCase) == true || item.Asm.TrimStart().StartsWith("call", StringComparison.OrdinalIgnoreCase)))
@@ -690,8 +754,16 @@ namespace DOSRE.Dasm
                     var optimized = OptimizeStatements(blockLines);
                     foreach (var s in optimized)
                     {
-                        sb.AppendLine("    " + s);
+                        sb.AppendLine(new string(' ', indent * 4) + s);
                     }
+                }
+
+                // Close any remaining nesting
+                while (nestedFollows.Count > 0)
+                {
+                    nestedFollows.Pop();
+                    indent = Math.Max(1, indent - 1);
+                    sb.AppendLine(new string(' ', indent * 4) + "}");
                 }
 
                 // If some referenced labels were NOT in fn.Blocks, we must emit them at the end.
@@ -826,17 +898,26 @@ namespace DOSRE.Dasm
                 ["bp"]="ebp", ["ebp"]="ebp",
                 ["sp"]="esp", ["esp"]="esp",
                 ["cs"]="cs", ["ds"]="ds", ["es"]="es", ["fs"]="fs", ["gs"]="gs", ["ss"]="ss",
-                ["this"]="this"
+                ["this"]="_this"
+            };
+
+            var globals = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+                "cs", "ds", "es", "fs", "gs", "ss", "dr0", "dr1", "dr2", "dr3", "dr6", "dr7", "_this", "carry"
             };
 
             foreach (var r in regs)
             {
                 if (map.TryGetValue(r, out var root))
                 {
+                    if (globals.Contains(root)) continue;
                     roots.Add(root);
                     if (r != root) subRegs.Add(r);
                 }
-                else roots.Add(r);
+                else
+                {
+                    if (globals.Contains(r)) continue;
+                    roots.Add(r);
+                }
             }
 
             var sb = new StringBuilder();
@@ -1059,6 +1140,11 @@ namespace DOSRE.Dasm
             public List<ParsedInsOrComment> Lines;
             public List<string> Successors = new List<string>();
             public List<string> Predecessors = new List<string>();
+            public string StructuredType; // "if", "else", "while", "loop"
+            public string StructuredCondition;
+            public string StructuredFollow;
+            public string SecondaryFollow;
+            public string LastJumpMnemonic;
         }
 
         private sealed class ParsedFunction
@@ -1168,8 +1254,9 @@ namespace DOSRE.Dasm
                 }
 
                 var asm = lastLine.Asm.ToLowerInvariant();
-                if (IsJccLine(lastLine, out _, out var jccTarget))
+                if (IsJccLine(lastLine, out var mn, out var jccTarget))
                 {
+                    block.LastJumpMnemonic = mn;
                     var targetLabel = labelByAddr.GetValueOrDefault(jccTarget);
                     if (targetLabel != null)
                     {
@@ -1522,8 +1609,8 @@ namespace DOSRE.Dasm
                     pending.LastWasTest = false;
                     var lhsSize = GetOperandSize(parts.Value.lhs);
                     var rhsSize = GetOperandSize(parts.Value.rhs);
-                    pending.LastCmpLhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: false, fn, rhsSize);
-                    pending.LastCmpRhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize);
+                    pending.LastCmpLhs = WrapExprForPointerMath(NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: false, fn, rhsSize));
+                    pending.LastCmpRhs = WrapExprForPointerMath(NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize));
                 }
                 return "// " + asm + commentSuffix;
             }
@@ -1536,8 +1623,8 @@ namespace DOSRE.Dasm
                     pending.LastWasCmp = false;
                     var lhsSize = GetOperandSize(parts.Value.lhs);
                     var rhsSize = GetOperandSize(parts.Value.rhs);
-                    pending.LastTestLhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: false, fn, rhsSize);
-                    pending.LastTestRhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize);
+                    pending.LastTestLhs = WrapExprForPointerMath(NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: false, fn, rhsSize));
+                    pending.LastTestRhs = WrapExprForPointerMath(NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize));
                 }
                 return "// " + asm + commentSuffix;
             }
@@ -1601,7 +1688,7 @@ namespace DOSRE.Dasm
             if (mn == "push")
             {
                 pending.Clear(dstIsEax);
-                var resolved = state.Resolve(NormalizeAsmOperandToC(ops, false, fn));
+                var resolved = WrapExprForPointerMath(state.Resolve(NormalizeAsmOperandToC(ops, false, fn)));
                 state.Push(resolved);
                 return $"// push {resolved};";
             }
@@ -1664,7 +1751,7 @@ namespace DOSRE.Dasm
                 var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true, fn, rhsSize);
                 var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize);
                 
-                var resolvedRhs = state.Resolve(rhs);
+                var resolvedRhs = WrapExprForPointerMath(state.Resolve(rhs));
                 state.Set(lhs, resolvedRhs);
                 if (lhs == "eax") pending.LastEaxAssignment = resolvedRhs;
                 return $"{lhs} = {resolvedRhs};{commentSuffix}";
@@ -1679,7 +1766,7 @@ namespace DOSRE.Dasm
                     var lhsSize = GetOperandSize(parts.Value.lhs);
                     var rhsSize = GetOperandSize(parts.Value.rhs);
                     var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true, fn, rhsSize);
-                    var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize);
+                    var rhs = WrapExprForPointerMath(NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize));
                     var cast = mn == "movzx" ? "(uint32_t)" : "(int32_t)";
                     return $"{lhs} = {cast}{rhs};{commentSuffix}";
                 }
@@ -1734,7 +1821,7 @@ namespace DOSRE.Dasm
                 var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true, fn, rhsSize);
                 var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize);
 
-                var resolvedRhs = state.Resolve(rhs);
+                var resolvedRhs = WrapExprForPointerMath(state.Resolve(rhs));
                 
                 if (mn == "xor" && lhs.Equals(rhs, StringComparison.OrdinalIgnoreCase))
                 {
@@ -1788,7 +1875,7 @@ namespace DOSRE.Dasm
                 return $"{lhs} {op} {rhs};{commentSuffix}";
             }
 
-            if (mn is "bt" or "bts" or "btr")
+            if (mn == "bt" || mn == "bts" || mn == "btr")
             {
                 var parts = SplitTwoOperands(ops);
                 if (parts != null)
@@ -1803,9 +1890,31 @@ namespace DOSRE.Dasm
                 }
             }
 
+            if (mn == "out")
+            {
+                var parts = SplitTwoOperands(ops);
+                if (parts != null)
+                {
+                    var port = NormalizeAsmOperandToC(parts.Value.lhs, false, fn);
+                    var val = NormalizeAsmOperandToC(parts.Value.rhs, false, fn);
+                    return $"__out({port}, {val});{commentSuffix}";
+                }
+            }
+            if (mn == "in")
+            {
+                var parts = SplitTwoOperands(ops);
+                if (parts != null)
+                {
+                    var dst = NormalizeAsmOperandToC(parts.Value.lhs, true, fn);
+                    var port = NormalizeAsmOperandToC(parts.Value.rhs, false, fn);
+                    return $"{dst} = __in({port});{commentSuffix}";
+                }
+            }
+
             if (mn == "neg")
             {
                 pending.Clear(dstIsEax);
+                if (string.IsNullOrWhiteSpace(ops)) return "// " + asm;
                 var opnd = NormalizeAsmOperandToC(ops, isMemoryWrite: true, fn);
                 return $"{opnd} = -{opnd};{commentSuffix}";
             }
@@ -1820,14 +1929,6 @@ namespace DOSRE.Dasm
                 return mn == "inc" ? $"({opnd})++;{commentSuffix}" : $"({opnd})--;{commentSuffix}";
             }
 
-            if (mn == "neg")
-            {
-                pending.Clear(dstIsEax);
-                if (string.IsNullOrWhiteSpace(ops)) return "// " + asm;
-                var opnd = NormalizeAsmOperandToC(ops, isMemoryWrite: true, fn);
-                return $"{opnd} = -{opnd};{commentSuffix}";
-            }
-
             if (mn == "not")
             {
                 pending.Clear(dstIsEax);
@@ -1835,6 +1936,11 @@ namespace DOSRE.Dasm
                 var opnd = NormalizeAsmOperandToC(ops, isMemoryWrite: true, fn);
                 return $"{opnd} = ~{opnd};{commentSuffix}";
             }
+
+            if (mn == "cdq" || mn == "cltd") return $"edx = (uint32_t)((int32_t)eax >> 31);{commentSuffix}";
+            if (mn == "cwde") return $"eax = (uint32_t)(int16_t)ax;{commentSuffix}";
+            if (mn == "cwd") return $"dx = (uint16_t)((int16_t)ax >> 15);{commentSuffix}";
+            if (mn == "cbw") return $"ah = (uint8_t)((int8_t)al >> 7);{commentSuffix}";
 
             if (mn == "call")
             {
@@ -1846,7 +1952,7 @@ namespace DOSRE.Dasm
                 else if (otherFunctions.TryGetValue(target, out var other)) argCount = other.argCount;
 
                 var argsList = new List<string>();
-                for (int i = 0; i < argCount; i++) argsList.Add(state.Pop());
+                for (int i = 0; i < argCount; i++) argsList.Add(WrapExprForPointerMath(state.Pop()));
                 argsList.Reverse();
 
                 var argsStrs = argsList.Count > 0 ? string.Join(", ", argsList) : "";
@@ -1864,7 +1970,7 @@ namespace DOSRE.Dasm
                     else if (ins.Comment != null && (ins.Comment.Contains("RET: ax", StringComparison.OrdinalIgnoreCase) || ins.Comment.Contains("RET: al", StringComparison.OrdinalIgnoreCase)))
                         retVal = " eax"; // simplified
                     else
-                        retVal = " 0"; // Fallback for non-void functions
+                        retVal = " eax"; // Fallback for non-void functions
                 }
 
                 pending.Clear(true);
@@ -1951,6 +2057,7 @@ namespace DOSRE.Dasm
                 return string.Empty;
 
             var t = op.Trim();
+            if (t.Equals("this", StringComparison.OrdinalIgnoreCase)) return "_this";
 
             // Replace any hex literal or symbolized address with its string/global name/func name
             t = Regex.Replace(t, @"\b(?:0x|[psg]_)?(?<hex>[0-9A-Fa-f]{4,8})h?\b", m => {
@@ -2102,7 +2209,7 @@ namespace DOSRE.Dasm
             {
                 var hex = hexMatch.Groups["hex"].Value.ToUpperInvariant().PadLeft(8, '0');
                 if (_addrToString.TryGetValue(hex, out var s)) return s;
-                if (_addrToGlobal.TryGetValue(hex, out var g)) return g;
+                if (_addrToGlobal.TryGetValue(hex, out var g)) return $"(uintptr_t){g}";
             }
 
             if ((t.StartsWith("ptr_", StringComparison.OrdinalIgnoreCase) || t.StartsWith("s_", StringComparison.OrdinalIgnoreCase)))
@@ -2126,8 +2233,21 @@ namespace DOSRE.Dasm
             // Remove segment prefixes like cs:
             expr = Regex.Replace(expr, @"\b(cs|ds|es|fs|gs|ss):", "", RegexOptions.IgnoreCase);
 
+            // Replace hex with g_ symbols if known
+            expr = Regex.Replace(expr, @"\b(?:0x)?(?<hex>[0-9A-Fa-f]{5,8})h?\b", m => {
+                var h = m.Groups["hex"].Value.TrimStart('0');
+                if (h.Length < 4) h = m.Groups["hex"].Value; // keep some padding if it was short
+                var hex = m.Groups["hex"].Value.ToUpperInvariant().PadLeft(8, '0');
+                if (_addrToGlobal.TryGetValue(hex, out var g)) return g;
+                return m.Value;
+            }, RegexOptions.IgnoreCase);
+
             // Change dot to plus for macros like ptr.field
             expr = expr.Replace(".", " + ");
+
+            // Protect globals and pointers by casting them to uintptr_t if they are used in arithmetic or as bare values.
+            // We use a negative lookbehind for '&' and a negative lookahead for '[' to avoid casting when taking address or indexing.
+            expr = Regex.Replace(expr, @"(?<!&\s*)\b(?<sym>(g_|ptr_|s_)[0-9A-Fa-f]{8})\b(?!\s*\[)", "((uintptr_t)$0)");
 
             // Heuristic: if it's a register + offset, cast the register to uint8_t* 
             // to ensure byte-based pointer arithmetic in the pseudo-C.
@@ -2189,6 +2309,18 @@ namespace DOSRE.Dasm
                     }
                 }
             }
+        }
+
+        private static string NegateCondition(string cond)
+        {
+            if (string.IsNullOrEmpty(cond)) return "!(unknown)";
+            if (cond.Contains("==")) return cond.Replace("==", "!=");
+            if (cond.Contains("!=")) return cond.Replace("!=", "==");
+            if (cond.Contains("> ")) return cond.Replace("> ", "<= ");
+            if (cond.Contains("< ")) return cond.Replace("< ", ">= ");
+            if (cond.Contains(">= ")) return cond.Replace(">= ", "< ");
+            if (cond.Contains("<= ")) return cond.Replace("<= ", "> ");
+            return "!(" + cond + ")";
         }
 
         private static bool IsJcc(string mn)
@@ -2470,6 +2602,107 @@ namespace DOSRE.Dasm
             }
 
             return null;
+        }
+
+        private static void IdentifySimpleStructures(ParsedFunction fn)
+        {
+            // Identify structures
+            foreach (var b in fn.Blocks)
+            {
+                var p = new PendingFlags();
+                foreach (var line in b.Lines)
+                {
+                    if (line.Kind != ParsedLineKind.Instruction) continue;
+                    var asm = line.Asm.ToLowerInvariant();
+                    if (asm.StartsWith("cmp "))
+                    {
+                        var ops = asm.Substring(4).Trim();
+                        var parts = SplitTwoOperands(ops);
+                        if (parts != null)
+                        {
+                            p.LastWasCmp = true; p.LastWasTest = false;
+                            p.LastCmpLhs = NormalizeAsmOperandToC(parts.Value.lhs, false, fn);
+                            p.LastCmpRhs = NormalizeAsmOperandToC(parts.Value.rhs, false, fn);
+                        }
+                    }
+                    else if (asm.StartsWith("test "))
+                    {
+                        var ops = asm.Substring(5).Trim();
+                        var parts = SplitTwoOperands(ops);
+                        if (parts != null)
+                        {
+                            p.LastWasTest = true; p.LastWasCmp = false;
+                            p.LastTestLhs = NormalizeAsmOperandToC(parts.Value.lhs, false, fn);
+                            p.LastTestRhs = NormalizeAsmOperandToC(parts.Value.rhs, false, fn);
+                        }
+                    }
+                }
+
+                if (b.Successors.Count == 2)
+                {
+                    var sJump = b.Successors[0]; // Usually the jump target
+                    var sFall = b.Successors[1]; // Usually the fallthrough
+
+                    var bJump = fn.Blocks.FirstOrDefault(x => x.Label.Equals(sJump, StringComparison.OrdinalIgnoreCase));
+                    var bFall = fn.Blocks.FirstOrDefault(x => x.Label.Equals(sFall, StringComparison.OrdinalIgnoreCase));
+
+                    if (bJump != null && bFall != null)
+                    {
+                        // Triangle (If-Then): A -> B, C; B -> C
+                        if (bJump.Successors.Count == 1 && bJump.Successors[0].Equals(sFall, StringComparison.OrdinalIgnoreCase))
+                        {
+                            b.StructuredType = "if-then";
+                            var cond = TryMakeConditionFromPending(b.LastJumpMnemonic, p);
+                            b.StructuredCondition = !string.IsNullOrEmpty(cond) ? NegateCondition(cond) : NegateAsmCondition(b.LastJumpMnemonic);
+                            b.StructuredFollow = sFall;
+                        }
+                        else if (bFall.Successors.Count == 1 && bFall.Successors[0].Equals(sJump, StringComparison.OrdinalIgnoreCase))
+                        {
+                            b.StructuredType = "if-then";
+                            var cond = TryMakeConditionFromPending(b.LastJumpMnemonic, p);
+                            b.StructuredCondition = !string.IsNullOrEmpty(cond) ? cond : b.LastJumpMnemonic;
+                            b.StructuredFollow = sJump;
+                        }
+                        // Diamond (If-Then-Else): A -> B, C; B -> D; C -> D
+                        else if (bJump.Successors.Count == 1 && bFall.Successors.Count == 1 &&
+                                 bJump.Successors[0].Equals(bFall.Successors[0], StringComparison.OrdinalIgnoreCase))
+                        {
+                            var sFollow = bJump.Successors[0];
+                            b.StructuredType = "diamond-header";
+                            var cond = TryMakeConditionFromPending(b.LastJumpMnemonic, p);
+                            b.StructuredCondition = !string.IsNullOrEmpty(cond) ? NegateCondition(cond) : NegateAsmCondition(b.LastJumpMnemonic);
+                            b.StructuredFollow = sFall; // The 'else' block is the first follow
+                            b.SecondaryFollow = sFollow;
+                        }
+                    }
+                }
+                // While(1) detect: block ends in jmp to itself
+                if (b.Successors.Count == 1 && b.Successors[0].Equals(b.Label, StringComparison.OrdinalIgnoreCase))
+                {
+                    b.StructuredType = "while-true";
+                }
+            }
+        }
+
+        private static string NegateAsmCondition(string jccMn)
+        {
+            if (string.IsNullOrEmpty(jccMn)) return "!(unknown)";
+            switch (jccMn.ToLowerInvariant())
+            {
+                case "jz": return "jnz";
+                case "je": return "jne";
+                case "jnz": return "jz";
+                case "jne": return "je";
+                case "ja": return "jbe";
+                case "jae": return "jb";
+                case "jb": return "jae";
+                case "jbe": return "ja";
+                case "jg": return "jle";
+                case "jge": return "jl";
+                case "jl": return "jge";
+                case "jle": return "jg";
+                default: return "!" + jccMn;
+            }
         }
     }
 }

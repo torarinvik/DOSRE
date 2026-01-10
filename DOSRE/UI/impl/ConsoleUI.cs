@@ -599,7 +599,7 @@ namespace DOSRE.UI.impl
                             _logger.Warn("Warning: -splitkb requires -o, ignoring");
                         if (_bMacros)
                             leOutput = MacroDeduper.Apply(leOutput);
-                        _logger.Info(leOutput);
+                        Console.WriteLine(leOutput);
                     }
                     else
                     {
@@ -641,7 +641,7 @@ namespace DOSRE.UI.impl
                             _logger.Warn("Warning: -splitkb requires -o, ignoring");
                         if (_bMacros)
                             mzOutput = MacroDeduper.Apply(mzOutput);
-                        _logger.Info(mzOutput);
+                        Console.WriteLine(mzOutput);
                     }
                     else
                     {

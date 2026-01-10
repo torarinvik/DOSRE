@@ -13,6 +13,7 @@ namespace DOSRE.Logging
             //Setup Console Logging
             var logconsole = new NLog.Targets.ConsoleTarget("logconsole")
             {
+                Error = true,
                 Layout = Layout.FromString("${shortdate}\t${time}\t${message}")
             };
             config.AddTarget(logconsole);
