@@ -79,7 +79,8 @@ namespace DOSRE.Dasm
                 onlyFunction: null,
                 strictOnlyFunction: false,
                 chunkSize: chunkSize,
-                chunkSizeIsCount: chunkSizeIsCount);
+                chunkSizeIsCount: chunkSizeIsCount,
+                inputFileForLoader: inputFile);
             if (!ok)
             {
                 error = errText;
@@ -153,7 +154,8 @@ namespace DOSRE.Dasm
                 onlyFunction: onlyFunction,
                 strictOnlyFunction: !string.IsNullOrWhiteSpace(onlyFunction),
                 chunkSize: chunkSize,
-                chunkSizeIsCount: chunkSizeIsCount);
+                chunkSizeIsCount: chunkSizeIsCount,
+                inputFileForLoader: null);
             if (!ok)
             {
                 error = errText;
@@ -164,14 +166,14 @@ namespace DOSRE.Dasm
             return true;
         }
 
-        private static (bool ok, string output, string error) PseudoCFromLeAsm(string asm, string onlyFunction = null, bool strictOnlyFunction = false, int chunkSize = 0, bool chunkSizeIsCount = false)
+        private static (bool ok, string output, string error) PseudoCFromLeAsm(string asm, string onlyFunction = null, bool strictOnlyFunction = false, int chunkSize = 0, bool chunkSizeIsCount = false, string inputFileForLoader = null)
         {
             if (string.IsNullOrWhiteSpace(asm))
                 return (true, string.Empty, string.Empty);
 
             var lines = asm.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
 
-            var (ok, files, err) = PseudoCFromLeAsm(lines, onlyFunction, strictOnlyFunction: strictOnlyFunction, chunkSize: chunkSize, chunkSizeIsCount: chunkSizeIsCount);
+            var (ok, files, err) = PseudoCFromLeAsm(lines, onlyFunction, strictOnlyFunction: strictOnlyFunction, chunkSize: chunkSize, chunkSizeIsCount: chunkSizeIsCount, inputFileForLoader: inputFileForLoader);
             if (!ok) return (false, string.Empty, err);
 
             // If we have multiple files but the caller only wanted a string, join them or return the main one.
@@ -188,10 +190,10 @@ namespace DOSRE.Dasm
                 return (true, new Dictionary<string, string>(), string.Empty);
 
             var lines = asm.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
-            return PseudoCFromLeAsm(lines, null, strictOnlyFunction: false, chunkSize: chunkSize, chunkSizeIsCount: false);
+            return PseudoCFromLeAsm(lines, null, strictOnlyFunction: false, chunkSize: chunkSize, chunkSizeIsCount: false, inputFileForLoader: null);
         }
 
-        private static (bool ok, Dictionary<string, string> files, string error) PseudoCFromLeAsm(string[] lines, string onlyFunction = null, bool strictOnlyFunction = false, int chunkSize = 0, bool chunkSizeIsCount = false)
+        private static (bool ok, Dictionary<string, string> files, string error) PseudoCFromLeAsm(string[] lines, string onlyFunction = null, bool strictOnlyFunction = false, int chunkSize = 0, bool chunkSizeIsCount = false, string inputFileForLoader = null)
         {
             if (chunkSize <= 0 && !strictOnlyFunction) chunkSize = 200;
 
@@ -200,6 +202,63 @@ namespace DOSRE.Dasm
             var functions = new List<ParsedFunction>();
             var otherFunctions = new Dictionary<string, (string proto, int argCount)>(StringComparer.OrdinalIgnoreCase);
             uint? entryLinear = null;
+
+            // Optional: if we have the original input file path, parse its LE metadata so generated
+            // main.c can load the original image into guest linear memory and initialize esp.
+            LEHeader leHeader = default;
+            List<LEObject> leObjects = null;
+            uint[] lePageMap = null;
+            bool haveLeMeta = false;
+            string leOrigFilename = null;
+            uint leDataPagesBase = 0;
+            uint leEntryEspLinear = 0;
+            uint leEntryEipLinear = 0;
+            uint leSuggestedMemSize = 0;
+
+            if (!string.IsNullOrWhiteSpace(inputFileForLoader) && File.Exists(inputFileForLoader))
+            {
+                try
+                {
+                    var fileBytes = File.ReadAllBytes(inputFileForLoader);
+                    if (TryFindLEHeaderOffset(fileBytes, out var headerOffset) && TryParseHeader(fileBytes, headerOffset, out leHeader, out var _))
+                    {
+                        leObjects = ParseObjects(fileBytes, leHeader);
+                        lePageMap = ParseObjectPageMap(fileBytes, leHeader);
+                        if (leObjects != null && leObjects.Count > 0 && lePageMap != null && lePageMap.Length > 0)
+                        {
+                            leOrigFilename = Path.GetFileName(inputFileForLoader);
+                            leDataPagesBase = (uint)(leHeader.HeaderOffset + (int)leHeader.DataPagesOffset);
+
+                            // Entry EIP/ESP linear (best-effort).
+                            var eipObj = leObjects.FirstOrDefault(o => o.Index == (int)leHeader.EntryEipObject);
+                            var espObj = leObjects.FirstOrDefault(o => o.Index == (int)leHeader.EntryEspObject);
+                            if (eipObj.Index != 0)
+                                leEntryEipLinear = unchecked(eipObj.BaseAddress + leHeader.EntryEip);
+                            if (espObj.Index != 0)
+                                leEntryEspLinear = unchecked(espObj.BaseAddress + leHeader.EntryEsp);
+
+                            // Guest memory window: cover the highest object end + slack.
+                            ulong maxEnd = 0;
+                            foreach (var o in leObjects)
+                            {
+                                var backed = unchecked(o.PageCount * leHeader.PageSize);
+                                var span = Math.Max(o.VirtualSize, backed);
+                                var end = (ulong)unchecked(o.BaseAddress + span);
+                                if (end > maxEnd) maxEnd = end;
+                            }
+                            var withSlack = maxEnd + 0x10000u;
+                            leSuggestedMemSize = (uint)((withSlack + 0xFFFu) & ~0xFFFu);
+                            if (leSuggestedMemSize < 0x200000u) leSuggestedMemSize = 0x200000u;
+
+                            haveLeMeta = leEntryEipLinear != 0 && leEntryEspLinear != 0 && leSuggestedMemSize != 0;
+                        }
+                    }
+                }
+                catch
+                {
+                    // best-effort only
+                }
+            }
             _addrToString.Clear();
             _addrToStringLiteral.Clear();
             _addrToGlobal.Clear();
@@ -544,11 +603,14 @@ namespace DOSRE.Dasm
             sb.AppendLine("#define DOS_INT(intno) do { (void)(intno); /* stub */ } while(0)");
             sb.AppendLine("#endif");
             sb.AppendLine();
+            sb.AppendLine("static uint8_t* __mem; static uint32_t __mem_size;");
+            sb.AppendLine("static inline void* __ptr(uint32_t addr) { return (addr < __mem_size) ? (void*)(__mem + addr) : (void*)0; }");
+            sb.AppendLine();
             sb.AppendLine("// Best-effort stack pop: reads dword at esp and advances esp by 4.");
-            sb.AppendLine("static inline uint32_t __pop32(uint32_t *esp_) { uint32_t v = *(uint32_t*)(uintptr_t)(*esp_); *esp_ += 4; return v; }");
+            sb.AppendLine("static inline uint32_t __pop32(uint32_t *esp_) { uint32_t v = *(uint32_t*)__ptr(*esp_); *esp_ += 4; return v; }");
             sb.AppendLine("#define pop() __pop32(&esp)");
-            sb.AppendLine("#define memset_32(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*4)");
-            sb.AppendLine("#define memset_16(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*2)");
+            sb.AppendLine("#define memset_32(dst, val, count) memset(__ptr((uint32_t)(dst)), val, (count)*4)");
+            sb.AppendLine("#define memset_16(dst, val, count) memset(__ptr((uint32_t)(dst)), val, (count)*2)");
             sb.AppendLine("#define __builtin_bswap32(x) ((((x) & 0xFF000000) >> 24) | (((x) & 0x00FF0000) >> 8) | (((x) & 0x0000FF00) << 8) | (((x) & 0x000000FF) << 24))");
             sb.AppendLine("uint32_t func_0000000D() { return 0; }");
             sb.AppendLine("uint32_t func_000000EA() { return 0; }");
@@ -767,6 +829,7 @@ namespace DOSRE.Dasm
                 sbSingle.AppendLine("#include <stdint.h>");
                 sbSingle.AppendLine("#include <stdio.h>");
                 sbSingle.AppendLine("#include <string.h>");
+                sbSingle.AppendLine("#include <stdlib.h>");
                 sbSingle.AppendLine();
                 sbSingle.AppendLine("#define ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))");
                 sbSingle.AppendLine("#define ROL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))");
@@ -820,11 +883,14 @@ namespace DOSRE.Dasm
                 sbSingle.AppendLine("#define DOS_INT(intno) do { (void)(intno); /* stub */ } while(0)");
                 sbSingle.AppendLine("#endif");
                 sbSingle.AppendLine();
-                sbSingle.AppendLine("// Best-effort stack pop: reads dword at esp and advances esp by 4.");
-                sbSingle.AppendLine("static inline uint32_t __pop32(uint32_t *esp_) { uint32_t v = *(uint32_t*)(uintptr_t)(*esp_); *esp_ += 4; return v; }");
+                sbSingle.AppendLine("static uint8_t* __mem; static uint32_t __mem_size;");
+                sbSingle.AppendLine("static inline void* __ptr(uint32_t addr) { return (addr < __mem_size) ? (void*)(__mem + addr) : (void*)0; }");
+                sbSingle.AppendLine();
+                sbSingle.AppendLine("// Best-effort stack pop: reads dword at guest linear esp and advances esp by 4.");
+                sbSingle.AppendLine("static inline uint32_t __pop32(uint32_t *esp_) { uint32_t v = *(uint32_t*)__ptr(*esp_); *esp_ += 4; return v; }");
                 sbSingle.AppendLine("#define pop() __pop32(&esp)");
-                sbSingle.AppendLine("#define memset_32(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*4)");
-                sbSingle.AppendLine("#define memset_16(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*2)");
+                sbSingle.AppendLine("#define memset_32(dst, val, count) memset(__ptr((uint32_t)(dst)), val, (count)*4)");
+                sbSingle.AppendLine("#define memset_16(dst, val, count) memset(__ptr((uint32_t)(dst)), val, (count)*2)");
                 sbSingle.AppendLine("#define __builtin_bswap32(x) ((((x) & 0xFF000000) >> 24) | (((x) & 0x00FF0000) >> 8) | (((x) & 0x0000FF00) << 8) | (((x) & 0x000000FF) << 24))");
                 sbSingle.AppendLine("uint32_t func_0000000D() { return 0; }");
                 sbSingle.AppendLine("uint32_t func_000000EA() { return 0; }");
@@ -919,6 +985,7 @@ namespace DOSRE.Dasm
                 h.AppendLine("#include <stdint.h>");
                 h.AppendLine("#include <stdio.h>");
                 h.AppendLine("#include <string.h>");
+                h.AppendLine("#include <stdlib.h>");
                 h.AppendLine();
                 h.AppendLine("#define ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))");
                 h.AppendLine("#define ROL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))");
@@ -977,7 +1044,9 @@ namespace DOSRE.Dasm
                 h.AppendLine("#define DOS_INT(intno) do { (void)(intno); } while(0)");
                 h.AppendLine("#endif");
                 h.AppendLine();
-                h.AppendLine("static inline uint32_t __pop32(uint32_t *esp_) { uint32_t v = *(uint32_t*)(uintptr_t)(*esp_); *esp_ += 4; return v; }");
+                h.AppendLine("extern uint8_t* __mem; extern uint32_t __mem_size;");
+                h.AppendLine("static inline void* __ptr(uint32_t addr) { return (addr < __mem_size) ? (void*)(__mem + addr) : (void*)0; }");
+                h.AppendLine("static inline uint32_t __pop32(uint32_t *esp_) { uint32_t v = *(uint32_t*)__ptr(*esp_); *esp_ += 4; return v; }");
                 h.AppendLine("extern uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp;");
                 h.AppendLine("#define ax (*(uint16_t*)&eax)");
                 h.AppendLine("#define al (*(uint8_t*)&eax)");
@@ -1003,13 +1072,13 @@ namespace DOSRE.Dasm
                 h.AppendLine("static inline uint32_t __strlen_rep(uint32_t edi_, uint8_t al_, uint32_t ecx_) {");
                 h.AppendLine("    uint32_t count = 0;");
                 h.AppendLine("    while (ecx_ != 0) {");
-                h.AppendLine("        if (*(uint8_t*)(uintptr_t)edi_ == al_) break;");
+                h.AppendLine("        if (*(uint8_t*)__ptr(edi_) == al_) break;");
                 h.AppendLine("        edi_++; ecx_--; count++;");
                 h.AppendLine("    }");
                 h.AppendLine("    return count;");
                 h.AppendLine("}");
-                h.AppendLine("#define memset_32(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*4)");
-                h.AppendLine("#define memset_16(dst, val, count) memset((void*)(uintptr_t)(dst), val, (count)*2)");
+                h.AppendLine("#define memset_32(dst, val, count) memset(__ptr((uint32_t)(dst)), val, (count)*4)");
+                h.AppendLine("#define memset_16(dst, val, count) memset(__ptr((uint32_t)(dst)), val, (count)*2)");
                 h.AppendLine("#define __builtin_bswap32(x) ((((x) & 0xFF000000) >> 24) | (((x) & 0x00FF0000) >> 8) | (((x) & 0x0000FF00) << 8) | (((x) & 0x000000FF) << 24))");
                 h.AppendLine();
 
@@ -1109,12 +1178,88 @@ namespace DOSRE.Dasm
                 var mainSb = new StringBuilder();
                 mainSb.AppendLine("#include \"blst.h\"");
                 mainSb.AppendLine();
-                mainSb.AppendLine("static uint8_t __guest_stack[0x40000];");
+                mainSb.AppendLine("// NOTE: guest linear memory backing is allocated at runtime into __mem.");
+                if (haveLeMeta)
+                {
+                    mainSb.AppendLine("// NOTE: this build expects the original LE EXE to be present next to the rebuilt program.");
+                    mainSb.AppendLine();
+                    mainSb.AppendLine("typedef struct { uint32_t base; uint32_t vsize; uint32_t flags; uint32_t pageMapIndex; uint32_t pageCount; } __le_obj;");
+                    mainSb.AppendLine($"static const uint32_t __le_page_size = 0x{leHeader.PageSize:X}u;");
+                    mainSb.AppendLine($"static const uint32_t __le_last_page_size = 0x{leHeader.LastPageSize:X}u;");
+                    mainSb.AppendLine($"static const uint32_t __le_num_pages = 0x{leHeader.NumberOfPages:X}u;");
+                    mainSb.AppendLine($"static const uint32_t __le_data_pages_base = 0x{leDataPagesBase:X}u;");
+                    mainSb.AppendLine($"static const uint32_t __le_entry_esp = 0x{leEntryEspLinear:X8}u;");
+                    mainSb.AppendLine($"static const uint32_t __le_entry_eip = 0x{leEntryEipLinear:X8}u;");
+                    mainSb.AppendLine($"static const char* __le_orig_exe = \"{leOrigFilename.Replace("\\", "\\\\")}\";");
+                    mainSb.AppendLine();
+                    mainSb.AppendLine("static const __le_obj __le_objs[] = {");
+                    foreach (var o in leObjects.OrderBy(x => x.Index))
+                    {
+                        mainSb.AppendLine($"    {{ 0x{o.BaseAddress:X8}u, 0x{o.VirtualSize:X}u, 0x{o.Flags:X8}u, 0x{o.PageMapIndex:X}u, 0x{o.PageCount:X}u }},");
+                    }
+                    mainSb.AppendLine("};");
+                    mainSb.AppendLine();
+                    mainSb.AppendLine("static const uint16_t __le_page_map[] = {");
+                    // Emit page map in compact lines to avoid pathological line lengths.
+                    for (var i = 0; i < lePageMap.Length; i++)
+                    {
+                        if (i % 16 == 0) mainSb.Append("    ");
+                        mainSb.Append($"0x{(ushort)lePageMap[i]:X4}, ");
+                        if (i % 16 == 15 || i == lePageMap.Length - 1) mainSb.AppendLine();
+                    }
+                    mainSb.AppendLine("};");
+                    mainSb.AppendLine();
+                    mainSb.AppendLine("static int __load_le_image(const char* path)");
+                    mainSb.AppendLine("{");
+                    mainSb.AppendLine("    FILE* f = fopen(path, \"rb\");");
+                    mainSb.AppendLine("    if (!f) return 0;");
+                    mainSb.AppendLine("    for (unsigned oi = 0; oi < (unsigned)(sizeof(__le_objs)/sizeof(__le_objs[0])); oi++)");
+                    mainSb.AppendLine("    {");
+                    mainSb.AppendLine("        const __le_obj* o = &__le_objs[oi];");
+                    mainSb.AppendLine("        for (uint32_t i = 0; i < o->pageCount; i++)");
+                    mainSb.AppendLine("        {");
+                    mainSb.AppendLine("            uint32_t mapIndex0 = (o->pageMapIndex - 1u) + i;");
+                    mainSb.AppendLine("            if (mapIndex0 >= (uint32_t)(sizeof(__le_page_map)/sizeof(__le_page_map[0]))) break;");
+                    mainSb.AppendLine("            uint32_t phys = (uint32_t)__le_page_map[mapIndex0]; // 1-based physical page");
+                    mainSb.AppendLine("            if (phys == 0) continue; // zero-fill");
+                    mainSb.AppendLine("            uint32_t bytesThisPage = (phys == __le_num_pages) ? __le_last_page_size : __le_page_size;");
+                    mainSb.AppendLine("            uint32_t fileOff = __le_data_pages_base + (phys - 1u) * __le_page_size;");
+                    mainSb.AppendLine("            if (fseek(f, (long)fileOff, SEEK_SET) != 0) { fclose(f); return 0; }");
+                    mainSb.AppendLine("            void* dst = __ptr(o->base + i * __le_page_size);");
+                    mainSb.AppendLine("            if (!dst) { fclose(f); return 0; }");
+                    mainSb.AppendLine("            if (fread(dst, 1, (size_t)bytesThisPage, f) != (size_t)bytesThisPage) { fclose(f); return 0; }");
+                    mainSb.AppendLine("        }");
+                    mainSb.AppendLine("    }");
+                    mainSb.AppendLine("    fclose(f);");
+                    mainSb.AppendLine("    return 1;");
+                    mainSb.AppendLine("}");
+                    mainSb.AppendLine();
+                }
                 mainSb.AppendLine();
                 mainSb.AppendLine("int main(void)");
                 mainSb.AppendLine("{");
-                mainSb.AppendLine("    memset(__guest_stack, 0, sizeof(__guest_stack));");
-                mainSb.AppendLine("    esp = (uint32_t)(uintptr_t)(__guest_stack + sizeof(__guest_stack) - 4);");
+                if (haveLeMeta)
+                {
+                    mainSb.AppendLine("    // Allocate guest linear memory window based on LE object layout.");
+                    mainSb.AppendLine($"    __mem_size = 0x{leSuggestedMemSize:X}u;");
+                }
+                else
+                {
+                    mainSb.AppendLine("    // Allocate a conservative guest memory window (best-effort).");
+                    mainSb.AppendLine("    __mem_size = 0x02000000u; // 32 MiB");
+                }
+                mainSb.AppendLine("    __mem = (uint8_t*)malloc(__mem_size);");
+                mainSb.AppendLine("    if (!__mem) return 1;");
+                mainSb.AppendLine("    memset(__mem, 0, __mem_size);");
+                if (haveLeMeta)
+                {
+                    mainSb.AppendLine("    if (!__load_le_image(__le_orig_exe)) return 2;");
+                    mainSb.AppendLine("    esp = __le_entry_esp;");
+                }
+                else
+                {
+                    mainSb.AppendLine("    esp = 0x00100000u; // best-effort stack top");
+                }
                 mainSb.AppendLine("    ebp = esp;");
                 mainSb.AppendLine();
                 mainSb.AppendLine("    __entry_jump_enabled = 0;");
@@ -1216,6 +1361,8 @@ namespace DOSRE.Dasm
 
                 var d = new StringBuilder();
                 d.AppendLine("#include \"blst.h\"");
+                d.AppendLine();
+                d.AppendLine("uint8_t* __mem; uint32_t __mem_size;");
                 d.AppendLine();
                 d.AppendLine("uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp;");
                 d.AppendLine("uint32_t cs, ds, es, fs, gs, ss, dr0, dr1, dr2, dr3, dr6, dr7, _this, carry;");
@@ -1745,16 +1892,16 @@ namespace DOSRE.Dasm
 
             if (retMatch.Success)
             {
-                var r = retMatch.Groups["ret"].Value;
+                var r = retMatch.Groups["ret"].Value.Trim().ToLowerInvariant();
+
                 if (r == "eax")
                 {
                     pending.LastEaxAssignment = callStr;
                     return null;
                 }
-                else if (!r.Contains("unused"))
-                {
+
+                if (!string.IsNullOrWhiteSpace(r) && !r.Contains("unused"))
                     return $"{r} = {callStr};";
-                }
             }
 
             return callStr + ";";
@@ -2360,12 +2507,12 @@ namespace DOSRE.Dasm
             {
                 pending.Clear(dstIsEax);
                 var subMn = ops.ToLowerInvariant();
-                if (subMn == "movsd") return $"memcpy((void*)(uintptr_t)edi, (void*)(uintptr_t)esi, ecx * 4);{commentSuffix}";
-                if (subMn == "movsw") return $"memcpy((void*)(uintptr_t)edi, (void*)(uintptr_t)esi, ecx * 2);{commentSuffix}";
-                if (subMn == "movsb") return $"memcpy((void*)(uintptr_t)edi, (void*)(uintptr_t)esi, ecx);{commentSuffix}";
+                if (subMn == "movsd") return $"memcpy(__ptr(edi), __ptr(esi), ecx * 4);{commentSuffix}";
+                if (subMn == "movsw") return $"memcpy(__ptr(edi), __ptr(esi), ecx * 2);{commentSuffix}";
+                if (subMn == "movsb") return $"memcpy(__ptr(edi), __ptr(esi), ecx);{commentSuffix}";
                 if (subMn == "stosd") return $"memset_32(edi, eax, ecx);{commentSuffix}";
                 if (subMn == "stosw") return $"memset_16(edi, ax, ecx);{commentSuffix}";
-                if (subMn == "stosb") return $"memset((void*)(uintptr_t)edi, al, ecx);{commentSuffix}";
+                if (subMn == "stosb") return $"memset(__ptr(edi), al, ecx);{commentSuffix}";
             }
 
             if (mn == "repne")
@@ -2525,14 +2672,26 @@ namespace DOSRE.Dasm
 
                 // If Normalize returned a bare variable name (because it was [local_XX]), 
                 // LEA needs the address of it.
-                if (Regex.IsMatch(rhs, @"^(local_[0-9A-Fa-f]+|arg_[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase))
+                // Also handle cases where Normalize wrapped locals (e.g. `*(uint32_t*)&(local_x)`),
+                // or where the memory operand was normalized into a __ptr-based deref.
+                var mAnyLocal = Regex.Match(rhs, @"\blocal_(?<off>[0-9A-Fa-f]+)\b", RegexOptions.IgnoreCase);
+                if (mAnyLocal.Success)
                 {
-                    return $"{lhs} = (uint32_t)(uintptr_t)&{rhs};{commentSuffix}";
+                    var off = Convert.ToUInt32(mAnyLocal.Groups["off"].Value, 16);
+                    return $"{lhs} = (uint32_t)(ebp - 0x{off:X}u);{commentSuffix}";
+                }
+
+                var mAnyArg = Regex.Match(rhs, @"\barg_(?<idx>[0-9A-Fa-f]+)\b", RegexOptions.IgnoreCase);
+                if (mAnyArg.Success)
+                {
+                    var idx = Convert.ToUInt32(mAnyArg.Groups["idx"].Value, 16);
+                    var off = 8u + idx * 4u;
+                    return $"{lhs} = (uint32_t)(ebp + 0x{off:X}u);{commentSuffix}";
                 }
 
                 // If it's a deref like *(uint32_t*)(expr), strip the deref to get expr.
                 rhs = StripSingleDeref(rhs);
-                return $"{lhs} = (uint32_t)(uintptr_t)({rhs});{commentSuffix}";
+                return $"{lhs} = (uint32_t)({rhs});{commentSuffix}";
             }
 
             if (mn is "add" or "sub" or "and" or "or" or "xor" or "adc" or "sbb")
@@ -2957,7 +3116,7 @@ namespace DOSRE.Dasm
                     "qword" => "uint64_t",
                     _ => "uint32_t"
                 };
-                return $"*({ty}*)({WrapExprForPointerMath(expr)})";
+                return $"*({ty}*)__ptr((uint32_t)({WrapExprForPointerMath(expr)}))";
             }
 
             // Bare [expr] => assume dword in 32-bit mode unless sizeOverride set.
@@ -2997,7 +3156,7 @@ namespace DOSRE.Dasm
                 if (sizeOverride == 1) type = "uint8_t";
                 else if (sizeOverride == 2) type = "uint16_t";
 
-                return $"*({type}*)({WrapExprForPointerMath(expr)})";
+                return $"*({type}*)__ptr((uint32_t)({WrapExprForPointerMath(expr)}))";
             }
 
             // Handle hex literals that might be strings or globals
@@ -3009,7 +3168,7 @@ namespace DOSRE.Dasm
                 // If this hex literal maps to a known global address, emit it as a numeric linear address.
                 // We intentionally don't emit thousands of g_XXXXXXXX declarations (to keep Watcom from OOMing),
                 // so returning a bare g_XXXXXXXX here would trigger E1011 (symbol not declared).
-                if (_addrToGlobal.TryGetValue(hex, out _)) return $"(uintptr_t)0x{hex}u";
+                if (_addrToGlobal.TryGetValue(hex, out _)) return $"0x{hex}u";
             }
 
             if ((t.StartsWith("ptr_", StringComparison.OrdinalIgnoreCase) || t.StartsWith("s_", StringComparison.OrdinalIgnoreCase)))
@@ -3025,10 +3184,11 @@ namespace DOSRE.Dasm
             // If a symbolized global/ptr token appears as a bare value (not dereferenced),
             // treat it as an address. This avoids invalid C like `ebp = g_XXXXXXXX;` where
             // g_XXXXXXXX is declared as a byte array placeholder.
-            if (!t.StartsWith("(uintptr_t)", StringComparison.OrdinalIgnoreCase)
-                && Regex.IsMatch(t, @"^(g_|ptr_|s_)[0-9A-Fa-f]{8}$", RegexOptions.IgnoreCase))
+            var symAddr = Regex.Match(t, @"^(?:g_|ptr_|s_)(?<addr>[0-9A-Fa-f]{8})$", RegexOptions.IgnoreCase);
+            if (symAddr.Success)
             {
-                return $"(uintptr_t){t}";
+                var addr = symAddr.Groups["addr"].Value.ToUpperInvariant();
+                return $"0x{addr}u";
             }
 
             return t;
@@ -3054,19 +3214,16 @@ namespace DOSRE.Dasm
             // Change dot to plus for macros like ptr.field
             expr = expr.Replace(".", " + ");
 
-            // Protect globals and pointers by casting them to uintptr_t if they are used in arithmetic or as bare values.
-            // We use a negative lookbehind for '&' and a negative lookahead for '[' to avoid casting when taking address or indexing.
-            expr = Regex.Replace(expr, @"(?<!&\s*)\b(?<sym>(g_|ptr_|s_)[0-9A-Fa-f]{8})\b(?!\s*\[)", "((uintptr_t)$0)");
+            // Convert symbolized address tokens (g_/ptr_/s_) to numeric guest linear addresses.
+            // Avoid conversion when taking address-of or indexing an array placeholder.
+            expr = Regex.Replace(expr, @"(?<!&\s*)\b(?:g_|ptr_|s_)(?<addr>[0-9A-Fa-f]{8})\b(?!\s*\[)",
+                m => $"0x{m.Groups["addr"].Value.ToUpperInvariant()}u", RegexOptions.IgnoreCase);
 
-            // Convert any remaining g_XXXXXXXX tokens to numeric address literals.
-            expr = Regex.Replace(expr, @"\bg_(?<addr>[0-9A-Fa-f]{8})\b", m => $"0x{m.Groups["addr"].Value.ToUpperInvariant()}u", RegexOptions.IgnoreCase);
-
-            // Heuristic: if it's a register + offset, cast the register to uint8_t* 
-            // to ensure byte-based pointer arithmetic in the pseudo-C.
+            // Keep it numeric: all guest memory accesses go through __ptr(addr).
             var regMatch = Regex.Match(expr, @"^(?<reg>eax|ebx|ecx|edx|esi|edi|ebp|esp)(?<rest>[\+\-].+)$", RegexOptions.IgnoreCase);
             if (regMatch.Success)
             {
-                return $"(uint8_t*)(uintptr_t){regMatch.Groups["reg"].Value} {regMatch.Groups["rest"].Value}";
+                return $"({regMatch.Groups["reg"].Value} {regMatch.Groups["rest"].Value})";
             }
 
             return expr;
@@ -3077,10 +3234,32 @@ namespace DOSRE.Dasm
             if (string.IsNullOrWhiteSpace(expr))
                 return expr;
 
+            var trimmed = expr.Trim();
+
             // *(uint32_t*)(something)  =>  (something)
-            var m = Regex.Match(expr.Trim(), @"^\*\([^\)]*\)\((?<inner>.*)\)$");
+            var m = Regex.Match(trimmed, @"^\*\([^\)]*\)\((?<inner>.*)\)$");
             if (m.Success)
                 return m.Groups["inner"].Value.Trim();
+
+            // *(uint32_t*)__ptr((uint32_t)(addr))  =>  addr
+            var m2 = Regex.Match(trimmed, @"^\*\([^\)]*\)\s*__ptr\((?<inner>.*)\)\s*$");
+            if (m2.Success)
+            {
+                var inner = m2.Groups["inner"].Value.Trim();
+
+                // Peel common casts/paren wrappers: (uint32_t)(X) or ((uint32_t)(X))
+                for (int i = 0; i < 2; i++)
+                {
+                    var mc = Regex.Match(inner, @"^\(?\s*\(uint32_t\)\s*\((?<a>.*)\)\s*\)?$", RegexOptions.IgnoreCase);
+                    if (!mc.Success) break;
+                    inner = mc.Groups["a"].Value.Trim();
+                }
+
+                // Also peel one outer paren pair.
+                var mp = Regex.Match(inner, @"^\((?<a>.*)\)$");
+                if (mp.Success) inner = mp.Groups["a"].Value.Trim();
+                return inner;
+            }
 
             return expr;
         }
