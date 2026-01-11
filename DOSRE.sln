@@ -2,6 +2,8 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DOSRE", "DOSRE\DOSRE.csproj", "{AA98FDB5-ACB6-4828-9A7F-C78318CD0E54}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DOSRE.Tests", "DOSRE.Tests\DOSRE.Tests.csproj", "{9E7F1B2B-2F6D-4B1B-A2F4-0A9B98F9F76B}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -12,5 +14,9 @@ Global
 		{AA98FDB5-ACB6-4828-9A7F-C78318CD0E54}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{AA98FDB5-ACB6-4828-9A7F-C78318CD0E54}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{AA98FDB5-ACB6-4828-9A7F-C78318CD0E54}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9E7F1B2B-2F6D-4B1B-A2F4-0A9B98F9F76B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9E7F1B2B-2F6D-4B1B-A2F4-0A9B98F9F76B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9E7F1B2B-2F6D-4B1B-A2F4-0A9B98F9F76B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9E7F1B2B-2F6D-4B1B-A2F4-0A9B98F9F76B}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal
