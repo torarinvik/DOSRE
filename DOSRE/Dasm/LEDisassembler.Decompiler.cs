@@ -380,6 +380,7 @@ namespace DOSRE.Dasm
             // Pass 2: parse functions and instructions
             ParsedFunction currentFunc = null;
             ParsedBlock currentBlock = null;
+            var skipUntilNextFunction = false;
 
             for (var i = 0; i < lines.Length; i++)
             {
@@ -399,8 +400,12 @@ namespace DOSRE.Dasm
                     };
                     functions.Add(currentFunc);
                     currentBlock = null;
+                    skipUntilNextFunction = false;
                     continue;
                 }
+
+                if (skipUntilNextFunction)
+                    continue;
 
                 if (currentFunc != null)
                 {
@@ -435,6 +440,16 @@ namespace DOSRE.Dasm
                         }
 
                         currentBlock.Lines.Add(ins);
+
+                        // If this is a known no-return DOS exit interrupt, stop consuming further lines
+                        // in this function. Tiny LE programs often place data (e.g., strings) immediately
+                        // after the exit and would otherwise be decoded as garbage instructions.
+                        if (IsNoReturnDosExitInterrupt(ins, currentBlock))
+                        {
+                            skipUntilNextFunction = true;
+                            currentFunc = null;
+                            currentBlock = null;
+                        }
                         continue;
                     }
 
@@ -1824,7 +1839,33 @@ namespace DOSRE.Dasm
             }
 
             // Slice exactly to the function for speed.
-            return (true, lines.Skip(start).Take(end - start).ToArray(), string.Empty);
+            // Then, apply a conservative truncation at known no-return DOS exits so we don't
+            // misinterpret embedded data (often strings) as code after program termination.
+            var slice = lines.Skip(start).Take(end - start).ToList();
+            for (var i = 0; i < slice.Count; i++)
+            {
+                var t = slice[i];
+                if (t == null) continue;
+
+                // Prefer matching on the embedded raw bytes so this works regardless of the rendered
+                // statement form (e.g., `int 0x21` vs `DOS_INT(0x21)`), as long as insights are present.
+                if (t.Contains("RAW: CD21", StringComparison.OrdinalIgnoreCase) &&
+                    t.Contains("Exit", StringComparison.OrdinalIgnoreCase))
+                {
+                    slice = slice.Take(i + 1).ToList();
+                    break;
+                }
+
+                // INT 20h terminates the program too (old DOS style).
+                if (t.Contains("RAW: CD20", StringComparison.OrdinalIgnoreCase) &&
+                    t.Contains("Terminate", StringComparison.OrdinalIgnoreCase))
+                {
+                    slice = slice.Take(i + 1).ToList();
+                    break;
+                }
+            }
+
+            return (true, slice.ToArray(), string.Empty);
         }
 
         private static HashSet<string> CollectRegistersUsed(ParsedFunction fn)
@@ -2662,6 +2703,51 @@ namespace DOSRE.Dasm
             }
 
             return result;
+        }
+
+        private static bool IsNoReturnDosExitInterrupt(ParsedInsOrComment ins, ParsedBlock currentBlock)
+        {
+            if (ins == null || ins.Kind != ParsedLineKind.Instruction)
+                return false;
+            if (!"int".Equals(ins.Mnemonic, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            // Prefer the insights comment if present (more robust than parsing operands).
+            if (!string.IsNullOrWhiteSpace(ins.Comment) &&
+                ins.Comment.Contains("DOS API", StringComparison.OrdinalIgnoreCase) &&
+                ins.Comment.Contains("Exit", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            // Fallback: INT 21h with a preceding "mov ah, 0x4c" or "mov ax, 0x4c00".
+            // Works when comments are missing.
+            var ops = ins.Operands ?? string.Empty;
+            if (!(ops.Contains("21", StringComparison.OrdinalIgnoreCase)))
+                return false;
+
+            if (currentBlock?.Lines == null || currentBlock.Lines.Count < 2)
+                return false;
+
+            // Look at the previous instruction in the same block.
+            for (var i = currentBlock.Lines.Count - 2; i >= 0 && i >= currentBlock.Lines.Count - 4; i--)
+            {
+                var prev = currentBlock.Lines[i];
+                if (prev?.Kind != ParsedLineKind.Instruction)
+                    continue;
+                if (!"mov".Equals(prev.Mnemonic, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var prevOps = prev.Operands ?? string.Empty;
+                // Examples: "ah, 0x4c" or "ax, 0x4c00"
+                if (Regex.IsMatch(prevOps, @"^ah\s*,\s*(0x)?4c(h)?\b", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(prevOps, @"^ax\s*,\s*(0x)?4c00(h)?\b", RegexOptions.IgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static string TranslateInstructionToPseudoC(
