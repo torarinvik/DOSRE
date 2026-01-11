@@ -112,5 +112,75 @@ namespace DOSRE.Tests
             // Call edges: A has 2, B has 1, D has 1 (self), others 0 => 4
             Assert.Equal(4, report.callEdgeCount);
         }
+
+        [Fact]
+        public void CallGraphExport_SccsAreIncludedAndSortedDeterministically()
+        {
+            // Two SCCs:
+            //   SCC1 size=3: A<->B<->C<->A
+            //   SCC2 size=2: D<->E
+            // plus one leaf F
+            var a = 0x1000u;
+            var b = 0x2000u;
+            var c = 0x3000u;
+            var d = 0x4000u;
+            var e = 0x5000u;
+            var f = 0x6000u;
+
+            var analysis = new LEDisassembler.LeAnalysis { InputFile = "scc.exe", EntryLinear = a };
+            analysis.Functions[a] = new LEDisassembler.LeFunctionInfo { Start = a, Calls = new List<uint> { b } };
+            analysis.Functions[b] = new LEDisassembler.LeFunctionInfo { Start = b, Calls = new List<uint> { c } };
+            analysis.Functions[c] = new LEDisassembler.LeFunctionInfo { Start = c, Calls = new List<uint> { a } };
+            analysis.Functions[d] = new LEDisassembler.LeFunctionInfo { Start = d, Calls = new List<uint> { e } };
+            analysis.Functions[e] = new LEDisassembler.LeFunctionInfo { Start = e, Calls = new List<uint> { d } };
+            analysis.Functions[f] = new LEDisassembler.LeFunctionInfo { Start = f, Calls = new List<uint>() };
+
+            var export = LeExports.BuildCallGraphExport(analysis);
+            Assert.NotNull(export.stronglyConnectedComponents);
+
+            // Sorted by size desc then lowest address asc.
+            Assert.True(export.stronglyConnectedComponents!.Length >= 2);
+            Assert.Equal(new[] { "0x00001000", "0x00002000", "0x00003000" }, export.stronglyConnectedComponents[0]);
+            Assert.Equal(new[] { "0x00004000", "0x00005000" }, export.stronglyConnectedComponents[1]);
+        }
+
+        [Fact]
+        public void CallGraphExport_DisconnectedSubgraphsAndTiesAreDeterministic()
+        {
+            // Disconnected components:
+            //   Component1: A -> C
+            //   Component2: B -> C
+            //   Component3: D orphan
+            // Roots should be A,B,D (C has in-degree 2).
+            // Fan-out ties: A and B both out-degree 1; should order by address.
+            // Fan-in: C has in-degree 2.
+            var a = 0x1000u;
+            var b = 0x1100u;
+            var c = 0x2000u;
+            var d = 0x3000u;
+
+            var analysis = new LEDisassembler.LeAnalysis { InputFile = "disc.exe", EntryLinear = a };
+            analysis.Functions[a] = new LEDisassembler.LeFunctionInfo { Start = a, Calls = new List<uint> { c } };
+            analysis.Functions[b] = new LEDisassembler.LeFunctionInfo { Start = b, Calls = new List<uint> { c } };
+            analysis.Functions[c] = new LEDisassembler.LeFunctionInfo { Start = c, Calls = new List<uint>() };
+            analysis.Functions[d] = new LEDisassembler.LeFunctionInfo { Start = d, Calls = new List<uint>() };
+
+            var export = LeExports.BuildCallGraphExport(analysis);
+
+            Assert.NotNull(export.roots);
+            Assert.Equal(new[] { "0x00001000", "0x00001100", "0x00003000" }, export.roots);
+
+            Assert.NotNull(export.orphans);
+            Assert.Equal(new[] { "0x00003000" }, export.orphans);
+
+            Assert.NotNull(export.topFanIn);
+            Assert.Equal("0x00002000", export.topFanIn![0].addr);
+            Assert.Equal(2, export.topFanIn[0].count);
+
+            Assert.NotNull(export.topFanOut);
+            // A and B both have out-degree 1; deterministic tie-break by address.
+            Assert.Equal("0x00001000", export.topFanOut![0].addr);
+            Assert.Equal("0x00001100", export.topFanOut[1].addr);
+        }
     }
 }
