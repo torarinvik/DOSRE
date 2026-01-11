@@ -377,3 +377,4 @@ Artifacts/test-exports/blst.dSYM/Contents/Resources/Relocations/aarch64/blst.yml
 Artifacts/test-exports/blst.dSYM/Contents/Resources/DWARF/blst
 Artifacts/test-exports/blst.dSYM/Contents/Info.plist
 Artifacts/test-exports/blst
+Artifacts/test-exports/HELLO.fixups.clusters.type-flags.json
