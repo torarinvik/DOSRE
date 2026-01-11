@@ -1178,26 +1178,56 @@ namespace DOSRE.UI.impl
 
                     if (!string.IsNullOrWhiteSpace(_leReachJson))
                     {
+                        if (_bLeDecompile && !string.IsNullOrWhiteSpace(_leDecompileAsmFile))
+                        {
+                            // Already warned earlier: no LE decode pass / no input file to analyze.
+                        }
+                        else
+                        {
+                        var opts = new JsonSerializerOptions
+                        {
+                            WriteIndented = true,
+                            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+                        };
+
                         if (string.IsNullOrWhiteSpace(_sInputFile) || !File.Exists(_sInputFile))
                         {
-                            _logger.Warn("Warning: -LEREACHJSON requested but no valid input file was provided");
+                            var payload = new LeExports.LeReachabilityExport
+                            {
+                                input = _sInputFile,
+                                error = "No valid input file was provided",
+                                objectCount = 0,
+                                totalInstructionCount = 0,
+                                totalReachableInstructionCount = 0,
+                                totalReachableByteCount = 0,
+                                objects = Array.Empty<LeExports.LeReachabilityObject>()
+                            };
+
+                            File.WriteAllText(_leReachJson, JsonSerializer.Serialize(payload, opts));
+                            _logger.Warn($"Warning: -LEREACHJSON requested but no valid input file was provided (wrote error JSON to {_leReachJson})");
                         }
                         else if (LEDisassembler.TryBuildReachabilityMap(_sInputFile, _bLeScanMz, out var reach, out var reachErr))
                         {
                             var payload = LeExports.BuildReachabilityExport(reach);
-
-                            var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions
-                            {
-                                WriteIndented = true,
-                                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-                            });
-
-                            File.WriteAllText(_leReachJson, json);
+                            File.WriteAllText(_leReachJson, JsonSerializer.Serialize(payload, opts));
                             _logger.Info($"Wrote LE reachability JSON to {_leReachJson} (objects {payload.objectCount} reachableIns {payload.totalReachableInstructionCount})");
                         }
                         else
                         {
-                            _logger.Warn($"Warning: -LEREACHJSON failed: {reachErr}");
+                            var payload = new LeExports.LeReachabilityExport
+                            {
+                                input = _sInputFile,
+                                error = reachErr,
+                                objectCount = 0,
+                                totalInstructionCount = 0,
+                                totalReachableInstructionCount = 0,
+                                totalReachableByteCount = 0,
+                                objects = Array.Empty<LeExports.LeReachabilityObject>()
+                            };
+
+                            File.WriteAllText(_leReachJson, JsonSerializer.Serialize(payload, opts));
+                            _logger.Warn($"Warning: -LEREACHJSON failed: {reachErr} (wrote error JSON to {_leReachJson})");
+                        }
                         }
                     }
 
@@ -1295,7 +1325,34 @@ namespace DOSRE.UI.impl
                     _logger.Info($"{DateTime.Now} Done!");
                     return;
                 }
-                else if (!string.IsNullOrEmpty(leError) && leError != "LE header not found")
+
+                // If LE mode failed but the user requested LE reachability export, still write a structured error payload.
+                // This is common for non-LE inputs where we fall back to the MZ disassembler.
+                if (!leOk && wantLeReachJson && !(_bLeDecompile && !string.IsNullOrWhiteSpace(_leDecompileAsmFile)))
+                {
+                    var opts = new JsonSerializerOptions
+                    {
+                        WriteIndented = true,
+                        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+                    };
+
+                    var err = !string.IsNullOrWhiteSpace(leError) ? leError : "LE disassembly failed";
+                    var payload = new LeExports.LeReachabilityExport
+                    {
+                        input = _sInputFile,
+                        error = err,
+                        objectCount = 0,
+                        totalInstructionCount = 0,
+                        totalReachableInstructionCount = 0,
+                        totalReachableByteCount = 0,
+                        objects = Array.Empty<LeExports.LeReachabilityObject>()
+                    };
+
+                    File.WriteAllText(_leReachJson, JsonSerializer.Serialize(payload, opts));
+                    _logger.Warn($"Warning: -LEREACHJSON failed: {err} (wrote error JSON to {_leReachJson})");
+                }
+
+                if (!string.IsNullOrEmpty(leError) && leError != "LE header not found")
                 {
                     throw new Exception(leError);
                 }

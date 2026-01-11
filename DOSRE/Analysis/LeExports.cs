@@ -184,6 +184,8 @@ namespace DOSRE.Analysis
             public string entry { get; set; }
             public string entryName { get; set; }
 
+            public string error { get; set; }
+
             public int objectCount { get; set; }
             public int totalInstructionCount { get; set; }
             public int totalReachableInstructionCount { get; set; }
