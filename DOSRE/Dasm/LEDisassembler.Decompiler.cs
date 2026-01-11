@@ -2748,6 +2748,12 @@ namespace DOSRE.Dasm
                     var dst = NormalizeAsmOperandToC(p3.Value.o1, isMemoryWrite: true, fn);
                     var src = NormalizeAsmOperandToC(p3.Value.o2, isMemoryWrite: false, fn);
                     var imm = NormalizeAsmOperandToC(p3.Value.o3, isMemoryWrite: false, fn);
+
+                    pending.LastWasArith = true;
+                    pending.LastArithOp = "imul";
+                    pending.LastArithA = WrapExprForPointerMath(state.Resolve(src));
+                    pending.LastArithB = WrapExprForPointerMath(state.Resolve(imm));
+
                     return $"{dst} = {src} * {imm};{commentSuffix}";
                 }
 
@@ -2756,12 +2762,24 @@ namespace DOSRE.Dasm
                 {
                     var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true, fn);
                     var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn);
+
+                    pending.LastWasArith = true;
+                    pending.LastArithOp = "imul";
+                    pending.LastArithA = WrapExprForPointerMath(state.Resolve(lhs));
+                    pending.LastArithB = WrapExprForPointerMath(state.Resolve(rhs));
+
                     return $"{lhs} *= {rhs};{commentSuffix}";
                 }
                 else if (!string.IsNullOrWhiteSpace(ops))
                 {
                     // Single operand imul: edx:eax = eax * ops
                     var src = NormalizeAsmOperandToC(ops, isMemoryWrite: false, fn);
+
+                    pending.LastWasArith = true;
+                    pending.LastArithOp = "imul";
+                    pending.LastArithA = WrapExprForPointerMath(state.Resolve("eax"));
+                    pending.LastArithB = WrapExprForPointerMath(state.Resolve(src));
+
                     return $"{{ int64_t res = (int64_t)eax * (int64_t){src}; eax = (uint32_t)res; edx = (uint32_t)(res >> 32); }}{commentSuffix}";
                 }
             }
@@ -3685,6 +3703,10 @@ namespace DOSRE.Dasm
                 else if (arithOp is "sub" or "dec")
                 {
                     expr = $"(((int64_t)(int32_t)({arithA}) - (int64_t)(int32_t)({arithB})) > 0x7fffffffLL) || (((int64_t)(int32_t)({arithA}) - (int64_t)(int32_t)({arithB})) < (-0x80000000LL))";
+                }
+                else if (arithOp is "imul")
+                {
+                    expr = $"(((int64_t)(int32_t)({arithA}) * (int64_t)(int32_t)({arithB})) > 0x7fffffffLL) || (((int64_t)(int32_t)({arithA}) * (int64_t)(int32_t)({arithB})) < (-0x80000000LL))";
                 }
 
                 if (!string.IsNullOrWhiteSpace(expr))
