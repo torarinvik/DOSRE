@@ -4,6 +4,8 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using DOSRE.Analysis;
 using DOSRE.Dasm;
 using DOSRE.Enums;
@@ -40,6 +42,18 @@ namespace DOSRE.UI.impl
     ///     Optional: only emit a single function (func_XXXXXXXX or hex address)
     /// </summary>
     private string _leOnlyFunction;
+
+    /// <summary>
+    ///     Optional: export LE call graph in DOT format.
+    ///     Specified with -LECALLGRAPHDOT <file.dot>
+    /// </summary>
+    private string _leCallGraphDot;
+
+    /// <summary>
+    ///     Optional: export LE call graph in JSON format.
+    ///     Specified with -LECALLGRAPHJSON <file.json>
+    /// </summary>
+    private string _leCallGraphJson;
         ///     Logger Implementation
         /// </summary>
         protected static readonly Logger _logger = LogManager.GetCurrentClassLogger(typeof(CustomLogger));
@@ -369,6 +383,18 @@ namespace DOSRE.UI.impl
                                 i++;
                             }
                             break;
+                        case "LECALLGRAPHDOT":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LECALLGRAPHDOT requires a <file.dot>");
+                            _leCallGraphDot = _args[i + 1];
+                            i++;
+                            break;
+                        case "LECALLGRAPHJSON":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LECALLGRAPHJSON requires a <file.json>");
+                            _leCallGraphJson = _args[i + 1];
+                            i++;
+                            break;
                         case "MZFULL":
                             _bMzFull = true;
                             break;
@@ -483,6 +509,10 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LEFIXDUMP [maxPages] -- (LE inputs) Dump raw fixup pages + decoding hints (writes <out>.fixups.txt if -O is used)");
                             Console.WriteLine(
+                                "-LECALLGRAPHDOT <file.dot> -- (LE inputs) Export a best-effort function call graph in Graphviz DOT format (implies -LEINSIGHTS)");
+                            Console.WriteLine(
+                                "-LECALLGRAPHJSON <file.json> -- (LE inputs) Export a best-effort function call graph in JSON format (implies -LEINSIGHTS)");
+                            Console.WriteLine(
                                 "-MZFULL -- (MZ inputs) Disassemble from entrypoint to end of load module");
                             Console.WriteLine(
                                 "-MZBYTES <n> -- (MZ inputs) Limit disassembly to n bytes from entrypoint");
@@ -546,6 +576,9 @@ namespace DOSRE.UI.impl
                 string leOutput;
                 string leError;
 
+                var wantLeCallGraph = !string.IsNullOrWhiteSpace(_leCallGraphDot) || !string.IsNullOrWhiteSpace(_leCallGraphJson);
+                var leInsightsForRun = _bLeInsights || wantLeCallGraph;
+
                 static string ChooseLeOutput(Dictionary<string, string> files)
                 {
                     if (files == null || files.Count == 0)
@@ -561,6 +594,8 @@ namespace DOSRE.UI.impl
 
                 if (_bLeDecompile && !string.IsNullOrWhiteSpace(_leDecompileAsmFile))
                 {
+                    if (wantLeCallGraph)
+                        _logger.Warn("Warning: -LECALLGRAPH* is not supported with -LEDECOMPASM (no LE decode pass). Run without -LEDECOMPASM to export call graphs.");
                     leOk = LEDisassembler.TryDecompileToMultipartFromAsmFile(_leDecompileAsmFile, _leOnlyFunction, _leChunks, out leDecompFiles, out leError);
                     leOutput = leOk ? ChooseLeOutput(leDecompFiles) : string.Empty;
                 }
@@ -654,12 +689,83 @@ namespace DOSRE.UI.impl
                     }
                     else
                     {
-                        leOk = LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _leRenderLimit, _leJobs, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, _leStartLinear, out leOutput, out leError);
+                        leOk = LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _leRenderLimit, _leJobs, _bLeFixups, _bLeGlobals, leInsightsForRun, _toolchainHint, _leStartLinear, out leOutput, out leError);
                     }
                 }
 
                 if (leOk)
                 {
+                    if (wantLeCallGraph)
+                    {
+                        var analysis = LEDisassembler.GetLastAnalysis();
+                        if (analysis == null || analysis.Functions == null || analysis.Functions.Count == 0)
+                        {
+                            _logger.Warn("Warning: -LECALLGRAPH* requested but no LE analysis was captured (try enabling -LEINSIGHTS and avoid -LERENDERLIMIT 0 on first run if needed)");
+                        }
+                        else
+                        {
+                            string FuncName(uint addr) => $"func_{addr:X8}";
+
+                            if (!string.IsNullOrWhiteSpace(_leCallGraphDot))
+                            {
+                                var dot = new StringBuilder();
+                                dot.AppendLine("digraph le_callgraph {");
+                                dot.AppendLine("  rankdir=LR;");
+                                dot.AppendLine("  node [shape=box,fontname=\"monospace\"];");
+                                dot.AppendLine($"  \"{FuncName(analysis.EntryLinear)}\" [shape=doubleoctagon,label=\"{FuncName(analysis.EntryLinear)}\\n(entry)\"]; ");
+
+                                foreach (var fn in analysis.Functions.Values.OrderBy(f => f.Start))
+                                {
+                                    dot.AppendLine($"  \"{FuncName(fn.Start)}\" [label=\"{FuncName(fn.Start)}\\nins={fn.InstructionCount} blocks={fn.BlockCount}\"]; ");
+                                }
+
+                                foreach (var fn in analysis.Functions.Values.OrderBy(f => f.Start))
+                                {
+                                    if (fn.Calls == null) continue;
+                                    foreach (var callee in fn.Calls.OrderBy(x => x))
+                                        dot.AppendLine($"  \"{FuncName(fn.Start)}\" -> \"{FuncName(callee)}\";");
+                                }
+
+                                dot.AppendLine("}");
+                                File.WriteAllText(_leCallGraphDot, dot.ToString());
+                                _logger.Info($"Wrote LE call graph DOT to {_leCallGraphDot}");
+                            }
+
+                            if (!string.IsNullOrWhiteSpace(_leCallGraphJson))
+                            {
+                                var functions = analysis.Functions.Values
+                                    .OrderBy(f => f.Start)
+                                    .Select(f => new
+                                    {
+                                        addr = $"0x{f.Start:X8}",
+                                        name = FuncName(f.Start),
+                                        ins = f.InstructionCount,
+                                        blocks = f.BlockCount,
+                                        calls = (f.Calls ?? new List<uint>()).OrderBy(x => x).Select(x => $"0x{x:X8}").ToArray(),
+                                        globals = (f.Globals ?? new List<string>()).ToArray(),
+                                        strings = (f.Strings ?? new List<string>()).ToArray(),
+                                    }).ToArray();
+
+                                var payload = new
+                                {
+                                    input = analysis.InputFile,
+                                    entry = $"0x{analysis.EntryLinear:X8}",
+                                    entryName = FuncName(analysis.EntryLinear),
+                                    functions
+                                };
+
+                                var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions
+                                {
+                                    WriteIndented = true,
+                                    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+                                });
+
+                                File.WriteAllText(_leCallGraphJson, json);
+                                _logger.Info($"Wrote LE call graph JSON to {_leCallGraphJson}");
+                            }
+                        }
+                    }
+
                     if (_bLeDecompile && _leChunks > 0 && leDecompFiles != null && leDecompFiles.Count > 0)
                     {
                         if (string.IsNullOrEmpty(_sOutputFile))

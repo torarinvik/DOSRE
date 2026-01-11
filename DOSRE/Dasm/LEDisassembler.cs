@@ -30,6 +30,38 @@ namespace DOSRE.Dasm
     {
         private static readonly Logger _logger = LogManager.GetCurrentClassLogger(typeof(CustomLogger));
 
+        public sealed class LeFunctionInfo
+        {
+            public uint Start { get; set; }
+            public int InstructionCount { get; set; }
+            public int BlockCount { get; set; }
+            public List<uint> Calls { get; set; } = new List<uint>();
+            public List<string> Globals { get; set; } = new List<string>();
+            public List<string> Strings { get; set; } = new List<string>();
+        }
+
+        public sealed class LeAnalysis
+        {
+            public string InputFile { get; set; }
+            public uint EntryLinear { get; set; }
+            public Dictionary<uint, LeFunctionInfo> Functions { get; } = new Dictionary<uint, LeFunctionInfo>();
+        }
+
+        private static readonly object _lastAnalysisLock = new object();
+        private static LeAnalysis _lastAnalysis;
+
+        public static LeAnalysis GetLastAnalysis()
+        {
+            lock (_lastAnalysisLock)
+                return _lastAnalysis;
+        }
+
+        private static void SetLastAnalysis(LeAnalysis analysis)
+        {
+            lock (_lastAnalysisLock)
+                _lastAnalysis = analysis;
+        }
+
         // SharpDisasm's default Instruction.ToString() path uses shared translator state.
         // For parallel insights passes, use a per-thread translator instance.
         private static readonly ThreadLocal<SharpDisasm.Translators.Translator> _tlsIntelTranslator =
@@ -5478,6 +5510,9 @@ namespace DOSRE.Dasm
             output = string.Empty;
             error = string.Empty;
 
+            // Avoid returning stale analysis from a prior run.
+            SetLastAnalysis(null);
+
             var swTotal = Stopwatch.StartNew();
 
             if (!File.Exists(inputFile))
@@ -5499,6 +5534,12 @@ namespace DOSRE.Dasm
             var objects = ParseObjects(fileBytes, header);
             var pageMap = ParseObjectPageMap(fileBytes, header);
 
+            var entryLinearU = ComputeEntryLinear(header, objects);
+            var entryLinear = unchecked((uint)entryLinearU);
+            var analysis = leInsights
+                ? new LeAnalysis { InputFile = inputFile, EntryLinear = entryLinear }
+                : null;
+
             List<string> importModules = null;
             byte[] fixupRecordStream = null;
             uint[] fixupPageOffsets = null;
@@ -5519,7 +5560,7 @@ namespace DOSRE.Dasm
             var sb = new StringBuilder();
             AppendWrappedDisasmLine(sb, string.Empty, $" ; Disassembly of {Path.GetFileName(inputFile)} (LE / DOS4GW)", commentColumn: 0, maxWidth: 160);
             AppendWrappedDisasmLine(sb, string.Empty, $" ; PageSize: {header.PageSize}  LastPageSize: {header.LastPageSize}  Pages: {header.NumberOfPages}", commentColumn: 0, maxWidth: 160);
-            AppendWrappedDisasmLine(sb, string.Empty, $" ; Entry: Obj {header.EntryEipObject} + 0x{header.EntryEip:X} (Linear 0x{ComputeEntryLinear(header, objects):X})", commentColumn: 0, maxWidth: 160);
+            AppendWrappedDisasmLine(sb, string.Empty, $" ; Entry: Obj {header.EntryEipObject} + 0x{header.EntryEip:X} (Linear 0x{entryLinearU:X})", commentColumn: 0, maxWidth: 160);
             if (toolchainHint != EnumToolchainHint.None)
             {
                 AppendWrappedDisasmLine(sb, string.Empty, $" ; Toolchain hint: {toolchainHint}", commentColumn: 0, maxWidth: 160);
@@ -5989,6 +6030,27 @@ namespace DOSRE.Dasm
                     _logger.Info($"LE: Summarizing {functionStarts.Count} functions (insights)...");
                     funcSummaries = SummarizeFunctions(instructions, functionStarts, blockStarts, fixupsByInsAddr, globalSymbols, stringSymbols);
                     _logger.Info($"LE: Function summaries complete in {swSumm.ElapsedMilliseconds} ms");
+
+                    if (analysis != null && funcSummaries != null && funcSummaries.Count > 0)
+                    {
+                        foreach (var kvp in funcSummaries)
+                        {
+                            var start = kvp.Key;
+                            var fs = kvp.Value;
+                            if (fs == null)
+                                continue;
+
+                            analysis.Functions[start] = new LeFunctionInfo
+                            {
+                                Start = start,
+                                InstructionCount = fs.InstructionCount,
+                                BlockCount = fs.BlockCount,
+                                Calls = fs.Calls.OrderBy(x => x).ToList(),
+                                Globals = fs.Globals.OrderBy(x => x, StringComparer.Ordinal).ToList(),
+                                Strings = fs.Strings.OrderBy(x => x, StringComparer.Ordinal).ToList(),
+                            };
+                        }
+                    }
                 }
 
                 // Infer common pointer globals (absolute addresses frequently loaded into a register and used as a base).
@@ -7209,6 +7271,9 @@ namespace DOSRE.Dasm
 
             output = sb.ToString();
             _logger.Info($"LE: Disassembly complete in {swTotal.ElapsedMilliseconds} ms");
+
+            if (analysis != null)
+                SetLastAnalysis(analysis);
             return true;
         }
 
