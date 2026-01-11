@@ -21,7 +21,11 @@ namespace DOSRE.Tests
                     new LEDisassembler.LeFixupRecordInfo
                     {
                         targetKind = "import",
-                        siteLinear = 0x1010,
+                        // Simulate a fixup located inside an instruction whose immediate/disp bytes cross a function boundary.
+                        // The raw site lands exactly on the next function's start, but the owning instruction begins earlier.
+                        siteLinear = 0x1100,
+                        sourceLinear = 0,
+                        instructionLinear = 0x10FD,
                         importModuleIndex = 0,
                         importModule = "KERNEL",
                         importProcNameOffset = 0x20,
@@ -31,6 +35,7 @@ namespace DOSRE.Tests
                     {
                         targetKind = "import",
                         siteLinear = 0x2010,
+                        sourceLinear = 0x2010,
                         importModuleIndex = 0,
                         importModule = "KERNEL",
                         importProcNameOffset = 0x20,
@@ -41,6 +46,7 @@ namespace DOSRE.Tests
 
             var analysis = new LEDisassembler.LeAnalysis { InputFile = "test.exe", EntryLinear = 0x1000 };
             analysis.Functions[0x1000] = new LEDisassembler.LeFunctionInfo { Start = 0x1000 };
+            analysis.Functions[0x1100] = new LEDisassembler.LeFunctionInfo { Start = 0x1100 };
             analysis.Functions[0x2000] = new LEDisassembler.LeFunctionInfo { Start = 0x2000 };
 
             var payload = LeExports.BuildImportMapExport(table, analysis);
@@ -66,7 +72,7 @@ namespace DOSRE.Tests
             Assert.Equal("0x20", p.procNameOffset);
             Assert.Equal("Foo", p.name);
             Assert.Equal(2, p.xrefCount);
-            Assert.Equal(new[] { "0x00001010", "0x00002010" }, p.sites);
+            Assert.Equal(new[] { "0x00001100", "0x00002010" }, p.sites);
             Assert.Equal(new[] { "0x00001000", "0x00002000" }, p.functions);
         }
     }

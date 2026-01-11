@@ -60,6 +60,7 @@ namespace DOSRE.Tests
                     {
                         siteLinear = 0x1000,
                         sourceLinear = 0x1000,
+                        instructionLinear = 0x1000,
                         siteDelta = 2,
                         logicalPageNumber = 1,
                         physicalPageNumber = 4,
@@ -116,6 +117,7 @@ namespace DOSRE.Tests
             Assert.Equal("0x00001000", payload.fixups[0].site);
             Assert.Equal("0x01", payload.fixups[0].type);
             Assert.Equal("0x0000300C", payload.fixups[0].siteValue32);
+            Assert.Equal("0x00001000", payload.fixups[0].instructionLinear);
             Assert.Equal("internal", payload.fixups[0].targetKind);
             Assert.Equal("0x10", payload.fixups[0].targetOffset);
             Assert.Equal("0x00003010", payload.fixups[0].targetLinear);

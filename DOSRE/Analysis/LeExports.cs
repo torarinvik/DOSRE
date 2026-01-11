@@ -61,6 +61,7 @@ namespace DOSRE.Analysis
         {
             public string site { get; set; }
             public string source { get; set; }
+            public string instructionLinear { get; set; }
             public int delta { get; set; }
             public int logicalPage { get; set; }
             public int physicalPage { get; set; }
@@ -412,6 +413,7 @@ namespace DOSRE.Analysis
                 {
                     site = HexU32(f.siteLinear),
                     source = HexU32(f.sourceLinear),
+                    instructionLinear = f.instructionLinear.HasValue ? HexU32(f.instructionLinear.Value) : null,
                     delta = f.siteDelta,
                     logicalPage = (int)f.logicalPageNumber,
                     physicalPage = (int)f.physicalPageNumber,
@@ -520,7 +522,8 @@ namespace DOSRE.Analysis
                         .ToArray();
 
                     var funcs = g
-                        .Select(x => FindOwnerStart(functionStarts, x.siteLinear))
+                        .Select(x => FindOwnerStart(functionStarts,
+                            x.instructionLinear.HasValue ? x.instructionLinear.Value : (x.sourceLinear != 0 ? x.sourceLinear : x.siteLinear)))
                         .Where(x => x != 0)
                         .Distinct()
                         .OrderBy(x => x)
