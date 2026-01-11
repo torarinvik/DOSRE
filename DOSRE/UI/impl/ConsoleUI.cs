@@ -60,6 +60,12 @@ namespace DOSRE.UI.impl
     ///     Specified with -LECFGDOT <file.dot>
     /// </summary>
     private string _leCfgDot;
+
+    /// <summary>
+    ///     Optional: export whole-program LE CFG index in DOT format (clusters per function).
+    ///     Specified with -LECFGALLDOT <file.dot>
+    /// </summary>
+    private string _leCfgAllDot;
         ///     Logger Implementation
         /// </summary>
         protected static readonly Logger _logger = LogManager.GetCurrentClassLogger(typeof(CustomLogger));
@@ -407,6 +413,12 @@ namespace DOSRE.UI.impl
                             _leCfgDot = _args[i + 1];
                             i++;
                             break;
+                        case "LECFGALLDOT":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LECFGALLDOT requires a <file.dot>");
+                            _leCfgAllDot = _args[i + 1];
+                            i++;
+                            break;
                         case "MZFULL":
                             _bMzFull = true;
                             break;
@@ -527,6 +539,8 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LECFGDOT <file.dot> -- (LE inputs) Export a best-effort per-function CFG in Graphviz DOT format (implies -LEINSIGHTS; uses -LEFUNC if provided, else entry function)");
                             Console.WriteLine(
+                                "-LECFGALLDOT <file.dot> -- (LE inputs) Export a best-effort whole-program CFG index in Graphviz DOT format (clusters per function; implies -LEINSIGHTS)");
+                            Console.WriteLine(
                                 "-MZFULL -- (MZ inputs) Disassemble from entrypoint to end of load module");
                             Console.WriteLine(
                                 "-MZBYTES <n> -- (MZ inputs) Limit disassembly to n bytes from entrypoint");
@@ -592,7 +606,8 @@ namespace DOSRE.UI.impl
 
                 var wantLeCallGraph = !string.IsNullOrWhiteSpace(_leCallGraphDot) || !string.IsNullOrWhiteSpace(_leCallGraphJson);
                 var wantLeCfgDot = !string.IsNullOrWhiteSpace(_leCfgDot);
-                var leInsightsForRun = _bLeInsights || wantLeCallGraph || wantLeCfgDot;
+                var wantLeCfgAllDot = !string.IsNullOrWhiteSpace(_leCfgAllDot);
+                var leInsightsForRun = _bLeInsights || wantLeCallGraph || wantLeCfgDot || wantLeCfgAllDot;
 
                 static string ChooseLeOutput(Dictionary<string, string> files)
                 {
@@ -613,6 +628,8 @@ namespace DOSRE.UI.impl
                         _logger.Warn("Warning: -LECALLGRAPH* is not supported with -LEDECOMPASM (no LE decode pass). Run without -LEDECOMPASM to export call graphs.");
                     if (wantLeCfgDot)
                         _logger.Warn("Warning: -LECFGDOT is not supported with -LEDECOMPASM (no LE decode pass). Run without -LEDECOMPASM to export CFG.");
+                    if (wantLeCfgAllDot)
+                        _logger.Warn("Warning: -LECFGALLDOT is not supported with -LEDECOMPASM (no LE decode pass). Run without -LEDECOMPASM to export CFG.");
                     leOk = LEDisassembler.TryDecompileToMultipartFromAsmFile(_leDecompileAsmFile, _leOnlyFunction, _leChunks, out leDecompFiles, out leError);
                     leOutput = leOk ? ChooseLeOutput(leDecompFiles) : string.Empty;
                 }
@@ -872,6 +889,68 @@ namespace DOSRE.UI.impl
                                 File.WriteAllText(_leCfgDot, dot.ToString());
                                 _logger.Info($"Wrote LE CFG DOT to {_leCfgDot} (function {FuncName(targetFunc)})");
                             }
+                        }
+                    }
+
+                    if (wantLeCfgAllDot)
+                    {
+                        var analysis = LEDisassembler.GetLastAnalysis();
+                        if (analysis == null || analysis.CfgByFunction == null || analysis.CfgByFunction.Count == 0)
+                        {
+                            _logger.Warn("Warning: -LECFGALLDOT requested but no LE CFG snapshot was captured (requires -LEINSIGHTS and a run that decodes relative branches)");
+                        }
+                        else
+                        {
+                            string BbName(uint a2) => $"bb_{a2:X8}";
+                            string FuncName(uint a2) => $"func_{a2:X8}";
+
+                            var dot = new StringBuilder();
+                            dot.AppendLine("digraph le_cfg_all {");
+                            dot.AppendLine("  rankdir=TB;");
+                            dot.AppendLine("  compound=true;");
+                            dot.AppendLine("  node [shape=box,fontname=\"monospace\"]; ");
+
+                            foreach (var kv in analysis.CfgByFunction.OrderBy(k => k.Key))
+                            {
+                                var fStart = kv.Key;
+                                var cfg = kv.Value;
+                                if (cfg == null || cfg.Blocks == null || cfg.Blocks.Count == 0)
+                                    continue;
+
+                                analysis.Functions.TryGetValue(fStart, out var fInfo);
+                                var ins = fInfo?.InstructionCount ?? 0;
+                                var bbCount = cfg.Blocks.Count;
+
+                                var clusterName = $"cluster_{FuncName(fStart)}";
+                                dot.AppendLine($"  subgraph {clusterName} {{");
+                                var entryTag = (analysis.EntryLinear == fStart) ? " (entry)" : string.Empty;
+                                dot.AppendLine($"    label=\"{FuncName(fStart)}{entryTag}\\nins={ins} bb={bbCount}\";");
+                                dot.AppendLine("    color=gray;");
+
+                                foreach (var b in cfg.Blocks.Values.OrderBy(b => b.Start))
+                                {
+                                    var shape = b.Start == fStart ? "doubleoctagon" : "box";
+                                    dot.AppendLine($"    \"{BbName(b.Start)}\" [shape={shape},label=\"{BbName(b.Start)}\"]; ");
+                                }
+
+                                foreach (var b in cfg.Blocks.Values.OrderBy(b => b.Start))
+                                {
+                                    if (b.Successors == null) continue;
+                                    foreach (var succ in b.Successors.OrderBy(x => x))
+                                    {
+                                        if (!cfg.Blocks.ContainsKey(succ))
+                                            continue;
+                                        dot.AppendLine($"    \"{BbName(b.Start)}\" -> \"{BbName(succ)}\";");
+                                    }
+                                }
+
+                                dot.AppendLine("  }");
+                            }
+
+                            dot.AppendLine("}");
+
+                            File.WriteAllText(_leCfgAllDot, dot.ToString());
+                            _logger.Info($"Wrote whole-program LE CFG DOT to {_leCfgAllDot} (functions {analysis.CfgByFunction.Count})");
                         }
                     }
 
