@@ -2076,6 +2076,8 @@ namespace DOSRE.Dasm
                 "jbe" => "ja",
                 "ja" => "jbe",
                 "jae" => "jb",
+                "jc" => "jnc",
+                "jnc" => "jc",
                 _ => null
             };
 
@@ -2492,6 +2494,13 @@ namespace DOSRE.Dasm
             public string LastArithA;
             public string LastArithB;
 
+            // Tracks the last arithmetic op that can set carry/borrow (for jc/jnc recovery).
+            public bool LastWasCarry;
+            public string LastCarryOp; // add|sub|adc|sbb
+            public string LastCarryA;
+            public string LastCarryB;
+            public string LastCarryIn; // "0" or "carry" (best-effort)
+
             public string LastEaxAssignment;
 
             public void Clear(bool targetIsEax = false)
@@ -2508,6 +2517,11 @@ namespace DOSRE.Dasm
                 LastArithOp = null;
                 LastArithA = null;
                 LastArithB = null;
+                LastWasCarry = false;
+                LastCarryOp = null;
+                LastCarryA = null;
+                LastCarryB = null;
+                LastCarryIn = null;
                 if (targetIsEax) LastEaxAssignment = null;
             }
 
@@ -2935,6 +2949,16 @@ namespace DOSRE.Dasm
                     pending.LastArithOp = mn;
                     pending.LastArithA = WrapExprForPointerMath(state.Resolve(lhs));
                     pending.LastArithB = resolvedRhs;
+                }
+
+                // For carry/borrow-based conditionals (jc/jnc), capture the arithmetic inputs.
+                if (mn is "add" or "sub" or "adc" or "sbb")
+                {
+                    pending.LastWasCarry = true;
+                    pending.LastCarryOp = mn;
+                    pending.LastCarryA = WrapExprForPointerMath(state.Resolve(lhs));
+                    pending.LastCarryB = resolvedRhs;
+                    pending.LastCarryIn = (mn is "adc" or "sbb") ? "carry" : "0";
                 }
                 
                 if (mn == "xor" && lhs.Equals(rhs, StringComparison.OrdinalIgnoreCase))
@@ -3607,7 +3631,7 @@ namespace DOSRE.Dasm
 
         private static bool IsJcc(string mn)
         {
-            return mn is "jz" or "jnz" or "je" or "jne" or "jg" or "jge" or "jl" or "jle" or "ja" or "jae" or "jb" or "jbe" or "jo" or "jno" or "js" or "jns";
+            return mn is "jz" or "jnz" or "je" or "jne" or "jg" or "jge" or "jl" or "jle" or "ja" or "jae" or "jb" or "jbe" or "jc" or "jnc" or "jo" or "jno" or "js" or "jns";
         }
 
         internal static string MakeConditionFromPendingForTest(
@@ -3623,7 +3647,12 @@ namespace DOSRE.Dasm
             bool lastWasArith,
             string arithOp,
             string arithA,
-            string arithB)
+            string arithB,
+            bool lastWasCarry = false,
+            string carryOp = null,
+            string carryA = null,
+            string carryB = null,
+            string carryIn = null)
         {
             if (string.IsNullOrWhiteSpace(jcc))
                 return string.Empty;
@@ -3713,6 +3742,26 @@ namespace DOSRE.Dasm
                     return jcc == "jo" ? expr : $"!({expr})";
             }
 
+            // Carry/borrow (CF) recovery for jc/jnc after add/sub/adc/sbb.
+            // Use uint64-based check to avoid relying on wraparound behavior.
+            if (lastWasCarry && (jcc is "jc" or "jnc") && !string.IsNullOrWhiteSpace(carryA) && !string.IsNullOrWhiteSpace(carryB))
+            {
+                var cin = string.IsNullOrWhiteSpace(carryIn) ? "0" : carryIn;
+                string expr = string.Empty;
+
+                if (carryOp is "add" or "adc")
+                {
+                    expr = $"((uint64_t)(uint32_t)({carryA}) + (uint64_t)(uint32_t)({carryB}) + (uint64_t)(uint32_t)({cin})) > 0xFFFFFFFFULL";
+                }
+                else if (carryOp is "sub" or "sbb")
+                {
+                    expr = $"(uint64_t)(uint32_t)({carryA}) < ((uint64_t)(uint32_t)({carryB}) + (uint64_t)(uint32_t)({cin}))";
+                }
+
+                if (!string.IsNullOrWhiteSpace(expr))
+                    return jcc == "jc" ? expr : $"!({expr})";
+            }
+
             return string.Empty;
         }
 
@@ -3734,7 +3783,12 @@ namespace DOSRE.Dasm
                 pending.LastWasArith,
                 pending.LastArithOp,
                 pending.LastArithA,
-                pending.LastArithB);
+                pending.LastArithB,
+                pending.LastWasCarry,
+                pending.LastCarryOp,
+                pending.LastCarryA,
+                pending.LastCarryB,
+                pending.LastCarryIn);
         }
 
         private static (string o1, string o2, string o3)? SplitThreeOperands(string ops)
@@ -4055,6 +4109,8 @@ namespace DOSRE.Dasm
                 case "jge": return "jl";
                 case "jl": return "jge";
                 case "jle": return "jg";
+                case "jc": return "jnc";
+                case "jnc": return "jc";
                 default: return "!" + jccMn;
             }
         }
