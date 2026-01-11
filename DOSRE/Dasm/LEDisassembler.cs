@@ -61,6 +61,188 @@ namespace DOSRE.Dasm
             public Dictionary<uint, LeFunctionCfg> CfgByFunction { get; } = new Dictionary<uint, LeFunctionCfg>();
         }
 
+        public sealed class LeObjectInfo
+        {
+            public int index { get; set; }
+            public uint virtualSize { get; set; }
+            public uint baseAddress { get; set; }
+            public uint flags { get; set; }
+            public uint pageMapIndex { get; set; }
+            public uint pageCount { get; set; }
+        }
+
+        public sealed class LeFixupRecordInfo
+        {
+            public uint siteLinear { get; set; }
+            public uint sourceLinear { get; set; }
+            public sbyte siteDelta { get; set; }
+            public ushort sourceOffsetInPage { get; set; }
+            public uint logicalPageNumber { get; set; }
+            public uint physicalPageNumber { get; set; }
+
+            public byte type { get; set; }
+            public byte flags { get; set; }
+            public int recordStreamOffset { get; set; }
+            public int stride { get; set; }
+
+            public uint? siteValue32 { get; set; }
+            public ushort? siteValue16 { get; set; }
+
+            public string targetKind { get; set; } // "internal", "import", "unknown"
+            public int? targetObject { get; set; }
+            public uint? targetOffset { get; set; }
+            public uint? targetLinear { get; set; }
+            public int? addend32 { get; set; }
+
+            public ushort? importModuleIndex { get; set; }
+            public string importModule { get; set; }
+            public uint? importProcNameOffset { get; set; }
+            public string importProc { get; set; }
+        }
+
+        public sealed class LeFixupChainInfo
+        {
+            public string targetKind { get; set; }
+            public int? targetObject { get; set; }
+            public uint? targetOffset { get; set; }
+            public uint? targetLinear { get; set; }
+            public ushort? importModuleIndex { get; set; }
+            public uint? importProcNameOffset { get; set; }
+            public int count { get; set; }
+        }
+
+        public sealed class LeFixupTableInfo
+        {
+            public string inputFile { get; set; }
+            public uint entryLinear { get; set; }
+            public uint pageSize { get; set; }
+            public uint numberOfPages { get; set; }
+
+            public LeObjectInfo[] objects { get; set; }
+            public string[] importModules { get; set; }
+            public LeFixupRecordInfo[] fixups { get; set; }
+            public LeFixupChainInfo[] chains { get; set; }
+        }
+
+        public static bool TryBuildFixupTable(string inputFile, bool leScanMzOverlayFallback, out LeFixupTableInfo table, out string error)
+        {
+            table = null;
+            error = string.Empty;
+
+            if (string.IsNullOrWhiteSpace(inputFile) || !File.Exists(inputFile))
+            {
+                error = "Input file not found";
+                return false;
+            }
+
+            try
+            {
+                var fileBytes = File.ReadAllBytes(inputFile);
+                if (!TryFindLEHeaderOffset(fileBytes, allowMzOverlayScanFallback: leScanMzOverlayFallback, out var leHeaderOffset))
+                {
+                    error = "LE header not found";
+                    return false;
+                }
+
+                if (!TryParseHeader(fileBytes, leHeaderOffset, out var header, out error))
+                    return false;
+
+                var objects = ParseObjects(fileBytes, header);
+                var pageMap = ParseObjectPageMap(fileBytes, header);
+                var entryLinearU = ComputeEntryLinear(header, objects);
+                var entryLinear = unchecked((uint)entryLinearU);
+
+                var importModules = TryParseImportModules(fileBytes, header) ?? new List<string>();
+                TryGetFixupStreams(fileBytes, header, out var fixupPageOffsets, out var fixupRecordStream);
+
+                // Still return a payload even if there are no fixups; it makes automation easier.
+                if (fixupPageOffsets == null || fixupRecordStream == null)
+                {
+                    table = new LeFixupTableInfo
+                    {
+                        inputFile = inputFile,
+                        entryLinear = entryLinear,
+                        pageSize = header.PageSize,
+                        numberOfPages = header.NumberOfPages,
+                        objects = objects.Select(o => new LeObjectInfo
+                        {
+                            index = o.Index,
+                            virtualSize = o.VirtualSize,
+                            baseAddress = o.BaseAddress,
+                            flags = o.Flags,
+                            pageMapIndex = o.PageMapIndex,
+                            pageCount = o.PageCount
+                        }).ToArray(),
+                        importModules = importModules.Count > 0 ? importModules.ToArray() : null,
+                        fixups = Array.Empty<LeFixupRecordInfo>(),
+                        chains = Array.Empty<LeFixupChainInfo>()
+                    };
+                    return true;
+                }
+
+                var dataPagesBase = header.HeaderOffset + (int)header.DataPagesOffset;
+                if (dataPagesBase <= 0 || dataPagesBase >= fileBytes.Length)
+                {
+                    error = "Invalid LE data pages offset";
+                    return false;
+                }
+
+                // Reconstruct object bytes (needed to read addends/site values deterministically).
+                var objBytesByIndex = new Dictionary<int, byte[]>();
+                foreach (var o in objects)
+                {
+                    if (o.VirtualSize == 0 || o.PageCount == 0)
+                        continue;
+                    var bytes = ReconstructObjectBytes(fileBytes, header, pageMap, dataPagesBase, o);
+                    if (bytes != null && bytes.Length > 0)
+                        objBytesByIndex[o.Index] = bytes;
+                }
+
+                var allFixups = new List<LeFixupRecordInfo>();
+                foreach (var obj in objects)
+                {
+                    if (!objBytesByIndex.TryGetValue(obj.Index, out var objBytes) || objBytes == null || objBytes.Length == 0)
+                        continue;
+                    allFixups.AddRange(ParseFixupTableForObject(header, objects, pageMap, importModules, fileBytes, fixupPageOffsets, fixupRecordStream, objBytes, obj));
+                }
+
+                // Deterministic ordering.
+                allFixups = allFixups
+                    .OrderBy(f => f.siteLinear)
+                    .ThenBy(f => f.recordStreamOffset)
+                    .ToList();
+
+                var chains = BuildFixupChains(allFixups, importModules);
+
+                table = new LeFixupTableInfo
+                {
+                    inputFile = inputFile,
+                    entryLinear = entryLinear,
+                    pageSize = header.PageSize,
+                    numberOfPages = header.NumberOfPages,
+                    objects = objects.Select(o => new LeObjectInfo
+                    {
+                        index = o.Index,
+                        virtualSize = o.VirtualSize,
+                        baseAddress = o.BaseAddress,
+                        flags = o.Flags,
+                        pageMapIndex = o.PageMapIndex,
+                        pageCount = o.PageCount
+                    }).ToArray(),
+                    importModules = importModules.Count > 0 ? importModules.ToArray() : null,
+                    fixups = allFixups.ToArray(),
+                    chains = chains
+                };
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
         private static void CaptureCfgSnapshot(
             LeAnalysis analysis,
             HashSet<uint> functionStarts,
@@ -5330,7 +5512,7 @@ namespace DOSRE.Dasm
             public ushort SourceOffsetInPage;
             public uint PageNumber; // 1-based physical page
             public uint SiteLinear;
-            public byte SiteDelta;
+            public sbyte SiteDelta;
             public uint? Value32;
             public int? TargetObject;
             public uint? TargetOffset;
@@ -9884,7 +10066,7 @@ namespace DOSRE.Dasm
                             SourceOffsetInPage = srcOff,
                             PageNumber = physicalPage,
                             SiteLinear = siteLinear,
-                            SiteDelta = (byte)Math.Min(255, Math.Max(0, chosenDelta)),
+                            SiteDelta = (sbyte)Math.Min(sbyte.MaxValue, Math.Max(sbyte.MinValue, chosenDelta)),
                             Value32 = value32,
                             TargetObject = mappedObj,
                             TargetOffset = mappedObj.HasValue ? (uint?)mappedOff : null,
@@ -9896,6 +10078,308 @@ namespace DOSRE.Dasm
             }
 
             return fixups;
+        }
+
+        private static List<LeFixupRecordInfo> ParseFixupTableForObject(
+            LEHeader header,
+            List<LEObject> objects,
+            uint[] pageMap,
+            List<string> importModules,
+            byte[] fileBytes,
+            uint[] fixupPageOffsets,
+            byte[] fixupRecordStream,
+            byte[] objBytes,
+            LEObject obj)
+        {
+            var fixups = new List<LeFixupRecordInfo>();
+            if (objBytes == null || objBytes.Length == 0)
+                return fixups;
+
+            static bool TryReadU16(byte[] b, int off, int end, out ushort v)
+            {
+                v = 0;
+                if (b == null || off < 0 || off + 2 > end)
+                    return false;
+                v = (ushort)(b[off] | (b[off + 1] << 8));
+                return true;
+            }
+
+            static bool TryReadU32(byte[] b, int off, int end, out uint v)
+            {
+                v = 0;
+                if (b == null || off < 0 || off + 4 > end)
+                    return false;
+                v = (uint)(b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24));
+                return true;
+            }
+
+            static uint ObjBase(List<LEObject> objs, int idx1)
+            {
+                if (objs == null || idx1 <= 0 || idx1 > objs.Count)
+                    return 0;
+                return objs[idx1 - 1].BaseAddress;
+            }
+
+            static uint ObjSize(List<LEObject> objs, int idx1)
+            {
+                if (objs == null || idx1 <= 0 || idx1 > objs.Count)
+                    return 0;
+                return objs[idx1 - 1].VirtualSize;
+            }
+
+            for (var i = 0; i < obj.PageCount; i++)
+            {
+                var logicalPageIndex0 = (int)obj.PageMapIndex - 1 + i;
+                if (logicalPageIndex0 < 0 || logicalPageIndex0 >= pageMap.Length)
+                    break;
+
+                var logicalPageNumber1 = (uint)(logicalPageIndex0 + 1);
+                if (logicalPageNumber1 == 0 || logicalPageNumber1 > header.NumberOfPages)
+                    continue;
+
+                var physicalPage = pageMap[logicalPageIndex0];
+                var pageLinearBase = unchecked(obj.BaseAddress + (uint)(i * header.PageSize));
+
+                var pageIndex0 = (int)(logicalPageNumber1 - 1);
+                if (pageIndex0 < 0 || pageIndex0 + 1 >= fixupPageOffsets.Length)
+                    continue;
+
+                var recStart = fixupPageOffsets[pageIndex0];
+                var recEnd = fixupPageOffsets[pageIndex0 + 1];
+                if (recEnd <= recStart)
+                    continue;
+                if (recEnd > fixupRecordStream.Length)
+                    continue;
+
+                var len = (int)(recEnd - recStart);
+                var guess = GuessStride(fixupRecordStream, (int)recStart, len, (int)header.PageSize);
+                var stride = guess.Stride > 0 ? guess.Stride : 16;
+
+                var entries = len / stride;
+                if (entries <= 0)
+                    continue;
+                entries = Math.Min(entries, 65536);
+
+                var recEndI = (int)recEnd;
+                for (var entry = 0; entry < entries; entry++)
+                {
+                    var p = (int)recStart + entry * stride;
+                    if (p + 4 > recEndI)
+                        break;
+
+                    var srcType = fixupRecordStream[p + 0];
+                    var flags = fixupRecordStream[p + 1];
+                    var srcOff = (ushort)(fixupRecordStream[p + 2] | (fixupRecordStream[p + 3] << 8));
+                    var sourceLinear = unchecked(pageLinearBase + srcOff);
+
+                    // Optional DOS4GW-style target spec: u16 + u32 after the header (often object/module index + offset/nameOff)
+                    ushort specU16 = 0;
+                    uint specU32 = 0;
+                    var hasSpecU16 = TryReadU16(fixupRecordStream, p + 4, recEndI, out specU16);
+                    var hasSpecU32 = TryReadU32(fixupRecordStream, p + 6, recEndI, out specU32);
+
+                    string targetKind = "unknown";
+                    int? targetObj = null;
+                    uint? targetOff = null;
+                    uint? targetLinear = null;
+                    ushort? importModIdx = null;
+                    string importModName = null;
+                    uint? importProcNameOff = null;
+                    string importProcName = null;
+
+                    if (hasSpecU16 && hasSpecU32)
+                    {
+                        // Prefer internal object targets when plausible.
+                        if (specU16 >= 1 && specU16 <= objects.Count)
+                        {
+                            var sz = ObjSize(objects, specU16);
+                            if (sz == 0 || specU32 <= sz + 0x1000)
+                            {
+                                targetKind = "internal";
+                                targetObj = specU16;
+                                targetOff = specU32;
+                                var baseAddr = ObjBase(objects, specU16);
+                                if (baseAddr != 0)
+                                    targetLinear = unchecked(baseAddr + specU32);
+                            }
+                        }
+
+                        // Fallback: import target
+                        if (targetKind == "unknown" && importModules != null && importModules.Count > 0 && specU16 >= 1 && specU16 <= importModules.Count)
+                        {
+                            importModIdx = specU16;
+                            importModName = importModules[specU16 - 1];
+                            importProcNameOff = specU32;
+                            importProcName = TryReadImportProcName(fileBytes, header, specU32);
+                            if (!string.IsNullOrWhiteSpace(importModName))
+                                targetKind = "import";
+                        }
+                    }
+
+                    // Read addend / site value near fixup site.
+                    var objOffset = (int)((uint)i * header.PageSize + srcOff);
+                    uint? siteV32 = null;
+                    ushort? siteV16 = null;
+                    var chosenDelta = 0;
+
+                    if (objOffset >= 0)
+                    {
+                        // Prefer a value that matches the target spec (internal pointers).
+                        if (targetKind == "internal" && targetLinear.HasValue)
+                        {
+                            for (var delta = -3; delta <= 3; delta++)
+                            {
+                                var off = objOffset + delta;
+                                if (off < 0 || off + 4 > objBytes.Length)
+                                    continue;
+                                var v = ReadUInt32(objBytes, off);
+                                // Accept if it lands in the same object and the addend is sane.
+                                if (TryMapLinearToObject(objects, v, out var tobj, out var toff) && tobj == targetObj)
+                                {
+                                    var add = unchecked((long)toff - (long)targetOff.GetValueOrDefault());
+                                    if (Math.Abs(add) <= 0x10000)
+                                    {
+                                        siteV32 = v;
+                                        chosenDelta = delta;
+                                        break;
+                                    }
+                                }
+                                if (v == targetLinear.Value)
+                                {
+                                    siteV32 = v;
+                                    chosenDelta = delta;
+                                    break;
+                                }
+                            }
+                        }
+
+                        // If no match, try any mapped pointer near the site.
+                        if (!siteV32.HasValue)
+                        {
+                            for (var delta = -3; delta <= 3; delta++)
+                            {
+                                var off = objOffset + delta;
+                                if (off < 0 || off + 4 > objBytes.Length)
+                                    continue;
+                                var v = ReadUInt32(objBytes, off);
+                                if (TryMapLinearToObject(objects, v, out var tobj, out var toff))
+                                {
+                                    siteV32 = v;
+                                    chosenDelta = delta;
+                                    if (targetKind == "unknown")
+                                    {
+                                        targetKind = "internal";
+                                        targetObj = tobj;
+                                        targetOff = toff;
+                                        targetLinear = v;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Fallback raw reads.
+                        if (!siteV32.HasValue)
+                        {
+                            if (objOffset + 4 <= objBytes.Length)
+                                siteV32 = ReadUInt32(objBytes, objOffset);
+                            else if (objOffset + 2 <= objBytes.Length)
+                                siteV16 = ReadUInt16(objBytes, objOffset);
+                        }
+                    }
+
+                    var addend32 = (int?)null;
+                    if (targetKind == "internal" && siteV32.HasValue && targetLinear.HasValue)
+                    {
+                        var add = unchecked((long)siteV32.Value - (long)targetLinear.Value);
+                        if (add >= int.MinValue && add <= int.MaxValue)
+                            addend32 = (int)add;
+                    }
+
+                    var siteLinear = unchecked(sourceLinear + (uint)chosenDelta);
+                    fixups.Add(new LeFixupRecordInfo
+                    {
+                        siteLinear = siteLinear,
+                        sourceLinear = sourceLinear,
+                        siteDelta = (sbyte)Math.Min(sbyte.MaxValue, Math.Max(sbyte.MinValue, chosenDelta)),
+                        sourceOffsetInPage = srcOff,
+                        logicalPageNumber = logicalPageNumber1,
+                        physicalPageNumber = physicalPage,
+                        type = srcType,
+                        flags = flags,
+                        recordStreamOffset = p,
+                        stride = stride,
+                        siteValue32 = siteV32,
+                        siteValue16 = siteV16,
+                        targetKind = targetKind,
+                        targetObject = targetObj,
+                        targetOffset = targetOff,
+                        targetLinear = targetLinear,
+                        addend32 = addend32,
+                        importModuleIndex = importModIdx,
+                        importModule = importModName,
+                        importProcNameOffset = importProcNameOff,
+                        importProc = importProcName
+                    });
+                }
+            }
+
+            return fixups;
+        }
+
+        private static LeFixupChainInfo[] BuildFixupChains(List<LeFixupRecordInfo> fixups, List<string> importModules)
+        {
+            if (fixups == null || fixups.Count == 0)
+                return Array.Empty<LeFixupChainInfo>();
+
+            var groups = fixups
+                .GroupBy(f => new
+                {
+                    k = f.targetKind ?? "unknown",
+                    obj = f.targetObject,
+                    off = f.targetOffset,
+                    lin = f.targetLinear,
+                    imod = f.importModuleIndex,
+                    iproc = f.importProcNameOffset
+                })
+                .Select(g => new LeFixupChainInfo
+                {
+                    targetKind = g.Key.k,
+                    targetObject = g.Key.obj,
+                    targetOffset = g.Key.off,
+                    targetLinear = g.Key.lin,
+                    importModuleIndex = g.Key.imod,
+                    importProcNameOffset = g.Key.iproc,
+                    count = g.Count()
+                })
+                .OrderByDescending(c => c.count)
+                .ThenBy(c => c.targetKind)
+                .ThenBy(c => c.targetObject ?? 0)
+                .ThenBy(c => c.targetOffset ?? 0)
+                .ThenBy(c => c.importModuleIndex ?? 0)
+                .ThenBy(c => c.importProcNameOffset ?? 0)
+                .ToArray();
+
+            // Keep output manageable.
+            const int maxChains = 200;
+            if (groups.Length > maxChains)
+                groups = groups.Take(maxChains).ToArray();
+
+            // Enrich import module names if available.
+            if (importModules != null && importModules.Count > 0)
+            {
+                foreach (var c in groups)
+                {
+                    if (c.targetKind != "import")
+                        continue;
+                    if (c.importModuleIndex.HasValue && c.importModuleIndex.Value >= 1 && c.importModuleIndex.Value <= importModules.Count)
+                    {
+                        // Names live on per-fixup entries too; this is just best-effort context.
+                    }
+                }
+            }
+
+            return groups;
         }
 
         private static bool TryMapLinearToObject(List<LEObject> objects, uint linear, out int objIndex, out uint offset)

@@ -57,7 +57,74 @@ namespace DOSRE.Analysis
             public int? stringCount { get; set; }
         }
 
+        public sealed class LeFixupTableFixup
+        {
+            public string site { get; set; }
+            public string source { get; set; }
+            public int delta { get; set; }
+            public int logicalPage { get; set; }
+            public int physicalPage { get; set; }
+            public string type { get; set; }
+            public string flags { get; set; }
+            public int recordStreamOffset { get; set; }
+            public int stride { get; set; }
+
+            public string siteValue32 { get; set; }
+            public string siteValue16 { get; set; }
+
+            public string targetKind { get; set; }
+            public int? targetObject { get; set; }
+            public string targetOffset { get; set; }
+            public string targetLinear { get; set; }
+            public int? addend32 { get; set; }
+
+            public int? importModuleIndex { get; set; }
+            public string importModule { get; set; }
+            public string importProcNameOffset { get; set; }
+            public string importProc { get; set; }
+        }
+
+        public sealed class LeFixupTableChain
+        {
+            public string targetKind { get; set; }
+            public int? targetObject { get; set; }
+            public string targetOffset { get; set; }
+            public string targetLinear { get; set; }
+            public int? importModuleIndex { get; set; }
+            public string importProcNameOffset { get; set; }
+            public int count { get; set; }
+        }
+
+        public sealed class LeFixupTableObject
+        {
+            public int index { get; set; }
+            public string baseAddress { get; set; }
+            public string virtualSize { get; set; }
+            public string flags { get; set; }
+            public int pageMapIndex { get; set; }
+            public int pageCount { get; set; }
+        }
+
+        public sealed class LeFixupTableExport
+        {
+            public string input { get; set; }
+            public string entry { get; set; }
+            public string entryName { get; set; }
+            public string pageSize { get; set; }
+            public int pages { get; set; }
+
+            public LeFixupTableObject[] objects { get; set; }
+            public string[] importModules { get; set; }
+
+            public int fixupCount { get; set; }
+            public LeFixupTableFixup[] fixups { get; set; }
+            public LeFixupTableChain[] chains { get; set; }
+        }
+
         private static string Hex(uint a2) => $"0x{a2:X8}";
+        private static string HexU16(ushort v) => $"0x{v:X4}";
+        private static string HexU32(uint v) => $"0x{v:X8}";
+        private static string HexU32Short(uint v) => $"0x{v:X}";
         private static string FuncName(uint a2) => $"func_{a2:X8}";
 
         private static List<List<uint>> ComputeSccs(Dictionary<uint, HashSet<uint>> graph, List<uint> nodes)
@@ -285,6 +352,80 @@ namespace DOSRE.Analysis
                 callEdgeCount = callEdgeCount > 0 ? (int?)callEdgeCount : null,
                 globalCount = globals.Count > 0 ? (int?)globals.Count : null,
                 stringCount = strings.Count > 0 ? (int?)strings.Count : null,
+            };
+        }
+
+        public static LeFixupTableExport BuildFixupTableExport(LEDisassembler.LeFixupTableInfo table)
+        {
+            if (table == null)
+                throw new ArgumentNullException(nameof(table));
+
+            var objects = (table.objects ?? Array.Empty<LEDisassembler.LeObjectInfo>())
+                .OrderBy(o => o.index)
+                .Select(o => new LeFixupTableObject
+                {
+                    index = o.index,
+                    baseAddress = HexU32(o.baseAddress),
+                    virtualSize = HexU32Short(o.virtualSize),
+                    flags = HexU32(o.flags),
+                    pageMapIndex = (int)o.pageMapIndex,
+                    pageCount = (int)o.pageCount
+                })
+                .ToArray();
+
+            var fixups = (table.fixups ?? Array.Empty<LEDisassembler.LeFixupRecordInfo>())
+                .OrderBy(f => f.siteLinear)
+                .ThenBy(f => f.recordStreamOffset)
+                .Select(f => new LeFixupTableFixup
+                {
+                    site = HexU32(f.siteLinear),
+                    source = HexU32(f.sourceLinear),
+                    delta = f.siteDelta,
+                    logicalPage = (int)f.logicalPageNumber,
+                    physicalPage = (int)f.physicalPageNumber,
+                    type = $"0x{f.type:X2}",
+                    flags = $"0x{f.flags:X2}",
+                    recordStreamOffset = f.recordStreamOffset,
+                    stride = f.stride,
+                    siteValue32 = f.siteValue32.HasValue ? HexU32(f.siteValue32.Value) : null,
+                    siteValue16 = f.siteValue16.HasValue ? HexU16(f.siteValue16.Value) : null,
+                    targetKind = string.IsNullOrWhiteSpace(f.targetKind) ? null : f.targetKind,
+                    targetObject = f.targetObject,
+                    targetOffset = f.targetOffset.HasValue ? HexU32Short(f.targetOffset.Value) : null,
+                    targetLinear = f.targetLinear.HasValue ? HexU32(f.targetLinear.Value) : null,
+                    addend32 = f.addend32,
+                    importModuleIndex = f.importModuleIndex.HasValue ? (int?)f.importModuleIndex.Value : null,
+                    importModule = string.IsNullOrWhiteSpace(f.importModule) ? null : f.importModule,
+                    importProcNameOffset = f.importProcNameOffset.HasValue ? HexU32Short(f.importProcNameOffset.Value) : null,
+                    importProc = string.IsNullOrWhiteSpace(f.importProc) ? null : f.importProc,
+                })
+                .ToArray();
+
+            var chains = (table.chains ?? Array.Empty<LEDisassembler.LeFixupChainInfo>())
+                .Select(c => new LeFixupTableChain
+                {
+                    targetKind = c.targetKind,
+                    targetObject = c.targetObject,
+                    targetOffset = c.targetOffset.HasValue ? HexU32Short(c.targetOffset.Value) : null,
+                    targetLinear = c.targetLinear.HasValue ? HexU32(c.targetLinear.Value) : null,
+                    importModuleIndex = c.importModuleIndex.HasValue ? (int?)c.importModuleIndex.Value : null,
+                    importProcNameOffset = c.importProcNameOffset.HasValue ? HexU32Short(c.importProcNameOffset.Value) : null,
+                    count = c.count
+                })
+                .ToArray();
+
+            return new LeFixupTableExport
+            {
+                input = table.inputFile,
+                entry = HexU32(table.entryLinear),
+                entryName = FuncName(table.entryLinear),
+                pageSize = HexU32Short(table.pageSize),
+                pages = (int)table.numberOfPages,
+                objects = objects.Length > 0 ? objects : null,
+                importModules = table.importModules != null && table.importModules.Length > 0 ? table.importModules : null,
+                fixupCount = fixups.Length,
+                fixups = fixups.Length > 0 ? fixups : null,
+                chains = chains.Length > 0 ? chains : null,
             };
         }
     }
