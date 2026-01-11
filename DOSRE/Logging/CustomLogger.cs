@@ -1,5 +1,6 @@
 ﻿using NLog;
 using NLog.Layouts;
+using System;
 
 namespace DOSRE.Logging
 {
@@ -8,6 +9,12 @@ namespace DOSRE.Logging
 
         static CustomLogger()
         {
+            // Don't override an existing NLog configuration.
+            // This allows test code (and future hosts) to provide their own config
+            // without getting forced into noisy console logging.
+            if (LogManager.Configuration != null)
+                return;
+
             var config = new NLog.Config.LoggingConfiguration();
 
             //Setup Console Logging
