@@ -19,6 +19,7 @@
 [Dd]ebugPublic/
 [Rr]elease/
 [Rr]eleases/
+/screenshots/
 x64/
 x86/
 bld/
@@ -347,3 +348,5 @@ EXES/disasm_le/FIDEMO.func_000100DC.pseudo.c
 /Dosbox-Bridge
 *.o
 *.o
+Euro96Plan.md
+journal.md

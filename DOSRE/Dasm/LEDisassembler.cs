@@ -5460,20 +5460,20 @@ namespace DOSRE.Dasm
 
         public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, bool leFixups, bool leGlobals, bool leInsights, out string output, out string error)
         {
-            return TryDisassembleToString(inputFile, leFull, leBytesLimit, leRenderLimit: null, leJobs: 1, leFixups, leGlobals, leInsights, EnumToolchainHint.None, out output, out error);
+            return TryDisassembleToString(inputFile, leFull, leBytesLimit, leRenderLimit: null, leJobs: 1, leFixups, leGlobals, leInsights, EnumToolchainHint.None, leStartLinear: null, out output, out error);
         }
 
         public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, bool leFixups, bool leGlobals, bool leInsights, EnumToolchainHint toolchainHint, out string output, out string error)
         {
-            return TryDisassembleToString(inputFile, leFull, leBytesLimit, leRenderLimit: null, leJobs: 1, leFixups, leGlobals, leInsights, toolchainHint, out output, out error);
+            return TryDisassembleToString(inputFile, leFull, leBytesLimit, leRenderLimit: null, leJobs: 1, leFixups, leGlobals, leInsights, toolchainHint, leStartLinear: null, out output, out error);
         }
 
         public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, int? leRenderLimit, bool leFixups, bool leGlobals, bool leInsights, EnumToolchainHint toolchainHint, out string output, out string error)
         {
-            return TryDisassembleToString(inputFile, leFull, leBytesLimit, leRenderLimit, leJobs: 1, leFixups, leGlobals, leInsights, toolchainHint, out output, out error);
+            return TryDisassembleToString(inputFile, leFull, leBytesLimit, leRenderLimit, leJobs: 1, leFixups, leGlobals, leInsights, toolchainHint, leStartLinear: null, out output, out error);
         }
 
-        public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, int? leRenderLimit, int leJobs, bool leFixups, bool leGlobals, bool leInsights, EnumToolchainHint toolchainHint, out string output, out string error)
+        public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, int? leRenderLimit, int leJobs, bool leFixups, bool leGlobals, bool leInsights, EnumToolchainHint toolchainHint, uint? leStartLinear, out string output, out string error)
         {
             output = string.Empty;
             error = string.Empty;
@@ -5655,7 +5655,16 @@ namespace DOSRE.Dasm
                     continue;
 
                 var startOffsetWithinObject = 0;
-                if (!leFull)
+
+                // Optional override: start disassembly at an arbitrary LE linear address.
+                // This is useful for inspecting code near the entrypoint without rendering the entire object.
+                if (leStartLinear.HasValue)
+                {
+                    var lin = leStartLinear.Value;
+                    if (lin >= obj.BaseAddress && lin < obj.BaseAddress + (uint)maxLen)
+                        startOffsetWithinObject = (int)(lin - obj.BaseAddress);
+                }
+                else if (!leFull)
                 {
                     if (header.EntryEipObject == (uint)obj.Index && header.EntryEip < (uint)maxLen)
                     {
@@ -5675,7 +5684,8 @@ namespace DOSRE.Dasm
                 }
 
                 var codeLen = maxLen - startOffsetWithinObject;
-                if (!leFull && leBytesLimit.HasValue)
+                // When an explicit start is provided, honor the byte limit even in -LEFULL mode.
+                if ((leStartLinear.HasValue || !leFull) && leBytesLimit.HasValue)
                     codeLen = Math.Min(codeLen, leBytesLimit.Value);
                 if (codeLen <= 0)
                     continue;

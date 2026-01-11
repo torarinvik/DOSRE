@@ -197,6 +197,14 @@ namespace DOSRE.Dasm
         {
             if (chunkSize <= 0 && !strictOnlyFunction) chunkSize = 200;
 
+            if (strictOnlyFunction && !string.IsNullOrWhiteSpace(onlyFunction))
+            {
+                var slice = TrySliceToSingleFunction(lines, onlyFunction);
+                if (!slice.ok)
+                    return (false, new Dictionary<string, string>(), slice.error);
+                lines = slice.lines;
+            }
+
             var files = new Dictionary<string, string>();
             var labelByAddr = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var functions = new List<ParsedFunction>();
@@ -227,7 +235,34 @@ namespace DOSRE.Dasm
                         if (leObjects != null && leObjects.Count > 0 && lePageMap != null && lePageMap.Length > 0)
                         {
                             leOrigFilename = Path.GetFileName(inputFileForLoader);
+                            // Data pages base (file offset): prefer the LE header field, but fall back to a packed-at-EOF
+                            // heuristic when the header is stale (commonly seen in "unwrapped" executables).
                             leDataPagesBase = (uint)(leHeader.HeaderOffset + (int)leHeader.DataPagesOffset);
+
+                            var pageSize = (ulong)leHeader.PageSize;
+                            var numPages = (ulong)leHeader.NumberOfPages;
+                            var lastPageSize = (ulong)leHeader.LastPageSize;
+                            if (lastPageSize == 0 && pageSize != 0)
+                                lastPageSize = pageSize;
+
+                            var dataSize = 0UL;
+                            if (pageSize != 0 && numPages != 0)
+                                dataSize = ((numPages - 1) * pageSize) + lastPageSize;
+
+                            if (dataSize != 0)
+                            {
+                                var expectedEnd = (ulong)leDataPagesBase + dataSize;
+                                if (leDataPagesBase >= fileBytes.Length || expectedEnd > (ulong)fileBytes.Length)
+                                {
+                                    // If data pages are laid out contiguously at the end of the file, we can recover the base.
+                                    if (dataSize < (ulong)fileBytes.Length)
+                                    {
+                                        var packedBase = (ulong)fileBytes.Length - dataSize;
+                                        if (packedBase < (ulong)fileBytes.Length)
+                                            leDataPagesBase = (uint)packedBase;
+                                    }
+                                }
+                            }
 
                             // Entry EIP/ESP linear (best-effort).
                             var eipObj = leObjects.FirstOrDefault(o => o.Index == (int)leHeader.EntryEipObject);
@@ -1159,9 +1194,9 @@ namespace DOSRE.Dasm
                 buildBat.Append("@echo off\r\n");
                 buildBat.Append("call C:\\WATCOM\\OWSETENV.BAT\r\n");
                 buildBat.Append("echo Compiling data...\r\n");
-                buildBat.Append("wcc386 -6r -s -zq -fo=bdata.obj bdata.c\r\n");
+                buildBat.Append("wcc386 -zastd=c99 -6r -s -zq -fo=bdata.obj bdata.c\r\n");
                 buildBat.Append("echo Compiling main...\r\n");
-                buildBat.Append("wcc386 -6r -s -zq -fo=main.obj main.c\r\n");
+                buildBat.Append("wcc386 -zastd=c99 -6r -s -zq -fo=main.obj main.c\r\n");
                 
                 var linkerRsp = new StringBuilder();
                 linkerRsp.Append("name blst\r\n");
@@ -1177,21 +1212,56 @@ namespace DOSRE.Dasm
                 // Entry point: initialize an emulated guest stack for esp/pop() and transfer control into translated code.
                 var mainSb = new StringBuilder();
                 mainSb.AppendLine("#include \"blst.h\"");
+                mainSb.AppendLine("#include <ctype.h>");
                 mainSb.AppendLine();
-                mainSb.AppendLine("// NOTE: guest linear memory backing is allocated at runtime into __mem.");
+                mainSb.AppendLine("/* NOTE: guest linear memory backing is allocated at runtime into __mem. */");
                 if (haveLeMeta)
                 {
-                    mainSb.AppendLine("// NOTE: this build expects the original LE EXE to be present next to the rebuilt program.");
+                    mainSb.AppendLine("/* NOTE: this build expects the original LE EXE to be present next to the rebuilt program. */");
                     mainSb.AppendLine();
                     mainSb.AppendLine("typedef struct { uint32_t base; uint32_t vsize; uint32_t flags; uint32_t pageMapIndex; uint32_t pageCount; } __le_obj;");
                     mainSb.AppendLine($"static const uint32_t __le_page_size = 0x{leHeader.PageSize:X}u;");
-                    mainSb.AppendLine($"static const uint32_t __le_last_page_size = 0x{leHeader.LastPageSize:X}u;");
+                    var leLastPageSize = leHeader.LastPageSize == 0 ? leHeader.PageSize : leHeader.LastPageSize;
+                    mainSb.AppendLine($"static const uint32_t __le_last_page_size = 0x{leLastPageSize:X}u;");
                     mainSb.AppendLine($"static const uint32_t __le_num_pages = 0x{leHeader.NumberOfPages:X}u;");
                     mainSb.AppendLine($"static const uint32_t __le_data_pages_base = 0x{leDataPagesBase:X}u;");
                     mainSb.AppendLine($"static const uint32_t __le_entry_esp = 0x{leEntryEspLinear:X8}u;");
                     mainSb.AppendLine($"static const uint32_t __le_entry_eip = 0x{leEntryEipLinear:X8}u;");
                     mainSb.AppendLine($"static const char* __le_orig_exe = \"{leOrigFilename.Replace("\\", "\\\\")}\";");
                     mainSb.AppendLine();
+                    mainSb.AppendLine("// Best-effort DOS 8.3 fallback: try BASE~N.EXT when long filenames are not accessible.");
+                    mainSb.AppendLine("static FILE* __fopen_le(const char* path)");
+                    mainSb.AppendLine("{");
+                    mainSb.AppendLine("    FILE* f = fopen(path, \"rb\");");
+                    mainSb.AppendLine("    if (f) return f;");
+                    mainSb.AppendLine();
+                    mainSb.AppendLine("    const char* dot = strrchr(path, '.');");
+                    mainSb.AppendLine("    if (!dot || dot == path) return (FILE*)0;");
+                    mainSb.AppendLine();
+                    mainSb.AppendLine("    char base6[7]; char ext3[4];");
+                    mainSb.AppendLine("    unsigned bi = 0, ei = 0;");
+                    mainSb.AppendLine("    memset(base6, 0, sizeof(base6));");
+                    mainSb.AppendLine("    memset(ext3, 0, sizeof(ext3));");
+                    mainSb.AppendLine("    for (const char* p = path; p < dot && bi < 6; p++) {");
+                    mainSb.AppendLine("        unsigned char c = (unsigned char)*p;");
+                    mainSb.AppendLine("        if (isalnum(c)) base6[bi++] = (char)toupper(c);");
+                    mainSb.AppendLine("    }");
+                    mainSb.AppendLine("    for (const char* p = dot + 1; *p && ei < 3; p++) {");
+                    mainSb.AppendLine("        unsigned char c = (unsigned char)*p;");
+                    mainSb.AppendLine("        if (isalnum(c)) ext3[ei++] = (char)toupper(c);");
+                    mainSb.AppendLine("    }");
+                    mainSb.AppendLine("    if (bi == 0 || ei == 0) return (FILE*)0;");
+                    mainSb.AppendLine();
+                    mainSb.AppendLine("    char sfn[16];");
+                    mainSb.AppendLine("    for (unsigned n = 1; n <= 9; n++) {");
+                    mainSb.AppendLine("        sprintf(sfn, \"%s~%u.%s\", base6, n, ext3);");
+                    mainSb.AppendLine("        f = fopen(sfn, \"rb\");");
+                    mainSb.AppendLine("        if (f) return f;");
+                    mainSb.AppendLine("    }");
+                    mainSb.AppendLine("    return (FILE*)0;");
+                    mainSb.AppendLine("}");
+                    mainSb.AppendLine();
+
                     mainSb.AppendLine("static const __le_obj __le_objs[] = {");
                     foreach (var o in leObjects.OrderBy(x => x.Index))
                     {
@@ -1211,17 +1281,19 @@ namespace DOSRE.Dasm
                     mainSb.AppendLine();
                     mainSb.AppendLine("static int __load_le_image(const char* path)");
                     mainSb.AppendLine("{");
-                    mainSb.AppendLine("    FILE* f = fopen(path, \"rb\");");
+                    mainSb.AppendLine("    FILE* f = __fopen_le(path);");
                     mainSb.AppendLine("    if (!f) return 0;");
-                    mainSb.AppendLine("    for (unsigned oi = 0; oi < (unsigned)(sizeof(__le_objs)/sizeof(__le_objs[0])); oi++)");
+                    mainSb.AppendLine("    unsigned oi;");
+                    mainSb.AppendLine("    uint32_t i;");
+                    mainSb.AppendLine("    for (oi = 0; oi < (unsigned)(sizeof(__le_objs)/sizeof(__le_objs[0])); oi++)");
                     mainSb.AppendLine("    {");
                     mainSb.AppendLine("        const __le_obj* o = &__le_objs[oi];");
-                    mainSb.AppendLine("        for (uint32_t i = 0; i < o->pageCount; i++)");
+                    mainSb.AppendLine("        for (i = 0; i < o->pageCount; i++)");
                     mainSb.AppendLine("        {");
                     mainSb.AppendLine("            uint32_t mapIndex0 = (o->pageMapIndex - 1u) + i;");
                     mainSb.AppendLine("            if (mapIndex0 >= (uint32_t)(sizeof(__le_page_map)/sizeof(__le_page_map[0]))) break;");
-                    mainSb.AppendLine("            uint32_t phys = (uint32_t)__le_page_map[mapIndex0]; // 1-based physical page");
-                    mainSb.AppendLine("            if (phys == 0) continue; // zero-fill");
+                    mainSb.AppendLine("            uint32_t phys = (uint32_t)__le_page_map[mapIndex0]; /* 1-based physical page */");
+                    mainSb.AppendLine("            if (phys == 0) continue; /* zero-fill */");
                     mainSb.AppendLine("            uint32_t bytesThisPage = (phys == __le_num_pages) ? __le_last_page_size : __le_page_size;");
                     mainSb.AppendLine("            uint32_t fileOff = __le_data_pages_base + (phys - 1u) * __le_page_size;");
                     mainSb.AppendLine("            if (fseek(f, (long)fileOff, SEEK_SET) != 0) { fclose(f); return 0; }");
@@ -1240,13 +1312,13 @@ namespace DOSRE.Dasm
                 mainSb.AppendLine("{");
                 if (haveLeMeta)
                 {
-                    mainSb.AppendLine("    // Allocate guest linear memory window based on LE object layout.");
+                    mainSb.AppendLine("    /* Allocate guest linear memory window based on LE object layout. */");
                     mainSb.AppendLine($"    __mem_size = 0x{leSuggestedMemSize:X}u;");
                 }
                 else
                 {
-                    mainSb.AppendLine("    // Allocate a conservative guest memory window (best-effort).");
-                    mainSb.AppendLine("    __mem_size = 0x02000000u; // 32 MiB");
+                    mainSb.AppendLine("    /* Allocate a conservative guest memory window (best-effort). */");
+                    mainSb.AppendLine("    __mem_size = 0x02000000u; /* 32 MiB */");
                 }
                 mainSb.AppendLine("    __mem = (uint8_t*)malloc(__mem_size);");
                 mainSb.AppendLine("    if (!__mem) return 1;");
@@ -1330,7 +1402,7 @@ namespace DOSRE.Dasm
                     files[$"b{partNum}.c"] = csb.ToString();
                     
                     buildBat.Append($"echo Compiling chunk {partNum}...\r\n");
-                    buildBat.Append($"wcc386 -6r -s -zq -fo=b{partNum}.obj b{partNum}.c\r\n");
+                    buildBat.Append($"wcc386 -zastd=c99 -6r -s -zq -fo=b{partNum}.obj b{partNum}.c\r\n");
                     linkerRsp.Append($"file b{partNum}.obj\r\n");
                 }
                 
@@ -1341,6 +1413,21 @@ namespace DOSRE.Dasm
                 linkerRsp.Append("library math3r.lib\r\n");
 
                 var definedFuncs = new HashSet<string>(functions.Select(f => f.Name), StringComparer.OrdinalIgnoreCase);
+
+                // If the LE entrypoint is in the middle of another function, emit a small wrapper at the
+                // entry linear address so users can call it directly (e.g. func_000A5C24()).
+                // This helps debugging and avoids Watcom implicit-declaration/name-decoration pitfalls.
+                string entryWrapperName = null;
+                bool emitEntryWrapper = false;
+                if (entryLinear.HasValue && entryJumpAddr.HasValue && !string.IsNullOrWhiteSpace(entryContainerFunc))
+                {
+                    entryWrapperName = $"func_{entryLinear.Value:X8}";
+                    if (!definedFuncs.Contains(entryWrapperName))
+                    {
+                        emitEntryWrapper = true;
+                        definedFuncs.Add(entryWrapperName);
+                    }
+                }
                 var neededStubs = calledFuncs.Where(f => !definedFuncs.Contains(f)).OrderBy(x => x).ToList();
                 
                 if (calledFuncs.Count > 0)
@@ -1351,6 +1438,11 @@ namespace DOSRE.Dasm
                 {
                     var stubName = SanitizeLabel(stub);
                     h.AppendLine($"uint32_t {stubName}();");
+                }
+
+                if (emitEntryWrapper)
+                {
+                    h.AppendLine($"uint32_t {SanitizeLabel(entryWrapperName)}();");
                 }
 
                 h.AppendLine("#endif");
@@ -1369,6 +1461,18 @@ namespace DOSRE.Dasm
                 d.AppendLine("int jz, jnz, je, jne, jg, jge, jl, jle, ja, jae, jb, jbe, jo, jno, js, jns;");
                 d.AppendLine("uint32_t __entry_jump_enabled, __entry_jump_target, __entry_jump_addr;");
                 d.AppendLine();
+
+                if (emitEntryWrapper)
+                {
+                    d.AppendLine($"uint32_t {SanitizeLabel(entryWrapperName)}()");
+                    d.AppendLine("{");
+                    d.AppendLine("    __entry_jump_enabled = 1;");
+                    d.AppendLine($"    __entry_jump_target = 0x{entryLinear.Value:X8}u;");
+                    d.AppendLine($"    __entry_jump_addr = 0x{entryJumpAddr.Value:X8}u;");
+                    d.AppendLine($"    return {SanitizeLabel(entryContainerFunc)}();");
+                    d.AppendLine("}");
+                    d.AppendLine();
+                }
                 foreach (var stub in neededStubs)
                 {
                     var stubName = SanitizeLabel(stub);
@@ -2281,6 +2385,11 @@ namespace DOSRE.Dasm
             public string LastTestRhs;
             public bool LastWasTest;
 
+            // Tracks the last INC/DEC target so we can recover simple jz/jnz patterns
+            // (ZF after INC/DEC is equivalent to result == 0).
+            public string LastIncDecOperand;
+            public bool LastWasIncDec;
+
             public string LastEaxAssignment;
 
             public void Clear(bool targetIsEax = false)
@@ -2291,6 +2400,8 @@ namespace DOSRE.Dasm
                 LastTestLhs = null;
                 LastTestRhs = null;
                 LastWasTest = false;
+                LastIncDecOperand = null;
+                LastWasIncDec = false;
                 if (targetIsEax) LastEaxAssignment = null;
             }
 
@@ -2812,6 +2923,8 @@ namespace DOSRE.Dasm
                     return "/* " + asm + " */" + commentSuffix;
 
                 var opnd = NormalizeAsmOperandToC(ops, isMemoryWrite: true, fn);
+                pending.LastIncDecOperand = opnd;
+                pending.LastWasIncDec = true;
                 return mn == "inc" ? $"({opnd})++;{commentSuffix}" : $"({opnd})--;{commentSuffix}";
             }
 
@@ -3373,6 +3486,19 @@ namespace DOSRE.Dasm
                     return $"({a} & {b}) == 0";
                 if (jcc is "jne" or "jnz")
                     return $"({a} & {b}) != 0";
+            }
+
+            // Heuristic: INC/DEC affects ZF based on the result being zero.
+            // If we don't have a cmp/test pending, recover jz/jnz from the last inc/dec target.
+            if (pending.LastWasIncDec && !string.IsNullOrWhiteSpace(pending.LastIncDecOperand))
+            {
+                var x = pending.LastIncDecOperand;
+                return jcc switch
+                {
+                    "je" or "jz" => $"{x} == 0",
+                    "jne" or "jnz" => $"{x} != 0",
+                    _ => string.Empty
+                };
             }
 
             return string.Empty;

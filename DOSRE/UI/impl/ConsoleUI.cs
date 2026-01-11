@@ -118,6 +118,12 @@ namespace DOSRE.UI.impl
         private int _leJobs = 1;
 
         /// <summary>
+        ///     Optional LE linear start address override (hex). If set, disassembly starts at this address.
+        ///     Specified with the -lestart <hex> argument
+        /// </summary>
+        private uint? _leStartLinear;
+
+        /// <summary>
         ///     Output slicing (KB)
         ///     Specified with the -splitkb <n> argument
         ///     When used with -o, splits output into multiple numbered files about n KB each.
@@ -318,6 +324,17 @@ namespace DOSRE.UI.impl
                             _leJobs = jobs;
                             i++;
                             break;
+                        case "LESTART":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LESTART requires a value (hex, e.g. A5BE2 or 0xA5BE2)");
+                            var s = _args[i + 1].Trim();
+                            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                                s = s.Substring(2);
+                            if (!uint.TryParse(s, System.Globalization.NumberStyles.HexNumber, null, out var lin))
+                                throw new Exception("Error: -LESTART must be a hex number (e.g. A5BE2 or 0xA5BE2)");
+                            _leStartLinear = lin;
+                            i++;
+                            break;
                         case "LEDECOMP":
                         case "LEDECOMPILE":
                             _bLeDecompile = true;
@@ -462,7 +479,7 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LEUNWRAP -- (EURO96/EUROBLST-style) If input is an MZ stub with a BW overlay header, unwrap the embedded bound MZ+LE and run the LE pipeline on that payload");
                             Console.WriteLine(
-                                "-LEFUNC <func_XXXXXXXX|XXXXXXXX|0xXXXXXXXX> -- Only emit a single function (useful with -LEDECOMPASM)");
+                                "-LEFUNC <func_XXXXXXXX|XXXXXXXX|0xXXXXXXXX> -- Only emit a single function (works with -LEDECOMP; useful for patching stubs; slicing omits loader/main.c)");
                             Console.WriteLine(
                                 "-LEFIXDUMP [maxPages] -- (LE inputs) Dump raw fixup pages + decoding hints (writes <out>.fixups.txt if -O is used)");
                             Console.WriteLine(
@@ -529,12 +546,23 @@ namespace DOSRE.UI.impl
                 string leOutput;
                 string leError;
 
+                static string ChooseLeOutput(Dictionary<string, string> files)
+                {
+                    if (files == null || files.Count == 0)
+                        return string.Empty;
+                    if (files.TryGetValue("blst.c", out var blst))
+                        return blst;
+                    if (files.TryGetValue("main.c", out var main))
+                        return main;
+                    return files.Values.First();
+                }
+
                 Dictionary<string, string> leDecompFiles = null;
 
                 if (_bLeDecompile && !string.IsNullOrWhiteSpace(_leDecompileAsmFile))
                 {
                     leOk = LEDisassembler.TryDecompileToMultipartFromAsmFile(_leDecompileAsmFile, _leOnlyFunction, _leChunks, out leDecompFiles, out leError);
-                    leOutput = (leOk && leDecompFiles.Count > 0) ? leDecompFiles.Values.First() : string.Empty;
+                    leOutput = leOk ? ChooseLeOutput(leDecompFiles) : string.Empty;
                 }
                 else if (_bLeDecompile && _bLeDecompCacheAsm)
                 {
@@ -547,7 +575,7 @@ namespace DOSRE.UI.impl
                     {
                         _logger.Info($"LE decompile: using cached asm {cacheAsmPath}");
                         leOk = LEDisassembler.TryDecompileToMultipartFromAsmFile(cacheAsmPath, _leOnlyFunction, _leChunks, chunkSizeIsCount: true, out leDecompFiles, out leError);
-                        leOutput = (leOk && leDecompFiles.Count > 0) ? leDecompFiles.Values.First() : string.Empty;
+                        leOutput = leOk ? ChooseLeOutput(leDecompFiles) : string.Empty;
                     }
                     else
                     {
@@ -567,6 +595,7 @@ namespace DOSRE.UI.impl
                             leGlobals: _bLeGlobals,
                             leInsights: true,
                             _toolchainHint,
+                            _leStartLinear,
                             out var asm,
                             out leError);
 
@@ -579,7 +608,7 @@ namespace DOSRE.UI.impl
                         {
                             File.WriteAllText(cacheAsmPath, asm);
                             leOk = LEDisassembler.TryDecompileToMultipartFromAsm(asm, _leOnlyFunction, _leChunks, chunkSizeIsCount: true, out leDecompFiles, out leError);
-                            leOutput = (leOk && leDecompFiles.Count > 0) ? leDecompFiles.Values.First() : string.Empty;
+                            leOutput = leOk ? ChooseLeOutput(leDecompFiles) : string.Empty;
                         }
                     }
                 }
@@ -587,12 +616,45 @@ namespace DOSRE.UI.impl
                 {
                     if (_bLeDecompile)
                     {
-                        leOk = LEDisassembler.TryDecompileToMultipart(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, _leChunks, chunkSizeIsCount: true, out leDecompFiles, out leError);
-                        leOutput = (leOk && leDecompFiles.Count > 0) ? leDecompFiles.Values.First() : string.Empty;
+                        // If -LEFUNC is specified, route through the asm->pseudo-C path so we can slice to a single function.
+                        // This intentionally skips generating loader/main.c and emits only pseudo-C for the requested function.
+                        if (!string.IsNullOrWhiteSpace(_leOnlyFunction))
+                        {
+                            var asmOk = LEDisassembler.TryDisassembleToString(
+                                _sInputFile,
+                                _bLeFull,
+                                _leBytesLimit,
+                                _leRenderLimit,
+                                _leJobs,
+                                _bLeFixups,
+                                _bLeGlobals,
+                                leInsights: true,
+                                _toolchainHint,
+                                _leStartLinear,
+                                out var asm,
+                                out leError);
+
+                            if (!asmOk)
+                            {
+                                leOk = false;
+                                leDecompFiles = null;
+                                leOutput = string.Empty;
+                            }
+                            else
+                            {
+                                leOk = LEDisassembler.TryDecompileToMultipartFromAsm(asm, _leOnlyFunction, _leChunks, chunkSizeIsCount: true, out leDecompFiles, out leError);
+                                leOutput = leOk ? ChooseLeOutput(leDecompFiles) : string.Empty;
+                            }
+                        }
+                        else
+                        {
+                            leOk = LEDisassembler.TryDecompileToMultipart(_sInputFile, _bLeFull, _leBytesLimit, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, _leChunks, chunkSizeIsCount: true, out leDecompFiles, out leError);
+                            leOutput = leOk ? ChooseLeOutput(leDecompFiles) : string.Empty;
+                        }
                     }
                     else
                     {
-                        leOk = LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _leRenderLimit, _leJobs, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, out leOutput, out leError);
+                        leOk = LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _leRenderLimit, _leJobs, _bLeFixups, _bLeGlobals, _bLeInsights, _toolchainHint, _leStartLinear, out leOutput, out leError);
                     }
                 }
 
