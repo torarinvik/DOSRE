@@ -14,4 +14,10 @@
   <ItemGroup>
     <ProjectReference Include="../DOSRE/DOSRE.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Fixtures/**">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
 </Project>
