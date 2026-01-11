@@ -9354,7 +9354,8 @@ namespace DOSRE.Dasm
                 if (isMz)
                 {
                     var lfanew = (int)ReadUInt32(fileBytes, 0x3C);
-                    if (lfanew > 0 && lfanew + 4 <= fileBytes.Length)
+                    var lfanewLooksInvalid = lfanew <= 0 || lfanew + 4 > fileBytes.Length;
+                    if (!lfanewLooksInvalid)
                     {
                         if (fileBytes[lfanew] == (byte)'L' && fileBytes[lfanew + 1] == (byte)'E' && fileBytes[lfanew + 2] == 0x00 &&
                             fileBytes[lfanew + 3] == 0x00)
@@ -9376,9 +9377,11 @@ namespace DOSRE.Dasm
                         return true;
                     }
 
-                    // Opt-in: constrained fallback scan *only* in the overlay region.
-                    // This is useful for unusual containers where e_lfanew is bogus and there's no BW header.
-                    if (allowMzOverlayScanFallback && TryScanForLeHeaderInMzOverlay(fileBytes, out var scanOffset))
+                    // Constrained fallback scan *only* in the overlay region.
+                    // - If explicitly enabled, always try.
+                    // - If e_lfanew is clearly bogus/out-of-range, try automatically (real-world DOS4GW stubs exist like this).
+                    if ((allowMzOverlayScanFallback || lfanewLooksInvalid) &&
+                        TryScanForLeHeaderInMzOverlay(fileBytes, out var scanOffset))
                     {
                         offset = scanOffset;
                         return true;

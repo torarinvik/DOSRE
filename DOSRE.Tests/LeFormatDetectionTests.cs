@@ -135,7 +135,7 @@ namespace DOSRE.Tests
             // Synthetic layout:
             //   0x0000: Outer MZ header (e_cp=1, e_cblp=0x200) => overlayBase=0x200
             //   0x0240: LE header (valid)
-            // No BW header and e_lfanew=0 => default path should fail unless scan fallback is enabled.
+            // No BW header and e_lfanew points to a non-LE location => default path should fail unless scan fallback is enabled.
             var bytes = new byte[0x600];
 
             bytes[0x00] = (byte)'M';
@@ -147,8 +147,8 @@ namespace DOSRE.Tests
             // e_cp = 1
             bytes[0x04] = 0x01;
             bytes[0x05] = 0x00;
-            // e_lfanew = 0 (forces fallback path; no BW header present)
-            bytes[0x3C] = 0x00;
+            // e_lfanew = 0x40 (in-range but not an LE signature)
+            bytes[0x3C] = 0x40;
             bytes[0x3D] = 0x00;
             bytes[0x3E] = 0x00;
             bytes[0x3F] = 0x00;
@@ -174,6 +174,50 @@ namespace DOSRE.Tests
 
             // Opt-in scan: should succeed.
             var (ok, off) = InvokeTryFindLeHeaderOffset(bytes, allowMzOverlayScanFallback: true);
+            Assert.True(ok);
+            Assert.Equal(leOff, off);
+        }
+
+        [Fact]
+        public void TryFindLEHeaderOffset_AutoOverlayScan_FindsLe_WhenELfanewIsOutOfRange()
+        {
+            // Synthetic layout:
+            //   0x0000: Outer MZ header (e_cp=1, e_cblp=0x200) => overlayBase=0x200
+            //   0x0240: LE header (valid)
+            // e_lfanew is out-of-range (bogus), which should trigger the automatic overlay-only scan.
+            var bytes = new byte[0x600];
+
+            bytes[0x00] = (byte)'M';
+            bytes[0x01] = (byte)'Z';
+
+            // e_cblp = 0x0200
+            bytes[0x02] = 0x00;
+            bytes[0x03] = 0x02;
+            // e_cp = 1
+            bytes[0x04] = 0x01;
+            bytes[0x05] = 0x00;
+
+            // e_lfanew = 0x70000000 (clearly out-of-range)
+            bytes[0x3C] = 0x00;
+            bytes[0x3D] = 0x00;
+            bytes[0x3E] = 0x00;
+            bytes[0x3F] = 0x70;
+
+            // Valid LE header at 0x240
+            var leOff = 0x240;
+            bytes[leOff + 0x00] = (byte)'L';
+            bytes[leOff + 0x01] = (byte)'E';
+            bytes[leOff + 0x02] = 0x00;
+            bytes[leOff + 0x03] = 0x00;
+            // NumberOfPages at +0x14 = 1
+            bytes[leOff + 0x14] = 0x01;
+            // PageSize at +0x28 = 0x1000
+            bytes[leOff + 0x28] = 0x00;
+            bytes[leOff + 0x29] = 0x10;
+            // ObjectCount at +0x44 = 1
+            bytes[leOff + 0x44] = 0x01;
+
+            var (ok, off) = InvokeTryFindLeHeaderOffsetDefault(bytes);
             Assert.True(ok);
             Assert.Equal(leOff, off);
         }
