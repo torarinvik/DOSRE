@@ -86,6 +86,14 @@ namespace DOSRE.Dasm
             public int recordStreamOffset { get; set; }
             public int stride { get; set; }
 
+            // Raw record bytes (best-effort, truncated to keep JSON manageable).
+            public byte[] recordBytes { get; set; }
+
+            // Best-effort parsed spec fields from within the record (never read across stride).
+            public ushort? specU16 { get; set; }
+            public ushort? specU16b { get; set; }
+            public uint? specU32 { get; set; }
+
             public uint? siteValue32 { get; set; }
             public ushort? siteValue16 { get; set; }
 
@@ -10978,16 +10986,24 @@ namespace DOSRE.Dasm
                     if (p + 4 > recEndI)
                         break;
 
+                    // Constrain parsing to the current record boundary.
+                    var recBound = p + stride;
+                    if (recBound > recEndI)
+                        recBound = recEndI;
+
                     var srcType = fixupRecordStream[p + 0];
                     var flags = fixupRecordStream[p + 1];
                     var srcOff = (ushort)(fixupRecordStream[p + 2] | (fixupRecordStream[p + 3] << 8));
                     var sourceLinear = unchecked(pageLinearBase + srcOff);
 
-                    // Optional DOS4GW-style target spec: u16 + u32 after the header (often object/module index + offset/nameOff)
-                    ushort specU16 = 0;
-                    uint specU32 = 0;
-                    var hasSpecU16 = TryReadU16(fixupRecordStream, p + 4, recEndI, out specU16);
-                    var hasSpecU32 = TryReadU32(fixupRecordStream, p + 6, recEndI, out specU32);
+                    // Optional target spec fields inside the record.
+                    // IMPORTANT: only read within this record (recBound) to avoid bleeding into the next record when stride < 10.
+                    ushort _specU16 = 0;
+                    ushort _specU16b = 0;
+                    uint _specU32 = 0;
+                    var hasSpecU16 = TryReadU16(fixupRecordStream, p + 4, recBound, out _specU16);
+                    var hasSpecU16b = TryReadU16(fixupRecordStream, p + 6, recBound, out _specU16b);
+                    var hasSpecU32 = TryReadU32(fixupRecordStream, p + 6, recBound, out _specU32);
 
                     string targetKind = "unknown";
                     int? targetObj = null;
@@ -11001,31 +11017,32 @@ namespace DOSRE.Dasm
                     if (hasSpecU16 && hasSpecU32)
                     {
                         // Prefer internal object targets when plausible.
-                        if (specU16 >= 1 && specU16 <= objects.Count)
+                        if (_specU16 >= 1 && _specU16 <= objects.Count)
                         {
-                            var sz = ObjSize(objects, specU16);
-                            if (sz == 0 || specU32 <= sz + 0x1000)
+                            var sz = ObjSize(objects, _specU16);
+                            if (sz == 0 || _specU32 <= sz + 0x1000)
                             {
                                 targetKind = "internal";
-                                targetObj = specU16;
-                                targetOff = specU32;
-                                var baseAddr = ObjBase(objects, specU16);
+                                targetObj = _specU16;
+                                targetOff = _specU32;
+                                var baseAddr = ObjBase(objects, _specU16);
                                 if (baseAddr != 0)
-                                    targetLinear = unchecked(baseAddr + specU32);
+                                    targetLinear = unchecked(baseAddr + _specU32);
                             }
                         }
 
                         // Fallback: import target
-                        if (targetKind == "unknown" && importModules != null && importModules.Count > 0 && specU16 >= 1 && specU16 <= importModules.Count)
+                        if (targetKind == "unknown" && importModules != null && importModules.Count > 0 && _specU16 >= 1 && _specU16 <= importModules.Count)
                         {
-                            importModIdx = specU16;
-                            importModName = importModules[specU16 - 1];
-                            importProcNameOff = specU32;
-                            importProcName = TryReadImportProcName(fileBytes, header, specU32);
+                            importModIdx = _specU16;
+                            importModName = importModules[_specU16 - 1];
+                            importProcNameOff = _specU32;
+                            importProcName = TryReadImportProcName(fileBytes, header, _specU32);
                             if (!string.IsNullOrWhiteSpace(importModName))
                                 targetKind = "import";
                         }
                     }
+
 
                     // Read addend / site value near fixup site.
                     var objOffset = (int)((uint)i * header.PageSize + srcOff);
@@ -11038,7 +11055,7 @@ namespace DOSRE.Dasm
                         // Prefer a value that matches the target spec (internal pointers).
                         if (targetKind == "internal" && targetLinear.HasValue)
                         {
-                            for (var delta = -3; delta <= 3; delta++)
+                            for (var delta = -4; delta <= 8; delta++)
                             {
                                 var off = objOffset + delta;
                                 if (off < 0 || off + 4 > objBytes.Length)
@@ -11067,7 +11084,7 @@ namespace DOSRE.Dasm
                         // If no match, try any mapped pointer near the site.
                         if (!siteV32.HasValue)
                         {
-                            for (var delta = -3; delta <= 3; delta++)
+                            for (var delta = -4; delta <= 8; delta++)
                             {
                                 var off = objOffset + delta;
                                 if (off < 0 || off + 4 > objBytes.Length)
@@ -11107,6 +11124,16 @@ namespace DOSRE.Dasm
                             addend32 = (int)add;
                     }
 
+                    byte[] recordBytes = null;
+                    {
+                        var n = Math.Max(0, Math.Min(16, recBound - p));
+                        if (n > 0)
+                        {
+                            recordBytes = new byte[n];
+                            Buffer.BlockCopy(fixupRecordStream, p, recordBytes, 0, n);
+                        }
+                    }
+
                     var siteLinear = unchecked(sourceLinear + (uint)chosenDelta);
                     fixups.Add(new LeFixupRecordInfo
                     {
@@ -11120,6 +11147,10 @@ namespace DOSRE.Dasm
                         flags = flags,
                         recordStreamOffset = p,
                         stride = stride,
+                        recordBytes = recordBytes,
+                        specU16 = hasSpecU16 ? _specU16 : (ushort?)null,
+                        specU16b = hasSpecU16b ? _specU16b : (ushort?)null,
+                        specU32 = hasSpecU32 ? _specU32 : (uint?)null,
                         siteValue32 = siteV32,
                         siteValue16 = siteV16,
                         targetKind = targetKind,

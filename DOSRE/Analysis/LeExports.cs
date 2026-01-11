@@ -42,9 +42,13 @@ namespace DOSRE.Analysis
 
         public sealed class LeReportExport
         {
+            // Basic run context.
             public string input { get; set; }
             public string entry { get; set; }
             public string entryName { get; set; }
+
+            // Optional: raw format classification from the front-end.
+            public string detectedFormat { get; set; }
 
             public int functionCount { get; set; }
 
@@ -55,6 +59,20 @@ namespace DOSRE.Analysis
             public int? callEdgeCount { get; set; }
             public int? globalCount { get; set; }
             public int? stringCount { get; set; }
+
+            // Optional: LE header/object/import/fixup summary (best-effort).
+            public string pageSize { get; set; }
+            public int? pages { get; set; }
+            public int? objectCount { get; set; }
+            public LeFixupTableObject[] objects { get; set; }
+            public int? importModuleCount { get; set; }
+            public string[] importModules { get; set; }
+            public int? fixupCount { get; set; }
+            public int? fixupChainCount { get; set; }
+            public SortedDictionary<string, int> fixupTargetKindCounts { get; set; }
+
+            // Optional: capture a best-effort error string if a secondary parse failed.
+            public string fixupTableError { get; set; }
         }
 
         public sealed class LeFixupTableFixup
@@ -69,6 +87,12 @@ namespace DOSRE.Analysis
             public string flags { get; set; }
             public int recordStreamOffset { get; set; }
             public int stride { get; set; }
+
+            // Best-effort raw record data for reverse engineering/hardening.
+            public string recordBytes { get; set; }
+            public string specU16 { get; set; }
+            public string specU16b { get; set; }
+            public string specU32 { get; set; }
 
             public string siteValue32 { get; set; }
             public string siteValue16 { get; set; }
@@ -362,7 +386,11 @@ namespace DOSRE.Analysis
             };
         }
 
-        public static LeReportExport BuildReportExport(LEDisassembler.LeAnalysis analysis)
+        public static LeReportExport BuildReportExport(
+            LEDisassembler.LeAnalysis analysis,
+            LEDisassembler.LeFixupTableInfo table = null,
+            string detectedFormat = null,
+            string fixupTableError = null)
         {
             if (analysis == null)
                 throw new ArgumentNullException(nameof(analysis));
@@ -414,11 +442,12 @@ namespace DOSRE.Analysis
                 }
             }
 
-            return new LeReportExport
+            var report = new LeReportExport
             {
                 input = analysis.InputFile,
                 entry = Hex(analysis.EntryLinear),
                 entryName = FuncName(analysis.EntryLinear),
+                detectedFormat = string.IsNullOrWhiteSpace(detectedFormat) ? null : detectedFormat,
                 functionCount = functionCount,
                 cfgFunctionCount = cfgFunctionCount > 0 ? (int?)cfgFunctionCount : null,
                 totalInstructionCount = totalInstructionCount > 0 ? (int?)totalInstructionCount : null,
@@ -427,7 +456,58 @@ namespace DOSRE.Analysis
                 callEdgeCount = callEdgeCount > 0 ? (int?)callEdgeCount : null,
                 globalCount = globals.Count > 0 ? (int?)globals.Count : null,
                 stringCount = strings.Count > 0 ? (int?)strings.Count : null,
+                fixupTableError = string.IsNullOrWhiteSpace(fixupTableError) ? null : fixupTableError,
             };
+
+            if (table != null)
+            {
+                report.pageSize = HexU32Short(table.pageSize);
+                report.pages = table.numberOfPages > 0 ? (int?)table.numberOfPages : null;
+
+                if (table.objects != null && table.objects.Length > 0)
+                {
+                    report.objectCount = table.objects.Length;
+                    report.objects = table.objects
+                        .OrderBy(o => o.index)
+                        .Select(o => new LeFixupTableObject
+                        {
+                            index = o.index,
+                            baseAddress = HexU32(o.baseAddress),
+                            virtualSize = HexU32Short(o.virtualSize),
+                            flags = HexU32(o.flags),
+                            pageMapIndex = (int)o.pageMapIndex,
+                            pageCount = (int)o.pageCount
+                        })
+                        .ToArray();
+                }
+
+                if (table.importModules != null && table.importModules.Length > 0)
+                {
+                    report.importModuleCount = table.importModules.Length;
+                    report.importModules = table.importModules;
+                }
+
+                var fixupCount = table.fixups?.Length ?? 0;
+                report.fixupCount = fixupCount > 0 ? (int?)fixupCount : null;
+
+                var chainCount = table.chains?.Length ?? 0;
+                report.fixupChainCount = chainCount > 0 ? (int?)chainCount : null;
+
+                if (table.fixups != null && table.fixups.Length > 0)
+                {
+                    var counts = new SortedDictionary<string, int>(StringComparer.Ordinal);
+                    foreach (var f in table.fixups)
+                    {
+                        var k = string.IsNullOrWhiteSpace(f?.targetKind) ? "unknown" : f.targetKind;
+                        counts.TryGetValue(k, out var c);
+                        counts[k] = c + 1;
+                    }
+
+                    report.fixupTargetKindCounts = counts.Count > 0 ? counts : null;
+                }
+            }
+
+            return report;
         }
 
         public static LeFixupTableExport BuildFixupTableExport(LEDisassembler.LeFixupTableInfo table)
@@ -463,6 +543,12 @@ namespace DOSRE.Analysis
                     flags = $"0x{f.flags:X2}",
                     recordStreamOffset = f.recordStreamOffset,
                     stride = f.stride,
+                    recordBytes = f.recordBytes != null && f.recordBytes.Length > 0
+                        ? string.Concat(f.recordBytes.Select(b => b.ToString("X2")))
+                        : null,
+                    specU16 = f.specU16.HasValue ? HexU16(f.specU16.Value) : null,
+                    specU16b = f.specU16b.HasValue ? HexU16(f.specU16b.Value) : null,
+                    specU32 = f.specU32.HasValue ? HexU32(f.specU32.Value) : null,
                     siteValue32 = f.siteValue32.HasValue ? HexU32(f.siteValue32.Value) : null,
                     siteValue16 = f.siteValue16.HasValue ? HexU16(f.siteValue16.Value) : null,
                     targetKind = string.IsNullOrWhiteSpace(f.targetKind) ? null : f.targetKind,

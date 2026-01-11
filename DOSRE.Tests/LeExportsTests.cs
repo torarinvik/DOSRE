@@ -111,6 +111,75 @@ namespace DOSRE.Tests
 
             // Call edges: A has 2, B has 1, D has 1 (self), others 0 => 4
             Assert.Equal(4, report.callEdgeCount);
+
+            // Optional header/import/fixup fields should not be set without a table.
+            Assert.Null(report.detectedFormat);
+            Assert.Null(report.pageSize);
+            Assert.Null(report.pages);
+            Assert.Null(report.objectCount);
+            Assert.Null(report.objects);
+            Assert.Null(report.importModuleCount);
+            Assert.Null(report.importModules);
+            Assert.Null(report.fixupCount);
+            Assert.Null(report.fixupChainCount);
+            Assert.Null(report.fixupTargetKindCounts);
+            Assert.Null(report.fixupTableError);
+        }
+
+        [Fact]
+        public void ReportExport_IncludesHeaderImportAndFixupSummary_WhenTableProvided()
+        {
+            var analysis = MakeTinyAnalysis();
+
+            var table = new LEDisassembler.LeFixupTableInfo
+            {
+                inputFile = "tiny.exe",
+                entryLinear = 0x1000u,
+                pageSize = 0x1000u,
+                numberOfPages = 3,
+                objects = new[]
+                {
+                    new LEDisassembler.LeObjectInfo { index = 1, baseAddress = 0x00010000u, virtualSize = 0x2000u, flags = 0x00000005u, pageMapIndex = 1u, pageCount = 2u },
+                    new LEDisassembler.LeObjectInfo { index = 2, baseAddress = 0x00020000u, virtualSize = 0x1000u, flags = 0x00000001u, pageMapIndex = 3u, pageCount = 1u },
+                },
+                importModules = new[] { "DOSCALLS", "DPMI" },
+                fixups = new[]
+                {
+                    new LEDisassembler.LeFixupRecordInfo { siteLinear = 0x00010010u, targetKind = "import" },
+                    new LEDisassembler.LeFixupRecordInfo { siteLinear = 0x00010020u, targetKind = "internal" },
+                    new LEDisassembler.LeFixupRecordInfo { siteLinear = 0x00010030u, targetKind = "import" },
+                    new LEDisassembler.LeFixupRecordInfo { siteLinear = 0x00010040u, targetKind = null },
+                },
+                chains = new[]
+                {
+                    new LEDisassembler.LeFixupChainInfo { targetKind = "import", count = 2 },
+                }
+            };
+
+            var report = LeExports.BuildReportExport(analysis, table, detectedFormat: "LE");
+
+            Assert.Equal("LE", report.detectedFormat);
+            Assert.Equal("0x1000", report.pageSize);
+            Assert.Equal(3, report.pages);
+
+            Assert.Equal(2, report.objectCount);
+            Assert.NotNull(report.objects);
+            Assert.Equal(2, report.objects!.Length);
+            Assert.Equal(1, report.objects[0].index);
+            Assert.Equal("0x00010000", report.objects[0].baseAddress);
+            Assert.Equal("0x2000", report.objects[0].virtualSize);
+
+            Assert.Equal(2, report.importModuleCount);
+            Assert.Equal(new[] { "DOSCALLS", "DPMI" }, report.importModules);
+
+            Assert.Equal(4, report.fixupCount);
+            Assert.Equal(1, report.fixupChainCount);
+
+            Assert.NotNull(report.fixupTargetKindCounts);
+            Assert.Equal(3, report.fixupTargetKindCounts!.Count);
+            Assert.Equal(1, report.fixupTargetKindCounts["internal"]);
+            Assert.Equal(2, report.fixupTargetKindCounts["import"]);
+            Assert.Equal(1, report.fixupTargetKindCounts["unknown"]);
         }
 
         [Fact]

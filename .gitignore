@@ -370,3 +370,10 @@ Artifacts/test-exports/unwrap-scan/HOCKEY.cfg.all.json
 DOSRE.Tests/Fixtures/tiny.callgraph.json
 DOSRE.Tests/Fixtures/tiny.report.json
 Artifacts/test-exports/HELLO.callgraph.json
+Artifacts/test-exports/HELLO.report.json
+Artifacts/test-exports/HELLO.fixups.json
+Artifacts/test-exports/build.sh
+Artifacts/test-exports/blst.dSYM/Contents/Resources/Relocations/aarch64/blst.yml
+Artifacts/test-exports/blst.dSYM/Contents/Resources/DWARF/blst
+Artifacts/test-exports/blst.dSYM/Contents/Info.plist
+Artifacts/test-exports/blst

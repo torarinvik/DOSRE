@@ -1,3 +1,4 @@
+using System;
 using DOSRE.Analysis;
 using DOSRE.Dasm;
 using Xunit;
@@ -128,6 +129,49 @@ namespace DOSRE.Tests
             Assert.Equal(-1, payload.fixups[1].delta);
             Assert.Equal(1, payload.fixups[1].importModuleIndex);
             Assert.Equal("0x123", payload.fixups[1].importProcNameOffset);
+        }
+
+        [Fact]
+        public void BuildFixupTableExport_IncludesRawRecordFields_WhenProvided()
+        {
+            var table = new LEDisassembler.LeFixupTableInfo
+            {
+                inputFile = "X",
+                entryLinear = 0x00001000u,
+                pageSize = 0x1000,
+                numberOfPages = 1,
+                objects = Array.Empty<LEDisassembler.LeObjectInfo>(),
+                fixups = new[]
+                {
+                    new LEDisassembler.LeFixupRecordInfo
+                    {
+                        siteLinear = 0x00001000u,
+                        sourceLinear = 0x00001000u,
+                        logicalPageNumber = 1,
+                        physicalPageNumber = 1,
+                        type = 0x07,
+                        flags = 0x00,
+                        recordStreamOffset = 123,
+                        stride = 8,
+                        recordBytes = new byte[] { 0x07, 0x00, 0x48, 0x00, 0x07, 0x00, 0x46, 0x00 },
+                        specU16 = 0x0007,
+                        specU16b = 0x0046,
+                        specU32 = null,
+                        targetKind = "unknown"
+                    }
+                },
+                chains = Array.Empty<LEDisassembler.LeFixupChainInfo>()
+            };
+
+            var payload = LeExports.BuildFixupTableExport(table);
+            Assert.NotNull(payload.fixups);
+            Assert.Single(payload.fixups);
+
+            var f = payload.fixups[0];
+            Assert.Equal("0700480007004600", f.recordBytes);
+            Assert.Equal("0x0007", f.specU16);
+            Assert.Equal("0x0046", f.specU16b);
+            Assert.Null(f.specU32);
         }
     }
 }

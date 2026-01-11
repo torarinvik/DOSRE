@@ -615,7 +615,7 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LECFGALLJSON <file.json> -- (LE inputs) Export a best-effort whole-program CFG index in JSON format (implies -LEINSIGHTS)");
                             Console.WriteLine(
-                                "-LEREPORTJSON <file.json> -- (LE inputs) Export a compact LE analysis report (counts + entry + input) in JSON format (implies -LEINSIGHTS)");
+                                "-LEREPORTJSON <file.json> -- (LE inputs) Export a compact LE analysis report (entry + counts + header/object/import/fixup summary) in JSON format (implies -LEINSIGHTS)");
                             Console.WriteLine(
                                 "-LEFIXUPSJSON <file.json> -- (LE inputs) Export a best-effort normalized LE fixup table in JSON format");
                             Console.WriteLine(
@@ -1172,7 +1172,21 @@ namespace DOSRE.UI.impl
                         }
                         else
                         {
-                            var payload = LeExports.BuildReportExport(analysis);
+                            // Best-effort enrich the report with header/object/import/fixup summary.
+                            LEDisassembler.LeFixupTableInfo fixupTable = null;
+                            string fixupTableError = null;
+                            try
+                            {
+                                if (!LEDisassembler.TryBuildFixupTable(_sInputFile, _bLeScanMz, out fixupTable, out var fixErr))
+                                    fixupTableError = string.IsNullOrWhiteSpace(fixErr) ? "LE fixup table parse failed" : fixErr;
+                            }
+                            catch (Exception ex)
+                            {
+                                fixupTableError = ex.Message;
+                            }
+
+                            var detectedFormat = DetectExeFormat(_sInputFile);
+                            var payload = LeExports.BuildReportExport(analysis, fixupTable, detectedFormat, fixupTableError);
 
                             var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions
                             {
@@ -1187,7 +1201,6 @@ namespace DOSRE.UI.impl
 
                     if (!string.IsNullOrWhiteSpace(_leFixupsJson))
                     {
-                        // This export runs a dedicated LE fixup-table parser pass over the input file.
                         if (string.IsNullOrWhiteSpace(_sInputFile) || !File.Exists(_sInputFile))
                         {
                             _logger.Warn("Warning: -LEFIXUPSJSON requested but no valid input file was provided");

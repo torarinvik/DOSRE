@@ -890,6 +890,23 @@ namespace DOSRE.Dasm
                 sbSingle.AppendLine("#include <string.h>");
                 sbSingle.AppendLine("#include <stdlib.h>");
                 sbSingle.AppendLine();
+                sbSingle.AppendLine("// Some toolchains (or older stdlib setups) may not provide <stdint.h> with C99 types.");
+                sbSingle.AppendLine("// Provide minimal fallbacks so the generated code still parses.");
+                sbSingle.AppendLine("#ifndef UINT32_MAX");
+                sbSingle.AppendLine("typedef unsigned char uint8_t;");
+                sbSingle.AppendLine("typedef unsigned short uint16_t;");
+                sbSingle.AppendLine("typedef unsigned long uint32_t;");
+                sbSingle.AppendLine("typedef signed char int8_t;");
+                sbSingle.AppendLine("typedef signed short int16_t;");
+                sbSingle.AppendLine("typedef signed long int32_t;");
+                sbSingle.AppendLine("typedef unsigned long uintptr_t;");
+                sbSingle.AppendLine("#define UINT32_MAX 0xFFFFFFFFu");
+                sbSingle.AppendLine("#endif");
+                sbSingle.AppendLine();
+                sbSingle.AppendLine("// x86 LSL sets ZF=1 on success (selector valid), ZF=0 on failure.");
+                sbSingle.AppendLine("// We don't model descriptor tables here, so this is a best-effort placeholder used for jz/jnz recovery.");
+                sbSingle.AppendLine("static inline int __lsl_success(uint32_t selector) { (void)selector; return 0; /* unknown */ }");
+                sbSingle.AppendLine();
                 sbSingle.AppendLine("#define ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))");
                 sbSingle.AppendLine("#define ROL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))");
                 sbSingle.AppendLine("#define ROR8(x, n) (uint8_t)(((x) >> (n)) | ((x) << (8 - (n))))");
@@ -1045,6 +1062,23 @@ namespace DOSRE.Dasm
                 h.AppendLine("#include <stdio.h>");
                 h.AppendLine("#include <string.h>");
                 h.AppendLine("#include <stdlib.h>");
+                h.AppendLine();
+                h.AppendLine("// Some toolchains (or older stdlib setups) may not provide <stdint.h> with C99 types.");
+                h.AppendLine("// Provide minimal fallbacks so the generated code still parses.");
+                h.AppendLine("#ifndef UINT32_MAX");
+                h.AppendLine("typedef unsigned char uint8_t;");
+                h.AppendLine("typedef unsigned short uint16_t;");
+                h.AppendLine("typedef unsigned long uint32_t;");
+                h.AppendLine("typedef signed char int8_t;");
+                h.AppendLine("typedef signed short int16_t;");
+                h.AppendLine("typedef signed long int32_t;");
+                h.AppendLine("typedef unsigned long uintptr_t;");
+                h.AppendLine("#define UINT32_MAX 0xFFFFFFFFu");
+                h.AppendLine("#endif");
+                h.AppendLine();
+                h.AppendLine("// x86 LSL sets ZF=1 on success (selector valid), ZF=0 on failure.");
+                h.AppendLine("// We don't model descriptor tables here, so this is a best-effort placeholder used for jz/jnz recovery.");
+                h.AppendLine("static inline int __lsl_success(uint32_t selector) { (void)selector; return 0; /* unknown */ }");
                 h.AppendLine();
                 h.AppendLine("#define ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))");
                 h.AppendLine("#define ROL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))");
@@ -1221,6 +1255,13 @@ namespace DOSRE.Dasm
                 buildBat.Append("wcc386 -zastd=c99 -6r -s -zq -fo=bdata.obj bdata.c\r\n");
                 buildBat.Append("echo Compiling main...\r\n");
                 buildBat.Append("wcc386 -zastd=c99 -6r -s -zq -fo=main.obj main.c\r\n");
+
+                // Host-friendly build script (clang/gcc). Uses LF line endings for Unix shells.
+                var buildSh = new StringBuilder();
+                buildSh.AppendLine("#!/usr/bin/env sh");
+                buildSh.AppendLine("set -e");
+                buildSh.AppendLine("cc -std=c99 -O0 -g -o blst main.c bdata.c b[0-9]*.c");
+                buildSh.AppendLine("echo \"Built ./blst\"");
                 
                 var linkerRsp = new StringBuilder();
                 linkerRsp.Append("name blst\r\n");
@@ -1332,7 +1373,7 @@ namespace DOSRE.Dasm
                     mainSb.AppendLine();
                 }
                 mainSb.AppendLine();
-                mainSb.AppendLine("int main(void)");
+                mainSb.AppendLine("int main(int argc, char** argv)");
                 mainSb.AppendLine("{");
                 if (haveLeMeta)
                 {
@@ -1349,7 +1390,9 @@ namespace DOSRE.Dasm
                 mainSb.AppendLine("    memset(__mem, 0, __mem_size);");
                 if (haveLeMeta)
                 {
-                    mainSb.AppendLine("    if (!__load_le_image(__le_orig_exe)) return 2;");
+                    mainSb.AppendLine("    const char* __img = __le_orig_exe;");
+                    mainSb.AppendLine("    if (argc > 1 && argv && argv[1] && argv[1][0]) __img = argv[1];");
+                    mainSb.AppendLine("    if (!__load_le_image(__img)) return 2;");
                     mainSb.AppendLine("    esp = __le_entry_esp;");
                 }
                 else
@@ -1383,6 +1426,7 @@ namespace DOSRE.Dasm
                 mainSb.AppendLine("}");
 
                 files["main.c"] = mainSb.ToString().Replace("\n", "\r\n");
+                files["build.sh"] = buildSh.ToString();
 
                 var calledFuncs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -3699,11 +3743,11 @@ namespace DOSRE.Dasm
 
             var localTok = Regex.Match(s, @"^local_(?<off>[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase);
             if (localTok.Success)
-                return "&local_" + localTok.Groups["off"].Value.ToLowerInvariant();
+                return "(uint32_t)(uintptr_t)(&local_" + localTok.Groups["off"].Value.ToLowerInvariant() + ")";
 
             var argTok = Regex.Match(s, @"^arg_(?<idx>[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase);
             if (argTok.Success)
-                return "&arg_" + argTok.Groups["idx"].Value.ToLowerInvariant();
+                return "(uint32_t)(uintptr_t)(&arg_" + argTok.Groups["idx"].Value.ToLowerInvariant() + ")";
 
             var ebp = Regex.Match(s, @"^ebp\s*(?<sign>[\+\-])\s*(?<off>0x[0-9A-Fa-f]+|[0-9]+|(?<hexoff>[0-9A-Fa-f]+)h)$", RegexOptions.IgnoreCase);
             if (ebp.Success)
@@ -3719,11 +3763,11 @@ namespace DOSRE.Dasm
                     off = uint.Parse(offStr);
 
                 if (sign == "-")
-                    return $"&local_{off:x}";
+                    return $"(uint32_t)(uintptr_t)(&local_{off:x})";
 
                 // Args: [ebp+8] is arg_0. Only map clean dword slots.
                 if (off >= 8 && ((off - 8) % 4u) == 0)
-                    return $"&arg_{((off - 8) / 4u):x}";
+                    return $"(uint32_t)(uintptr_t)(&arg_{((off - 8) / 4u):x})";
             }
 
             return null;
