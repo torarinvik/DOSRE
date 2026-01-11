@@ -99,5 +99,32 @@ namespace DOSRE.Tests
                 Assert.Equal(0, payload.fixupCount);
             }
         }
+
+        [Fact]
+        public void TryBuildFixupTable_HELLO_EXE_ReducesUnknownFixups()
+        {
+            // Locate repo root from test output directory.
+            var repoRoot = FindRepoRoot(AppContext.BaseDirectory);
+            if (string.IsNullOrWhiteSpace(repoRoot))
+                return;
+
+            var input = Path.Combine(repoRoot, "EXES", "HELLO.EXE");
+            if (!File.Exists(input))
+                return;
+
+            var ok = LEDisassembler.TryBuildFixupTable(input, leScanMzOverlayFallback: true, out var table, out var err);
+            Assert.True(ok, err);
+            Assert.NotNull(table);
+
+            var payload = LeExports.BuildFixupTableExport(table);
+            Assert.NotNull(payload);
+            Assert.Equal(input, payload.input);
+
+            var unknown = payload.fixups?.Count(f => string.Equals(f.targetKind, "unknown", StringComparison.Ordinal)) ?? 0;
+
+            // Historically HELLO had the vast majority of fixups classified as unknown.
+            // This assertion is intentionally loose: it should stay true as decoding improves further.
+            Assert.True(unknown < 100, $"Too many unknown fixups: {unknown}");
+        }
     }
 }

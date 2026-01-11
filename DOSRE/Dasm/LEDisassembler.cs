@@ -10914,6 +10914,51 @@ namespace DOSRE.Dasm
             if (objBytes == null || objBytes.Length == 0)
                 return fixups;
 
+            static bool TryMapOffsetToUniqueObject(List<LEObject> objs, uint off, out int objIndex, out uint linear)
+            {
+                objIndex = 0;
+                linear = 0;
+
+                if (objs == null || objs.Count == 0)
+                    return false;
+
+                // Only accept offsets that fit *uniquely* into exactly one object (by smallest size).
+                // This is intentionally conservative to avoid turning random immediates into targets.
+                const uint slack = 0x1000;
+                uint bestSize = uint.MaxValue;
+                int bestObj = 0;
+                uint bestBase = 0;
+
+                foreach (var o in objs)
+                {
+                    if (o.VirtualSize == 0)
+                        continue;
+                    if (off > unchecked(o.VirtualSize + slack))
+                        continue;
+                    if (o.BaseAddress == 0)
+                        continue;
+
+                    if (o.VirtualSize < bestSize)
+                    {
+                        bestSize = o.VirtualSize;
+                        bestObj = o.Index;
+                        bestBase = o.BaseAddress;
+                    }
+                    else if (o.VirtualSize == bestSize)
+                    {
+                        // Ambiguous.
+                        bestObj = 0;
+                    }
+                }
+
+                if (bestObj == 0)
+                    return false;
+
+                objIndex = bestObj;
+                linear = unchecked(bestBase + off);
+                return true;
+            }
+
             static bool TryReadU16(byte[] b, int off, int end, out ushort v)
             {
                 v = 0;
@@ -11052,6 +11097,51 @@ namespace DOSRE.Dasm
 
                     if (objOffset >= 0)
                     {
+                        // Some DOS4GW/MS-DOS workflows store object-relative offsets (often 16-bit) at the fixup site,
+                        // rather than a fully relocated linear address. If the offset fits uniquely into one object,
+                        // we can classify the target safely even when the on-disk value is 0 or doesn't map as linear.
+                        if (targetKind == "unknown")
+                        {
+                            for (var delta = -4; delta <= 8; delta++)
+                            {
+                                var off = objOffset + delta;
+                                if (off < 0)
+                                    continue;
+
+                                // Prefer u32 offsets first (matches typical disp32/imm32 fields), but keep it conservative.
+                                if (off + 4 <= objBytes.Length)
+                                {
+                                    var v = ReadUInt32(objBytes, off);
+                                    if (v != 0 && v <= 0xFFFF && TryMapOffsetToUniqueObject(objects, v, out var tobj, out var tlin))
+                                    {
+                                        siteV32 = v;
+                                        chosenDelta = delta;
+                                        targetKind = "internal";
+                                        targetObj = tobj;
+                                        targetOff = v;
+                                        targetLinear = tlin;
+                                        break;
+                                    }
+                                }
+
+                                // Also try u16 offsets (common for selector/offset fixups).
+                                if (!siteV32.HasValue && off + 2 <= objBytes.Length)
+                                {
+                                    var v16 = ReadUInt16(objBytes, off);
+                                    if (v16 != 0 && v16 <= 0xFFFF && TryMapOffsetToUniqueObject(objects, v16, out var tobj, out var tlin))
+                                    {
+                                        siteV16 = v16;
+                                        chosenDelta = delta;
+                                        targetKind = "internal";
+                                        targetObj = tobj;
+                                        targetOff = v16;
+                                        targetLinear = tlin;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
                         // Prefer a value that matches the target spec (internal pointers).
                         if (targetKind == "internal" && targetLinear.HasValue)
                         {
@@ -11119,9 +11209,14 @@ namespace DOSRE.Dasm
                     var addend32 = (int?)null;
                     if (targetKind == "internal" && siteV32.HasValue && targetLinear.HasValue)
                     {
-                        var add = unchecked((long)siteV32.Value - (long)targetLinear.Value);
-                        if (add >= int.MinValue && add <= int.MaxValue)
-                            addend32 = (int)add;
+                        // Only compute addends when the site value looks like a relocated linear address.
+                        // When we classified via object-relative offsets (v <= 0xFFFF), the subtraction is not meaningful.
+                        if (siteV32.Value > 0xFFFF)
+                        {
+                            var add = unchecked((long)siteV32.Value - (long)targetLinear.Value);
+                            if (add >= int.MinValue && add <= int.MaxValue)
+                                addend32 = (int)add;
+                        }
                     }
 
                     byte[] recordBytes = null;
