@@ -72,6 +72,12 @@ namespace DOSRE.UI.impl
     ///     Specified with -LECFGALLJSON <file.json>
     /// </summary>
     private string _leCfgAllJson;
+
+    /// <summary>
+    ///     Optional: export a compact LE analysis report in JSON format.
+    ///     Specified with -LEREPORTJSON <file.json>
+    /// </summary>
+    private string _leReportJson;
         ///     Logger Implementation
         /// </summary>
         protected static readonly Logger _logger = LogManager.GetCurrentClassLogger(typeof(CustomLogger));
@@ -431,6 +437,12 @@ namespace DOSRE.UI.impl
                             _leCfgAllJson = _args[i + 1];
                             i++;
                             break;
+                        case "LEREPORTJSON":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LEREPORTJSON requires a <file.json>");
+                            _leReportJson = _args[i + 1];
+                            i++;
+                            break;
                         case "MZFULL":
                             _bMzFull = true;
                             break;
@@ -555,6 +567,8 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LECFGALLJSON <file.json> -- (LE inputs) Export a best-effort whole-program CFG index in JSON format (implies -LEINSIGHTS)");
                             Console.WriteLine(
+                                "-LEREPORTJSON <file.json> -- (LE inputs) Export a compact LE analysis report (counts + entry + input) in JSON format (implies -LEINSIGHTS)");
+                            Console.WriteLine(
                                 "-MZFULL -- (MZ inputs) Disassemble from entrypoint to end of load module");
                             Console.WriteLine(
                                 "-MZBYTES <n> -- (MZ inputs) Limit disassembly to n bytes from entrypoint");
@@ -622,7 +636,8 @@ namespace DOSRE.UI.impl
                 var wantLeCfgDot = !string.IsNullOrWhiteSpace(_leCfgDot);
                 var wantLeCfgAllDot = !string.IsNullOrWhiteSpace(_leCfgAllDot);
                 var wantLeCfgAllJson = !string.IsNullOrWhiteSpace(_leCfgAllJson);
-                var leInsightsForRun = _bLeInsights || wantLeCallGraph || wantLeCfgDot || wantLeCfgAllDot || wantLeCfgAllJson;
+                var wantLeReportJson = !string.IsNullOrWhiteSpace(_leReportJson);
+                var leInsightsForRun = _bLeInsights || wantLeCallGraph || wantLeCfgDot || wantLeCfgAllDot || wantLeCfgAllJson || wantLeReportJson;
 
                 static string ChooseLeOutput(Dictionary<string, string> files)
                 {
@@ -647,6 +662,8 @@ namespace DOSRE.UI.impl
                         _logger.Warn("Warning: -LECFGALLDOT is not supported with -LEDECOMPASM (no LE decode pass). Run without -LEDECOMPASM to export CFG.");
                     if (wantLeCfgAllJson)
                         _logger.Warn("Warning: -LECFGALLJSON is not supported with -LEDECOMPASM (no LE decode pass). Run without -LEDECOMPASM to export CFG.");
+                    if (wantLeReportJson)
+                        _logger.Warn("Warning: -LEREPORTJSON is not supported with -LEDECOMPASM (no LE decode pass). Run without -LEDECOMPASM to export the report.");
                     leOk = LEDisassembler.TryDecompileToMultipartFromAsmFile(_leDecompileAsmFile, _leOnlyFunction, _leChunks, out leDecompFiles, out leError);
                     leOutput = leOk ? ChooseLeOutput(leDecompFiles) : string.Empty;
                 }
@@ -1036,6 +1053,91 @@ namespace DOSRE.UI.impl
 
                             File.WriteAllText(_leCfgAllJson, json);
                             _logger.Info($"Wrote whole-program LE CFG JSON to {_leCfgAllJson} (functions {analysis.CfgByFunction.Count})");
+                        }
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(_leReportJson))
+                    {
+                        var analysis = LEDisassembler.GetLastAnalysis();
+                        if (analysis == null)
+                        {
+                            _logger.Warn("Warning: -LEREPORTJSON requested but no LE analysis was captured (try enabling -LEINSIGHTS and avoid -LEDECOMPASM)");
+                        }
+                        else
+                        {
+                            static string Hex(uint a2) => $"0x{a2:X8}";
+                            static string FuncName(uint a2) => $"func_{a2:X8}";
+
+                            var functions = analysis.Functions ?? new Dictionary<uint, LEDisassembler.LeFunctionInfo>();
+                            var cfgByFunction = analysis.CfgByFunction ?? new Dictionary<uint, LEDisassembler.LeFunctionCfg>();
+
+                            var functionCount = functions.Count;
+                            var cfgFunctionCount = cfgByFunction.Count;
+                            var totalInstructionCount = functions.Values.Sum(f => f?.InstructionCount ?? 0);
+
+                            var callEdgeCount = 0;
+                            var globals = new HashSet<string>(StringComparer.Ordinal);
+                            var strings = new HashSet<string>(StringComparer.Ordinal);
+                            foreach (var fn in functions.Values)
+                            {
+                                if (fn == null)
+                                    continue;
+
+                                if (fn.Calls != null && fn.Calls.Count > 0)
+                                    callEdgeCount += fn.Calls.Distinct().Count();
+
+                                if (fn.Globals != null)
+                                {
+                                    foreach (var g in fn.Globals)
+                                        if (!string.IsNullOrWhiteSpace(g))
+                                            globals.Add(g);
+                                }
+
+                                if (fn.Strings != null)
+                                {
+                                    foreach (var s in fn.Strings)
+                                        if (!string.IsNullOrWhiteSpace(s))
+                                            strings.Add(s);
+                                }
+                            }
+
+                            var totalBasicBlocks = 0;
+                            var cfgEdgeCount = 0;
+                            foreach (var cfg in cfgByFunction.Values)
+                            {
+                                if (cfg?.Blocks == null || cfg.Blocks.Count == 0)
+                                    continue;
+                                totalBasicBlocks += cfg.Blocks.Count;
+                                foreach (var b in cfg.Blocks.Values)
+                                {
+                                    if (b?.Successors != null)
+                                        cfgEdgeCount += b.Successors.Count;
+                                }
+                            }
+
+                            var payload = new
+                            {
+                                input = analysis.InputFile,
+                                entry = Hex(analysis.EntryLinear),
+                                entryName = FuncName(analysis.EntryLinear),
+                                functionCount,
+                                cfgFunctionCount = cfgFunctionCount > 0 ? (int?)cfgFunctionCount : null,
+                                totalInstructionCount = totalInstructionCount > 0 ? (int?)totalInstructionCount : null,
+                                totalBasicBlocks = totalBasicBlocks > 0 ? (int?)totalBasicBlocks : null,
+                                cfgEdgeCount = cfgEdgeCount > 0 ? (int?)cfgEdgeCount : null,
+                                callEdgeCount = callEdgeCount > 0 ? (int?)callEdgeCount : null,
+                                globalCount = globals.Count > 0 ? (int?)globals.Count : null,
+                                stringCount = strings.Count > 0 ? (int?)strings.Count : null,
+                            };
+
+                            var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions
+                            {
+                                WriteIndented = true,
+                                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+                            });
+
+                            File.WriteAllText(_leReportJson, json);
+                            _logger.Info($"Wrote LE report JSON to {_leReportJson} (functions {functionCount})");
                         }
                     }
 

@@ -354,3 +354,16 @@ dosbox-sync/EURO96/_mbx/CMD.RUN
 tools/dosbox_sync_euro96.sh
 tools/dosbox_sync_euro96.sh
 dosbox-sync/EURO96/makefile
+Artifacts/test-exports/CLIENT.callgraph.json
+Artifacts/test-exports/CLIENT.cfg.all.json
+Artifacts/test-exports/unwrap-scan/BLST.callgraph.json
+Artifacts/test-exports/unwrap-scan/BLST.cfg.all.json
+Artifacts/test-exports/unwrap-scan/CLIENT.callgraph.json
+Artifacts/test-exports/unwrap-scan/CLIENT.cfg.all.json
+Artifacts/test-exports/unwrap-scan/CLIENT.report.json
+Artifacts/test-exports/unwrap-scan/EURO96.callgraph.json
+Artifacts/test-exports/unwrap-scan/EURO96.cfg.all.json
+Artifacts/test-exports/unwrap-scan/FIDEMO.callgraph.json
+Artifacts/test-exports/unwrap-scan/FIDEMO.cfg.all.json
+Artifacts/test-exports/unwrap-scan/HOCKEY.callgraph.json
+Artifacts/test-exports/unwrap-scan/HOCKEY.cfg.all.json

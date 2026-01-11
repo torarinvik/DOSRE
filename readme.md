@@ -44,6 +44,8 @@ For DOS4GW LE inputs, DOSRE can export best-effort graphs derived from the LE di
     - `-LECFGDOT <file.dot>` (per-function; uses `-LEFUNC` if provided, else entry function)
     - `-LECFGALLDOT <file.dot>` (whole-program index; clusters per function)
     - `-LECFGALLJSON <file.json>` (whole-program index)
+- Report:
+    - `-LEREPORTJSON <file.json>` (compact summary: entry + counts)
 
 Notes:
 
@@ -55,6 +57,12 @@ Example (whole-program CFG as JSON):
 
 ```
 -i EUROBLST.EXE -o EUROBLST.disasm.txt -leinsights -lecfgalljson EUROBLST.cfg.json
+
+Example (compact LE report as JSON):
+
+```
+-i EUROBLST.EXE -o EUROBLST.disasm.txt -leinsights -lereportjson EUROBLST.report.json
+```
 ```
 
 # Current Features
