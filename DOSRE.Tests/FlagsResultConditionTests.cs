@@ -141,4 +141,46 @@ public class FlagsResultConditionTests
 
         Assert.Equal("(int16_t)(uint16_t)(ax) >= 0", got);
     }
+
+    [Fact]
+    public void MakeConditionFromPendingForTest_JsAfterTestRegReg_8Bit_UsesInt8Cast()
+    {
+        var got = DOSRE.Dasm.LEDisassembler.MakeConditionFromPendingForTest(
+            jcc: "js",
+            lastWasCmp: false,
+            cmpLhs: null,
+            cmpRhs: null,
+            lastWasTest: true,
+            testLhs: "al",
+            testRhs: "al",
+            lastWasIncDec: false,
+            incDecOperand: null,
+            lastWasArith: false,
+            arithOp: null,
+            arithA: null,
+            arithB: null);
+
+        Assert.Equal("(int8_t)(uint8_t)(al) < 0", got);
+    }
+
+    [Fact]
+    public void MakeConditionFromPendingForTest_JnsAfterTestRegReg_16Bit_UsesInt16Cast()
+    {
+        var got = DOSRE.Dasm.LEDisassembler.MakeConditionFromPendingForTest(
+            jcc: "jns",
+            lastWasCmp: false,
+            cmpLhs: null,
+            cmpRhs: null,
+            lastWasTest: true,
+            testLhs: "ax",
+            testRhs: "ax",
+            lastWasIncDec: false,
+            incDecOperand: null,
+            lastWasArith: false,
+            arithOp: null,
+            arithA: null,
+            arithB: null);
+
+        Assert.Equal("(int16_t)(uint16_t)(ax) >= 0", got);
+    }
 }

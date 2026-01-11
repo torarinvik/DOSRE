@@ -3740,12 +3740,20 @@ namespace DOSRE.Dasm
                 // Simple case: test reg, reg => check if reg is 0, negative, etc.
                 if (a.Equals(b, StringComparison.OrdinalIgnoreCase))
                 {
+                    var bits = GuessBitWidthFromExpr(a);
+                    var signedExpr = bits switch
+                    {
+                        8 => $"(int8_t)(uint8_t)({a})",
+                        16 => $"(int16_t)(uint16_t)({a})",
+                        _ => null
+                    };
+
                     return jcc switch
                     {
                         "je" or "jz" => $"{a} == 0",
                         "jne" or "jnz" => $"{a} != 0",
-                        "js" => $"(int32_t){a} < 0",
-                        "jns" => $"(int32_t){a} >= 0",
+                        "js" => signedExpr != null ? $"{signedExpr} < 0" : $"(int32_t){a} < 0",
+                        "jns" => signedExpr != null ? $"{signedExpr} >= 0" : $"(int32_t){a} >= 0",
                         "jg" => $"(int32_t){a} > 0",
                         "jge" => $"(int32_t){a} >= 0",
                         "jl" => $"(int32_t){a} < 0",
