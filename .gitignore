@@ -350,3 +350,7 @@ EXES/disasm_le/FIDEMO.func_000100DC.pseudo.c
 *.o
 Euro96Plan.md
 journal.md
+dosbox-sync/EURO96/_mbx/CMD.RUN
+tools/dosbox_sync_euro96.sh
+tools/dosbox_sync_euro96.sh
+dosbox-sync/EURO96/makefile
