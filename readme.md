@@ -52,6 +52,7 @@ Notes:
 - These exports imply `-LEINSIGHTS`.
 - `-LEDECOMPASM` is not supported for these exports (it skips the LE decode pass).
 - CFG output is best-effort (built from decoded relative branches and inferred fallthrough starts).
+- If an LE payload is hidden inside an unusual MZ container where `e_lfanew` is bogus and there is no BW overlay header, you can opt-in to a constrained overlay scan with `-LESCANMZ`.
 
 Call graph JSON notes:
 

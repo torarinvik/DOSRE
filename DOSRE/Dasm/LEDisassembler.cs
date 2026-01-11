@@ -5375,6 +5375,11 @@ namespace DOSRE.Dasm
 
         public static bool TryDumpFixupsToString(string inputFile, int? maxPages, int maxBytesPerPage, out string output, out string error)
         {
+            return TryDumpFixupsToString(inputFile, maxPages, maxBytesPerPage, leScanMzOverlayFallback: false, out output, out error);
+        }
+
+        public static bool TryDumpFixupsToString(string inputFile, int? maxPages, int maxBytesPerPage, bool leScanMzOverlayFallback, out string output, out string error)
+        {
             output = string.Empty;
             error = string.Empty;
 
@@ -5388,7 +5393,7 @@ namespace DOSRE.Dasm
                 maxBytesPerPage = 256;
 
             var fileBytes = File.ReadAllBytes(inputFile);
-            if (!TryFindLEHeaderOffset(fileBytes, out var leHeaderOffset))
+            if (!TryFindLEHeaderOffset(fileBytes, allowMzOverlayScanFallback: leScanMzOverlayFallback, out var leHeaderOffset))
             {
                 error = "LE header not found";
                 return false;
@@ -5621,6 +5626,11 @@ namespace DOSRE.Dasm
 
         public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, int? leRenderLimit, int leJobs, bool leFixups, bool leGlobals, bool leInsights, EnumToolchainHint toolchainHint, uint? leStartLinear, out string output, out string error)
         {
+            return TryDisassembleToString(inputFile, leFull, leBytesLimit, leRenderLimit, leJobs, leFixups, leGlobals, leInsights, toolchainHint, leStartLinear, leScanMzOverlayFallback: false, out output, out error);
+        }
+
+        public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, int? leRenderLimit, int leJobs, bool leFixups, bool leGlobals, bool leInsights, EnumToolchainHint toolchainHint, uint? leStartLinear, bool leScanMzOverlayFallback, out string output, out string error)
+        {
             output = string.Empty;
             error = string.Empty;
 
@@ -5636,7 +5646,7 @@ namespace DOSRE.Dasm
             }
 
             var fileBytes = File.ReadAllBytes(inputFile);
-            if (!TryFindLEHeaderOffset(fileBytes, out var leHeaderOffset))
+            if (!TryFindLEHeaderOffset(fileBytes, allowMzOverlayScanFallback: leScanMzOverlayFallback, out var leHeaderOffset))
             {
                 error = "LE header not found";
                 return false;
@@ -9327,63 +9337,183 @@ namespace DOSRE.Dasm
             return obj.BaseAddress + header.EntryEip;
         }
 
-        private static bool TryFindLEHeaderOffset(byte[] fileBytes, out int offset)
-        {
-            offset = 0;
-            if (fileBytes == null || fileBytes.Length < 0x40)
-                return false;
-
-            // First: if this is an MZ container, prefer e_lfanew.
-            // This avoids false positives where an "LE\0\0" byte sequence appears in the stub or data.
-            var isMz = fileBytes[0] == (byte)'M' && fileBytes[1] == (byte)'Z';
-            if (isMz)
+            private static bool TryFindLEHeaderOffset(byte[] fileBytes, out int offset)
             {
-                var lfanew = (int)ReadUInt32(fileBytes, 0x3C);
-                if (lfanew > 0 && lfanew + 4 <= fileBytes.Length)
+                return TryFindLEHeaderOffset(fileBytes, allowMzOverlayScanFallback: false, out offset);
+            }
+
+            private static bool TryFindLEHeaderOffset(byte[] fileBytes, bool allowMzOverlayScanFallback, out int offset)
+            {
+                offset = 0;
+                if (fileBytes == null || fileBytes.Length < 0x40)
+                    return false;
+
+                // First: if this is an MZ container, prefer e_lfanew.
+                // This avoids false positives where an "LE\0\0" byte sequence appears in the stub or data.
+                var isMz = fileBytes[0] == (byte)'M' && fileBytes[1] == (byte)'Z';
+                if (isMz)
                 {
-                    if (fileBytes[lfanew] == (byte)'L' && fileBytes[lfanew + 1] == (byte)'E' && fileBytes[lfanew + 2] == 0x00 &&
-                        fileBytes[lfanew + 3] == 0x00)
+                    var lfanew = (int)ReadUInt32(fileBytes, 0x3C);
+                    if (lfanew > 0 && lfanew + 4 <= fileBytes.Length)
                     {
-                        if (TryParseHeader(fileBytes, lfanew, out var _, out var _))
+                        if (fileBytes[lfanew] == (byte)'L' && fileBytes[lfanew + 1] == (byte)'E' && fileBytes[lfanew + 2] == 0x00 &&
+                            fileBytes[lfanew + 3] == 0x00)
                         {
-                            offset = lfanew;
-                            return true;
+                            if (TryParseHeader(fileBytes, lfanew, out var _, out var _))
+                            {
+                                offset = lfanew;
+                                return true;
+                            }
                         }
+                    }
+
+                    // Next: handle BW overlay containers (EURO96/EUROBLST-style), where the *real* bound MZ+LE lives
+                    // behind a BW overlay header and e_lfanew may be bogus/out-of-range.
+                    if (TryFindEmbeddedLeOffsetFromBwOverlay(fileBytes, out var bwLeOffset) &&
+                        TryParseHeader(fileBytes, bwLeOffset, out var _, out var _))
+                    {
+                        offset = bwLeOffset;
+                        return true;
+                    }
+
+                    // Opt-in: constrained fallback scan *only* in the overlay region.
+                    // This is useful for unusual containers where e_lfanew is bogus and there's no BW header.
+                    if (allowMzOverlayScanFallback && TryScanForLeHeaderInMzOverlay(fileBytes, out var scanOffset))
+                    {
+                        offset = scanOffset;
+                        return true;
+                    }
+
+                    // Default behavior: do NOT scan inside MZ containers.
+                    offset = 0;
+                    return false;
+                }
+
+                // Fallback: scan for a plausible LE signature and validate by parsing.
+                // (Used for raw LE images without an MZ container.)
+                for (var i = 0; i <= fileBytes.Length - 4; i++)
+                {
+                    if (fileBytes[i] != (byte)'L' || fileBytes[i + 1] != (byte)'E' || fileBytes[i + 2] != 0x00 || fileBytes[i + 3] != 0x00)
+                        continue;
+
+                    if (TryParseHeader(fileBytes, i, out var _, out var _))
+                    {
+                        offset = i;
+                        return true;
                     }
                 }
 
-                // If the input is an MZ container but doesn't have a valid LE header at e_lfanew,
-                // do NOT fall back to scanning for "LE\0\0" within the file.
-                // Many large 16-bit MZ binaries (often with overlays) may contain that byte pattern
-                // in data, leading to false-positive LE detections.
                 offset = 0;
                 return false;
             }
 
-            // Fallback: scan for a plausible LE signature and validate by parsing.
-            // (Used for raw LE images without an MZ container.)
-            for (var i = 0; i <= fileBytes.Length - 4; i++)
+            private static bool TryScanForLeHeaderInMzOverlay(byte[] fileBytes, out int leHeaderOffset)
             {
-                if (fileBytes[i] != (byte)'L' || fileBytes[i + 1] != (byte)'E' || fileBytes[i + 2] != 0x00 || fileBytes[i + 3] != 0x00)
-                    continue;
+                leHeaderOffset = 0;
+                if (fileBytes == null || fileBytes.Length < 0x40)
+                    return false;
+                if (fileBytes[0] != (byte)'M' || fileBytes[1] != (byte)'Z')
+                    return false;
 
-                if (TryParseHeader(fileBytes, i, out var _, out var _))
+                // Compute the overlay base (load module size) from the outer MZ header.
+                // This intentionally avoids scanning the MZ stub body.
+                var eCblp = ReadUInt16(fileBytes, 0x02);
+                var eCp = ReadUInt16(fileBytes, 0x04);
+                if (eCp == 0)
+                    return false;
+
+                var overlayBaseL = ((long)eCp - 1) * 512L + (eCblp == 0 ? 512L : eCblp);
+                if (overlayBaseL < 0x40 || overlayBaseL >= fileBytes.Length)
+                    return false;
+	
+                var start = (int)overlayBaseL;
+                for (var i = start; i <= fileBytes.Length - 4; i++)
                 {
-                    offset = i;
-                    return true;
+                    if (fileBytes[i] != (byte)'L' || fileBytes[i + 1] != (byte)'E' || fileBytes[i + 2] != 0x00 || fileBytes[i + 3] != 0x00)
+                        continue;
+
+                    if (TryParseHeader(fileBytes, i, out var _, out var _))
+                    {
+                        leHeaderOffset = i;
+                        return true;
+                    }
                 }
+
+                return false;
             }
 
-            offset = 0;
-            return false;
-        }
+	        private static bool TryFindEmbeddedLeOffsetFromBwOverlay(byte[] fileBytes, out int leHeaderOffset)
+	        {
+	            leHeaderOffset = 0;
+	            if (fileBytes == null || fileBytes.Length < 0x40)
+	                return false;
+	            if (fileBytes[0] != (byte)'M' || fileBytes[1] != (byte)'Z')
+	                return false;
 
-        private static bool TryParseHeader(byte[] fileBytes, int headerOffset, out LEHeader header, out string error)
-        {
-            header = default;
-            error = string.Empty;
+	            // Compute the overlay base (load module size) from the outer MZ header.
+	            var eCblp = ReadUInt16(fileBytes, 0x02);
+	            var eCp = ReadUInt16(fileBytes, 0x04);
+	            if (eCp == 0)
+	                return false;
 
-            if (headerOffset < 0 || headerOffset + 0x84 >= fileBytes.Length)
+	            var overlayBaseL = ((long)eCp - 1) * 512L + (eCblp == 0 ? 512L : eCblp);
+	            if (overlayBaseL < 0x40 || overlayBaseL + 4 > fileBytes.Length)
+	                return false;
+	            var overlayBase = (int)overlayBaseL;
+
+	            // BW overlay header signature.
+	            if (fileBytes[overlayBase] != (byte)'B' || fileBytes[overlayBase + 1] != (byte)'W')
+	                return false;
+
+	            var bwHeaderLen = (int)ReadUInt16(fileBytes, overlayBase + 2);
+	            if (bwHeaderLen <= 0 || bwHeaderLen > 64 * 1024)
+	                return false;
+	            if (overlayBase + bwHeaderLen > fileBytes.Length)
+	                return false;
+
+	            // Heuristic: scan BW header u32 fields for a relative pointer to an embedded MZ which itself is bound to LE.
+	            for (var fieldOff = 0; fieldOff + 4 <= bwHeaderLen; fieldOff += 4)
+	            {
+	                var rel = ReadUInt32(fileBytes, overlayBase + fieldOff);
+	                if (rel == 0)
+	                    continue;
+
+	                var innerMzOffL = overlayBaseL + rel;
+	                if (innerMzOffL < 0 || innerMzOffL + 0x40 > fileBytes.Length)
+	                    continue;
+	                var innerMzOff = (int)innerMzOffL;
+
+	                if (fileBytes[innerMzOff] != (byte)'M' || fileBytes[innerMzOff + 1] != (byte)'Z')
+	                    continue;
+
+	                var innerLfanew = ReadUInt32(fileBytes, innerMzOff + 0x3C);
+	                if (innerLfanew < 0x40)
+	                    continue;
+
+	                var innerLeOffL = innerMzOffL + innerLfanew;
+	                if (innerLeOffL < 0 || innerLeOffL + 4 > fileBytes.Length)
+	                    continue;
+	                var innerLeOff = (int)innerLeOffL;
+
+	                if (fileBytes[innerLeOff] == (byte)'L' &&
+	                    fileBytes[innerLeOff + 1] == (byte)'E' &&
+	                    fileBytes[innerLeOff + 2] == 0x00 &&
+	                    fileBytes[innerLeOff + 3] == 0x00)
+	                {
+	                    leHeaderOffset = innerLeOff;
+	                    return true;
+	                }
+	            }
+
+	            return false;
+	        }
+
+	        private static bool TryParseHeader(byte[] fileBytes, int headerOffset, out LEHeader header, out string error)
+	        {
+	            header = default;
+	            error = string.Empty;
+
+            if (headerOffset < 0 || headerOffset + 0x84 > fileBytes.Length)
             {
                 error = "Invalid LE header offset";
                 return false;

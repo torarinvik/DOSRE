@@ -218,6 +218,13 @@ namespace DOSRE.UI.impl
         private bool _bLeUnwrap;
 
         /// <summary>
+        ///     LE header detection fallback for unusual MZ containers.
+        ///     Specified with the -lescanmz argument.
+        ///     When enabled, DOSRE will (as a last resort) scan the computed MZ overlay region for an LE header.
+        /// </summary>
+        private bool _bLeScanMz;
+
+        /// <summary>
         ///     LE (DOS4GW) fixup dump
         ///     Specified with the -lefixdump [maxPages] argument
         ///     For LE inputs, emits a raw per-page fixup table dump to help reverse the record layout.
@@ -392,6 +399,9 @@ namespace DOSRE.UI.impl
                         case "LEUNWRAP":
                             _bLeUnwrap = true;
                             break;
+						case "LESCANMZ":
+							_bLeScanMz = true;
+							break;
                         case "LEFUNC":
                         case "LEONLYFUNC":
                             if (i + 1 >= _args.Length)
@@ -553,6 +563,8 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LEUNWRAP -- (EURO96/EUROBLST-style) If input is an MZ stub with a BW overlay header, unwrap the embedded bound MZ+LE and run the LE pipeline on that payload");
                             Console.WriteLine(
+                                "-LESCANMZ -- (LE detection) Opt-in fallback: scan only the MZ overlay region for an LE header if e_lfanew/BW detection fails (may be slower; avoids most false positives)");
+                            Console.WriteLine(
                                 "-LEFUNC <func_XXXXXXXX|XXXXXXXX|0xXXXXXXXX> -- Only emit a single function (works with -LEDECOMP; useful for patching stubs; slicing omits loader/main.c)");
                             Console.WriteLine(
                                 "-LEFIXDUMP [maxPages] -- (LE inputs) Dump raw fixup pages + decoding hints (writes <out>.fixups.txt if -O is used)");
@@ -699,6 +711,7 @@ namespace DOSRE.UI.impl
                             leInsights: true,
                             _toolchainHint,
                             _leStartLinear,
+                            _bLeScanMz,
                             out var asm,
                             out leError);
 
@@ -734,6 +747,7 @@ namespace DOSRE.UI.impl
                                 leInsights: true,
                                 _toolchainHint,
                                 _leStartLinear,
+                                _bLeScanMz,
                                 out var asm,
                                 out leError);
 
@@ -757,7 +771,7 @@ namespace DOSRE.UI.impl
                     }
                     else
                     {
-                        leOk = LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _leRenderLimit, _leJobs, _bLeFixups, _bLeGlobals, leInsightsForRun, _toolchainHint, _leStartLinear, out leOutput, out leError);
+                        leOk = LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _leRenderLimit, _leJobs, _bLeFixups, _bLeGlobals, leInsightsForRun, _toolchainHint, _leStartLinear, _bLeScanMz, out leOutput, out leError);
                     }
                 }
 
@@ -1106,7 +1120,7 @@ namespace DOSRE.UI.impl
 
                     if (_bLeFixDump)
                     {
-                        if (LEDisassembler.TryDumpFixupsToString(_sInputFile, _leFixDumpMaxPages, 512, out var dump, out var dumpErr))
+                        if (LEDisassembler.TryDumpFixupsToString(_sInputFile, _leFixDumpMaxPages, 512, _bLeScanMz, out var dump, out var dumpErr))
                         {
                             if (string.IsNullOrEmpty(_sOutputFile))
                             {
