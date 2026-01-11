@@ -2501,6 +2501,11 @@ namespace DOSRE.Dasm
             public string LastCarryB;
             public string LastCarryIn; // "0" or "carry" (best-effort)
 
+            // Tracks the last flag-setting ALU destination so we can recover ZF/SF-based branches
+            // (jz/jnz/js/jns) even when there was no cmp/test.
+            public bool LastWasResult;
+            public string LastResultExpr;
+
             public string LastEaxAssignment;
 
             public void Clear(bool targetIsEax = false)
@@ -2522,6 +2527,8 @@ namespace DOSRE.Dasm
                 LastCarryA = null;
                 LastCarryB = null;
                 LastCarryIn = null;
+                LastWasResult = false;
+                LastResultExpr = null;
                 if (targetIsEax) LastEaxAssignment = null;
             }
 
@@ -2960,11 +2967,18 @@ namespace DOSRE.Dasm
                     pending.LastCarryB = resolvedRhs;
                     pending.LastCarryIn = (mn is "adc" or "sbb") ? "carry" : "0";
                 }
+
+                // For ZF/SF-based conditionals (jz/jnz/js/jns), remember the destination/result.
+                // After the operation, the destination holds the result.
+                pending.LastWasResult = true;
+                pending.LastResultExpr = lhs;
                 
                 if (mn == "xor" && lhs.Equals(rhs, StringComparison.OrdinalIgnoreCase))
                 {
                     state.Set(lhs, "0");
                     if (lhs == "eax") pending.LastEaxAssignment = "0";
+                    pending.LastWasResult = true;
+                    pending.LastResultExpr = "0";
                     return $"{lhs} = 0;{commentSuffix}";
                 }
 
@@ -2995,6 +3009,10 @@ namespace DOSRE.Dasm
                 pending.Clear(dstIsEax);
                 var lhs = NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: true, fn);
                 var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn);
+
+                pending.LastWasResult = true;
+                pending.LastResultExpr = lhs;
+
                 var op = mn == "shl" ? "<<=" : ">>=";
                 // If rhs is constant > 31, mask it to avoid C undefined behavior (matching x86 behavior)
                 if (rhs.StartsWith("0x") || int.TryParse(rhs, out _))
@@ -3071,6 +3089,9 @@ namespace DOSRE.Dasm
                 pending.LastArithOp = mn;
                 pending.LastArithA = WrapExprForPointerMath(state.Resolve(opnd));
                 pending.LastArithB = "1";
+
+                pending.LastWasResult = true;
+                pending.LastResultExpr = opnd;
 
                 return mn == "inc" ? $"({opnd})++;{commentSuffix}" : $"({opnd})--;{commentSuffix}";
             }
@@ -3634,6 +3655,35 @@ namespace DOSRE.Dasm
             return mn is "jz" or "jnz" or "je" or "jne" or "jg" or "jge" or "jl" or "jle" or "ja" or "jae" or "jb" or "jbe" or "jc" or "jnc" or "jo" or "jno" or "js" or "jns";
         }
 
+        private static int GuessBitWidthFromExpr(string expr)
+        {
+            if (string.IsNullOrWhiteSpace(expr))
+                return 32;
+
+            // If the expression already has an explicit width cast, trust it.
+            if (expr.Contains("uint8_t", StringComparison.OrdinalIgnoreCase) || expr.Contains("int8_t", StringComparison.OrdinalIgnoreCase))
+                return 8;
+            if (expr.Contains("uint16_t", StringComparison.OrdinalIgnoreCase) || expr.Contains("int16_t", StringComparison.OrdinalIgnoreCase))
+                return 16;
+            if (expr.Contains("uint32_t", StringComparison.OrdinalIgnoreCase) || expr.Contains("int32_t", StringComparison.OrdinalIgnoreCase))
+                return 32;
+
+            // Heuristic for common x86 register names.
+            var t = expr.Trim();
+            if (t.Length <= 4 && Regex.IsMatch(t, "^[a-zA-Z][a-zA-Z0-9]*$") )
+            {
+                t = t.ToLowerInvariant();
+                if (t is "al" or "ah" or "bl" or "bh" or "cl" or "ch" or "dl" or "dh")
+                    return 8;
+                if (t is "ax" or "bx" or "cx" or "dx" or "si" or "di" or "bp" or "sp" or "ip")
+                    return 16;
+                if (t is "eax" or "ebx" or "ecx" or "edx" or "esi" or "edi" or "ebp" or "esp" or "eip")
+                    return 32;
+            }
+
+            return 32;
+        }
+
         internal static string MakeConditionFromPendingForTest(
             string jcc,
             bool lastWasCmp,
@@ -3652,7 +3702,9 @@ namespace DOSRE.Dasm
             string carryOp = null,
             string carryA = null,
             string carryB = null,
-            string carryIn = null)
+            string carryIn = null,
+            bool lastWasResult = false,
+            string lastResultExpr = null)
         {
             if (string.IsNullOrWhiteSpace(jcc))
                 return string.Empty;
@@ -3762,6 +3814,28 @@ namespace DOSRE.Dasm
                     return jcc == "jc" ? expr : $"!({expr})";
             }
 
+            // ZF/SF recovery from last flag-setting ALU result (no cmp/test).
+            if (lastWasResult && !string.IsNullOrWhiteSpace(lastResultExpr))
+            {
+                var r = lastResultExpr;
+                var bits = GuessBitWidthFromExpr(r);
+                var signedExpr = bits switch
+                {
+                    8 => $"(int8_t)(uint8_t)({r})",
+                    16 => $"(int16_t)(uint16_t)({r})",
+                    _ => null
+                };
+
+                return jcc switch
+                {
+                    "je" or "jz" => $"{r} == 0",
+                    "jne" or "jnz" => $"{r} != 0",
+                    "js" => signedExpr != null ? $"{signedExpr} < 0" : $"(int32_t){r} < 0",
+                    "jns" => signedExpr != null ? $"{signedExpr} >= 0" : $"(int32_t){r} >= 0",
+                    _ => string.Empty
+                };
+            }
+
             return string.Empty;
         }
 
@@ -3788,7 +3862,9 @@ namespace DOSRE.Dasm
                 pending.LastCarryOp,
                 pending.LastCarryA,
                 pending.LastCarryB,
-                pending.LastCarryIn);
+                pending.LastCarryIn,
+                pending.LastWasResult,
+                pending.LastResultExpr);
         }
 
         private static (string o1, string o2, string o3)? SplitThreeOperands(string ops)
