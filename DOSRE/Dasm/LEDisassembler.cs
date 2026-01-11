@@ -125,6 +125,37 @@ namespace DOSRE.Dasm
             public LeFixupChainInfo[] chains { get; set; }
         }
 
+        public sealed class LeReachabilityRangeInfo
+        {
+            public uint startLinear { get; set; }
+            public uint endLinear { get; set; }
+        }
+
+        public sealed class LeReachabilityObjectInfo
+        {
+            public int index { get; set; }
+            public uint baseAddress { get; set; }
+            public uint virtualSize { get; set; }
+            public uint flags { get; set; }
+
+            public uint decodedStartLinear { get; set; }
+            public uint decodedEndLinear { get; set; }
+
+            public int instructionCount { get; set; }
+            public int reachableInstructionCount { get; set; }
+            public int reachableByteCount { get; set; }
+
+            public LeReachabilityRangeInfo[] reachableCodeRanges { get; set; }
+            public LeReachabilityRangeInfo[] dataCandidateRanges { get; set; }
+        }
+
+        public sealed class LeReachabilityInfo
+        {
+            public string inputFile { get; set; }
+            public uint entryLinear { get; set; }
+            public LeReachabilityObjectInfo[] objects { get; set; }
+        }
+
         public static bool TryBuildFixupTable(string inputFile, bool leScanMzOverlayFallback, out LeFixupTableInfo table, out string error)
         {
             table = null;
@@ -337,6 +368,381 @@ namespace DOSRE.Dasm
             catch (Exception ex)
             {
                 error = ex.Message;
+                return false;
+            }
+        }
+
+        public static bool TryBuildReachabilityMap(string inputFile, bool leScanMzOverlayFallback, out LeReachabilityInfo map, out string error)
+        {
+            map = null;
+            error = string.Empty;
+
+            if (string.IsNullOrWhiteSpace(inputFile) || !File.Exists(inputFile))
+            {
+                error = "Input file not found";
+                return false;
+            }
+
+            try
+            {
+                var fileBytes = File.ReadAllBytes(inputFile);
+                if (!TryFindLEHeaderOffset(fileBytes, allowMzOverlayScanFallback: leScanMzOverlayFallback, out var leHeaderOffset))
+                {
+                    error = "LE header not found";
+                    return false;
+                }
+
+                if (!TryParseHeader(fileBytes, leHeaderOffset, out var header, out error))
+                    return false;
+
+                var objects = ParseObjects(fileBytes, header);
+                var pageMap = ParseObjectPageMap(fileBytes, header);
+                var entryLinearU = ComputeEntryLinear(header, objects);
+                var entryLinear = unchecked((uint)entryLinearU);
+
+                var dataPagesBase = header.HeaderOffset + (int)header.DataPagesOffset;
+                if (dataPagesBase <= 0 || dataPagesBase >= fileBytes.Length)
+                {
+                    error = "Invalid LE data pages offset";
+                    return false;
+                }
+
+                var objBytesByIndex = new Dictionary<int, byte[]>();
+                foreach (var o in objects)
+                {
+                    if (o.VirtualSize == 0 || o.PageCount == 0)
+                        continue;
+                    var bytes = ReconstructObjectBytes(fileBytes, header, pageMap, dataPagesBase, o);
+                    if (bytes != null && bytes.Length > 0)
+                        objBytesByIndex[o.Index] = bytes;
+                }
+
+                // Decode executable objects from the start (full coverage for reachability marking).
+                var execObjIndices = new HashSet<int>();
+                var execObjInstructions = new Dictionary<int, List<Instruction>>();
+                var execObjInsIndexByAddr = new Dictionary<int, Dictionary<uint, int>>();
+                var execObjStarts = new Dictionary<int, uint[]>();
+                var execObjLens = new Dictionary<int, ushort[]>();
+                var execObjDecodedEndLinear = new Dictionary<int, uint>();
+
+                foreach (var obj in objects)
+                {
+                    if (obj.VirtualSize == 0 || obj.PageCount == 0)
+                        continue;
+
+                    var isExecutable = (obj.Flags & 0x0004) != 0;
+                    if (!isExecutable)
+                        continue;
+
+                    if (!objBytesByIndex.TryGetValue(obj.Index, out var objBytes) || objBytes == null || objBytes.Length == 0)
+                        continue;
+
+                    var maxLen = (int)Math.Min(obj.VirtualSize, (uint)objBytes.Length);
+                    if (maxLen <= 0)
+                        continue;
+
+                    var code = new byte[maxLen];
+                    Buffer.BlockCopy(objBytes, 0, code, 0, maxLen);
+
+                    var startLinear = obj.BaseAddress;
+                    var dis = new SharpDisasm.Disassembler(code, ArchitectureMode.x86_32, startLinear, true);
+                    var instructions = dis.Disassemble().ToList();
+                    if (instructions.Count == 0)
+                        continue;
+
+                    var insIndexByAddr = new Dictionary<uint, int>(instructions.Count);
+                    var starts = new uint[instructions.Count];
+                    var lens = new ushort[instructions.Count];
+                    for (var ii = 0; ii < instructions.Count; ii++)
+                    {
+                        var off = (uint)instructions[ii].Offset;
+                        insIndexByAddr[off] = ii;
+                        starts[ii] = off;
+                        lens[ii] = (ushort)Math.Max(1, instructions[ii].Length);
+                    }
+
+                    execObjIndices.Add(obj.Index);
+                    execObjInstructions[obj.Index] = instructions;
+                    execObjInsIndexByAddr[obj.Index] = insIndexByAddr;
+                    execObjStarts[obj.Index] = starts;
+                    execObjLens[obj.Index] = lens;
+                    execObjDecodedEndLinear[obj.Index] = unchecked(startLinear + (uint)maxLen);
+                }
+
+                static int LowerBound(uint[] arr, uint value)
+                {
+                    if (arr == null || arr.Length == 0)
+                        return 0;
+                    var idx = Array.BinarySearch(arr, value);
+                    return idx < 0 ? ~idx : idx;
+                }
+
+                bool TryNormalizeToContainingInstruction(uint addr, out uint insStart)
+                {
+                    insStart = 0;
+                    if (!TryMapLinearToObject(objects, addr, out var objIndex, out var _))
+                        return false;
+                    if (!execObjIndices.Contains(objIndex))
+                        return false;
+                    if (!execObjStarts.TryGetValue(objIndex, out var starts) || starts == null || starts.Length == 0)
+                        return false;
+                    if (!execObjLens.TryGetValue(objIndex, out var lens) || lens == null || lens.Length != starts.Length)
+                        return false;
+
+                    var lb = LowerBound(starts, addr);
+                    var i0 = lb;
+                    if (i0 >= starts.Length || starts[i0] > addr)
+                        i0 = i0 - 1;
+                    if (i0 < 0)
+                        return false;
+
+                    for (var tries = 0; tries < 2 && i0 >= 0; tries++, i0--)
+                    {
+                        var s = starts[i0];
+                        var e = unchecked(s + (uint)lens[i0]);
+                        if (addr >= s && addr < e)
+                        {
+                            insStart = s;
+                            return true;
+                        }
+                    }
+
+                    return false;
+                }
+
+                bool TryNormalizeToDecodedInstructionStart(uint addr, out uint insStart)
+                {
+                    insStart = 0;
+                    if (!TryMapLinearToObject(objects, addr, out var objIndex, out var _))
+                        return false;
+                    if (!execObjIndices.Contains(objIndex))
+                        return false;
+                    if (!execObjInsIndexByAddr.TryGetValue(objIndex, out var idxByAddr) || idxByAddr == null)
+                        return false;
+                    if (!idxByAddr.ContainsKey(addr))
+                        return false;
+                    insStart = addr;
+                    return true;
+                }
+
+                var visited = new HashSet<uint>();
+                var queue = new Queue<uint>();
+
+                // Seed: entry point (snap to containing instruction to avoid "mid-instruction" entry EIP).
+                if (TryNormalizeToContainingInstruction(entryLinear, out var entryIns))
+                {
+                    visited.Add(entryIns);
+                    queue.Enqueue(entryIns);
+                }
+
+                while (queue.Count > 0)
+                {
+                    var addr = queue.Dequeue();
+                    if (!TryMapLinearToObject(objects, addr, out var objIndex, out var _))
+                        continue;
+                    if (!execObjIndices.Contains(objIndex))
+                        continue;
+                    if (!execObjInstructions.TryGetValue(objIndex, out var instructions) || instructions == null || instructions.Count == 0)
+                        continue;
+                    if (!execObjInsIndexByAddr.TryGetValue(objIndex, out var idxByAddr) || idxByAddr == null)
+                        continue;
+                    if (!idxByAddr.TryGetValue(addr, out var idx))
+                        continue;
+
+                    void EnqueueIfValid(uint target)
+                    {
+                        if (!TryNormalizeToDecodedInstructionStart(target, out var t))
+                            return;
+                        if (visited.Add(t))
+                            queue.Enqueue(t);
+                    }
+
+                    var ins = instructions[idx];
+
+                    // Default fallthrough.
+                    uint? next = null;
+                    if (idx + 1 < instructions.Count)
+                        next = (uint)instructions[idx + 1].Offset;
+
+                    if (TryGetRelativeBranchTarget(ins, out var target, out var isCall))
+                    {
+                        if (isCall)
+                        {
+                            EnqueueIfValid(target);
+                            if (next.HasValue)
+                                EnqueueIfValid(next.Value);
+                        }
+                        else
+                        {
+                            EnqueueIfValid(target);
+                            if (IsConditionalBranch(ins) && next.HasValue)
+                                EnqueueIfValid(next.Value);
+                        }
+                    }
+                    else
+                    {
+                        // Try to follow jump-table targets for indirect jmps (best-effort).
+                        if (idxByAddr.ContainsKey(addr))
+                        {
+                            var wantCases = 16;
+                            if (TryParseIndirectJmpTable(ins.Bytes, out var _, out var idxRegProbe, out var scaleProbe) && scaleProbe == 4)
+                            {
+                                if (TryInferJumpTableSwitchBound(instructions, idx, idxRegProbe, out var inferredCasesProbe, out var _))
+                                    wantCases = Math.Min(64, Math.Max(1, inferredCasesProbe));
+                            }
+
+                            if (TryGetJumpTableTargets(instructions, idxByAddr, idx, ins, objects, objBytesByIndex, maxEntries: wantCases, out var _, out var idxReg, out var jtTargets))
+                            {
+                                var casesToAdd = jtTargets.Count;
+                                if (TryInferJumpTableSwitchBound(instructions, idx, idxReg, out var inferredCases, out var _))
+                                    casesToAdd = Math.Min(casesToAdd, Math.Max(1, inferredCases));
+                                casesToAdd = Math.Min(casesToAdd, 32);
+
+                                for (var ti = 0; ti < casesToAdd; ti++)
+                                    EnqueueIfValid(jtTargets[ti]);
+                            }
+                        }
+
+                        var t = InsText(ins);
+                        if (t.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
+                        {
+                            // no fallthrough
+                        }
+                        else
+                        {
+                            if (next.HasValue)
+                                EnqueueIfValid(next.Value);
+                        }
+                    }
+                }
+
+                // Build per-object ranges.
+                var outObjects = new List<LeReachabilityObjectInfo>();
+                foreach (var obj in objects.OrderBy(o => o.Index))
+                {
+                    var maxLen = 0;
+                    if (objBytesByIndex.TryGetValue(obj.Index, out var bytes) && bytes != null)
+                        maxLen = (int)Math.Min(obj.VirtualSize, (uint)bytes.Length);
+
+                    if (!execObjIndices.Contains(obj.Index) || maxLen <= 0 || !execObjInstructions.TryGetValue(obj.Index, out var insList) || insList == null)
+                    {
+                        outObjects.Add(new LeReachabilityObjectInfo
+                        {
+                            index = obj.Index,
+                            baseAddress = obj.BaseAddress,
+                            virtualSize = obj.VirtualSize,
+                            flags = obj.Flags,
+                            decodedStartLinear = obj.BaseAddress,
+                            decodedEndLinear = unchecked(obj.BaseAddress + (uint)Math.Max(0, maxLen)),
+                            instructionCount = 0,
+                            reachableInstructionCount = 0,
+                            reachableByteCount = 0,
+                            reachableCodeRanges = Array.Empty<LeReachabilityRangeInfo>(),
+                            dataCandidateRanges = Array.Empty<LeReachabilityRangeInfo>(),
+                        });
+                        continue;
+                    }
+
+                    var covered = new bool[maxLen];
+                    var reachableIns = 0;
+                    var reachableBytes = 0;
+
+                    foreach (var ins in insList)
+                    {
+                        var addr = (uint)ins.Offset;
+                        if (!visited.Contains(addr))
+                            continue;
+                        reachableIns++;
+
+                        var off = (int)(addr - obj.BaseAddress);
+                        var len = Math.Max(1, ins.Length);
+                        if (off < 0 || off >= maxLen)
+                            continue;
+                        var end = Math.Min(maxLen, off + len);
+                        for (var i = off; i < end; i++)
+                        {
+                            if (!covered[i])
+                            {
+                                covered[i] = true;
+                                reachableBytes++;
+                            }
+                        }
+                    }
+
+                    static LeReachabilityRangeInfo[] BuildRanges(bool[] mask, bool wantTrue, uint baseLinear)
+                    {
+                        if (mask == null || mask.Length == 0)
+                            return Array.Empty<LeReachabilityRangeInfo>();
+
+                        var ranges = new List<LeReachabilityRangeInfo>();
+                        var inRun = false;
+                        var runStart = 0;
+                        for (var i = 0; i < mask.Length; i++)
+                        {
+                            var v = mask[i];
+                            if (v == wantTrue)
+                            {
+                                if (!inRun)
+                                {
+                                    inRun = true;
+                                    runStart = i;
+                                }
+                            }
+                            else
+                            {
+                                if (inRun)
+                                {
+                                    inRun = false;
+                                    var s = unchecked(baseLinear + (uint)runStart);
+                                    var e = unchecked(baseLinear + (uint)i);
+                                    if (e > s)
+                                        ranges.Add(new LeReachabilityRangeInfo { startLinear = s, endLinear = e });
+                                }
+                            }
+                        }
+                        if (inRun)
+                        {
+                            var s = unchecked(baseLinear + (uint)runStart);
+                            var e = unchecked(baseLinear + (uint)mask.Length);
+                            if (e > s)
+                                ranges.Add(new LeReachabilityRangeInfo { startLinear = s, endLinear = e });
+                        }
+
+                        return ranges.OrderBy(r => r.startLinear).ToArray();
+                    }
+
+                    var codeRanges = BuildRanges(covered, wantTrue: true, obj.BaseAddress);
+                    var dataRanges = BuildRanges(covered, wantTrue: false, obj.BaseAddress);
+
+                    outObjects.Add(new LeReachabilityObjectInfo
+                    {
+                        index = obj.Index,
+                        baseAddress = obj.BaseAddress,
+                        virtualSize = obj.VirtualSize,
+                        flags = obj.Flags,
+                        decodedStartLinear = obj.BaseAddress,
+                        decodedEndLinear = execObjDecodedEndLinear.TryGetValue(obj.Index, out var de) ? de : unchecked(obj.BaseAddress + (uint)maxLen),
+                        instructionCount = insList.Count,
+                        reachableInstructionCount = reachableIns,
+                        reachableByteCount = reachableBytes,
+                        reachableCodeRanges = codeRanges,
+                        dataCandidateRanges = dataRanges,
+                    });
+                }
+
+                map = new LeReachabilityInfo
+                {
+                    inputFile = inputFile,
+                    entryLinear = entryLinear,
+                    objects = outObjects.ToArray(),
+                };
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                map = null;
                 return false;
             }
         }

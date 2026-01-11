@@ -90,6 +90,12 @@ namespace DOSRE.UI.impl
     ///     Specified with -LEIMPORTSJSON <file.json>
     /// </summary>
     private string _leImportsJson;
+
+    /// <summary>
+    ///     Optional: export reachability-based code marking (reachable code ranges vs data candidates).
+    ///     Specified with -LEREACHJSON <file.json>
+    /// </summary>
+    private string _leReachJson;
         ///     Logger Implementation
         /// </summary>
         protected static readonly Logger _logger = LogManager.GetCurrentClassLogger(typeof(CustomLogger));
@@ -477,6 +483,12 @@ namespace DOSRE.UI.impl
                             _leImportsJson = _args[i + 1];
                             i++;
                             break;
+                        case "LEREACHJSON":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LEREACHJSON requires a <file.json>");
+                            _leReachJson = _args[i + 1];
+                            i++;
+                            break;
                         case "MZFULL":
                             _bMzFull = true;
                             break;
@@ -609,6 +621,8 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LEIMPORTSJSON <file.json> -- (LE inputs) Export LE import map + best-effort xrefs (implies -LEINSIGHTS for function ownership mapping)");
                             Console.WriteLine(
+                                "-LEREACHJSON <file.json> -- (LE inputs) Export reachability-based code marking (reachable code ranges vs data candidates)");
+                            Console.WriteLine(
                                 "-MZFULL -- (MZ inputs) Disassemble from entrypoint to end of load module");
                             Console.WriteLine(
                                 "-MZBYTES <n> -- (MZ inputs) Limit disassembly to n bytes from entrypoint");
@@ -679,6 +693,7 @@ namespace DOSRE.UI.impl
                 var wantLeReportJson = !string.IsNullOrWhiteSpace(_leReportJson);
                 var wantLeFixupsJson = !string.IsNullOrWhiteSpace(_leFixupsJson);
                 var wantLeImportsJson = !string.IsNullOrWhiteSpace(_leImportsJson);
+                var wantLeReachJson = !string.IsNullOrWhiteSpace(_leReachJson);
                 var leInsightsForRun = _bLeInsights || wantLeCallGraph || wantLeCfgDot || wantLeCfgAllDot || wantLeCfgAllJson || wantLeReportJson || wantLeImportsJson;
 
                 static string ChooseLeOutput(Dictionary<string, string> files)
@@ -710,6 +725,8 @@ namespace DOSRE.UI.impl
                         _logger.Warn("Warning: -LEFIXUPSJSON is not supported with -LEDECOMPASM (no input file to parse). Run without -LEDECOMPASM to export fixups.");
                     if (wantLeImportsJson)
                         _logger.Warn("Warning: -LEIMPORTSJSON is not supported with -LEDECOMPASM (no input file to parse / no analysis). Run without -LEDECOMPASM to export imports.");
+                    if (wantLeReachJson)
+                        _logger.Warn("Warning: -LEREACHJSON is not supported with -LEDECOMPASM (no input file to parse / no decode pass). Run without -LEDECOMPASM to export reachability.");
                     leOk = LEDisassembler.TryDecompileToMultipartFromAsmFile(_leDecompileAsmFile, _leOnlyFunction, _leChunks, out leDecompFiles, out leError);
                     leOutput = leOk ? ChooseLeOutput(leDecompFiles) : string.Empty;
                 }
@@ -1156,6 +1173,31 @@ namespace DOSRE.UI.impl
                         else
                         {
                             _logger.Warn($"Warning: -LEIMPORTSJSON failed: {impErr}");
+                        }
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(_leReachJson))
+                    {
+                        if (string.IsNullOrWhiteSpace(_sInputFile) || !File.Exists(_sInputFile))
+                        {
+                            _logger.Warn("Warning: -LEREACHJSON requested but no valid input file was provided");
+                        }
+                        else if (LEDisassembler.TryBuildReachabilityMap(_sInputFile, _bLeScanMz, out var reach, out var reachErr))
+                        {
+                            var payload = LeExports.BuildReachabilityExport(reach);
+
+                            var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions
+                            {
+                                WriteIndented = true,
+                                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+                            });
+
+                            File.WriteAllText(_leReachJson, json);
+                            _logger.Info($"Wrote LE reachability JSON to {_leReachJson} (objects {payload.objectCount} reachableIns {payload.totalReachableInstructionCount})");
+                        }
+                        else
+                        {
+                            _logger.Warn($"Warning: -LEREACHJSON failed: {reachErr}");
                         }
                     }
 

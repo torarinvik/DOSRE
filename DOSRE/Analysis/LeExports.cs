@@ -154,6 +154,44 @@ namespace DOSRE.Analysis
             public LeImportModule[] modules { get; set; }
         }
 
+        public sealed class LeReachabilityRange
+        {
+            public string start { get; set; }
+            public string end { get; set; }
+            public int bytes { get; set; }
+        }
+
+        public sealed class LeReachabilityObject
+        {
+            public int index { get; set; }
+            public string baseAddress { get; set; }
+            public string virtualSize { get; set; }
+            public string flags { get; set; }
+            public string decodedStart { get; set; }
+            public string decodedEnd { get; set; }
+
+            public int instructionCount { get; set; }
+            public int reachableInstructionCount { get; set; }
+            public int reachableByteCount { get; set; }
+
+            public LeReachabilityRange[] reachableCode { get; set; }
+            public LeReachabilityRange[] dataCandidates { get; set; }
+        }
+
+        public sealed class LeReachabilityExport
+        {
+            public string input { get; set; }
+            public string entry { get; set; }
+            public string entryName { get; set; }
+
+            public int objectCount { get; set; }
+            public int totalInstructionCount { get; set; }
+            public int totalReachableInstructionCount { get; set; }
+            public int totalReachableByteCount { get; set; }
+
+            public LeReachabilityObject[] objects { get; set; }
+        }
+
         private static string Hex(uint a2) => $"0x{a2:X8}";
         private static string HexU16(ushort v) => $"0x{v:X4}";
         private static string HexU32(uint v) => $"0x{v:X8}";
@@ -597,6 +635,62 @@ namespace DOSRE.Analysis
                 procCount = procCount,
                 xrefCount = xrefCount,
                 modules = modules.Length > 0 ? modules : null
+            };
+        }
+
+        public static LeReachabilityExport BuildReachabilityExport(LEDisassembler.LeReachabilityInfo map)
+        {
+            if (map == null)
+                throw new ArgumentNullException(nameof(map));
+
+            LeReachabilityRange[] Ranges(LEDisassembler.LeReachabilityRangeInfo[] rs)
+            {
+                if (rs == null || rs.Length == 0)
+                    return null;
+
+                return rs
+                    .OrderBy(r => r.startLinear)
+                    .Select(r => new LeReachabilityRange
+                    {
+                        start = HexU32(r.startLinear),
+                        end = HexU32(r.endLinear),
+                        bytes = (int)unchecked(r.endLinear - r.startLinear)
+                    })
+                    .ToArray();
+            }
+
+            var objs = (map.objects ?? Array.Empty<LEDisassembler.LeReachabilityObjectInfo>())
+                .OrderBy(o => o.index)
+                .Select(o => new LeReachabilityObject
+                {
+                    index = o.index,
+                    baseAddress = HexU32(o.baseAddress),
+                    virtualSize = HexU32Short(o.virtualSize),
+                    flags = HexU32(o.flags),
+                    decodedStart = HexU32(o.decodedStartLinear),
+                    decodedEnd = HexU32(o.decodedEndLinear),
+                    instructionCount = o.instructionCount,
+                    reachableInstructionCount = o.reachableInstructionCount,
+                    reachableByteCount = o.reachableByteCount,
+                    reachableCode = Ranges(o.reachableCodeRanges),
+                    dataCandidates = Ranges(o.dataCandidateRanges),
+                })
+                .ToArray();
+
+            var totalIns = objs.Sum(o => o.instructionCount);
+            var totalReachIns = objs.Sum(o => o.reachableInstructionCount);
+            var totalReachBytes = objs.Sum(o => o.reachableByteCount);
+
+            return new LeReachabilityExport
+            {
+                input = map.inputFile,
+                entry = HexU32(map.entryLinear),
+                entryName = FuncName(map.entryLinear),
+                objectCount = objs.Length,
+                totalInstructionCount = totalIns,
+                totalReachableInstructionCount = totalReachIns,
+                totalReachableByteCount = totalReachBytes,
+                objects = objs.Length > 0 ? objs : null,
             };
         }
     }
