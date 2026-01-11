@@ -6498,6 +6498,12 @@ namespace DOSRE.Dasm
                     var srcType = data[off + 0];
                     var flags = data[off + 1];
                     var srcOff = (ushort)(data[off + 2] | (data[off + 3] << 8));
+                    if (srcOff >= pageSize)
+                    {
+                        var swapped = (ushort)((srcOff >> 8) | (srcOff << 8));
+                        if (swapped < pageSize)
+                            srcOff = swapped;
+                    }
 
                     checkedEntries++;
 
@@ -10763,6 +10769,12 @@ namespace DOSRE.Dasm
                     var srcType = fixupRecordStream[p + 0];
                     var flags = fixupRecordStream[p + 1];
                     var srcOff = (ushort)(fixupRecordStream[p + 2] | (fixupRecordStream[p + 3] << 8));
+                    if (srcOff >= header.PageSize)
+                    {
+                        var swapped = (ushort)((srcOff >> 8) | (srcOff << 8));
+                        if (swapped < header.PageSize)
+                            srcOff = swapped;
+                    }
                     var sourceLinear = unchecked(pageLinearBase + srcOff);
 
                     // Best-effort: read value at/near fixup site from reconstructed object bytes.
@@ -11039,6 +11051,12 @@ namespace DOSRE.Dasm
                     var srcType = fixupRecordStream[p + 0];
                     var flags = fixupRecordStream[p + 1];
                     var srcOff = (ushort)(fixupRecordStream[p + 2] | (fixupRecordStream[p + 3] << 8));
+                    if (srcOff >= header.PageSize)
+                    {
+                        var swapped = (ushort)((srcOff >> 8) | (srcOff << 8));
+                        if (swapped < header.PageSize)
+                            srcOff = swapped;
+                    }
                     var sourceLinear = unchecked(pageLinearBase + srcOff);
 
                     // Optional target spec fields inside the record.
