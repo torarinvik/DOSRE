@@ -37,6 +37,9 @@ This file restates the source checklist as **actionable engineering tasks for DO
 - [ ] Ensure disassembly is done with fixups applied/visible (mis-disasm avoidance).
 - [ ] Mark all entry points (LE entry + known exports/thunks + callback entry points).
 - [ ] Build cross-reference index (calls/jumps/data xrefs) as structured data.
+- [x] Export LE call graph (best-effort):
+	- `-LECALLGRAPHDOT <file.dot>`
+	- `-LECALLGRAPHJSON <file.json>`
 
 ## 7) Code vs data separation
 - [ ] Reachability-based code marking from entry points + call/jump graph.
@@ -45,7 +48,10 @@ This file restates the source checklist as **actionable engineering tasks for DO
 
 ## 8) Control-flow + semantics recovery (minimum viable, but correct)
 - [ ] Function boundary detection improvements.
-- [ ] CFG construction per function; basic block + preds/succs.
+- [x] CFG construction per function; basic block + preds/succs (best-effort) + exports:
+	- `-LECFGDOT <file.dot>` (per-function; uses `-LEFUNC` if provided, else entry)
+	- `-LECFGALLDOT <file.dot>` (whole-program index)
+	- `-LECFGALLJSON <file.json>` (whole-program index)
 - [ ] Loop recognition and stable loop headers.
 - [ ] Flag-sensitive correctness (carry/overflow dependencies, conditional moves/sets).
 

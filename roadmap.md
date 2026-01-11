@@ -16,8 +16,11 @@ Notes on current baseline (already present in the repo):
 - Why: makes every later feature testable without scraping text.
 
 2) **Export CFG as DOT for a chosen function**
-- CLI idea: `-LECFGDOT func_XXXXXXXX out.dot` (or `-LECFGDOT outDir` for top N).
-- Uses existing basic-block/pred logic.
+- Implemented:
+	- Per-function CFG (DOT): `-LECFGDOT <file.dot>` (uses `-LEFUNC` if provided, else entry function)
+	- Whole-program CFG index (DOT): `-LECFGALLDOT <file.dot>`
+	- Whole-program CFG index (JSON): `-LECFGALLJSON <file.json>`
+- Uses existing basic-block/pred logic (best-effort).
 
 3) **Improve per-run analysis exports**
 - Extend the existing callgraph JSON to include: roots, strongly connected components (SCCs), top fan-in/out, orphan funcs.

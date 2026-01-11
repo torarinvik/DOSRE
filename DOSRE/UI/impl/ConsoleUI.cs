@@ -66,6 +66,12 @@ namespace DOSRE.UI.impl
     ///     Specified with -LECFGALLDOT <file.dot>
     /// </summary>
     private string _leCfgAllDot;
+
+    /// <summary>
+    ///     Optional: export whole-program LE CFG index in JSON format.
+    ///     Specified with -LECFGALLJSON <file.json>
+    /// </summary>
+    private string _leCfgAllJson;
         ///     Logger Implementation
         /// </summary>
         protected static readonly Logger _logger = LogManager.GetCurrentClassLogger(typeof(CustomLogger));
@@ -419,6 +425,12 @@ namespace DOSRE.UI.impl
                             _leCfgAllDot = _args[i + 1];
                             i++;
                             break;
+                        case "LECFGALLJSON":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LECFGALLJSON requires a <file.json>");
+                            _leCfgAllJson = _args[i + 1];
+                            i++;
+                            break;
                         case "MZFULL":
                             _bMzFull = true;
                             break;
@@ -541,6 +553,8 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LECFGALLDOT <file.dot> -- (LE inputs) Export a best-effort whole-program CFG index in Graphviz DOT format (clusters per function; implies -LEINSIGHTS)");
                             Console.WriteLine(
+                                "-LECFGALLJSON <file.json> -- (LE inputs) Export a best-effort whole-program CFG index in JSON format (implies -LEINSIGHTS)");
+                            Console.WriteLine(
                                 "-MZFULL -- (MZ inputs) Disassemble from entrypoint to end of load module");
                             Console.WriteLine(
                                 "-MZBYTES <n> -- (MZ inputs) Limit disassembly to n bytes from entrypoint");
@@ -607,7 +621,8 @@ namespace DOSRE.UI.impl
                 var wantLeCallGraph = !string.IsNullOrWhiteSpace(_leCallGraphDot) || !string.IsNullOrWhiteSpace(_leCallGraphJson);
                 var wantLeCfgDot = !string.IsNullOrWhiteSpace(_leCfgDot);
                 var wantLeCfgAllDot = !string.IsNullOrWhiteSpace(_leCfgAllDot);
-                var leInsightsForRun = _bLeInsights || wantLeCallGraph || wantLeCfgDot || wantLeCfgAllDot;
+                var wantLeCfgAllJson = !string.IsNullOrWhiteSpace(_leCfgAllJson);
+                var leInsightsForRun = _bLeInsights || wantLeCallGraph || wantLeCfgDot || wantLeCfgAllDot || wantLeCfgAllJson;
 
                 static string ChooseLeOutput(Dictionary<string, string> files)
                 {
@@ -630,6 +645,8 @@ namespace DOSRE.UI.impl
                         _logger.Warn("Warning: -LECFGDOT is not supported with -LEDECOMPASM (no LE decode pass). Run without -LEDECOMPASM to export CFG.");
                     if (wantLeCfgAllDot)
                         _logger.Warn("Warning: -LECFGALLDOT is not supported with -LEDECOMPASM (no LE decode pass). Run without -LEDECOMPASM to export CFG.");
+                    if (wantLeCfgAllJson)
+                        _logger.Warn("Warning: -LECFGALLJSON is not supported with -LEDECOMPASM (no LE decode pass). Run without -LEDECOMPASM to export CFG.");
                     leOk = LEDisassembler.TryDecompileToMultipartFromAsmFile(_leDecompileAsmFile, _leOnlyFunction, _leChunks, out leDecompFiles, out leError);
                     leOutput = leOk ? ChooseLeOutput(leDecompFiles) : string.Empty;
                 }
@@ -951,6 +968,74 @@ namespace DOSRE.UI.impl
 
                             File.WriteAllText(_leCfgAllDot, dot.ToString());
                             _logger.Info($"Wrote whole-program LE CFG DOT to {_leCfgAllDot} (functions {analysis.CfgByFunction.Count})");
+                        }
+                    }
+
+                    if (wantLeCfgAllJson)
+                    {
+                        var analysis = LEDisassembler.GetLastAnalysis();
+                        if (analysis == null || analysis.CfgByFunction == null || analysis.CfgByFunction.Count == 0)
+                        {
+                            _logger.Warn("Warning: -LECFGALLJSON requested but no LE CFG snapshot was captured (requires -LEINSIGHTS and a run that decodes relative branches)");
+                        }
+                        else
+                        {
+                            static string Hex(uint a2) => $"0x{a2:X8}";
+                            static string FuncName(uint a2) => $"func_{a2:X8}";
+
+                            var functions = analysis.CfgByFunction
+                                .OrderBy(k => k.Key)
+                                .Select(kv =>
+                                {
+                                    var fStart = kv.Key;
+                                    var cfg = kv.Value;
+
+                                    LEDisassembler.LeFunctionInfo fInfo = null;
+                                    if (analysis.Functions != null)
+                                        analysis.Functions.TryGetValue(fStart, out fInfo);
+                                    var ins = fInfo?.InstructionCount ?? 0;
+
+                                    IEnumerable<LEDisassembler.LeBasicBlockInfo> blockValues =
+                                        cfg?.Blocks != null ? cfg.Blocks.Values : Enumerable.Empty<LEDisassembler.LeBasicBlockInfo>();
+
+                                    var blocks = blockValues
+                                        .OrderBy(b => b.Start)
+                                        .Select(b => new
+                                        {
+                                            start = Hex(b.Start),
+                                            predecessors = (b.Predecessors ?? new List<uint>()).OrderBy(x => x).Select(Hex).ToArray(),
+                                            successors = (b.Successors ?? new List<uint>()).OrderBy(x => x).Select(Hex).ToArray(),
+                                        })
+                                        .ToArray();
+
+                                    return new
+                                    {
+                                        start = Hex(fStart),
+                                        name = FuncName(fStart),
+                                        isEntry = analysis.EntryLinear == fStart ? (bool?)true : null,
+                                        instructionCount = ins > 0 ? (int?)ins : null,
+                                        basicBlockCount = (cfg?.Blocks?.Count ?? 0) > 0 ? (int?)cfg.Blocks.Count : null,
+                                        blocks = blocks.Length > 0 ? blocks : null
+                                    };
+                                })
+                                .ToArray();
+
+                            var payload = new
+                            {
+                                input = analysis.InputFile,
+                                entry = Hex(analysis.EntryLinear),
+                                entryName = FuncName(analysis.EntryLinear),
+                                functions
+                            };
+
+                            var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions
+                            {
+                                WriteIndented = true,
+                                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+                            });
+
+                            File.WriteAllText(_leCfgAllJson, json);
+                            _logger.Info($"Wrote whole-program LE CFG JSON to {_leCfgAllJson} (functions {analysis.CfgByFunction.Count})");
                         }
                     }
 

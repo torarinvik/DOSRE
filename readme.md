@@ -33,6 +33,30 @@ If you also pass `-splitkb <n>` together with `-o`, DOSRE will split the output 
 -i EUROBLST.EXE -o EUROBLST.disasm.txt -leinsights -lefixups -leglobals -lebytes 131072
 ```
 
+## LE graph exports (call graph / CFG)
+
+For DOS4GW LE inputs, DOSRE can export best-effort graphs derived from the LE disassembly + insights pass.
+
+- Call graph:
+    - `-LECALLGRAPHDOT <file.dot>`
+    - `-LECALLGRAPHJSON <file.json>`
+- Control-flow graph (CFG):
+    - `-LECFGDOT <file.dot>` (per-function; uses `-LEFUNC` if provided, else entry function)
+    - `-LECFGALLDOT <file.dot>` (whole-program index; clusters per function)
+    - `-LECFGALLJSON <file.json>` (whole-program index)
+
+Notes:
+
+- These exports imply `-LEINSIGHTS`.
+- `-LEDECOMPASM` is not supported for these exports (it skips the LE decode pass).
+- CFG output is best-effort (built from decoded relative branches and inferred fallthrough starts).
+
+Example (whole-program CFG as JSON):
+
+```
+-i EUROBLST.EXE -o EUROBLST.disasm.txt -leinsights -lecfgalljson EUROBLST.cfg.json
+```
+
 # Current Features
 **DOSRE** offers several disassembly/code analysis options that are configurable through the command line.
 
