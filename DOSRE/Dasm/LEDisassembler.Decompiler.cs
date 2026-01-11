@@ -458,42 +458,48 @@ namespace DOSRE.Dasm
                 {
                     var startBlock = fn.Blocks[0];
                     blockEntryStates[startBlock.Label] = new DecompilationState();
+
+                    // Fixpoint worklist: keep joining states until convergence.
                     var queue = new Queue<ParsedBlock>();
+                    var enqueued = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     queue.Enqueue(startBlock);
-                    var visited = new HashSet<string>();
+                    enqueued.Add(startBlock.Label);
 
                     while (queue.Count > 0)
                     {
                         var block = queue.Dequeue();
-                        if (visited.Contains(block.Label)) continue;
-                        visited.Add(block.Label);
+                        enqueued.Remove(block.Label);
 
-                        var state = blockEntryStates[block.Label].Clone();
+                        if (!blockEntryStates.TryGetValue(block.Label, out var entry))
+                            continue;
+
+                        var outState = entry.Clone();
                         foreach (var line in block.Lines)
                         {
                             if (line.Kind == ParsedLineKind.Instruction)
-                                SimulateInstructionForState(line, state, fn);
+                                SimulateInstructionForState(line, outState, fn);
                         }
 
                         foreach (var succLabel in block.Successors)
                         {
-                            var succ = fn.Blocks.FirstOrDefault(b => b.Label == succLabel);
-                            if (succ != null)
+                            var succ = fn.Blocks.FirstOrDefault(b => b.Label.Equals(succLabel, StringComparison.OrdinalIgnoreCase));
+                            if (succ == null)
+                                continue;
+
+                            if (!blockEntryStates.TryGetValue(succLabel, out var existing))
                             {
-                                if (!blockEntryStates.ContainsKey(succLabel))
-                                {
-                                    blockEntryStates[succLabel] = state.Clone();
+                                blockEntryStates[succLabel] = outState.Clone();
+                                if (enqueued.Add(succLabel))
                                     queue.Enqueue(succ);
-                                }
-                                else
-                                {
-                                    // Merge states (simplified: if stack depths differ, clear stack)
-                                    var existing = blockEntryStates[succLabel];
-                                    if (existing.Stack.Count != state.Stack.Count)
-                                    {
-                                        existing.Stack.Clear(); 
-                                    }
-                                }
+                                continue;
+                            }
+
+                            var merged = JoinStates(existing, outState);
+                            if (!StateEquals(existing, merged))
+                            {
+                                blockEntryStates[succLabel] = merged;
+                                if (enqueued.Add(succLabel))
+                                    queue.Enqueue(succ);
                             }
                         }
                     }
@@ -2167,7 +2173,22 @@ namespace DOSRE.Dasm
             {
                 if (string.IsNullOrWhiteSpace(op)) return op;
                 if (RegisterValues.TryGetValue(op, out var val)) return val;
-                return op;
+
+                // Best-effort substitution inside simple expressions.
+                // This intentionally stays conservative: only replaces standalone register tokens.
+                return Regex.Replace(
+                    op,
+                    @"\b(eax|ebx|ecx|edx|esi|edi|ebp|esp|ax|bx|cx|dx|si|di|bp|sp|al|ah|bl|bh|cl|ch|dl|dh)\b",
+                    m =>
+                    {
+                        var r = m.Value;
+                        if (!RegisterValues.TryGetValue(r, out var v) || string.IsNullOrWhiteSpace(v))
+                            return r;
+                        if (v.Contains(r, StringComparison.OrdinalIgnoreCase))
+                            return r;
+                        return v;
+                    },
+                    RegexOptions.IgnoreCase);
             }
 
             public void Set(string reg, string val)
@@ -2210,6 +2231,81 @@ namespace DOSRE.Dasm
                 return l is "eax" or "ebx" or "ecx" or "edx" or "esi" or "edi" or "ebp" or "esp" 
                     or "ax" or "bx" or "cx" or "dx" or "al" or "ah" or "bl" or "bh" or "cl" or "ch" or "dl" or "dh";
             }
+        }
+
+        private static bool StateEquals(DecompilationState a, DecompilationState b)
+        {
+            if (ReferenceEquals(a, b))
+                return true;
+            if (a == null || b == null)
+                return false;
+
+            if (a.RegisterValues.Count != b.RegisterValues.Count)
+                return false;
+            foreach (var kv in a.RegisterValues)
+            {
+                if (!b.RegisterValues.TryGetValue(kv.Key, out var bv))
+                    return false;
+                if (!string.Equals(kv.Value, bv, StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+
+            if (a.Stack.Count != b.Stack.Count)
+                return false;
+            for (var i = 0; i < a.Stack.Count; i++)
+            {
+                if (!string.Equals(a.Stack[i], b.Stack[i], StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static DecompilationState JoinStates(DecompilationState a, DecompilationState b)
+        {
+            if (a == null && b == null)
+                return new DecompilationState();
+            if (a == null)
+                return b.Clone();
+            if (b == null)
+                return a.Clone();
+
+            var (regs, stack) = JoinStateForTest(a.RegisterValues, a.Stack, b.RegisterValues, b.Stack);
+            var merged = new DecompilationState();
+            foreach (var kv in regs)
+                merged.RegisterValues[kv.Key] = kv.Value;
+            merged.Stack.AddRange(stack);
+            return merged;
+        }
+
+        internal static (Dictionary<string, string> regs, List<string> stack) JoinStateForTest(
+            Dictionary<string, string> aRegs,
+            List<string> aStack,
+            Dictionary<string, string> bRegs,
+            List<string> bStack)
+        {
+            var regs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (aRegs != null && bRegs != null)
+            {
+                foreach (var kv in aRegs)
+                {
+                    if (!bRegs.TryGetValue(kv.Key, out var bv))
+                        continue;
+                    if (string.Equals(kv.Value, bv, StringComparison.OrdinalIgnoreCase))
+                        regs[kv.Key] = kv.Value;
+                }
+            }
+
+            var stack = new List<string>();
+            if (aStack != null && bStack != null && aStack.Count == bStack.Count)
+            {
+                for (var i = 0; i < aStack.Count; i++)
+                {
+                    stack.Add(string.Equals(aStack[i], bStack[i], StringComparison.OrdinalIgnoreCase) ? aStack[i] : "unk");
+                }
+            }
+
+            return (regs, stack);
         }
 
         private static void BuildCFG(ParsedFunction fn, Dictionary<string, string> labelByAddr)
@@ -2390,6 +2486,12 @@ namespace DOSRE.Dasm
             public string LastIncDecOperand;
             public bool LastWasIncDec;
 
+            // Tracks the last arithmetic op that can set overflow (for jo/jno recovery).
+            public bool LastWasArith;
+            public string LastArithOp; // add|sub|inc|dec
+            public string LastArithA;
+            public string LastArithB;
+
             public string LastEaxAssignment;
 
             public void Clear(bool targetIsEax = false)
@@ -2402,6 +2504,10 @@ namespace DOSRE.Dasm
                 LastWasTest = false;
                 LastIncDecOperand = null;
                 LastWasIncDec = false;
+                LastWasArith = false;
+                LastArithOp = null;
+                LastArithA = null;
+                LastArithB = null;
                 if (targetIsEax) LastEaxAssignment = null;
             }
 
@@ -2802,6 +2908,16 @@ namespace DOSRE.Dasm
                 var rhs = NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize);
 
                 var resolvedRhs = WrapExprForPointerMath(state.Resolve(rhs));
+
+                // For overflow-based conditionals (jo/jno), capture the arithmetic inputs.
+                // We must do this before we potentially drop register tracking for lhs.
+                if (mn is "add" or "sub")
+                {
+                    pending.LastWasArith = true;
+                    pending.LastArithOp = mn;
+                    pending.LastArithA = WrapExprForPointerMath(state.Resolve(lhs));
+                    pending.LastArithB = resolvedRhs;
+                }
                 
                 if (mn == "xor" && lhs.Equals(rhs, StringComparison.OrdinalIgnoreCase))
                 {
@@ -2908,6 +3024,12 @@ namespace DOSRE.Dasm
                 var opnd = NormalizeAsmOperandToC(ops, isMemoryWrite: true, fn);
                 pending.LastIncDecOperand = opnd;
                 pending.LastWasIncDec = true;
+
+                pending.LastWasArith = true;
+                pending.LastArithOp = mn;
+                pending.LastArithA = WrapExprForPointerMath(state.Resolve(opnd));
+                pending.LastArithB = "1";
+
                 return mn == "inc" ? $"({opnd})++;{commentSuffix}" : $"({opnd})--;{commentSuffix}";
             }
 
@@ -3470,15 +3592,28 @@ namespace DOSRE.Dasm
             return mn is "jz" or "jnz" or "je" or "jne" or "jg" or "jge" or "jl" or "jle" or "ja" or "jae" or "jb" or "jbe" or "jo" or "jno" or "js" or "jns";
         }
 
-        private static string TryMakeConditionFromPending(string jcc, PendingFlags pending)
+        internal static string MakeConditionFromPendingForTest(
+            string jcc,
+            bool lastWasCmp,
+            string cmpLhs,
+            string cmpRhs,
+            bool lastWasTest,
+            string testLhs,
+            string testRhs,
+            bool lastWasIncDec,
+            string incDecOperand,
+            bool lastWasArith,
+            string arithOp,
+            string arithA,
+            string arithB)
         {
-            if (pending == null)
+            if (string.IsNullOrWhiteSpace(jcc))
                 return string.Empty;
 
-            if (pending.LastWasCmp && !string.IsNullOrWhiteSpace(pending.LastCmpLhs))
+            if (lastWasCmp && !string.IsNullOrWhiteSpace(cmpLhs))
             {
-                var a = pending.LastCmpLhs;
-                var b = pending.LastCmpRhs;
+                var a = cmpLhs;
+                var b = cmpRhs;
                 return jcc switch
                 {
                     "je" or "jz" => $"{a} == {b}",
@@ -3498,10 +3633,10 @@ namespace DOSRE.Dasm
                 };
             }
 
-            if (pending.LastWasTest && !string.IsNullOrWhiteSpace(pending.LastTestLhs))
+            if (lastWasTest && !string.IsNullOrWhiteSpace(testLhs))
             {
-                var a = pending.LastTestLhs;
-                var b = pending.LastTestRhs;
+                var a = testLhs;
+                var b = testRhs;
 
                 // Simple case: test reg, reg => check if reg is 0, negative, etc.
                 if (a.Equals(b, StringComparison.OrdinalIgnoreCase))
@@ -3527,10 +3662,9 @@ namespace DOSRE.Dasm
             }
 
             // Heuristic: INC/DEC affects ZF based on the result being zero.
-            // If we don't have a cmp/test pending, recover jz/jnz from the last inc/dec target.
-            if (pending.LastWasIncDec && !string.IsNullOrWhiteSpace(pending.LastIncDecOperand))
+            if (lastWasIncDec && !string.IsNullOrWhiteSpace(incDecOperand))
             {
-                var x = pending.LastIncDecOperand;
+                var x = incDecOperand;
                 return jcc switch
                 {
                     "je" or "jz" => $"{x} == 0",
@@ -3539,7 +3673,46 @@ namespace DOSRE.Dasm
                 };
             }
 
+            // Overflow (OF) recovery for jo/jno after add/sub/inc/dec.
+            // Use int64-based check to avoid relying on signed overflow UB.
+            if (lastWasArith && (jcc is "jo" or "jno") && !string.IsNullOrWhiteSpace(arithA) && !string.IsNullOrWhiteSpace(arithB))
+            {
+                string expr = string.Empty;
+                if (arithOp is "add" or "inc")
+                {
+                    expr = $"(((int64_t)(int32_t)({arithA}) + (int64_t)(int32_t)({arithB})) > 0x7fffffffLL) || (((int64_t)(int32_t)({arithA}) + (int64_t)(int32_t)({arithB})) < (-0x80000000LL))";
+                }
+                else if (arithOp is "sub" or "dec")
+                {
+                    expr = $"(((int64_t)(int32_t)({arithA}) - (int64_t)(int32_t)({arithB})) > 0x7fffffffLL) || (((int64_t)(int32_t)({arithA}) - (int64_t)(int32_t)({arithB})) < (-0x80000000LL))";
+                }
+
+                if (!string.IsNullOrWhiteSpace(expr))
+                    return jcc == "jo" ? expr : $"!({expr})";
+            }
+
             return string.Empty;
+        }
+
+        private static string TryMakeConditionFromPending(string jcc, PendingFlags pending)
+        {
+            if (pending == null)
+                return string.Empty;
+
+            return MakeConditionFromPendingForTest(
+                jcc,
+                pending.LastWasCmp,
+                pending.LastCmpLhs,
+                pending.LastCmpRhs,
+                pending.LastWasTest,
+                pending.LastTestLhs,
+                pending.LastTestRhs,
+                pending.LastWasIncDec,
+                pending.LastIncDecOperand,
+                pending.LastWasArith,
+                pending.LastArithOp,
+                pending.LastArithA,
+                pending.LastArithB);
         }
 
         private static (string o1, string o2, string o3)? SplitThreeOperands(string ops)
@@ -3675,7 +3848,7 @@ namespace DOSRE.Dasm
 
             if (mn == "push")
             {
-                state.Push(NormalizeAsmOperandToC(ops, false, fn));
+                state.Push(state.Resolve(NormalizeAsmOperandToC(ops, false, fn)));
             }
             else if (mn == "pop")
             {
@@ -3688,7 +3861,7 @@ namespace DOSRE.Dasm
                 var parts = SplitTwoOperands(ops);
                 if (parts != null)
                 {
-                    state.Set(parts.Value.lhs, NormalizeAsmOperandToC(parts.Value.rhs, false, fn));
+                    state.Set(parts.Value.lhs, state.Resolve(NormalizeAsmOperandToC(parts.Value.rhs, false, fn)));
                 }
             }
             else if (mn == "lea")
@@ -3696,7 +3869,11 @@ namespace DOSRE.Dasm
                 var parts = SplitTwoOperands(ops);
                 if (parts != null)
                 {
-                    state.Set(parts.Value.lhs, NormalizeAsmOperandToC(parts.Value.rhs, false, fn));
+                    var addrExpr = NormalizeLeaRhsToAddressExpr(parts.Value.rhs);
+                    if (!string.IsNullOrWhiteSpace(addrExpr))
+                        state.Set(parts.Value.lhs, addrExpr);
+                    else
+                        state.Set(parts.Value.lhs, state.Resolve(NormalizeAsmOperandToC(parts.Value.rhs, false, fn)));
                 }
             }
             else if (mn == "add" || mn == "sub" || mn == "xor" || mn == "or" || mn == "and" || mn == "shl" || mn == "shr" || mn == "sar")
