@@ -696,6 +696,67 @@ namespace DOSRE.UI.impl
                 var wantLeReachJson = !string.IsNullOrWhiteSpace(_leReachJson);
                 var leInsightsForRun = _bLeInsights || wantLeCallGraph || wantLeCfgDot || wantLeCfgAllDot || wantLeCfgAllJson || wantLeReportJson || wantLeImportsJson;
 
+                static string DetectExeFormat(string path)
+                {
+                    try
+                    {
+                        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                            return null;
+
+                        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                        if (fs.Length < 2)
+                            return "Unknown";
+
+                        Span<byte> hdr = stackalloc byte[64];
+                        var read = fs.Read(hdr);
+                        if (read < 2)
+                            return "Unknown";
+
+                        static bool IsSig(ReadOnlySpan<byte> data, int length, int off, byte a, byte b)
+                            => off + 1 < length && data[off] == a && data[off + 1] == b;
+
+                        if (IsSig(hdr, read, 0, (byte)'M', (byte)'Z'))
+                        {
+                            if (read < 0x40)
+                                return "MZ";
+
+                            var lfanew = BitConverter.ToUInt32(hdr.Slice(0x3C, 4));
+                            if (lfanew == 0)
+                                return "MZ";
+                            if (lfanew > (ulong)fs.Length || lfanew + 4 > (ulong)fs.Length)
+                                return "MZ";
+
+                            fs.Position = lfanew;
+                            Span<byte> sig = stackalloc byte[4];
+                            var sigRead = fs.Read(sig);
+                            if (sigRead >= 2)
+                            {
+                                if (sigRead >= 4 && sig[0] == (byte)'P' && sig[1] == (byte)'E' && sig[2] == 0 && sig[3] == 0)
+                                    return "PE";
+                                if (sig[0] == (byte)'N' && sig[1] == (byte)'E')
+                                    return "NE";
+                                if (sig[0] == (byte)'L' && sig[1] == (byte)'E')
+                                    return "LE";
+                                if (sig[0] == (byte)'L' && sig[1] == (byte)'X')
+                                    return "LX";
+                            }
+
+                            return "MZ";
+                        }
+
+                        if (IsSig(hdr, read, 0, (byte)'N', (byte)'E')) return "NE";
+                        if (IsSig(hdr, read, 0, (byte)'L', (byte)'E')) return "LE";
+                        if (IsSig(hdr, read, 0, (byte)'L', (byte)'X')) return "LX";
+                        if (read >= 4 && hdr[0] == (byte)'P' && hdr[1] == (byte)'E' && hdr[2] == 0 && hdr[3] == 0) return "PE";
+
+                        return "Unknown";
+                    }
+                    catch
+                    {
+                        return "Unknown";
+                    }
+                }
+
                 static string ChooseLeOutput(Dictionary<string, string> files)
                 {
                     if (files == null || files.Count == 0)
@@ -1196,6 +1257,7 @@ namespace DOSRE.UI.impl
                             {
                                 input = _sInputFile,
                                 error = "No valid input file was provided",
+                                detectedFormat = DetectExeFormat(_sInputFile),
                                 objectCount = 0,
                                 totalInstructionCount = 0,
                                 totalReachableInstructionCount = 0,
@@ -1209,6 +1271,7 @@ namespace DOSRE.UI.impl
                         else if (LEDisassembler.TryBuildReachabilityMap(_sInputFile, _bLeScanMz, out var reach, out var reachErr))
                         {
                             var payload = LeExports.BuildReachabilityExport(reach);
+                            payload.detectedFormat = DetectExeFormat(_sInputFile);
                             File.WriteAllText(_leReachJson, JsonSerializer.Serialize(payload, opts));
                             _logger.Info($"Wrote LE reachability JSON to {_leReachJson} (objects {payload.objectCount} reachableIns {payload.totalReachableInstructionCount})");
                         }
@@ -1218,6 +1281,7 @@ namespace DOSRE.UI.impl
                             {
                                 input = _sInputFile,
                                 error = reachErr,
+                                detectedFormat = DetectExeFormat(_sInputFile),
                                 objectCount = 0,
                                 totalInstructionCount = 0,
                                 totalReachableInstructionCount = 0,
@@ -1341,6 +1405,7 @@ namespace DOSRE.UI.impl
                     {
                         input = _sInputFile,
                         error = err,
+                        detectedFormat = DetectExeFormat(_sInputFile),
                         objectCount = 0,
                         totalInstructionCount = 0,
                         totalReachableInstructionCount = 0,
