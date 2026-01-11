@@ -121,6 +121,38 @@ namespace DOSRE.Analysis
             public LeFixupTableChain[] chains { get; set; }
         }
 
+        public sealed class LeImportProc
+        {
+            public int? moduleIndex { get; set; }
+            public string module { get; set; }
+            public string procNameOffset { get; set; }
+            public string name { get; set; }
+            public int xrefCount { get; set; }
+            public string[] sites { get; set; }
+            public string[] functions { get; set; }
+        }
+
+        public sealed class LeImportModule
+        {
+            public int index { get; set; }
+            public string name { get; set; }
+            public int procCount { get; set; }
+            public LeImportProc[] procs { get; set; }
+        }
+
+        public sealed class LeImportMapExport
+        {
+            public string input { get; set; }
+            public string entry { get; set; }
+            public string entryName { get; set; }
+
+            public int moduleCount { get; set; }
+            public int procCount { get; set; }
+            public int xrefCount { get; set; }
+
+            public LeImportModule[] modules { get; set; }
+        }
+
         private static string Hex(uint a2) => $"0x{a2:X8}";
         private static string HexU16(ushort v) => $"0x{v:X4}";
         private static string HexU32(uint v) => $"0x{v:X8}";
@@ -426,6 +458,142 @@ namespace DOSRE.Analysis
                 fixupCount = fixups.Length,
                 fixups = fixups.Length > 0 ? fixups : null,
                 chains = chains.Length > 0 ? chains : null,
+            };
+        }
+
+        public static LeImportMapExport BuildImportMapExport(LEDisassembler.LeFixupTableInfo table, LEDisassembler.LeAnalysis analysis = null)
+        {
+            if (table == null)
+                throw new ArgumentNullException(nameof(table));
+
+            var functionStarts = (analysis?.Functions ?? new Dictionary<uint, LEDisassembler.LeFunctionInfo>())
+                .Keys
+                .OrderBy(x => x)
+                .ToArray();
+
+            static uint FindOwnerStart(uint[] sortedStarts, uint addr)
+            {
+                if (sortedStarts == null || sortedStarts.Length == 0)
+                    return 0;
+                var idx = Array.BinarySearch(sortedStarts, addr);
+                if (idx >= 0)
+                    return sortedStarts[idx];
+                idx = ~idx - 1;
+                if (idx < 0)
+                    return 0;
+                return sortedStarts[idx];
+            }
+
+            // Seed module names from the table (if present).
+            var moduleNames = new Dictionary<int, string>();
+            if (table.importModules != null)
+            {
+                for (var i = 0; i < table.importModules.Length; i++)
+                {
+                    if (!moduleNames.ContainsKey(i))
+                        moduleNames[i] = table.importModules[i];
+                }
+            }
+
+            // Collect import procs from import-kind fixups.
+            var fixups = table.fixups ?? Array.Empty<LEDisassembler.LeFixupRecordInfo>();
+
+            var procGroups = fixups
+                .Where(f => string.Equals(f.targetKind, "import", StringComparison.OrdinalIgnoreCase))
+                .GroupBy(f => new
+                {
+                    mod = f.importModuleIndex.HasValue ? (int)f.importModuleIndex.Value : -1,
+                    proc = f.importProcNameOffset.HasValue ? (uint)f.importProcNameOffset.Value : 0u,
+                    modName = string.IsNullOrWhiteSpace(f.importModule) ? null : f.importModule,
+                    procName = string.IsNullOrWhiteSpace(f.importProc) ? null : f.importProc
+                })
+                .Select(g =>
+                {
+                    // Prefer the fixup-captured module name when available.
+                    if (!string.IsNullOrWhiteSpace(g.Key.modName) && g.Key.mod >= 0)
+                        moduleNames[g.Key.mod] = g.Key.modName;
+
+                    var sites = g
+                        .Select(x => x.siteLinear)
+                        .OrderBy(x => x)
+                        .Select(HexU32)
+                        .ToArray();
+
+                    var funcs = g
+                        .Select(x => FindOwnerStart(functionStarts, x.siteLinear))
+                        .Where(x => x != 0)
+                        .Distinct()
+                        .OrderBy(x => x)
+                        .Select(HexU32)
+                        .ToArray();
+
+                    var procName = g.Key.procName;
+                    if (string.IsNullOrWhiteSpace(procName))
+                        procName = g.Key.proc != 0 ? $"(unnamed@{HexU32Short(g.Key.proc)})" : "(unnamed)";
+
+                    return new
+                    {
+                        moduleIndex = g.Key.mod >= 0 ? (int?)g.Key.mod : null,
+                        module = g.Key.mod >= 0 && moduleNames.TryGetValue(g.Key.mod, out var mn) ? mn : g.Key.modName,
+                        procNameOffset = g.Key.proc != 0 ? HexU32Short(g.Key.proc) : null,
+                        name = procName,
+                        xrefCount = g.Count(),
+                        sites,
+                        functions = funcs.Length > 0 ? funcs : null
+                    };
+                })
+                .ToList();
+
+            // Group procs into modules.
+            var modules = procGroups
+                .GroupBy(p => p.moduleIndex ?? -1)
+                .Select(g =>
+                {
+                    var idx = g.Key;
+                    var name = idx >= 0 && moduleNames.TryGetValue(idx, out var mn) ? mn : null;
+                    if (string.IsNullOrWhiteSpace(name))
+                        name = g.Select(x => x.module).FirstOrDefault(x => !string.IsNullOrWhiteSpace(x));
+
+                    var procs = g
+                        .OrderBy(x => x.procNameOffset ?? string.Empty)
+                        .ThenBy(x => x.name)
+                        .Select(x => new LeImportProc
+                        {
+                            moduleIndex = x.moduleIndex,
+                            module = string.IsNullOrWhiteSpace(x.module) ? null : x.module,
+                            procNameOffset = x.procNameOffset,
+                            name = x.name,
+                            xrefCount = x.xrefCount,
+                            sites = x.sites,
+                            functions = x.functions
+                        })
+                        .ToArray();
+
+                    return new LeImportModule
+                    {
+                        index = idx,
+                        name = string.IsNullOrWhiteSpace(name) ? null : name,
+                        procCount = procs.Length,
+                        procs = procs.Length > 0 ? procs : null
+                    };
+                })
+                .OrderBy(m => m.index < 0 ? int.MaxValue : m.index)
+                .ToArray();
+
+            var procCount = modules.Sum(m => m.procCount);
+            var xrefCount = modules
+                .SelectMany(m => m.procs ?? Array.Empty<LeImportProc>())
+                .Sum(p => p.xrefCount);
+
+            return new LeImportMapExport
+            {
+                input = table.inputFile,
+                entry = HexU32(table.entryLinear),
+                entryName = FuncName(table.entryLinear),
+                moduleCount = modules.Length,
+                procCount = procCount,
+                xrefCount = xrefCount,
+                modules = modules.Length > 0 ? modules : null
             };
         }
     }

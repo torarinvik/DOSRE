@@ -84,6 +84,12 @@ namespace DOSRE.UI.impl
     ///     Specified with -LEFIXUPSJSON <file.json>
     /// </summary>
     private string _leFixupsJson;
+
+    /// <summary>
+    ///     Optional: export LE import map + best-effort "where referenced" xrefs in JSON format.
+    ///     Specified with -LEIMPORTSJSON <file.json>
+    /// </summary>
+    private string _leImportsJson;
         ///     Logger Implementation
         /// </summary>
         protected static readonly Logger _logger = LogManager.GetCurrentClassLogger(typeof(CustomLogger));
@@ -465,6 +471,12 @@ namespace DOSRE.UI.impl
                             _leFixupsJson = _args[i + 1];
                             i++;
                             break;
+                        case "LEIMPORTSJSON":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LEIMPORTSJSON requires a <file.json>");
+                            _leImportsJson = _args[i + 1];
+                            i++;
+                            break;
                         case "MZFULL":
                             _bMzFull = true;
                             break;
@@ -595,6 +607,8 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LEFIXUPSJSON <file.json> -- (LE inputs) Export a best-effort normalized LE fixup table in JSON format");
                             Console.WriteLine(
+                                "-LEIMPORTSJSON <file.json> -- (LE inputs) Export LE import map + best-effort xrefs (implies -LEINSIGHTS for function ownership mapping)");
+                            Console.WriteLine(
                                 "-MZFULL -- (MZ inputs) Disassemble from entrypoint to end of load module");
                             Console.WriteLine(
                                 "-MZBYTES <n> -- (MZ inputs) Limit disassembly to n bytes from entrypoint");
@@ -664,7 +678,8 @@ namespace DOSRE.UI.impl
                 var wantLeCfgAllJson = !string.IsNullOrWhiteSpace(_leCfgAllJson);
                 var wantLeReportJson = !string.IsNullOrWhiteSpace(_leReportJson);
                 var wantLeFixupsJson = !string.IsNullOrWhiteSpace(_leFixupsJson);
-                var leInsightsForRun = _bLeInsights || wantLeCallGraph || wantLeCfgDot || wantLeCfgAllDot || wantLeCfgAllJson || wantLeReportJson;
+                var wantLeImportsJson = !string.IsNullOrWhiteSpace(_leImportsJson);
+                var leInsightsForRun = _bLeInsights || wantLeCallGraph || wantLeCfgDot || wantLeCfgAllDot || wantLeCfgAllJson || wantLeReportJson || wantLeImportsJson;
 
                 static string ChooseLeOutput(Dictionary<string, string> files)
                 {
@@ -693,6 +708,8 @@ namespace DOSRE.UI.impl
                         _logger.Warn("Warning: -LEREPORTJSON is not supported with -LEDECOMPASM (no LE decode pass). Run without -LEDECOMPASM to export the report.");
                     if (wantLeFixupsJson)
                         _logger.Warn("Warning: -LEFIXUPSJSON is not supported with -LEDECOMPASM (no input file to parse). Run without -LEDECOMPASM to export fixups.");
+                    if (wantLeImportsJson)
+                        _logger.Warn("Warning: -LEIMPORTSJSON is not supported with -LEDECOMPASM (no input file to parse / no analysis). Run without -LEDECOMPASM to export imports.");
                     leOk = LEDisassembler.TryDecompileToMultipartFromAsmFile(_leDecompileAsmFile, _leOnlyFunction, _leChunks, out leDecompFiles, out leError);
                     leOutput = leOk ? ChooseLeOutput(leDecompFiles) : string.Empty;
                 }
@@ -1113,6 +1130,32 @@ namespace DOSRE.UI.impl
                         else
                         {
                             _logger.Warn($"Warning: -LEFIXUPSJSON failed: {fixErr}");
+                        }
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(_leImportsJson))
+                    {
+                        if (string.IsNullOrWhiteSpace(_sInputFile) || !File.Exists(_sInputFile))
+                        {
+                            _logger.Warn("Warning: -LEIMPORTSJSON requested but no valid input file was provided");
+                        }
+                        else if (LEDisassembler.TryBuildFixupTable(_sInputFile, _bLeScanMz, out var table, out var impErr))
+                        {
+                            var analysis = LEDisassembler.GetLastAnalysis();
+                            var payload = LeExports.BuildImportMapExport(table, analysis);
+
+                            var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions
+                            {
+                                WriteIndented = true,
+                                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+                            });
+
+                            File.WriteAllText(_leImportsJson, json);
+                            _logger.Info($"Wrote LE imports JSON to {_leImportsJson} (modules {payload.moduleCount} procs {payload.procCount} xrefs {payload.xrefCount})");
+                        }
+                        else
+                        {
+                            _logger.Warn($"Warning: -LEIMPORTSJSON failed: {impErr}");
                         }
                     }
 
