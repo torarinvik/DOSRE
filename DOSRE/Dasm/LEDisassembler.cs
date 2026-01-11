@@ -3566,6 +3566,83 @@ namespace DOSRE.Dasm
             return false;
         }
 
+        internal static int RefineFunctionStartsByPrologAfterRet(List<Instruction> instructions, HashSet<uint> functionStarts)
+        {
+            if (instructions == null || instructions.Count < 4 || functionStarts == null)
+                return 0;
+
+            static bool IsPadding(string t)
+            {
+                if (string.IsNullOrWhiteSpace(t))
+                    return false;
+                t = t.Trim();
+                return t.Equals("nop", StringComparison.OrdinalIgnoreCase)
+                    || t.Equals("int3", StringComparison.OrdinalIgnoreCase);
+            }
+
+            static bool IsRet(string t)
+                => !string.IsNullOrWhiteSpace(t) && t.Trim().StartsWith("ret", StringComparison.OrdinalIgnoreCase);
+
+            static bool IsPushEbp(string t)
+                => !string.IsNullOrWhiteSpace(t) && t.Trim().Equals("push ebp", StringComparison.OrdinalIgnoreCase);
+
+            static bool IsMovEbpEsp(string t)
+                => !string.IsNullOrWhiteSpace(t) && t.Trim().Equals("mov ebp, esp", StringComparison.OrdinalIgnoreCase);
+
+            static bool IsEnter(string t)
+                => !string.IsNullOrWhiteSpace(t) && t.Trim().StartsWith("enter ", StringComparison.OrdinalIgnoreCase);
+
+            var added = 0;
+            for (var i = 0; i < instructions.Count - 1; i++)
+            {
+                var ti = InsText(instructions[i]);
+                if (!IsRet(ti))
+                    continue;
+
+                var j = i + 1;
+                while (j < instructions.Count)
+                {
+                    var tj = InsText(instructions[j]);
+                    if (!IsPadding(tj))
+                        break;
+                    j++;
+                }
+
+                if (j >= instructions.Count)
+                    break;
+
+                var t0 = InsText(instructions[j]);
+                uint start = 0;
+                var ok = false;
+
+                if (IsEnter(t0))
+                {
+                    start = (uint)instructions[j].Offset;
+                    ok = true;
+                }
+                else if (IsPushEbp(t0) && j + 1 < instructions.Count)
+                {
+                    var t1 = InsText(instructions[j + 1]);
+                    if (IsMovEbpEsp(t1))
+                    {
+                        start = (uint)instructions[j].Offset;
+                        ok = true;
+                    }
+                }
+
+                if (!ok)
+                    continue;
+
+                if (!functionStarts.Contains(start))
+                {
+                    functionStarts.Add(start);
+                    added++;
+                }
+            }
+
+            return added;
+        }
+
         private static void InferPointerishTokensForFunction(
             List<Instruction> instructions,
             int startIdx,
@@ -7002,6 +7079,15 @@ namespace DOSRE.Dasm
                 {
                     if (kv.Key >= startLinear && kv.Key < endLinear)
                         jumpXrefs[kv.Key] = kv.Value;
+                }
+
+                // Function boundary refinement (best-effort): split merged adjacent functions by
+                // detecting a classic prolog right after a RET (contiguous code layout).
+                if (leInsights && functionStarts.Count > 0)
+                {
+                    var added = RefineFunctionStartsByPrologAfterRet(instructions, functionStarts);
+                    if (added > 0)
+                        _logger.Info($"LE: Function boundary refinement: +{added} function starts (prolog after ret)");
                 }
 
                 // Pre-sorted function list for per-function insight passes.
