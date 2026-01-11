@@ -585,7 +585,7 @@ namespace DOSRE.Dasm
                         if (idxByAddr.ContainsKey(addr))
                         {
                             var wantCases = 16;
-                            if (TryParseIndirectJmpTable(ins.Bytes, out var _, out var idxRegProbe, out var scaleProbe) && scaleProbe == 4)
+                            if (TryParseIndirectJmpTable(ins.Bytes, out var _, out var idxRegProbe, out var scaleProbe))
                             {
                                 if (TryInferJumpTableSwitchBound(instructions, idx, idxRegProbe, out var inferredCasesProbe, out var _))
                                     wantCases = Math.Min(64, Math.Max(1, inferredCasesProbe));
@@ -5486,8 +5486,6 @@ namespace DOSRE.Dasm
             if (!TryParseIndirectJmpTable(ins.Bytes, out var disp, out var indexReg, out var scale))
                 return string.Empty;
 
-            if (scale != 4)
-                return string.Empty;
             var reg = string.IsNullOrWhiteSpace(indexReg) ? "?" : indexReg;
 
             var want = 8;
@@ -5499,7 +5497,7 @@ namespace DOSRE.Dasm
                 var symResolved = globalSymbols != null && globalSymbols.TryGetValue(tableBase, out var gResolved) ? gResolved : $"0x{tableBase:X8}";
                 var shownResolved = string.Join(", ", targets.Take(8).Select(x => $"0x{x:X8}"));
                 var modeSuffix = string.IsNullOrWhiteSpace(mode) ? string.Empty : $" {mode}";
-                return $"JUMPTABLE: idx={reg} base={symResolved}{modeSuffix} entries~{targets.Count} [{shownResolved}{(targets.Count > 8 ? ", ..." : string.Empty)}]";
+                return $"JUMPTABLE: idx={reg} stride={scale} base={symResolved}{modeSuffix} entries~{targets.Count} [{shownResolved}{(targets.Count > 8 ? ", ..." : string.Empty)}]";
             }
 
             // The disp32 in the encoding may be:
@@ -5515,8 +5513,9 @@ namespace DOSRE.Dasm
             }
 
             var max = 16;
-            TryReadJumpTableEntries(objects, objBytesByIndex, base1, max, out var entries1, out var raw1, out var adjByBase1);
-            TryReadJumpTableEntries(objects, objBytesByIndex, base2, max, out var entries2, out var raw2, out var adjByBase2);
+            var entrySize = HasOperandSizeOverridePrefix(ins.Bytes) ? 2 : 4;
+            TryReadJumpTableEntries(objects, objBytesByIndex, base1, max, stride: scale, entrySize: entrySize, out var entries1, out var raw1, out var adjByBase1);
+            TryReadJumpTableEntries(objects, objBytesByIndex, base2, max, stride: scale, entrySize: entrySize, out var entries2, out var raw2, out var adjByBase2);
 
             var useBase = base1;
             var entries = entries1;
@@ -5564,7 +5563,12 @@ namespace DOSRE.Dasm
             if (jmpIns?.Bytes == null || insIndexByAddr == null || objects == null || objBytesByIndex == null)
                 return false;
 
-            if (!TryParseIndirectJmpTable(jmpIns.Bytes, out var disp, out var indexReg, out var scale) || scale != 4)
+            if (!TryParseIndirectJmpTable(jmpIns.Bytes, out var dispU32, out var baseReg, out var indexReg, out var scale, out var dispSigned, out var _))
+                return false;
+
+            var entrySize = HasOperandSizeOverridePrefix(jmpIns.Bytes) ? 2 : 4;
+            var stride = scale;
+            if (stride != 1 && stride != 2 && stride != 4 && stride != 8)
                 return false;
 
             // Determine current object and bytes.
@@ -5583,10 +5587,18 @@ namespace DOSRE.Dasm
             var bestTargets = (List<uint>)null;
             var bestMode = string.Empty;
 
-            int ScoreTableAtOffset(int off0, string m, out List<uint> list)
+            int ScoreTableAtLinear(uint baseLinear, string m, out List<uint> list)
             {
                 list = null;
-                if (off0 < 0 || off0 + 4 > curBytes.Length)
+                if (baseLinear == 0)
+                    return -1;
+                if (!TryMapLinearToObject(objects, baseLinear, out var tob, out var toff))
+                    return -1;
+                if (!objBytesByIndex.TryGetValue(tob, out var bytes) || bytes == null)
+                    return -1;
+                var objBase = objects[tob - 1].BaseAddress;
+                var off0 = (int)toff;
+                if (off0 < 0 || off0 + entrySize > bytes.Length)
                     return -1;
 
                 var tmp = new List<uint>();
@@ -5596,10 +5608,69 @@ namespace DOSRE.Dasm
 
                 for (var i = 0; i < wantScan; i++)
                 {
-                    var off = off0 + i * 4;
-                    if (off + 4 > curBytes.Length)
+                    var off = off0 + i * stride;
+                    if (off + entrySize > bytes.Length)
                         break;
-                    var v = (uint)(curBytes[off] | (curBytes[off + 1] << 8) | (curBytes[off + 2] << 16) | (curBytes[off + 3] << 24));
+
+                    uint v;
+                    if (entrySize == 2)
+                        v = (uint)(bytes[off] | (bytes[off + 1] << 8));
+                    else
+                        v = (uint)(bytes[off] | (bytes[off + 1] << 8) | (bytes[off + 2] << 16) | (bytes[off + 3] << 24));
+
+                    if (v == 0)
+                        badZero++;
+
+                    uint t = m switch
+                    {
+                        "abs" => v,
+                        "csbase" => objBase + v,
+                        "rel" => unchecked((uint)((int)jmpIns.Offset + (int)v)),
+                        _ => v,
+                    };
+
+                    tmp.Add(t);
+                    distinct.Add(t);
+                    if (insIndexByAddr.ContainsKey(t))
+                        hits++;
+                }
+
+                if (tmp.Count < Math.Min(3, wantScan))
+                    return -1;
+
+                var score = hits * 10 + distinct.Count - badZero * 2;
+                if (distinct.Count <= 1)
+                    score -= 10;
+
+                list = tmp;
+                return score;
+            }
+
+            int ScoreTableAtOffset(int off0, string m, out List<uint> list)
+            {
+                list = null;
+                if (off0 < 0 || off0 + entrySize > curBytes.Length)
+                    return -1;
+
+                var tmp = new List<uint>();
+                var hits = 0;
+                var distinct = new HashSet<uint>();
+                var badZero = 0;
+
+                for (var i = 0; i < wantScan; i++)
+                {
+                    var off = off0 + i * stride;
+                    if (off + entrySize > curBytes.Length)
+                        break;
+                    uint v;
+                    if (entrySize == 2)
+                    {
+                        v = (uint)(curBytes[off] | (curBytes[off + 1] << 8));
+                    }
+                    else
+                    {
+                        v = (uint)(curBytes[off] | (curBytes[off + 1] << 8) | (curBytes[off + 2] << 16) | (curBytes[off + 3] << 24));
+                    }
                     if (v == 0)
                         badZero++;
 
@@ -5633,14 +5704,9 @@ namespace DOSRE.Dasm
             {
                 if (candBase == 0)
                     return;
-                if (!TryMapLinearToObject(objects, candBase, out var tob, out var toff))
-                    return;
-                if (tob != curObj)
-                    return;
-                var off0 = (int)toff;
                 foreach (var m in new[] { "abs", "csbase", "rel" })
                 {
-                    var score = ScoreTableAtOffset(off0, m, out var list);
+                    var score = ScoreTableAtLinear(candBase, m, out var list);
                     if (score > bestScore)
                     {
                         bestScore = score;
@@ -5652,8 +5718,15 @@ namespace DOSRE.Dasm
             }
 
             // 1) Try the two most likely base interpretations.
-            ConsiderTable(curBase + disp);
-            ConsiderTable(disp);
+            ConsiderTable(curBase + dispU32);
+            ConsiderTable(dispU32);
+
+            // 1b) If the SIB base is a register, try to resolve it to a table pointer.
+            if (!string.IsNullOrWhiteSpace(baseReg) && TryResolveRegisterAsTablePointer(instructions, jmpIdx, baseReg, objects, objBytesByIndex, out var basePtr, out var _src) && basePtr != 0)
+            {
+                var cand = unchecked(basePtr + (uint)dispSigned);
+                ConsiderTable(cand);
+            }
 
             // 2) Scan near the dispatch (common compiler placement).
             {
@@ -5679,7 +5752,7 @@ namespace DOSRE.Dasm
             // 3) If still nothing, scan around the disp-derived offsets within the object.
             if (bestScore < 20)
             {
-                foreach (var cand in new[] { curBase + disp, disp })
+                foreach (var cand in new[] { curBase + dispU32, dispU32 })
                 {
                     if (!TryMapLinearToObject(objects, cand, out var tob, out var toff) || tob != curObj)
                         continue;
@@ -5706,7 +5779,7 @@ namespace DOSRE.Dasm
             // 4) Last resort: full object scan (still cheap for small wantScan).
             if (bestScore < 20)
             {
-                for (var off = 0; off + 4 <= curBytes.Length; off += 4)
+                for (var off = 0; off + entrySize <= curBytes.Length; off += 4)
                 {
                     foreach (var m in new[] { "abs", "csbase" })
                     {
@@ -5746,10 +5819,20 @@ namespace DOSRE.Dasm
         private static void TryReadJumpTableEntries(List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex, uint tableBaseLinear, int max,
             out List<uint> entries, out List<uint> raw, out bool adjustedByBase)
         {
+            TryReadJumpTableEntries(objects, objBytesByIndex, tableBaseLinear, max, stride: 4, entrySize: 4, out entries, out raw, out adjustedByBase);
+        }
+
+        private static void TryReadJumpTableEntries(List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex, uint tableBaseLinear, int max,
+            int stride, int entrySize, out List<uint> entries, out List<uint> raw, out bool adjustedByBase)
+        {
             entries = new List<uint>();
             raw = new List<uint>();
             adjustedByBase = false;
             if (tableBaseLinear == 0)
+                return;
+            if (stride <= 0)
+                return;
+            if (entrySize != 2 && entrySize != 4)
                 return;
             if (!TryMapLinearToObject(objects, tableBaseLinear, out var tobj, out var toff))
                 return;
@@ -5759,10 +5842,18 @@ namespace DOSRE.Dasm
             var baseAdjust = objects != null && tobj > 0 && tobj - 1 < objects.Count ? objects[tobj - 1].BaseAddress : 0u;
             for (var i = 0; i < max; i++)
             {
-                var off = (int)toff + i * 4;
-                if (off + 4 > tgtBytes.Length)
+                var off = (int)toff + i * stride;
+                if (off + entrySize > tgtBytes.Length)
                     break;
-                var v = (uint)(tgtBytes[off] | (tgtBytes[off + 1] << 8) | (tgtBytes[off + 2] << 16) | (tgtBytes[off + 3] << 24));
+                uint v;
+                if (entrySize == 2)
+                {
+                    v = (uint)(tgtBytes[off] | (tgtBytes[off + 1] << 8));
+                }
+                else
+                {
+                    v = (uint)(tgtBytes[off] | (tgtBytes[off + 1] << 8) | (tgtBytes[off + 2] << 16) | (tgtBytes[off + 3] << 24));
+                }
                 raw.Add(v);
                 var cand = v;
                 if (!TryMapLinearToObject(objects, cand, out var _tmpObj, out var _tmpOff))
@@ -5777,11 +5868,26 @@ namespace DOSRE.Dasm
             }
         }
 
-        private static bool TryParseIndirectJmpTable(byte[] bytes, out uint disp32, out string indexReg, out int scale)
+        internal static bool TryParseIndirectJmpTable(byte[] bytes, out uint disp32, out string indexReg, out int scale)
         {
-            disp32 = 0;
+            return TryParseIndirectJmpTable(bytes, out disp32, out _, out indexReg, out scale, out _, out _);
+        }
+
+        private static bool TryParseIndirectJmpTable(
+            byte[] bytes,
+            out uint dispU32,
+            out string baseReg,
+            out string indexReg,
+            out int scale,
+            out int dispSigned,
+            out bool addressSizeOverride)
+        {
+            dispU32 = 0;
+            baseReg = string.Empty;
             indexReg = string.Empty;
             scale = 0;
+            dispSigned = 0;
+            addressSizeOverride = false;
             if (bytes == null)
                 return false;
 
@@ -5790,6 +5896,8 @@ namespace DOSRE.Dasm
             while (i < bytes.Length)
             {
                 var p = bytes[i];
+                if (p == 0x67)
+                    addressSizeOverride = true;
                 if (p == 0x2E || p == 0x36 || p == 0x3E || p == 0x26 || p == 0x64 || p == 0x65 || p == 0x66 || p == 0x67 || p == 0xF0 || p == 0xF2 || p == 0xF3)
                 {
                     i++;
@@ -5798,8 +5906,11 @@ namespace DOSRE.Dasm
                 break;
             }
 
-            // Need: FF /4, modrm=00 100 100, then SIB with base=101 (disp32) and scale=4.
-            if (i + 6 >= bytes.Length)
+            // We only support 32-bit addressing forms here (no 0x67).
+            if (addressSizeOverride)
+                return false;
+
+            if (i + 2 >= bytes.Length)
                 return false;
             if (bytes[i] != 0xFF)
                 return false;
@@ -5808,34 +5919,97 @@ namespace DOSRE.Dasm
             var mod = (modrm >> 6) & 0x3;
             var reg = (modrm >> 3) & 0x7;
             var rm = modrm & 0x7;
-            if (mod != 0 || rm != 4)
-                return false;
+            if (rm != 4)
+                return false; // need SIB
             if (reg != 4)
-                return false; // JMP r/m32
+                return false; // JMP r/m
 
             var sib = bytes[i + 2];
             var sibScale = (sib >> 6) & 0x3;
             var sibIndex = (sib >> 3) & 0x7;
             var sibBase = sib & 0x7;
-            if (sibBase != 5)
-                return false; // disp32 base only
 
             scale = 1 << (int)sibScale;
+
             indexReg = sibIndex switch
             {
                 0 => "eax",
                 1 => "ecx",
                 2 => "edx",
                 3 => "ebx",
-                4 => "esp",
+                4 => string.Empty, // no index
                 5 => "ebp",
                 6 => "esi",
                 7 => "edi",
                 _ => string.Empty,
             };
 
-            disp32 = (uint)(bytes[i + 3] | (bytes[i + 4] << 8) | (bytes[i + 5] << 16) | (bytes[i + 6] << 24));
-            return true;
+            baseReg = sibBase switch
+            {
+                0 => "eax",
+                1 => "ecx",
+                2 => "edx",
+                3 => "ebx",
+                4 => "esp",
+                5 => mod == 0 ? string.Empty : "ebp", // mod==0 => disp32 only
+                6 => "esi",
+                7 => "edi",
+                _ => string.Empty,
+            };
+
+            // Displacement comes after SIB; size depends on mod.
+            var dispOff = i + 3;
+            if (mod == 0)
+            {
+                if (sibBase == 5)
+                {
+                    if (dispOff + 4 > bytes.Length)
+                        return false;
+                    dispSigned = bytes[dispOff] | (bytes[dispOff + 1] << 8) | (bytes[dispOff + 2] << 16) | (bytes[dispOff + 3] << 24);
+                    dispU32 = unchecked((uint)dispSigned);
+                }
+                else
+                {
+                    dispSigned = 0;
+                    dispU32 = 0;
+                }
+            }
+            else if (mod == 1)
+            {
+                if (dispOff + 1 > bytes.Length)
+                    return false;
+                dispSigned = unchecked((sbyte)bytes[dispOff]);
+                dispU32 = unchecked((uint)dispSigned);
+            }
+            else if (mod == 2)
+            {
+                if (dispOff + 4 > bytes.Length)
+                    return false;
+                dispSigned = bytes[dispOff] | (bytes[dispOff + 1] << 8) | (bytes[dispOff + 2] << 16) | (bytes[dispOff + 3] << 24);
+                dispU32 = unchecked((uint)dispSigned);
+            }
+            else
+            {
+                // mod==3 is register indirect; not a table
+                return false;
+            }
+
+            return !string.IsNullOrWhiteSpace(indexReg) && scale != 0;
+        }
+
+        private static bool HasOperandSizeOverridePrefix(byte[] bytes)
+        {
+            if (bytes == null)
+                return false;
+            foreach (var b in bytes)
+            {
+                if (b == 0x66)
+                    return true;
+                // Stop scanning at opcode.
+                if (!(b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 || b == 0x64 || b == 0x65 || b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3))
+                    break;
+            }
+            return false;
         }
 
         private static bool TryGetJumpTableTargets(
@@ -5857,8 +6031,6 @@ namespace DOSRE.Dasm
                 return false;
             if (!TryParseIndirectJmpTable(ins.Bytes, out var disp, out var reg, out var scale))
                 return false;
-            if (scale != 4)
-                return false;
 
             indexReg = reg;
 
@@ -5872,7 +6044,7 @@ namespace DOSRE.Dasm
             return false;
         }
 
-        private static bool TryInferJumpTableSwitchBound(List<Instruction> instructions, int jmpIdx, string indexReg, out int caseCount, out uint defaultTarget)
+        internal static bool TryInferJumpTableSwitchBound(List<Instruction> instructions, int jmpIdx, string indexReg, out int caseCount, out uint defaultTarget)
         {
             caseCount = 0;
             defaultTarget = 0;
@@ -5890,35 +6062,47 @@ namespace DOSRE.Dasm
                 if (idx < 0)
                     break;
 
-                var t = instructions[idx]?.ToString() ?? string.Empty;
+                var t = InsText(instructions[idx]).Trim();
                 if (!t.StartsWith("cmp ", StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                var m = Regex.Match(t, @$"^cmp\s+{Regex.Escape(indexReg)}\s*,\s*(?<imm>0x[0-9A-Fa-f]+|[0-9]+)\s*$", RegexOptions.IgnoreCase);
+                var m = Regex.Match(
+                    t,
+                    @$"^cmp\s+{Regex.Escape(indexReg)}\s*,\s*(?:(?:byte|word|dword)\s+)?(?<imm>0x[0-9A-Fa-f]{{1,8}}|[0-9]+)\s*$",
+                    RegexOptions.IgnoreCase);
                 if (!m.Success)
                     continue;
 
                 if (!TryParseHexUInt(m.Groups["imm"].Value, out var imm))
                     continue;
 
-                // Find a following bounds-check jump (ja/jae/jg/jge) between cmp and jmp.
+                // Find a following bounds-check jump between cmp and jmp.
+                // Note: Disassemblers may render synonyms (e.g., jae == jnc == jnb).
+                var inclusive = true;
                 for (var fwd = idx + 1; fwd < jmpIdx && fwd <= idx + 3; fwd++)
                 {
-                    var jt = instructions[fwd]?.ToString() ?? string.Empty;
+                    var jt = InsText(instructions[fwd]).Trim();
                     if (jt.StartsWith("ja ", StringComparison.OrdinalIgnoreCase) || jt.StartsWith("jae ", StringComparison.OrdinalIgnoreCase) ||
-                        jt.StartsWith("jg ", StringComparison.OrdinalIgnoreCase) || jt.StartsWith("jge ", StringComparison.OrdinalIgnoreCase))
+                        jt.StartsWith("jg ", StringComparison.OrdinalIgnoreCase) || jt.StartsWith("jge ", StringComparison.OrdinalIgnoreCase) ||
+                        jt.StartsWith("jnc ", StringComparison.OrdinalIgnoreCase) || jt.StartsWith("jnb ", StringComparison.OrdinalIgnoreCase))
                     {
+                        // ja/jg => reg > imm ; valid cases: 0..imm (inclusive)
+                        // jae/jge/jnc/jnb => reg >= imm ; valid cases: 0..imm-1 (exclusive)
+                        inclusive = jt.StartsWith("ja ", StringComparison.OrdinalIgnoreCase) || jt.StartsWith("jg ", StringComparison.OrdinalIgnoreCase);
                         if (TryGetRelativeBranchTarget(instructions[fwd], out var target, out var isCall) && !isCall)
                             defaultTarget = target;
                         break;
                     }
                 }
 
-                // cmp reg, imm => cases likely 0..imm (imm+1)
                 if (imm < 0x10000)
                 {
-                    caseCount = checked((int)imm + 1);
-                    return true;
+                    var cc = inclusive ? checked((int)imm + 1) : checked((int)imm);
+                    if (cc > 0)
+                    {
+                        caseCount = cc;
+                        return true;
+                    }
                 }
             }
 
@@ -5932,7 +6116,7 @@ namespace DOSRE.Dasm
             if (ins?.Bytes == null)
                 return string.Empty;
 
-            if (!TryParseIndirectJmpTable(ins.Bytes, out var _, out var indexReg, out var scale) || scale != 4)
+            if (!TryParseIndirectJmpTable(ins.Bytes, out var _, out var indexReg, out var scale))
                 return string.Empty;
 
             if (!TryInferJumpTableSwitchBound(instructions, insLoopIndex, indexReg, out var cases, out var def))
@@ -6636,7 +6820,7 @@ namespace DOSRE.Dasm
                         if (insIndexByAddr.TryGetValue((uint)ins.Offset, out var insIdx))
                         {
                             var wantCases = 16;
-                            if (TryParseIndirectJmpTable(ins.Bytes, out var _, out var idxRegProbe, out var scaleProbe) && scaleProbe == 4)
+                            if (TryParseIndirectJmpTable(ins.Bytes, out var _, out var idxRegProbe, out var scaleProbe))
                             {
                                 if (TryInferJumpTableSwitchBound(instructions, insIdx, idxRegProbe, out var inferredCasesProbe, out var _))
                                     wantCases = Math.Min(64, Math.Max(1, inferredCasesProbe));
