@@ -610,6 +610,9 @@ namespace DOSRE.Dasm
             sb.AppendLine();
             sb.AppendLine("// Stubs for compilability");
             sb.AppendLine("#define strlen_rep(edi, al, ecx) 0 /* stub */");
+            sb.AppendLine("// x86 LSL sets ZF=1 on success (selector valid), ZF=0 on failure.");
+            sb.AppendLine("// We don't model descriptor tables here, so this is a best-effort placeholder used for jz/jnz recovery.");
+            sb.AppendLine("static inline int __lsl_success(uint32_t selector) { (void)selector; return 0; /* unknown */ }");
             sb.AppendLine();
             sb.AppendLine("// Low-level hooks (port I/O + interrupts)");
             sb.AppendLine("// - On DOS targets (DJGPP/Watcom) we provide best-effort real implementations.");
@@ -2612,6 +2615,11 @@ namespace DOSRE.Dasm
             public bool LastWasResult;
             public string LastResultExpr;
 
+            // Tracks a predicate meaning for ZF (e.g. x86 LSL success), where ZF isn't simply derived
+            // from a numeric result expression.
+            public bool LastWasZfPredicate;
+            public string LastZfPredicateExpr;
+
             public string LastEaxAssignment;
 
             public void Clear(bool targetIsEax = false)
@@ -2635,6 +2643,8 @@ namespace DOSRE.Dasm
                 LastCarryIn = null;
                 LastWasResult = false;
                 LastResultExpr = null;
+                LastWasZfPredicate = false;
+                LastZfPredicateExpr = null;
                 if (targetIsEax) LastEaxAssignment = null;
             }
 
@@ -2888,6 +2898,22 @@ namespace DOSRE.Dasm
                     var rhsSize = GetOperandSize(parts.Value.rhs);
                     pending.LastTestLhs = WrapExprForPointerMath(NormalizeAsmOperandToC(parts.Value.lhs, isMemoryWrite: false, fn, rhsSize));
                     pending.LastTestRhs = WrapExprForPointerMath(NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn, lhsSize));
+                }
+                return "// " + asm + commentSuffix;
+            }
+
+            // LSL r32, r/m16: loads segment limit and sets ZF=1 on success, ZF=0 on failure.
+            // We don't model descriptor tables, but we can at least carry forward the meaning of ZF
+            // so jz/jnz become informative.
+            if (mn == "lsl")
+            {
+                pending.Clear(dstIsEax);
+                var parts = SplitTwoOperands(ops);
+                if (parts != null)
+                {
+                    var src = WrapExprForPointerMath(NormalizeAsmOperandToC(parts.Value.rhs, isMemoryWrite: false, fn));
+                    pending.LastWasZfPredicate = true;
+                    pending.LastZfPredicateExpr = $"__lsl_success({src})";
                 }
                 return "// " + asm + commentSuffix;
             }
@@ -3877,7 +3903,9 @@ namespace DOSRE.Dasm
             string carryB = null,
             string carryIn = null,
             bool lastWasResult = false,
-            string lastResultExpr = null)
+            string lastResultExpr = null,
+            bool lastWasZfPredicate = false,
+            string zfPredicateExpr = null)
         {
             if (string.IsNullOrWhiteSpace(jcc))
                 return string.Empty;
@@ -3995,6 +4023,17 @@ namespace DOSRE.Dasm
                     return jcc == "jc" ? expr : $"!({expr})";
             }
 
+            // ZF meaning as an explicit predicate (e.g. LSL success).
+            if (lastWasZfPredicate && !string.IsNullOrWhiteSpace(zfPredicateExpr))
+            {
+                return jcc switch
+                {
+                    "je" or "jz" => zfPredicateExpr,
+                    "jne" or "jnz" => $"!({zfPredicateExpr})",
+                    _ => string.Empty
+                };
+            }
+
             // ZF/SF recovery from last flag-setting ALU result (no cmp/test).
             if (lastWasResult && !string.IsNullOrWhiteSpace(lastResultExpr))
             {
@@ -4045,7 +4084,9 @@ namespace DOSRE.Dasm
                 pending.LastCarryB,
                 pending.LastCarryIn,
                 pending.LastWasResult,
-                pending.LastResultExpr);
+                pending.LastResultExpr,
+                pending.LastWasZfPredicate,
+                pending.LastZfPredicateExpr);
         }
 
         private static (string o1, string o2, string o3)? SplitThreeOperands(string ops)

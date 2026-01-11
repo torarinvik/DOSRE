@@ -5,6 +5,31 @@ namespace DOSRE.Tests;
 public class FlagsResultConditionTests
 {
     [Fact]
+    public void MakeConditionFromPendingForTest_JnzAfterLsl_EmitsNegatedPredicate()
+    {
+        var got = DOSRE.Dasm.LEDisassembler.MakeConditionFromPendingForTest(
+            jcc: "jnz",
+            lastWasCmp: false,
+            cmpLhs: null,
+            cmpRhs: null,
+            lastWasTest: false,
+            testLhs: null,
+            testRhs: null,
+            lastWasIncDec: false,
+            incDecOperand: null,
+            lastWasArith: false,
+            arithOp: null,
+            arithA: null,
+            arithB: null,
+            lastWasResult: false,
+            lastResultExpr: null,
+            lastWasZfPredicate: true,
+            zfPredicateExpr: "__lsl_success(ax)");
+
+        Assert.Equal("!(__lsl_success(ax))", got);
+    }
+
+    [Fact]
     public void MakeConditionFromPendingForTest_JzFromLastResult_EmitsZeroCheck()
     {
         var got = DOSRE.Dasm.LEDisassembler.MakeConditionFromPendingForTest(
