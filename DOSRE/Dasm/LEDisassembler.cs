@@ -11106,6 +11106,30 @@ namespace DOSRE.Dasm
                         }
                     }
 
+                    // Some DOS4GW fixup records appear to be 8 bytes (no specU32) and carry a byte-swapped 16-bit
+                    // object-relative offset in specU16. For a small remaining bucket we can classify safely when:
+                    // - type/flags match a known family
+                    // - the fixup site value is 0 (placeholder)
+                    // - the inferred offset maps uniquely into exactly one object
+                    if (targetKind == "unknown" && hasSpecU16 && hasSpecU16b && !hasSpecU32)
+                    {
+                        if (srcType == 0x07 && flags == 0x00)
+                        {
+                            // Observed: specU16b has high byte 0x07 for this family (e.g., 0x0700/0x0702/0x0703).
+                            if (unchecked((_specU16b & 0xFF00)) == 0x0700)
+                            {
+                                var off16 = (uint)(ushort)((_specU16 >> 8) | (_specU16 << 8));
+                                if (off16 != 0 && TryMapOffsetToUniqueObject(objects, off16, out var tobj, out var tlin))
+                                {
+                                    targetKind = "internal";
+                                    targetObj = tobj;
+                                    targetOff = off16;
+                                    targetLinear = tlin;
+                                }
+                            }
+                        }
+                    }
+
 
                     // Read addend / site value near fixup site.
                     var objOffset = (int)((uint)i * header.PageSize + srcOff);
