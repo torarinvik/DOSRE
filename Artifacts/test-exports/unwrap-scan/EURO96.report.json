@@ -1,0 +1,11 @@
+{
+  "input": "Artifacts/test-exports/unwrap-scan/EURO96.unwrapped.exe",
+  "entry": "0x000A5C24",
+  "entryName": "func_000A5C24",
+  "functionCount": 816,
+  "cfgFunctionCount": 816,
+  "totalInstructionCount": 49155,
+  "totalBasicBlocks": 7458,
+  "cfgEdgeCount": 8159,
+  "callEdgeCount": 1291
+}

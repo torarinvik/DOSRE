@@ -1,0 +1,11 @@
+{
+  "input": "Artifacts/test-exports/unwrap-scan/HOCKEY.unwrapped.exe",
+  "entry": "0x0008FFD4",
+  "entryName": "func_0008FFD4",
+  "functionCount": 786,
+  "cfgFunctionCount": 786,
+  "totalInstructionCount": 56865,
+  "totalBasicBlocks": 9538,
+  "cfgEdgeCount": 10704,
+  "callEdgeCount": 1344
+}

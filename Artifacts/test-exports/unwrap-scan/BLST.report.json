@@ -1,0 +1,11 @@
+{
+  "input": "Artifacts/test-exports/unwrap-scan/BLST.unwrapped.exe",
+  "entry": "0x000A5E64",
+  "entryName": "func_000A5E64",
+  "functionCount": 816,
+  "cfgFunctionCount": 816,
+  "totalInstructionCount": 49171,
+  "totalBasicBlocks": 7496,
+  "cfgEdgeCount": 8193,
+  "callEdgeCount": 1290
+}

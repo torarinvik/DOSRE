@@ -1,0 +1,11 @@
+{
+  "input": "Artifacts/test-exports/unwrap-scan/FIDEMO.unwrapped.exe",
+  "entry": "0x000755D8",
+  "entryName": "func_000755D8",
+  "functionCount": 785,
+  "cfgFunctionCount": 785,
+  "totalInstructionCount": 62968,
+  "totalBasicBlocks": 9370,
+  "cfgEdgeCount": 10569,
+  "callEdgeCount": 1344
+}

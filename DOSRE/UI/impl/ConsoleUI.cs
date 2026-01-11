@@ -801,6 +801,72 @@ namespace DOSRE.UI.impl
 
                             if (!string.IsNullOrWhiteSpace(_leCallGraphJson))
                             {
+                                static string Hex(uint a2) => $"0x{a2:X8}";
+
+                                static List<List<uint>> ComputeSccs(Dictionary<uint, HashSet<uint>> graph, List<uint> nodes)
+                                {
+                                    // Tarjan SCC (deterministic order by sorted nodes + sorted successors).
+                                    var index = 0;
+                                    var stack = new Stack<uint>();
+                                    var onStack = new HashSet<uint>();
+                                    var indices = new Dictionary<uint, int>();
+                                    var lowlinks = new Dictionary<uint, int>();
+                                    var result = new List<List<uint>>();
+
+                                    void StrongConnect(uint v)
+                                    {
+                                        indices[v] = index;
+                                        lowlinks[v] = index;
+                                        index++;
+                                        stack.Push(v);
+                                        onStack.Add(v);
+
+                                        if (graph.TryGetValue(v, out var succs) && succs != null && succs.Count > 0)
+                                        {
+                                            foreach (var w in succs.OrderBy(x => x))
+                                            {
+                                                if (!indices.ContainsKey(w))
+                                                {
+                                                    StrongConnect(w);
+                                                    lowlinks[v] = Math.Min(lowlinks[v], lowlinks[w]);
+                                                }
+                                                else if (onStack.Contains(w))
+                                                {
+                                                    lowlinks[v] = Math.Min(lowlinks[v], indices[w]);
+                                                }
+                                            }
+                                        }
+
+                                        if (lowlinks[v] == indices[v])
+                                        {
+                                            var comp = new List<uint>();
+                                            while (stack.Count > 0)
+                                            {
+                                                var w = stack.Pop();
+                                                onStack.Remove(w);
+                                                comp.Add(w);
+                                                if (w == v)
+                                                    break;
+                                            }
+                                            comp.Sort();
+                                            result.Add(comp);
+                                        }
+                                    }
+
+                                    foreach (var v in nodes)
+                                    {
+                                        if (!indices.ContainsKey(v))
+                                            StrongConnect(v);
+                                    }
+
+                                    // Sort components deterministically by (size desc, first addr asc)
+                                    result = result
+                                        .OrderByDescending(c => c.Count)
+                                        .ThenBy(c => c.Count > 0 ? c[0] : 0)
+                                        .ToList();
+                                    return result;
+                                }
+
                                 var functions = analysis.Functions.Values
                                     .OrderBy(f => f.Start)
                                     .Select(f => new
@@ -814,12 +880,79 @@ namespace DOSRE.UI.impl
                                         strings = (f.Strings ?? new List<string>()).ToArray(),
                                     }).ToArray();
 
+                                // Summary fields (best-effort, internal edges only).
+                                var nodes = analysis.Functions.Keys.OrderBy(x => x).ToList();
+                                var nodeSet = new HashSet<uint>(nodes);
+
+                                var outEdges = new Dictionary<uint, HashSet<uint>>();
+                                var inDegree = nodes.ToDictionary(x => x, _ => 0);
+                                var outDegree = nodes.ToDictionary(x => x, _ => 0);
+
+                                foreach (var fn in analysis.Functions.Values)
+                                {
+                                    if (fn == null)
+                                        continue;
+
+                                    var src = fn.Start;
+                                    if (!nodeSet.Contains(src))
+                                        continue;
+
+                                    if (!outEdges.TryGetValue(src, out var set))
+                                        outEdges[src] = set = new HashSet<uint>();
+
+                                    if (fn.Calls != null)
+                                    {
+                                        foreach (var callee in fn.Calls)
+                                        {
+                                            if (!nodeSet.Contains(callee))
+                                                continue;
+
+                                            if (set.Add(callee))
+                                                inDegree[callee] = inDegree[callee] + 1;
+                                        }
+                                    }
+
+                                    outDegree[src] = set.Count;
+                                }
+
+                                var roots = nodes.Where(n => inDegree[n] == 0).Select(Hex).ToArray();
+                                var orphans = nodes.Where(n => inDegree[n] == 0 && outDegree[n] == 0).Select(Hex).ToArray();
+
+                                var topFanIn = inDegree
+                                    .OrderByDescending(kv => kv.Value)
+                                    .ThenBy(kv => kv.Key)
+                                    .Take(20)
+                                    .Where(kv => kv.Value > 0)
+                                    .Select(kv => new { addr = Hex(kv.Key), name = FuncName(kv.Key), count = kv.Value })
+                                    .ToArray();
+
+                                var topFanOut = outDegree
+                                    .OrderByDescending(kv => kv.Value)
+                                    .ThenBy(kv => kv.Key)
+                                    .Take(20)
+                                    .Where(kv => kv.Value > 0)
+                                    .Select(kv => new { addr = Hex(kv.Key), name = FuncName(kv.Key), count = kv.Value })
+                                    .ToArray();
+
+                                var sccAll = ComputeSccs(outEdges, nodes);
+                                // Only include interesting SCCs (size>1 or self-loop).
+                                bool HasSelfLoop(uint n) => outEdges.TryGetValue(n, out var es) && es != null && es.Contains(n);
+                                var sccs = sccAll
+                                    .Where(c => c.Count > 1 || (c.Count == 1 && HasSelfLoop(c[0])))
+                                    .Select(c => c.Select(Hex).ToArray())
+                                    .ToArray();
+
                                 var payload = new
                                 {
                                     input = analysis.InputFile,
                                     entry = $"0x{analysis.EntryLinear:X8}",
                                     entryName = FuncName(analysis.EntryLinear),
-                                    functions
+                                    functions,
+                                    roots = roots.Length > 0 ? roots : null,
+                                    orphans = orphans.Length > 0 ? orphans : null,
+                                    topFanIn = topFanIn.Length > 0 ? topFanIn : null,
+                                    topFanOut = topFanOut.Length > 0 ? topFanOut : null,
+                                    stronglyConnectedComponents = sccs.Length > 0 ? sccs : null,
                                 };
 
                                 var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions

@@ -53,6 +53,11 @@ Notes:
 - `-LEDECOMPASM` is not supported for these exports (it skips the LE decode pass).
 - CFG output is best-effort (built from decoded relative branches and inferred fallthrough starts).
 
+Call graph JSON notes:
+
+- The `functions[]` list is the stable core of the export.
+- Newer versions may also include extra summary fields like `roots`, `orphans`, `topFanIn`, `topFanOut`, and `stronglyConnectedComponents` (best-effort, internal edges only).
+
 Example (whole-program CFG as JSON):
 
 ```
