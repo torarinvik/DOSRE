@@ -1,6 +1,9 @@
 using System.Reflection;
 using System.Linq;
+using System;
+using System.IO;
 using DOSRE.Dasm;
+using DOSRE.Enums;
 using Xunit;
 
 namespace DOSRE.Tests
@@ -206,6 +209,159 @@ namespace DOSRE.Tests
             var (ok, off) = InvokeTryFindLeHeaderOffset(bytes, allowMzOverlayScanFallback: true);
             Assert.False(ok);
             Assert.Equal(0, off);
+        }
+
+        [Fact]
+        public void TryFindLEHeaderOffset_DoesNotMisclassifyPlainMz()
+        {
+            // Minimal MZ header, no extended header, no BW overlay.
+            var bytes = new byte[0x200];
+            bytes[0x00] = (byte)'M';
+            bytes[0x01] = (byte)'Z';
+            // e_cparhdr = 4 paragraphs (64 bytes header)
+            bytes[0x08] = 0x04;
+            bytes[0x09] = 0x00;
+            // e_cp = 1
+            bytes[0x04] = 0x01;
+            bytes[0x05] = 0x00;
+            // e_cblp = 0 -> treated as 512 in size compute
+            bytes[0x02] = 0x00;
+            bytes[0x03] = 0x00;
+            // e_lfanew = 0 (no extended header)
+            bytes[0x3C] = 0x00;
+            bytes[0x3D] = 0x00;
+            bytes[0x3E] = 0x00;
+            bytes[0x3F] = 0x00;
+
+            // Even if an LE-like signature appears in the stub, default should not scan MZ.
+            bytes[0x50] = (byte)'L';
+            bytes[0x51] = (byte)'E';
+            bytes[0x52] = 0x00;
+            bytes[0x53] = 0x00;
+
+            var (ok, off) = InvokeTryFindLeHeaderOffsetDefault(bytes);
+            Assert.False(ok);
+            Assert.Equal(0, off);
+        }
+
+        [Fact]
+        public void TryFindLEHeaderOffset_DetectsLeAtELfanewInMz()
+        {
+            // MZ stub with a proper LE header at e_lfanew.
+            var bytes = new byte[0x300];
+            bytes[0x00] = (byte)'M';
+            bytes[0x01] = (byte)'Z';
+            // e_cp = 1, e_cblp = 0
+            bytes[0x04] = 0x01;
+            bytes[0x05] = 0x00;
+            bytes[0x02] = 0x00;
+            bytes[0x03] = 0x00;
+
+            var leOff = 0x100;
+            bytes[0x3C] = (byte)(leOff & 0xFF);
+            bytes[0x3D] = (byte)((leOff >> 8) & 0xFF);
+            bytes[0x3E] = (byte)((leOff >> 16) & 0xFF);
+            bytes[0x3F] = (byte)((leOff >> 24) & 0xFF);
+
+            // Minimal valid LE header
+            bytes[leOff + 0x00] = (byte)'L';
+            bytes[leOff + 0x01] = (byte)'E';
+            bytes[leOff + 0x02] = 0x00;
+            bytes[leOff + 0x03] = 0x00;
+            // NumberOfPages at +0x14 = 1
+            bytes[leOff + 0x14] = 0x01;
+            // PageSize at +0x28 = 0x1000
+            bytes[leOff + 0x28] = 0x00;
+            bytes[leOff + 0x29] = 0x10;
+            // ObjectCount at +0x44 = 1
+            bytes[leOff + 0x44] = 0x01;
+
+            var (ok, off) = InvokeTryFindLeHeaderOffsetDefault(bytes);
+            Assert.True(ok);
+            Assert.Equal(leOff, off);
+        }
+
+        [Fact]
+        public void TryFindLEHeaderOffset_DetectsRawLeImage()
+        {
+            // Raw LE image (no MZ): detection should scan and find.
+            var bytes = new byte[0x300];
+            var leOff = 0x40;
+            bytes[leOff + 0x00] = (byte)'L';
+            bytes[leOff + 0x01] = (byte)'E';
+            bytes[leOff + 0x02] = 0x00;
+            bytes[leOff + 0x03] = 0x00;
+            // NumberOfPages at +0x14 = 1
+            bytes[leOff + 0x14] = 0x01;
+            // PageSize at +0x28 = 0x1000
+            bytes[leOff + 0x28] = 0x00;
+            bytes[leOff + 0x29] = 0x10;
+            // ObjectCount at +0x44 = 1
+            bytes[leOff + 0x44] = 0x01;
+
+            var (ok, off) = InvokeTryFindLeHeaderOffsetDefault(bytes);
+            Assert.True(ok);
+            Assert.Equal(leOff, off);
+        }
+
+        [Fact]
+        public void ConsoleRouting_LeFailsThenMzSucceeds_ForPlainMz()
+        {
+            // This matches ConsoleUI's strategy: try LE first; if it fails with "LE header not found",
+            // fall back to MZ.
+            var bytes = new byte[0x200];
+            bytes[0x00] = (byte)'M';
+            bytes[0x01] = (byte)'Z';
+            // e_cparhdr = 4 (64-byte header)
+            bytes[0x08] = 0x04;
+            bytes[0x09] = 0x00;
+            // e_ip=0, e_cs=0 (entry at start of module)
+            bytes[0x14] = 0x00;
+            bytes[0x15] = 0x00;
+            bytes[0x16] = 0x00;
+            bytes[0x17] = 0x00;
+            // Put a NOP at the first byte of the module.
+            bytes[0x40] = 0x90;
+
+            var tmp = Path.GetTempFileName();
+            try
+            {
+                File.WriteAllBytes(tmp, bytes);
+
+                var leOk = LEDisassembler.TryDisassembleToString(
+                    tmp,
+                    leFull: false,
+                    leBytesLimit: 16,
+                    leRenderLimit: null,
+                    leJobs: 1,
+                    leFixups: false,
+                    leGlobals: false,
+                    leInsights: false,
+                    toolchainHint: EnumToolchainHint.None,
+                    leStartLinear: null,
+                    leScanMzOverlayFallback: false,
+                    out var _,
+                    out var leErr);
+
+                Assert.False(leOk);
+                Assert.Equal("LE header not found", leErr);
+
+                var mzOk = MZDisassembler.TryDisassembleToString(
+                    tmp,
+                    mzFull: false,
+                    mzBytesLimit: 16,
+                    mzInsights: false,
+                    EnumToolchainHint.None,
+                    out var _,
+                    out var mzErr);
+
+                Assert.True(mzOk);
+                Assert.True(string.IsNullOrEmpty(mzErr));
+            }
+            finally
+            {
+                try { File.Delete(tmp); } catch { }
+            }
         }
     }
 }
