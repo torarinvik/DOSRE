@@ -30,6 +30,19 @@ namespace DOSRE.Dasm
     {
         private static readonly Logger _logger = LogManager.GetCurrentClassLogger(typeof(CustomLogger));
 
+        public sealed class LeBasicBlockInfo
+        {
+            public uint Start { get; set; }
+            public List<uint> Predecessors { get; set; } = new List<uint>();
+            public List<uint> Successors { get; set; } = new List<uint>();
+        }
+
+        public sealed class LeFunctionCfg
+        {
+            public uint FunctionStart { get; set; }
+            public Dictionary<uint, LeBasicBlockInfo> Blocks { get; } = new Dictionary<uint, LeBasicBlockInfo>();
+        }
+
         public sealed class LeFunctionInfo
         {
             public uint Start { get; set; }
@@ -45,6 +58,107 @@ namespace DOSRE.Dasm
             public string InputFile { get; set; }
             public uint EntryLinear { get; set; }
             public Dictionary<uint, LeFunctionInfo> Functions { get; } = new Dictionary<uint, LeFunctionInfo>();
+            public Dictionary<uint, LeFunctionCfg> CfgByFunction { get; } = new Dictionary<uint, LeFunctionCfg>();
+        }
+
+        private static void CaptureCfgSnapshot(
+            LeAnalysis analysis,
+            HashSet<uint> functionStarts,
+            HashSet<uint> blockStarts,
+            Dictionary<uint, List<uint>> blockPreds)
+        {
+            if (analysis == null)
+                return;
+            if (functionStarts == null || functionStarts.Count == 0)
+                return;
+            if (blockStarts == null || blockStarts.Count == 0)
+                return;
+            if (blockPreds == null || blockPreds.Count == 0)
+                return;
+
+            var sortedFunc = functionStarts.OrderBy(x => x).ToArray();
+            var sortedBlocks = blockStarts.OrderBy(x => x).ToArray();
+
+            static uint FindOwnerStart(uint[] sortedStarts, uint addr)
+            {
+                if (sortedStarts == null || sortedStarts.Length == 0)
+                    return 0;
+                var idx = Array.BinarySearch(sortedStarts, addr);
+                if (idx >= 0)
+                    return sortedStarts[idx];
+                idx = ~idx - 1;
+                if (idx < 0)
+                    return 0;
+                return sortedStarts[idx];
+            }
+
+            static uint FindContainingBlock(uint[] sortedBlockStarts, uint addr)
+            {
+                if (sortedBlockStarts == null || sortedBlockStarts.Length == 0)
+                    return 0;
+                var idx = Array.BinarySearch(sortedBlockStarts, addr);
+                if (idx >= 0)
+                    return sortedBlockStarts[idx];
+                idx = ~idx - 1;
+                if (idx < 0)
+                    return 0;
+                return sortedBlockStarts[idx];
+            }
+
+            // Ensure function CFG containers exist.
+            foreach (var f in sortedFunc)
+            {
+                if (!analysis.CfgByFunction.ContainsKey(f))
+                    analysis.CfgByFunction[f] = new LeFunctionCfg { FunctionStart = f };
+            }
+
+            // Seed blocks into their owner function.
+            foreach (var b in sortedBlocks)
+            {
+                var owner = FindOwnerStart(sortedFunc, b);
+                if (owner == 0)
+                    continue;
+                if (!analysis.CfgByFunction.TryGetValue(owner, out var cfg) || cfg == null)
+                    continue;
+                if (!cfg.Blocks.ContainsKey(b))
+                    cfg.Blocks[b] = new LeBasicBlockInfo { Start = b };
+            }
+
+            // Convert preds(dst <- srcInsAddr) into block->block edges (best-effort).
+            foreach (var kvp in blockPreds)
+            {
+                var dst = kvp.Key;
+                var ownerDst = FindOwnerStart(sortedFunc, dst);
+                if (ownerDst == 0)
+                    continue;
+
+                foreach (var srcInsAddr in kvp.Value)
+                {
+                    var srcBlock = FindContainingBlock(sortedBlocks, srcInsAddr);
+                    if (srcBlock == 0)
+                        continue;
+                    var ownerSrc = FindOwnerStart(sortedFunc, srcBlock);
+                    if (ownerSrc == 0)
+                        continue;
+
+                    // Keep CFG local to a single function for now (per-function export).
+                    if (ownerSrc != ownerDst)
+                        continue;
+
+                    if (!analysis.CfgByFunction.TryGetValue(ownerSrc, out var cfg) || cfg == null)
+                        continue;
+
+                    if (!cfg.Blocks.TryGetValue(srcBlock, out var srcInfo) || srcInfo == null)
+                        cfg.Blocks[srcBlock] = srcInfo = new LeBasicBlockInfo { Start = srcBlock };
+                    if (!cfg.Blocks.TryGetValue(dst, out var dstInfo) || dstInfo == null)
+                        cfg.Blocks[dst] = dstInfo = new LeBasicBlockInfo { Start = dst };
+
+                    if (!srcInfo.Successors.Contains(dst))
+                        srcInfo.Successors.Add(dst);
+                    if (!dstInfo.Predecessors.Contains(srcBlock))
+                        dstInfo.Predecessors.Add(srcBlock);
+                }
+            }
         }
 
         private static readonly object _lastAnalysisLock = new object();
@@ -5986,6 +6100,10 @@ namespace DOSRE.Dasm
                 if (leInsights)
                 {
                     BuildBasicBlocks(instructions, startLinear, endLinear, functionStarts, labelTargets, out blockStarts, out blockPreds);
+
+                    // Snapshot per-function CFG for exporters (best-effort, derived from relative branches only).
+                    if (analysis != null && functionStarts.Count > 0 && blockStarts != null && blockStarts.Count > 0 && blockPreds != null && blockPreds.Count > 0)
+                        CaptureCfgSnapshot(analysis, functionStarts, blockStarts, blockPreds);
                 }
 
                 // Second pass: render with labels and inline xref hints.

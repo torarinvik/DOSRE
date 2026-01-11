@@ -54,6 +54,12 @@ namespace DOSRE.UI.impl
     ///     Specified with -LECALLGRAPHJSON <file.json>
     /// </summary>
     private string _leCallGraphJson;
+
+    /// <summary>
+    ///     Optional: export LE per-function CFG in DOT format.
+    ///     Specified with -LECFGDOT <file.dot>
+    /// </summary>
+    private string _leCfgDot;
         ///     Logger Implementation
         /// </summary>
         protected static readonly Logger _logger = LogManager.GetCurrentClassLogger(typeof(CustomLogger));
@@ -395,6 +401,12 @@ namespace DOSRE.UI.impl
                             _leCallGraphJson = _args[i + 1];
                             i++;
                             break;
+                        case "LECFGDOT":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LECFGDOT requires a <file.dot>");
+                            _leCfgDot = _args[i + 1];
+                            i++;
+                            break;
                         case "MZFULL":
                             _bMzFull = true;
                             break;
@@ -513,6 +525,8 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-LECALLGRAPHJSON <file.json> -- (LE inputs) Export a best-effort function call graph in JSON format (implies -LEINSIGHTS)");
                             Console.WriteLine(
+                                "-LECFGDOT <file.dot> -- (LE inputs) Export a best-effort per-function CFG in Graphviz DOT format (implies -LEINSIGHTS; uses -LEFUNC if provided, else entry function)");
+                            Console.WriteLine(
                                 "-MZFULL -- (MZ inputs) Disassemble from entrypoint to end of load module");
                             Console.WriteLine(
                                 "-MZBYTES <n> -- (MZ inputs) Limit disassembly to n bytes from entrypoint");
@@ -577,7 +591,8 @@ namespace DOSRE.UI.impl
                 string leError;
 
                 var wantLeCallGraph = !string.IsNullOrWhiteSpace(_leCallGraphDot) || !string.IsNullOrWhiteSpace(_leCallGraphJson);
-                var leInsightsForRun = _bLeInsights || wantLeCallGraph;
+                var wantLeCfgDot = !string.IsNullOrWhiteSpace(_leCfgDot);
+                var leInsightsForRun = _bLeInsights || wantLeCallGraph || wantLeCfgDot;
 
                 static string ChooseLeOutput(Dictionary<string, string> files)
                 {
@@ -596,6 +611,8 @@ namespace DOSRE.UI.impl
                 {
                     if (wantLeCallGraph)
                         _logger.Warn("Warning: -LECALLGRAPH* is not supported with -LEDECOMPASM (no LE decode pass). Run without -LEDECOMPASM to export call graphs.");
+                    if (wantLeCfgDot)
+                        _logger.Warn("Warning: -LECFGDOT is not supported with -LEDECOMPASM (no LE decode pass). Run without -LEDECOMPASM to export CFG.");
                     leOk = LEDisassembler.TryDecompileToMultipartFromAsmFile(_leDecompileAsmFile, _leOnlyFunction, _leChunks, out leDecompFiles, out leError);
                     leOutput = leOk ? ChooseLeOutput(leDecompFiles) : string.Empty;
                 }
@@ -762,6 +779,98 @@ namespace DOSRE.UI.impl
 
                                 File.WriteAllText(_leCallGraphJson, json);
                                 _logger.Info($"Wrote LE call graph JSON to {_leCallGraphJson}");
+                            }
+                        }
+                    }
+
+                    if (wantLeCfgDot)
+                    {
+                        var analysis = LEDisassembler.GetLastAnalysis();
+                        if (analysis == null || analysis.CfgByFunction == null || analysis.CfgByFunction.Count == 0)
+                        {
+                            _logger.Warn("Warning: -LECFGDOT requested but no LE CFG snapshot was captured (requires -LEINSIGHTS and a run that decodes relative branches)");
+                        }
+                        else
+                        {
+                            static bool TryParseHexAddr(string s, out uint addr)
+                            {
+                                addr = 0;
+                                if (string.IsNullOrWhiteSpace(s))
+                                    return false;
+                                var t = s.Trim();
+                                if (t.StartsWith("func_", StringComparison.OrdinalIgnoreCase))
+                                    t = t.Substring("func_".Length);
+                                if (t.StartsWith("bb_", StringComparison.OrdinalIgnoreCase))
+                                    t = t.Substring("bb_".Length);
+                                if (t.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                                    t = t.Substring(2);
+                                return uint.TryParse(t, System.Globalization.NumberStyles.HexNumber, null, out addr);
+                            }
+
+                            static uint ResolveFunctionStart(LEDisassembler.LeAnalysis a, uint addr)
+                            {
+                                if (a == null || a.Functions == null || a.Functions.Count == 0)
+                                    return addr;
+                                if (a.Functions.ContainsKey(addr))
+                                    return addr;
+                                var starts = a.Functions.Keys.OrderBy(x => x).ToArray();
+                                var idx = Array.BinarySearch(starts, addr);
+                                if (idx >= 0)
+                                    return starts[idx];
+                                idx = ~idx - 1;
+                                if (idx < 0)
+                                    return starts[0];
+                                return starts[idx];
+                            }
+
+                            var targetFunc = analysis.EntryLinear;
+                            if (!string.IsNullOrWhiteSpace(_leOnlyFunction) && TryParseHexAddr(_leOnlyFunction, out var parsed))
+                                targetFunc = parsed;
+                            else if (!string.IsNullOrWhiteSpace(_leOnlyFunction))
+                                _logger.Warn("Warning: -LEFUNC could not be parsed as hex; defaulting CFG export to entry function");
+
+                            targetFunc = ResolveFunctionStart(analysis, targetFunc);
+
+                            if (!analysis.CfgByFunction.TryGetValue(targetFunc, out var cfg) || cfg == null || cfg.Blocks == null || cfg.Blocks.Count == 0)
+                            {
+                                _logger.Warn($"Warning: -LECFGDOT: no CFG blocks found for func_0x{targetFunc:X8} (try -LEINSIGHTS + larger decode window)");
+                            }
+                            else
+                            {
+                                string BbName(uint a2) => $"bb_{a2:X8}";
+                                string FuncName(uint a2) => $"func_{a2:X8}";
+
+                                var dot = new StringBuilder();
+                                dot.AppendLine("digraph le_cfg {");
+                                dot.AppendLine("  rankdir=TB;");
+                                dot.AppendLine("  node [shape=box,fontname=\"monospace\"]; ");
+
+                                dot.AppendLine($"  subgraph cluster_{FuncName(targetFunc)} {{");
+                                dot.AppendLine($"    label=\"{FuncName(targetFunc)}\";");
+                                dot.AppendLine("    color=gray;");
+
+                                foreach (var b in cfg.Blocks.Values.OrderBy(b => b.Start))
+                                {
+                                    var shape = b.Start == targetFunc ? "doubleoctagon" : "box";
+                                    dot.AppendLine($"    \"{BbName(b.Start)}\" [shape={shape},label=\"{BbName(b.Start)}\"]; ");
+                                }
+
+                                foreach (var b in cfg.Blocks.Values.OrderBy(b => b.Start))
+                                {
+                                    if (b.Successors == null) continue;
+                                    foreach (var succ in b.Successors.OrderBy(x => x))
+                                    {
+                                        if (!cfg.Blocks.ContainsKey(succ))
+                                            continue;
+                                        dot.AppendLine($"    \"{BbName(b.Start)}\" -> \"{BbName(succ)}\";");
+                                    }
+                                }
+
+                                dot.AppendLine("  }");
+                                dot.AppendLine("}");
+
+                                File.WriteAllText(_leCfgDot, dot.ToString());
+                                _logger.Info($"Wrote LE CFG DOT to {_leCfgDot} (function {FuncName(targetFunc)})");
                             }
                         }
                     }
