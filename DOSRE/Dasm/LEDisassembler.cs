@@ -6261,6 +6261,44 @@ namespace DOSRE.Dasm
                 }
             }
 
+            // Thunk/vector discovery (best-effort): scan non-executable objects for pointer tables that point at
+            // decoded executable instruction starts, and seed those as function entrypoints.
+            if (leInsights && objBytesByIndex.Count > 0 && execObjIndices.Count > 0)
+            {
+                var spans = objects
+                    .Select(o => new LeThunkDiscovery.LeObjectSpan(
+                        o.Index,
+                        o.BaseAddress,
+                        o.VirtualSize,
+                        (o.Flags & 0x0004) != 0))
+                    .ToList();
+
+                bool IsValidExecInsStart(uint target)
+                {
+                    if (!TryMapLinearToObject(objects, target, out var targetObjIndex, out var _))
+                        return false;
+                    if (!execObjIndices.Contains(targetObjIndex))
+                        return false;
+                    return execObjInsIndexByAddr.TryGetValue(targetObjIndex, out var idxByAddr) && idxByAddr.ContainsKey(target);
+                }
+
+                var thunkTargets = new HashSet<uint>();
+                var tables = LeThunkDiscovery.ScanPointerTablesForTargets(
+                    spans,
+                    objBytesByIndex,
+                    IsValidExecInsStart,
+                    thunkTargets,
+                    minRunEntries: 6,
+                    maxTables: 64,
+                    maxEntriesPerTable: 128);
+
+                foreach (var t in thunkTargets)
+                    globalFunctionStarts.Add(t);
+
+                if (tables.Count > 0)
+                    _logger.Info($"LE: Thunk/vector scan: {tables.Count} tables, {thunkTargets.Count} unique targets (seeded as function starts)");
+            }
+
             foreach (var obj in objects)
             {
                 if (obj.VirtualSize == 0 || obj.PageCount == 0)

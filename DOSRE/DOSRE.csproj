@@ -14,6 +14,7 @@
     <PackageReference Include="Terminal.Gui" Version="1.16.0" />
   </ItemGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="DOSRE.Tests" />
   </ItemGroup>
   <ItemGroup>
     <None Remove="Analysis\Assets\DOSCALLS_def.json" />
