@@ -2779,28 +2779,11 @@ namespace DOSRE.Dasm
                 
                 // For LEA, we want the address of the operand.
                 var rhsRaw = parts.Value.rhs;
+                var addrExpr = NormalizeLeaRhsToAddressExpr(rhsRaw);
+                if (!string.IsNullOrWhiteSpace(addrExpr))
+                    return $"{lhs} = (uint32_t)({addrExpr});{commentSuffix}";
+
                 var rhs = NormalizeAsmOperandToC(rhsRaw, isMemoryWrite: false, fn);
-
-                // If Normalize returned a bare variable name (because it was [local_XX]), 
-                // LEA needs the address of it.
-                // Also handle cases where Normalize wrapped locals (e.g. `*(uint32_t*)&(local_x)`),
-                // or where the memory operand was normalized into a __ptr-based deref.
-                var mAnyLocal = Regex.Match(rhs, @"\blocal_(?<off>[0-9A-Fa-f]+)\b", RegexOptions.IgnoreCase);
-                if (mAnyLocal.Success)
-                {
-                    var off = Convert.ToUInt32(mAnyLocal.Groups["off"].Value, 16);
-                    return $"{lhs} = (uint32_t)(ebp - 0x{off:X}u);{commentSuffix}";
-                }
-
-                var mAnyArg = Regex.Match(rhs, @"\barg_(?<idx>[0-9A-Fa-f]+)\b", RegexOptions.IgnoreCase);
-                if (mAnyArg.Success)
-                {
-                    var idx = Convert.ToUInt32(mAnyArg.Groups["idx"].Value, 16);
-                    var off = 8u + idx * 4u;
-                    return $"{lhs} = (uint32_t)(ebp + 0x{off:X}u);{commentSuffix}";
-                }
-
-                // If it's a deref like *(uint32_t*)(expr), strip the deref to get expr.
                 rhs = StripSingleDeref(rhs);
                 return $"{lhs} = (uint32_t)({rhs});{commentSuffix}";
             }
@@ -3305,6 +3288,61 @@ namespace DOSRE.Dasm
             }
 
             return t;
+        }
+
+        internal static string NormalizeLeaRhsToAddressExpr(string rhsRaw)
+        {
+            if (string.IsNullOrWhiteSpace(rhsRaw))
+                return null;
+
+            // Examples:
+            //   [ebp-0x10]
+            //   dword ptr [ebp+0x8]
+            //   [local_10]
+            //   [arg_2]
+            // Return a stable variable-based address expression when possible.
+
+            var s = rhsRaw.Trim();
+            s = Regex.Replace(s, @"^(?:byte|word|dword|qword)\s+(?:ptr\s+)?", "", RegexOptions.IgnoreCase).Trim();
+
+            var bracket = Regex.Match(s, @"^\[(?<expr>.+)\]$", RegexOptions.None);
+            if (bracket.Success)
+                s = bracket.Groups["expr"].Value.Trim();
+
+            // Normalize arg/local tokens without underscore.
+            s = Regex.Replace(s, @"\barg(?<n>[0-9A-Fa-f]+)\b", m => "arg_" + m.Groups["n"].Value.ToLowerInvariant(), RegexOptions.IgnoreCase);
+            s = Regex.Replace(s, @"\blocal(?<n>[0-9A-Fa-f]+)\b", m => "local_" + m.Groups["n"].Value.ToLowerInvariant(), RegexOptions.IgnoreCase);
+
+            var localTok = Regex.Match(s, @"^local_(?<off>[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase);
+            if (localTok.Success)
+                return "&local_" + localTok.Groups["off"].Value.ToLowerInvariant();
+
+            var argTok = Regex.Match(s, @"^arg_(?<idx>[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase);
+            if (argTok.Success)
+                return "&arg_" + argTok.Groups["idx"].Value.ToLowerInvariant();
+
+            var ebp = Regex.Match(s, @"^ebp\s*(?<sign>[\+\-])\s*(?<off>0x[0-9A-Fa-f]+|[0-9]+|(?<hexoff>[0-9A-Fa-f]+)h)$", RegexOptions.IgnoreCase);
+            if (ebp.Success)
+            {
+                var sign = ebp.Groups["sign"].Value;
+                var offStr = ebp.Groups["off"].Value;
+                uint off;
+                if (offStr.EndsWith("h", StringComparison.OrdinalIgnoreCase))
+                    off = Convert.ToUInt32(offStr.TrimEnd('h', 'H'), 16);
+                else if (offStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                    off = Convert.ToUInt32(offStr.Substring(2), 16);
+                else
+                    off = uint.Parse(offStr);
+
+                if (sign == "-")
+                    return $"&local_{off:x}";
+
+                // Args: [ebp+8] is arg_0. Only map clean dword slots.
+                if (off >= 8 && ((off - 8) % 4u) == 0)
+                    return $"&arg_{((off - 8) / 4u):x}";
+            }
+
+            return null;
         }
 
         private static string WrapExprForPointerMath(string expr)

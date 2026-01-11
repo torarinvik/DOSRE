@@ -7086,8 +7086,7 @@ namespace DOSRE.Dasm
                 if (leInsights && functionStarts.Count > 0)
                 {
                     var added = RefineFunctionStartsByPrologAfterRet(instructions, functionStarts);
-                    if (added > 0)
-                        _logger.Info($"LE: Function boundary refinement: +{added} function starts (prolog after ret)");
+                    _logger.Info($"LE: Function boundary refinement: +{added} function starts (prolog after ret)");
                 }
 
                 // Pre-sorted function list for per-function insight passes.
