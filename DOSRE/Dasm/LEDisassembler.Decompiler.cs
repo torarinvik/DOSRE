@@ -1601,7 +1601,10 @@ namespace DOSRE.Dasm
                 foreach (var line in block.Lines)
                 {
                     if (line.Kind != ParsedLineKind.Instruction) continue;
-                    var lblMatches = Regex.Matches(line.Asm + " " + line.Raw, @"\b(?<lbl>(loc|bb)_[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
+                    // Only scan the actual instruction text for explicit labels; avoid picking up
+                    // disassembler comment decorations like "; jmp loc_XXXXXXXX" which may refer
+                    // to non-block addresses (e.g., overlapping/mid-instruction targets).
+                    var lblMatches = Regex.Matches(line.Asm, @"\b(?<lbl>(loc|bb)_[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
                     foreach (Match lm in lblMatches) 
                         referencedLabels.Add(lm.Groups["lbl"].Value);
 
@@ -1728,7 +1731,14 @@ namespace DOSRE.Dasm
                     var stmt = TranslateInstructionToPseudoC(item, labelByAddr, pending, fn, functionsByName, otherFunctions, state);
                     if (!string.IsNullOrWhiteSpace(stmt))
                     {
-                        var extraLabels = Regex.Matches(stmt, @"\b(?<lbl>(loc|bb)_[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
+                        // Only track labels referenced by actual code, not by the trailing commentSuffix ("// jmp loc_...").
+                        // Otherwise, unresolved-target annotations would incorrectly fabricate "missing label" stubs.
+                        var labelScanText = stmt;
+                        var lineCommentIdx = labelScanText.IndexOf("//", StringComparison.Ordinal);
+                        if (lineCommentIdx >= 0)
+                            labelScanText = labelScanText.Substring(0, lineCommentIdx);
+
+                        var extraLabels = Regex.Matches(labelScanText, @"\b(?<lbl>(loc|bb)_[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
                         foreach (Match lm in extraLabels) referencedLabels.Add(lm.Value);
 
                         if (stmt == "return;")
@@ -1865,8 +1875,63 @@ namespace DOSRE.Dasm
                 }
             }
 
+            // Also truncate at a terminal return-like instruction inside the slice when doing so won't
+            // drop any label definitions that are referenced by the kept prefix. This keeps per-function
+            // exports stable when function-boundary detection is imprecise and bytes after the logical
+            // end get decoded as instructions (common in tiny DOS/Watcom samples).
+            var terminalRegex = new Regex(@"\b(retf|retn|ret|iret)\b", RegexOptions.IgnoreCase);
+            var labelDefRegex = new Regex(@"^(?<lbl>(loc|bb)_[0-9A-Fa-f]{8}):\s*$", RegexOptions.IgnoreCase);
+            var labelRefRegex = new Regex(@"\b(?<lbl>(loc|bb)_[0-9A-Fa-f]{8})\b", RegexOptions.IgnoreCase);
+
+            var bestTerminal = -1;
+            for (var term = 0; term < slice.Count; term++)
+            {
+                var t = slice[term];
+                if (t == null) continue;
+                if (!terminalRegex.IsMatch(t))
+                    continue;
+
+                // Collect label references from the kept prefix [0..term].
+                var referenced = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                for (var i = 0; i <= term; i++)
+                {
+                    var line = slice[i];
+                    if (line == null) continue;
+                    if (labelDefRegex.IsMatch(line.Trim()))
+                        continue;
+
+                    var ms = labelRefRegex.Matches(line);
+                    foreach (Match m in ms)
+                        referenced.Add(m.Groups["lbl"].Value);
+                }
+
+                // Collect label definitions that would be dropped (term+1..end).
+                var definesAfter = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                for (var i = term + 1; i < slice.Count; i++)
+                {
+                    var line = slice[i];
+                    if (line == null) continue;
+                    var dm = labelDefRegex.Match(line.Trim());
+                    if (dm.Success)
+                        definesAfter.Add(dm.Groups["lbl"].Value);
+                }
+
+                // Safe to truncate here if we wouldn't drop any referenced label definitions.
+                if (!definesAfter.Overlaps(referenced))
+                {
+                    bestTerminal = term;
+                    break;
+                }
+            }
+
+            if (bestTerminal >= 0 && bestTerminal + 1 < slice.Count)
+                slice = slice.Take(bestTerminal + 1).ToList();
+
             return (true, slice.ToArray(), string.Empty);
         }
+
+        internal static (bool ok, string[] lines, string error) TrySliceToSingleFunctionForTest(string[] lines, string onlyFunction)
+            => TrySliceToSingleFunction(lines, onlyFunction);
 
         private static HashSet<string> CollectRegistersUsed(ParsedFunction fn)
         {
@@ -3235,6 +3300,14 @@ namespace DOSRE.Dasm
             {
                 pending.Clear(dstIsEax);
                 var target = ResolveTarget(ops, labelByAddr);
+                // If the target isn't a known label in this slice, avoid manufacturing a loc_ label.
+                // This commonly happens when the disassembly contains overlapping instructions and a
+                // branch target points into the middle of another instruction.
+                if ((target.StartsWith("loc_", StringComparison.OrdinalIgnoreCase) || target.StartsWith("bb_", StringComparison.OrdinalIgnoreCase))
+                    && !fn.Blocks.Any(b => target.Equals(b.Label, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return $"// {asm} (unresolved target)" + commentSuffix;
+                }
                 // Heuristic: if jumping to another function, it's a tail call.
                 if (target.StartsWith("func_", StringComparison.OrdinalIgnoreCase))
                 {
@@ -3255,6 +3328,11 @@ namespace DOSRE.Dasm
             {
                 pending.Clear(dstIsEax);
                 var target = ResolveTarget(ops, labelByAddr);
+                if ((target.StartsWith("loc_", StringComparison.OrdinalIgnoreCase) || target.StartsWith("bb_", StringComparison.OrdinalIgnoreCase))
+                    && !fn.Blocks.Any(b => target.Equals(b.Label, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return $"// {asm} (unresolved target)" + commentSuffix;
+                }
                 return $"if (--ecx != 0) goto {target};{commentSuffix}";
             }
 
@@ -3301,10 +3379,19 @@ namespace DOSRE.Dasm
                 var cond = TryMakeConditionFromPending(mn, pending);
                 pending.Clear(dstIsEax);
 
-                if (!string.IsNullOrWhiteSpace(cond))
-                    return $"if ({cond}) goto {target};{commentSuffix}";
+                var targetIsKnown = !(target.StartsWith("loc_", StringComparison.OrdinalIgnoreCase) || target.StartsWith("bb_", StringComparison.OrdinalIgnoreCase))
+                    || fn.Blocks.Any(b => target.Equals(b.Label, StringComparison.OrdinalIgnoreCase));
 
-                return $"if (0 /* unknown: {mn} */) goto {target};{commentSuffix}";
+                if (!string.IsNullOrWhiteSpace(cond))
+                {
+                    if (targetIsKnown)
+                        return $"if ({cond}) goto {target};{commentSuffix}";
+                    return $"if ({cond}) {{ /* {mn} {ops} (unresolved target) */ }}{commentSuffix}";
+                }
+
+                if (targetIsKnown)
+                    return $"if (0 /* unknown: {mn} */) goto {target};{commentSuffix}";
+                return $"if (0 /* unknown: {mn} */) {{ /* {mn} {ops} (unresolved target) */ }}{commentSuffix}";
             }
 
             // Default: keep as comment.
