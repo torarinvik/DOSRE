@@ -765,6 +765,62 @@ namespace DOSRE.Dasm
                             }
                         }
                     }
+
+                    // Heuristic string attribution (best-effort): some DOS4GW-era binaries reference strings
+                    // by raw immediates (often 16-bit offsets into 0xC0000..0xF0000) without a usable fixup.
+                    // IMPORTANT: only consider *immediate operands* (e.g. "push 0x1234", "mov eax, 0x1234").
+                    // Do NOT treat displacements like [ebp-0x2dc] as string references.
+                    if (stringSymbols != null && stringSymbols.Count > 0)
+                    {
+                        var t = InsText(ins).TrimStart();
+
+                        string candidate = null;
+                        if (t.StartsWith("push ", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var op = t.Substring(5).Trim();
+                            if (!op.Contains('['))
+                                candidate = op;
+                        }
+                        else if (t.StartsWith("mov ", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var comma = t.IndexOf(',');
+                            if (comma >= 0 && comma + 1 < t.Length)
+                            {
+                                var src = t.Substring(comma + 1).Trim();
+                                if (!src.Contains('['))
+                                    candidate = src;
+                            }
+                        }
+                        else if (t.StartsWith("lea ", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var comma = t.IndexOf(',');
+                            if (comma >= 0 && comma + 1 < t.Length)
+                            {
+                                var src = t.Substring(comma + 1).Trim();
+                                // Only accept absolute address forms like "[0x000C02DC]".
+                                if (src.StartsWith("[0x", StringComparison.OrdinalIgnoreCase) &&
+                                    src.EndsWith("]", StringComparison.OrdinalIgnoreCase) &&
+                                    !src.Contains('+') &&
+                                    !src.Contains('-'))
+                                {
+                                    candidate = src.Substring(1, src.Length - 2).Trim();
+                                }
+                            }
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(candidate))
+                        {
+                            var m = HexLiteralRegex.Match(candidate);
+                            if (m.Success && TryParseHexUInt(m.Value, out var rawLit))
+                            {
+                                if (TryResolveStringAddressFromRaw(rawLit, stringSymbols, out var _, out var sym) &&
+                                    !string.IsNullOrEmpty(sym))
+                                {
+                                    summary.Strings.Add(sym);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 if (sortedBlocks != null && sortedBlocks.Length > 0)

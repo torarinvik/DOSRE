@@ -537,6 +537,18 @@ namespace DOSRE.Dasm
             static bool IsPushEbp(string t)
                 => !string.IsNullOrWhiteSpace(t) && t.Trim().Equals("push ebp", StringComparison.OrdinalIgnoreCase);
 
+            static bool IsLeadingPush(string t)
+            {
+                if (string.IsNullOrWhiteSpace(t))
+                    return false;
+                t = t.Trim();
+                return t.Equals("push ebx", StringComparison.OrdinalIgnoreCase)
+                    || t.Equals("push ecx", StringComparison.OrdinalIgnoreCase)
+                    || t.Equals("push edx", StringComparison.OrdinalIgnoreCase)
+                    || t.Equals("push esi", StringComparison.OrdinalIgnoreCase)
+                    || t.Equals("push edi", StringComparison.OrdinalIgnoreCase);
+            }
+
             static bool IsMovEbpEsp(string t)
                 => !string.IsNullOrWhiteSpace(t) && t.Trim().Equals("mov ebp, esp", StringComparison.OrdinalIgnoreCase);
 
@@ -571,13 +583,41 @@ namespace DOSRE.Dasm
                     start = (uint)instructions[j].Offset;
                     ok = true;
                 }
-                else if (IsPushEbp(t0) && j + 1 < instructions.Count)
+                else
                 {
-                    var t1 = InsText(instructions[j + 1]);
-                    if (IsMovEbpEsp(t1))
+                    // Accept optional leading pushes of saved regs before the classic frame setup.
+                    // Example:
+                    //   push ebx; push ecx; push edx; push esi; push edi; push ebp; mov ebp, esp
+                    var k = j;
+                    var pushed = 0;
+                    while (k < instructions.Count && pushed < 8)
                     {
-                        start = (uint)instructions[j].Offset;
-                        ok = true;
+                        var tk = InsText(instructions[k]);
+                        if (!IsLeadingPush(tk))
+                            break;
+                        k++;
+                        pushed++;
+                    }
+
+                    if (k < instructions.Count && IsPushEbp(InsText(instructions[k])) && k + 1 < instructions.Count)
+                    {
+                        var t1 = InsText(instructions[k + 1]);
+                        if (IsMovEbpEsp(t1))
+                        {
+                            start = (uint)instructions[j].Offset;
+                            ok = true;
+                        }
+                    }
+
+                    // Also keep the previous strict pattern for completeness.
+                    if (!ok && IsPushEbp(t0) && j + 1 < instructions.Count)
+                    {
+                        var t1 = InsText(instructions[j + 1]);
+                        if (IsMovEbpEsp(t1))
+                        {
+                            start = (uint)instructions[j].Offset;
+                            ok = true;
+                        }
                     }
                 }
 

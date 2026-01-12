@@ -103,63 +103,76 @@ namespace DOSRE.Dasm
                             // treat that delta as the actual relocated field start.
                             var currentObjIsExecutable = (obj.Flags & 0x0004) != 0;
 
-                            for (var delta = -3; delta <= 4; delta++)
-                            {
-                                var off = objOffset + delta;
-                                if (off < 0)
-                                    continue;
-                                if (off + 4 > objBytes.Length)
-                                    continue;
-
-                                var v = ReadLEUInt32(objBytes, off);
-                                if (TryMapLinearToObject(objects, v, out var tobj, out var toff))
-                                {
-                                    // If the record has an explicit target object, prioritize matches to that object.
-                                    if (recTargetObj.HasValue && tobj != recTargetObj.Value)
-                                    {
-                                        // But don't reject it yet if we don't find a better match.
-                                    }
-
-                                    if (currentObjIsExecutable)
-                                    {
-                                        var tgt = objects.FirstOrDefault(o => o.Index == (uint)tobj);
-                                        var targetIsExecutable = tgt.Index != 0 && (tgt.Flags & 0x0004) != 0;
-                                        if (targetIsExecutable)
-                                            continue;
-                                    }
-
-                                    value32 = v;
-                                    chosenDelta = delta;
-                                    mappedObj = tobj;
-                                    mappedOff = toff;
-
-                                    // If this matches our record's explicit target, we're very confident.
-                                    if (recTargetObj.HasValue && tobj == recTargetObj.Value)
-                                        break;
-                                }
-
-                                // NEW: If the record gives us an explicit target and offset, check if the site value
-                                // matches that offset or is 0.
-                                if (recTargetObj.HasValue && recTargetOff.HasValue)
-                                {
-                                    if (v == recTargetOff.Value || (v == 0 && delta == 0))
-                                    {
-                                        value32 = v;
-                                        chosenDelta = delta;
-                                        mappedObj = recTargetObj;
-                                        mappedOff = recTargetOff.Value;
-                                        if (v == recTargetOff.Value) break; // Perfect match
-                                    }
-                                }
-                            }
-
-                            // If the record gave us an explicit target but we didn't find a mapped linear address at the site,
-                            // and the site value is 0 or small, it's likely an additive fixup where the base is the record target.
-                            if (!mappedObj.HasValue && recTargetObj.HasValue)
+                            // IMPORTANT:
+                            // If the record gives us an explicit internal target (object+offset), treat that as ground truth.
+                            // The previous heuristic that searched for any nearby dword that *looks like* a loaded linear pointer
+                            // will frequently mis-detect instruction bytes (e.g., `81 EC 0C 00` -> 0x000CEC81) as pointers into
+                            // object 2, producing bogus string xrefs.
+                            if (recTargetObj.HasValue)
                             {
                                 mappedObj = recTargetObj;
                                 mappedOff = recTargetOff ?? 0;
-                                // chosenDelta remains 0 unless we find a reason otherwise.
+
+                                // Best-effort: some records appear to point slightly before/after the relocated field.
+                                // Only use a delta if the dword at the candidate location looks like the *expected* additive
+                                // operand (0) or matches the record's target offset.
+                                if (recTargetOff.HasValue)
+                                {
+                                    for (var delta = -3; delta <= 4; delta++)
+                                    {
+                                        var off = objOffset + delta;
+                                        if (off < 0 || off + 4 > objBytes.Length)
+                                            continue;
+
+                                        var v = ReadLEUInt32(objBytes, off);
+                                        if (v == 0 || v == recTargetOff.Value)
+                                        {
+                                            chosenDelta = delta;
+                                            value32 = v;
+                                            if (v == recTargetOff.Value)
+                                                break;
+                                        }
+                                    }
+                                }
+
+                                if (!value32.HasValue)
+                                {
+                                    var off = objOffset + chosenDelta;
+                                    if (off >= 0 && off + 4 <= objBytes.Length)
+                                        value32 = ReadLEUInt32(objBytes, off);
+                                    else if (off >= 0 && off + 2 <= objBytes.Length)
+                                        value16 = ReadLEUInt16(objBytes, off);
+                                }
+                            }
+
+                            if (!recTargetObj.HasValue)
+                            {
+                                for (var delta = -3; delta <= 4; delta++)
+                                {
+                                    var off = objOffset + delta;
+                                    if (off < 0)
+                                        continue;
+                                    if (off + 4 > objBytes.Length)
+                                        continue;
+
+                                    var v = ReadLEUInt32(objBytes, off);
+                                    if (TryMapLinearToObject(objects, v, out var tobj, out var toff))
+                                    {
+                                        if (currentObjIsExecutable)
+                                        {
+                                            var tgt = objects.FirstOrDefault(o => o.Index == (uint)tobj);
+                                            var targetIsExecutable = tgt.Index != 0 && (tgt.Flags & 0x0004) != 0;
+                                            if (targetIsExecutable)
+                                                continue;
+                                        }
+
+                                        value32 = v;
+                                        chosenDelta = delta;
+                                        mappedObj = tobj;
+                                        mappedOff = toff;
+                                        break;
+                                    }
+                                }
                             }
 
                             // If no mapped pointer found, read the raw dword/word at the original site.

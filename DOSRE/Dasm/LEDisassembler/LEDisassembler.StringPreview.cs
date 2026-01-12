@@ -145,7 +145,10 @@ namespace DOSRE.Dasm
             }
 
             // Common DOS4GW convention: strings live in C/D/E/F0000 regions and code references them by 16-bit offsets.
-            if (raw < 0x10000)
+            // IMPORTANT: avoid treating NULL / tiny constants as string offsets.
+            // In practice, values like 0, 1, 2, 0x10, 0x40 show up constantly as flags/booleans/lengths and
+            // will create massive false positives if we map them into 0x000C0000+raw.
+            if (raw >= 0x100 && raw < 0x10000)
             {
                 foreach (var baseAddr in new[] { 0x000C0000u, 0x000D0000u, 0x000E0000u, 0x000F0000u })
                 {

@@ -47,6 +47,9 @@ namespace DOSRE.Analysis
             public string entry { get; set; }
             public string entryName { get; set; }
 
+            // Optional: per-function details (best-effort, requires -LEINSIGHTS).
+            public LeCallGraphFunction[] functions { get; set; }
+
             // Optional: raw format classification from the front-end.
             public string detectedFormat { get; set; }
 
@@ -397,7 +400,8 @@ namespace DOSRE.Analysis
             LEDisassembler.LeAnalysis analysis,
             LEDisassembler.LeFixupTableInfo table = null,
             string detectedFormat = null,
-            string fixupTableError = null)
+            string fixupTableError = null,
+            bool includeFunctions = false)
         {
             if (analysis == null)
                 throw new ArgumentNullException(nameof(analysis));
@@ -465,6 +469,27 @@ namespace DOSRE.Analysis
                 stringCount = strings.Count > 0 ? (int?)strings.Count : null,
                 fixupTableError = string.IsNullOrWhiteSpace(fixupTableError) ? null : fixupTableError,
             };
+
+            // Include per-function details so the report JSON can be mined without requiring a separate call-graph export.
+            // Keep it deterministic (sort + distinct) to make diffs and tests stable.
+            if (includeFunctions && functions.Count > 0)
+            {
+                report.functions = functions
+                    .Values
+                    .Where(f => f != null)
+                    .OrderBy(f => f.Start)
+                    .Select(f => new LeCallGraphFunction
+                    {
+                        addr = Hex(f.Start),
+                        name = (analysis.ExportedNames != null && analysis.ExportedNames.TryGetValue(f.Start, out var name)) ? name : FuncName(f.Start),
+                        ins = f.InstructionCount,
+                        blocks = f.BlockCount,
+                        calls = (f.Calls ?? new List<uint>()).Distinct().OrderBy(x => x).Select(Hex).ToArray(),
+                        globals = (f.Globals ?? new List<string>()).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().ToArray(),
+                        strings = (f.Strings ?? new List<string>()).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().ToArray(),
+                    })
+                    .ToArray();
+            }
 
             if (table != null)
             {

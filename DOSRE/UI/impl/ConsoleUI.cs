@@ -80,6 +80,12 @@ namespace DOSRE.UI.impl
     private string _leReportJson;
 
     /// <summary>
+    ///     Optional: include per-function details in the -LEREPORTJSON payload.
+    ///     Enabled with -LEREPORTFUNCS.
+    /// </summary>
+    private bool _bLeReportFuncs;
+
+    /// <summary>
     ///     Optional: export a best-effort normalized LE fixup table in JSON format.
     ///     Specified with -LEFIXUPSJSON <file.json>
     /// </summary>
@@ -487,6 +493,9 @@ namespace DOSRE.UI.impl
                             _leReportJson = _args[i + 1];
                             i++;
                             break;
+                        case "LEREPORTFUNCS":
+                            _bLeReportFuncs = true;
+                            break;
                         case "LEFIXUPSJSON":
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -LEFIXUPSJSON requires a <file.json>");
@@ -632,6 +641,8 @@ namespace DOSRE.UI.impl
                                 "-LECFGALLJSON <file.json> -- (LE inputs) Export a best-effort whole-program CFG index in JSON format (implies -LEINSIGHTS)");
                             Console.WriteLine(
                                 "-LEREPORTJSON <file.json> -- (LE inputs) Export a compact LE analysis report (entry + counts + header/object/import/fixup summary) in JSON format (implies -LEINSIGHTS)");
+                            Console.WriteLine(
+                                "-LEREPORTFUNCS -- (LE inputs) Include per-function calls/globals/strings in the -LEREPORTJSON payload (implies -LEINSIGHTS)");
                             Console.WriteLine(
                                 "-LEFIXUPSJSON <file.json> -- (LE inputs) Export a best-effort normalized LE fixup table in JSON format");
                             Console.WriteLine(
@@ -1214,7 +1225,7 @@ namespace DOSRE.UI.impl
                             }
 
                             var detectedFormat = DetectExeFormat(_sInputFile);
-                            var payload = LeExports.BuildReportExport(analysis, fixupTable, detectedFormat, fixupTableError);
+                            var payload = LeExports.BuildReportExport(analysis, fixupTable, detectedFormat, fixupTableError, includeFunctions: _bLeReportFuncs);
 
                             var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions
                             {

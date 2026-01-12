@@ -388,8 +388,41 @@ namespace DOSRE.Dasm
                         if (!a.Equals("push ebp", StringComparison.OrdinalIgnoreCase))
                             continue;
                         var b = instructions[i + 1]?.ToString() ?? string.Empty;
+
+                        // Some 32-bit DOS4GW/Watcom code uses a prologue like:
+                        //   push ebx; push ecx; push edx; push esi; push edi; push ebp; mov ebp, esp
+                        // In that case, the true function start is the first push, not the inner "push ebp".
+                        static bool IsLeadingPush(string t)
+                        {
+                            if (string.IsNullOrWhiteSpace(t))
+                                return false;
+                            t = t.Trim();
+                            return t.Equals("push ebx", StringComparison.OrdinalIgnoreCase)
+                                || t.Equals("push ecx", StringComparison.OrdinalIgnoreCase)
+                                || t.Equals("push edx", StringComparison.OrdinalIgnoreCase)
+                                || t.Equals("push esi", StringComparison.OrdinalIgnoreCase)
+                                || t.Equals("push edi", StringComparison.OrdinalIgnoreCase);
+                        }
+
+                        uint BacktrackPrologStart(int pushEbpIdx)
+                        {
+                            var j = pushEbpIdx;
+                            var limit = Math.Max(0, pushEbpIdx - 8);
+                            while (j - 1 >= limit)
+                            {
+                                var prev = instructions[j - 1]?.ToString() ?? string.Empty;
+                                if (!IsLeadingPush(prev))
+                                    break;
+                                j--;
+                            }
+                            return (uint)instructions[j].Offset;
+                        }
+
                         if (b.Equals("mov ebp, esp", StringComparison.OrdinalIgnoreCase) || b.StartsWith("sub esp, ", StringComparison.OrdinalIgnoreCase))
-                            globalFunctionStarts.Add((uint)instructions[i].Offset);
+                        {
+                            var start = BacktrackPrologStart(i);
+                            globalFunctionStarts.Add(start);
+                        }
                     }
                 }
 
@@ -2059,11 +2092,31 @@ namespace DOSRE.Dasm
                 if (rawDelta < 0 || rawDelta >= ins.Bytes.Length)
                     return false;
 
-                // Some LE/LX fixup records (notably Watcom/DOS4GW variants) appear to report the *end* of the relocated field.
-                // Try shifting back up to 3 bytes so the delta lands on a recognizable 32-bit field start.
+                // Some LE/LX fixup records (notably Watcom/DOS4GW variants) can be slightly off.
+                // We've seen:
+                //  - fixup sites that point to the *end* of the relocated field (need to shift backwards)
+                //  - fixup sites that point at the *start of the instruction* (need to shift forwards to imm/disp)
+                // Probe within +/-3 bytes and accept the first location that classifies as a 32-bit reloc field.
                 for (var back = 0; back <= 3; back++)
                 {
                     var candDelta = rawDelta - back;
+                    if (candDelta < 0)
+                        continue;
+                    if (candDelta + 4 > ins.Bytes.Length)
+                        continue;
+
+                    if (!TryClassifyFixupKind(ins, candDelta, out var kind) || !Is32BitRelocKind(kind))
+                        continue;
+
+                    f.SiteDelta = (sbyte)Math.Min(sbyte.MaxValue, Math.Max(sbyte.MinValue, candDelta - rawDelta));
+                    f.SiteLinear = unchecked(begin + (uint)candDelta);
+                    f.Value32 = BitConverter.ToUInt32(ins.Bytes, candDelta);
+                    return true;
+                }
+
+                for (var fwd = 1; fwd <= 3; fwd++)
+                {
+                    var candDelta = rawDelta + fwd;
                     if (candDelta < 0)
                         continue;
                     if (candDelta + 4 > ins.Bytes.Length)
