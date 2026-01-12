@@ -835,7 +835,7 @@ namespace DOSRE.Dasm
         }
 
         private static string TryGetCallArgHint(List<Instruction> instructions, Dictionary<uint, int> insIndexByAddr, Instruction ins, List<LEFixup> fixupsHere,
-            Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols)
+            Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> stringPreview, List<LEObject> objects)
         {
             if (ins == null || instructions == null || insIndexByAddr == null)
                 return string.Empty;
@@ -877,38 +877,36 @@ namespace DOSRE.Dasm
             // Best-effort register-arg note (common in Watcom/DOS4GW style code)
             // This doesn't assume a calling convention; it simply records obvious setup like "movzx edx, word [0x....]" right before call.
             var regArgNotes = new List<string>();
-            for (var i = idx - 1; i >= 0 && i >= idx - 6; i--)
+            var regsToTrack = new[] { "edx", "eax", "ebx", "ecx" };
+
+            foreach (var r in regsToTrack)
             {
-                var t = InsText(instructions[i]).Trim();
-                if (TryParseSimpleRegSetup(t, "edx", out var rhsEdx))
+                for (var i = idx - 1; i >= 0 && i >= idx - 6; i--)
                 {
-                    regArgNotes.Add($"edx={rhsEdx}");
-                    break;
+                    var t = InsText(instructions[i]).Trim();
+                    if (TryParseSimpleRegSetup(t, r, out var rhs))
+                    {
+                        var note = $"{r}={rhs}";
+                        
+                        // Heuristic: if rhs is a hex literal, try to resolve it to a string preview.
+                        var m = HexLiteralRegex.Match(rhs);
+                        if (m.Success && TryParseHexUInt(m.Value, out var rawLit))
+                        {
+                            if (TryResolveStringAddressFromRaw(rawLit, stringSymbols, objects, out var _, out var sym))
+                            {
+                                if (stringPreview != null && stringPreview.TryGetValue(rawLit, out var preview))
+                                    note = $"{r}={sym} (\"{preview}\")";
+                                else
+                                    note = $"{r}={sym}";
+                            }
+                        }
+                        
+                        regArgNotes.Add(note);
+                        break;
+                    }
+                    if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
+                        break;
                 }
-                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
-                    break;
-            }
-            for (var i = idx - 1; i >= 0 && i >= idx - 6; i--)
-            {
-                var t = InsText(instructions[i]).Trim();
-                if (TryParseSimpleRegSetup(t, "eax", out var rhsEax))
-                {
-                    regArgNotes.Add($"eax={rhsEax}");
-                    break;
-                }
-                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
-                    break;
-            }
-            for (var i = idx - 1; i >= 0 && i >= idx - 6; i--)
-            {
-                var t = InsText(instructions[i]).Trim();
-                if (TryParseSimpleRegSetup(t, "ecx", out var rhsEcx))
-                {
-                    regArgNotes.Add($"ecx={rhsEcx}");
-                    break;
-                }
-                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
-                    break;
             }
 
             var regText = regArgNotes.Count > 0 ? $" reg~{string.Join(",", regArgNotes)}" : string.Empty;

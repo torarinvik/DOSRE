@@ -302,17 +302,37 @@ namespace DOSRE.Dasm
 
         private static string DescribeInt31Ax(ushort ax)
         {
-            // Minimal, commonly encountered DPMI services (not exhaustive)
+            // DPMI services (best-effort common subset)
             switch (ax)
             {
                 case 0x0000: return "Allocate LDT descriptors";
                 case 0x0001: return "Free LDT descriptor";
-                case 0x0007: return "Set segment base";
+                case 0x0002: return "Segment to descriptor";
+                case 0x0003: return "Get selector increment value";
+                case 0x0006: return "Get segment base address";
+                case 0x0007: return "Set segment base address";
                 case 0x0008: return "Set segment limit";
+                case 0x0009: return "Set descriptor access rights";
+                case 0x000A: return "Create alias descriptor";
                 case 0x0100: return "Allocate DOS memory block";
                 case 0x0101: return "Free DOS memory block";
+                case 0x0102: return "Resize DOS memory block";
+                case 0x0200: return "Get real-mode interrupt vector";
+                case 0x0201: return "Set real-mode interrupt vector";
+                case 0x0204: return "Get exception handler vector";
+                case 0x0205: return "Set exception handler vector";
                 case 0x0300: return "Simulate real-mode interrupt";
+                case 0x0301: return "Call real-mode procedure (far ret)";
+                case 0x0302: return "Call real-mode procedure (iret)";
+                case 0x0303: return "Allocate real-mode callback";
+                case 0x0304: return "Free real-mode callback";
                 case 0x0400: return "Get DPMI version";
+                case 0x0501: return "Allocate memory block";
+                case 0x0502: return "Free memory block";
+                case 0x0503: return "Resize memory block";
+                case 0x0600: return "Lock linear region";
+                case 0x0601: return "Unlock linear region";
+                case 0x0800: return "Physical address mapping";
                 default:
                     return string.Empty;
             }

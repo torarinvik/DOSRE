@@ -225,15 +225,25 @@ namespace DOSRE.Dasm
             // lea <reg>, [<base>+0x<disp>] where base resolves to a constant
             if (t.StartsWith("lea ", StringComparison.OrdinalIgnoreCase))
             {
-                // Example: lea eax, [ebx+0x4e]
-                var m = Regex.Match(t, @"^lea\s+(?<dst>e[a-z]{2}),\s*\[(?<base>e[a-z]{2})\+0x(?<disp>[0-9a-fA-F]+)\]$", RegexOptions.IgnoreCase);
+                // Support multiple variants: [reg+disp], [reg-disp], [reg]
+                var m = Regex.Match(t, @"^lea\s+(?<dst>e[a-z]{2}),\s*\[(?<base>e[a-z]{2})(?:\s*(?<sign>[\+\-])\s*(?<disp>0x[0-9a-fA-F]+|[0-9]+))?\]$", RegexOptions.IgnoreCase);
                 if (m.Success)
                 {
                     var baseReg = m.Groups["base"].Value;
-                    var disp = Convert.ToUInt32(m.Groups["disp"].Value, 16);
+                    var sign = m.Groups["sign"].Value;
+                    var dispStr = m.Groups["disp"].Value;
+                    uint disp = 0;
+                    if (!string.IsNullOrEmpty(dispStr))
+                    {
+                        if (dispStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                            disp = Convert.ToUInt32(dispStr[2..], 16);
+                        else
+                            disp = Convert.ToUInt32(dispStr);
+                    }
+
                     if (TryResolveRegisterValueBefore(instructions, insIdx, baseReg, out var baseVal, resourceGetterTargets))
                     {
-                        var addr = baseVal + disp;
+                        var addr = sign == "-" ? unchecked(baseVal - disp) : unchecked(baseVal + disp);
                         if (TryGetStringPreviewAt(addr, stringPreview, objects, objBytesByIndex, out var p) && !string.IsNullOrEmpty(p))
                         {
                             preview = p;

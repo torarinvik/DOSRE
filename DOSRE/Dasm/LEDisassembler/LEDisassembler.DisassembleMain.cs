@@ -723,6 +723,7 @@ namespace DOSRE.Dasm
                     var swSumm = Stopwatch.StartNew();
                     _logger.Info($"LE: Summarizing {functionStarts.Count} functions (insights)...");
                     funcSummaries = SummarizeFunctions(instructions, functionStarts, blockStarts, fixupsByInsAddr, globalSymbols, stringSymbols, objects);
+                    HeuristicLabelFunctions(instructions, functionStarts, analysis);
                     _logger.Info($"LE: Function summaries complete in {swSumm.ElapsedMilliseconds} ms");
 
                     if (analysis != null && funcSummaries != null && funcSummaries.Count > 0)
@@ -1696,7 +1697,7 @@ namespace DOSRE.Dasm
                         if (symXrefs != null && fixupsHere.Count > 0)
                             RecordSymbolXrefs(symXrefs, (uint)ins.Offset, fixupsHere, globalSymbols, stringSymbols, resourceSymbols, objects);
 
-                        var callHint = TryGetCallArgHint(instructions, insIndexByAddr, ins, fixupsHere, globalSymbols, stringSymbols);
+                        var callHint = TryGetCallArgHint(instructions, insIndexByAddr, ins, fixupsHere, globalSymbols, stringSymbols, stringPreview, objects);
                         if (!string.IsNullOrEmpty(callHint))
                             insText += $" ; CALLHINT: {callHint}";
 
