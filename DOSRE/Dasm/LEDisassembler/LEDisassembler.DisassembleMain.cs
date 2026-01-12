@@ -1690,7 +1690,7 @@ namespace DOSRE.Dasm
                             insText = ApplyStringSymbolRewrites(ins, insText, fixupsHere, stringSymbols, objects);
 
                         // Replace any matching 0x... literal with known symbol.
-                        insText = RewriteKnownAddressLiterals(insText, globalSymbols, stringSymbols, resourceSymbols);
+                        insText = RewriteKnownAddressLiterals(insText, globalSymbols, stringSymbols, resourceSymbols, objects);
 
                         // Record xrefs from fixups -> symbols
                         if (symXrefs != null && fixupsHere.Count > 0)

@@ -813,7 +813,7 @@ namespace DOSRE.Dasm
                             var m = HexLiteralRegex.Match(candidate);
                             if (m.Success && TryParseHexUInt(m.Value, out var rawLit))
                             {
-                                if (TryResolveStringAddressFromRaw(rawLit, stringSymbols, out var _, out var sym) &&
+                                if (TryResolveStringAddressFromRaw(rawLit, stringSymbols, objects, out var _, out var sym) &&
                                     !string.IsNullOrEmpty(sym))
                                 {
                                     summary.Strings.Add(sym);

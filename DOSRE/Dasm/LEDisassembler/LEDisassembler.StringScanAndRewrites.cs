@@ -143,10 +143,21 @@ namespace DOSRE.Dasm
                 // Common case: raw already equals a linear string address.
                 if (!stringSymbols.TryGetValue(raw, out sym))
                 {
-                    // Common DOS4GW pattern: raw is a small offset into a fixed resource region.
+                    // Common DOS4GW pattern: raw is a small offset into a fixed resource region or any object.
                     // If base+raw matches a known string symbol, rewrite the raw immediate to that symbol.
-                    if (raw < 0x10000)
+                    if (raw >= 0x10 && raw < 0x20000 && objects != null)
                     {
+                        foreach (var obj in objects)
+                        {
+                            var linear = unchecked(obj.BaseAddress + raw);
+                            if (stringSymbols.TryGetValue(linear, out sym))
+                                break;
+                        }
+                    }
+
+                    if (string.IsNullOrEmpty(sym))
+                    {
+                        // Fallback: check hardcoded typical bases if objects list is somehow insufficient.
                         foreach (var baseAddr in new[] { 0x000C0000u, 0x000D0000u, 0x000E0000u, 0x000F0000u })
                         {
                             var linear = unchecked(baseAddr + raw);

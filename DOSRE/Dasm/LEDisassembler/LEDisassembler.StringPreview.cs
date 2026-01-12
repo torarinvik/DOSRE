@@ -24,7 +24,9 @@ namespace DOSRE.Dasm
             var lower = insText.TrimStart();
             if (!lower.StartsWith("push ", StringComparison.OrdinalIgnoreCase) &&
                 !lower.StartsWith("lea ", StringComparison.OrdinalIgnoreCase) &&
-                !lower.StartsWith("mov ", StringComparison.OrdinalIgnoreCase))
+                !lower.StartsWith("mov ", StringComparison.OrdinalIgnoreCase) &&
+                !lower.StartsWith("add ", StringComparison.OrdinalIgnoreCase) &&
+                !lower.StartsWith("sub ", StringComparison.OrdinalIgnoreCase))
                 return string.Empty;
 
             // Fast path: already has an s_XXXXXXXX token
@@ -87,19 +89,23 @@ namespace DOSRE.Dasm
 
             // Direct r_ token (resource-derived). If it points to a known string preview, treat it as a string too.
             var rdirect = ExtractResourceSym(operandText);
-            if (!string.IsNullOrEmpty(rdirect) && TryParseResourceSym(rdirect, out var rdaddr) &&
-                TryGetStringPreviewAt(rdaddr, stringPreview, objects, objBytesByIndex, out var rdp) && !string.IsNullOrEmpty(rdp))
+            if (!string.IsNullOrEmpty(rdirect) && TryParseResourceSym(rdirect, out var rdaddr))
             {
-                sym = rdirect;
-                preview = rdp;
-                return true;
+                if (TryResolveStringAddressFromRaw(rdaddr, stringSymbols, objects, out var resolvedAddr, out var resolvedSym) &&
+                    TryGetStringPreviewAt(resolvedAddr, stringPreview, objects, objBytesByIndex, out var rp) && !string.IsNullOrEmpty(rp))
+                {
+                    sym = resolvedSym;
+                    preview = rp;
+                    return true;
+                }
             }
 
-            // Register operand (e.g. push eax)
             var op = operandText.Trim();
+
+            // Register operand (e.g. push eax)
             if (IsRegister32(op) && TryResolveRegisterValueBefore(instructions, callIdx, op, out var raddr, resourceGetterTargets))
             {
-                if (TryResolveStringAddressFromRaw(raddr, stringSymbols, out var resolvedAddr, out var resolvedSym) &&
+                if (TryResolveStringAddressFromRaw(raddr, stringSymbols, objects, out var resolvedAddr, out var resolvedSym) &&
                     TryGetStringPreviewAt(resolvedAddr, stringPreview, objects, objBytesByIndex, out var rp) && !string.IsNullOrEmpty(rp))
                 {
                     sym = resolvedSym;
@@ -109,7 +115,7 @@ namespace DOSRE.Dasm
             }
 
             // Immediate literal (0x...)
-            if (TryParseImm32(op, out var imm) && TryResolveStringAddressFromRaw(imm, stringSymbols, out var iaddr, out var isym) &&
+            if (TryParseImm32(op, out var imm) && TryResolveStringAddressFromRaw(imm, stringSymbols, objects, out var iaddr, out var isym) &&
                 TryGetStringPreviewAt(iaddr, stringPreview, objects, objBytesByIndex, out var ip) && !string.IsNullOrEmpty(ip))
             {
                 sym = isym;
@@ -120,7 +126,7 @@ namespace DOSRE.Dasm
             // Embedded literal (e.g. dword [0x4988])
             var hm = HexLiteralRegex.Match(operandText);
             if (hm.Success && TryParseHexUInt(hm.Value, out var rawLit) &&
-                TryResolveStringAddressFromRaw(rawLit, stringSymbols, out var haddr, out var hsym) &&
+                TryResolveStringAddressFromRaw(rawLit, stringSymbols, objects, out var haddr, out var hsym) &&
                 TryGetStringPreviewAt(haddr, stringPreview, objects, objBytesByIndex, out var hp) && !string.IsNullOrEmpty(hp))
             {
                 sym = hsym;
@@ -131,7 +137,7 @@ namespace DOSRE.Dasm
             return false;
         }
 
-        private static bool TryResolveStringAddressFromRaw(uint raw, Dictionary<uint, string> stringSymbols, out uint addr, out string sym)
+        private static bool TryResolveStringAddressFromRaw(uint raw, Dictionary<uint, string> stringSymbols, List<LEObject> objects, out uint addr, out string sym)
         {
             addr = 0;
             sym = string.Empty;
@@ -145,14 +151,13 @@ namespace DOSRE.Dasm
             }
 
             // Common DOS4GW convention: strings live in C/D/E/F0000 regions and code references them by 16-bit offsets.
+            // Heuristic: check if this raw value is an offset into any object that resolves to a string.
             // IMPORTANT: avoid treating NULL / tiny constants as string offsets.
-            // In practice, values like 0, 1, 2, 0x10, 0x40 show up constantly as flags/booleans/lengths and
-            // will create massive false positives if we map them into 0x000C0000+raw.
-            if (raw >= 0x100 && raw < 0x10000)
+            if (raw >= 0x100 && raw < 0x20000 && objects != null)
             {
-                foreach (var baseAddr in new[] { 0x000C0000u, 0x000D0000u, 0x000E0000u, 0x000F0000u })
+                foreach (var obj in objects)
                 {
-                    var candidate = unchecked(baseAddr + raw);
+                    var candidate = unchecked(obj.BaseAddress + raw);
                     if (stringSymbols.TryGetValue(candidate, out sym))
                     {
                         addr = candidate;
@@ -233,6 +238,42 @@ namespace DOSRE.Dasm
                         {
                             preview = p;
                             return true;
+                        }
+                    }
+                }
+            }
+
+            // add/sub <reg>, 0x...
+            if (t.StartsWith("add ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("sub ", StringComparison.OrdinalIgnoreCase))
+            {
+                var isSub = t.StartsWith("sub ", StringComparison.OrdinalIgnoreCase);
+                var parts = t.Substring(4).Split(',');
+                if (parts.Length == 2)
+                {
+                    var dst = parts[0].Trim();
+                    var src = parts[1].Trim();
+                    if (IsRegister32(dst) && TryParseImm32(src, out var imm))
+                    {
+                        // 1) Check if dst already has a base value
+                        if (TryResolveRegisterValueBefore(instructions, insIdx, dst, out var baseVal, resourceGetterTargets))
+                        {
+                            var addr = isSub ? unchecked(baseVal - imm) : unchecked(baseVal + imm);
+                            if (TryGetStringPreviewAt(addr, stringPreview, objects, objBytesByIndex, out var p) && !string.IsNullOrEmpty(p))
+                            {
+                                preview = p;
+                                return true;
+                            }
+                        }
+
+                        // 2) Also check if imm itself is a "naked" offset that resolves to a string in ANY object.
+                        // (Usually only for add)
+                        if (!isSub && TryResolveStringAddressFromRaw(imm, stringSymbols, objects, out var naddr, out var nsym))
+                        {
+                            if (TryGetStringPreviewAt(naddr, stringPreview, objects, objBytesByIndex, out var p) && !string.IsNullOrEmpty(p))
+                            {
+                                preview = p;
+                                return true;
+                            }
                         }
                     }
                 }

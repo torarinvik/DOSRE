@@ -66,7 +66,7 @@ namespace DOSRE.Dasm
 
         private static readonly Regex HexLiteralRegex = new Regex("0x[0-9A-Fa-f]{1,8}", RegexOptions.Compiled);
 
-        private static string RewriteKnownAddressLiterals(string insText, Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> resourceSymbols = null)
+        private static string RewriteKnownAddressLiterals(string insText, Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> resourceSymbols = null, List<LEObject> objects = null)
         {
             if (string.IsNullOrEmpty(insText))
                 return insText;
@@ -85,6 +85,23 @@ namespace DOSRE.Dasm
                     return r;
                 if (globalSymbols != null && globalSymbols.TryGetValue(v, out var g))
                     return g;
+
+                // HEURISTIC: Check if this looks like a naked offset into an object that has strings.
+                // We only do this for small-ish offsets (e.g. < 64KB) to avoid false positives with random large numbers.
+                if (v >= 0x10 && v < 0x20000 && objects != null && stringSymbols != null)
+                {
+                    foreach (var obj in objects)
+                    {
+                        var linear = unchecked(obj.BaseAddress + v);
+                        if (stringSymbols.TryGetValue(linear, out var sym))
+                        {
+                            // If we find it, we return the symbol name.
+                            // Note: this might be aggressive, so we could return "0x... (sym)" instead,
+                            // but usually these naked offsets are real in this context.
+                            return sym;
+                        }
+                    }
+                }
 
                 return m.Value;
             });
