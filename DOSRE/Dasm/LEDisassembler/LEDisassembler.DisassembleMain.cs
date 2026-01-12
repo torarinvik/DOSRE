@@ -72,7 +72,7 @@ namespace DOSRE.Dasm
             byte[] fixupRecordStream = null;
             uint[] fixupPageOffsets = null;
 
-            if (leFixups)
+            if (leFixups || leGlobals)
             {
                 importModules = TryParseImportModules(fileBytes, header);
                 TryGetFixupStreams(fileBytes, header, out fixupPageOffsets, out fixupRecordStream);
@@ -188,6 +188,54 @@ namespace DOSRE.Dasm
                     }
                     if (stringSymbols.Count > 512)
                         AppendWrappedDisasmLine(sb, string.Empty, $" ; (strings truncated: {stringSymbols.Count} total)", commentColumn: 0, maxWidth: 160);
+                    sb.AppendLine(";");
+                }
+            }
+
+            // Global symbol table (linear address -> symbol) from fixups
+            var leGlobalSymbols = new Dictionary<uint, string>();
+            if (leGlobals && fixupRecordStream != null && fixupPageOffsets != null)
+            {
+                var swGlob = Stopwatch.StartNew();
+                _logger.Info("LE: Collecting global symbols from fixup table...");
+                foreach (var obj in objects)
+                {
+                    if (obj.VirtualSize == 0 || obj.PageCount == 0) continue;
+                    // Pass null for objBytes to just get targets from the record stream without site probing.
+                    var gFixups = ParseFixupsForWindow(header, objects, pageMap, importModules, fileBytes, fixupPageOffsets, fixupRecordStream, null, obj, 0, uint.MaxValue);
+                    _logger.Info($"LE: Object {obj.Index} found {gFixups.Count} fixups for globals.");
+                    if (gFixups.Count > 0)
+                    {
+                        var first = gFixups[0];
+                        _logger.Info($"LE: SAMPLE FIXUP: Type={first.TargetType}, Obj={first.TargetObject}, Off={first.TargetOffset}");
+                    }
+                    foreach (var f in gFixups)
+                    {
+                        if ((f.TargetType == 0 || f.TargetType == 3) && f.TargetObject.HasValue && f.TargetOffset.HasValue)
+                        {
+                            var targetObj = objects.FirstOrDefault(o => o.Index == f.TargetObject.Value);
+                            if (targetObj.Index != 0)
+                            {
+                                var targetLinear = unchecked(targetObj.BaseAddress + f.TargetOffset.Value);
+                                if (targetLinear != 0 && !leGlobalSymbols.ContainsKey(targetLinear))
+                                {
+                                    leGlobalSymbols[targetLinear] = $"obj{f.TargetObject.Value}_0x{f.TargetOffset.Value:X}";
+                                }
+                            }
+                        }
+                    }
+                }
+                _logger.Info($"LE: Global symbols complete: {leGlobalSymbols.Count} symbols in {swGlob.ElapsedMilliseconds} ms");
+
+                if (leGlobalSymbols.Count > 0)
+                {
+                    AppendWrappedDisasmLine(sb, string.Empty, " ; Global Symbols (from fixups)", commentColumn: 0, maxWidth: 160);
+                    foreach (var kvp in leGlobalSymbols.OrderBy(k => k.Key).Take(512))
+                    {
+                        AppendWrappedDisasmLine(sb, string.Empty, $"{kvp.Value} EQU 0x{kvp.Key:X8}", commentColumn: 40, maxWidth: 160);
+                    }
+                    if (leGlobalSymbols.Count > 512)
+                        AppendWrappedDisasmLine(sb, string.Empty, $" ; (symbols truncated: {leGlobalSymbols.Count} total)", commentColumn: 0, maxWidth: 160);
                     sb.AppendLine(";");
                 }
             }
@@ -578,17 +626,34 @@ namespace DOSRE.Dasm
                 if (leInsights)
                     resourceGetterTargets = DetectResourceGetterTargets(instructions);
 
-                Dictionary<uint, string> globalSymbols = null;
+                Dictionary<uint, string> globalSymbols = leGlobalSymbols ?? new Dictionary<uint, string>();
                 if (leGlobals && sortedFixups != null && sortedFixups.Count > 0)
                 {
-                    globalSymbols = CollectGlobalSymbols(instructions, sortedFixups);
-                    if (globalSymbols.Count > 0)
+                    var siteToLinearMap = CollectGlobalSymbols(instructions, sortedFixups, objects);
+                    foreach (var kvp in siteToLinearMap)
                     {
-                        sb.AppendLine("; Globals (derived from disp32 fixups)");
-                        foreach (var kvp in globalSymbols.OrderBy(k => k.Key))
-                            sb.AppendLine($"{kvp.Value} EQU 0x{kvp.Key:X8}");
-                        sb.AppendLine(";");
+                        var siteValue = kvp.Key;
+                        var targetLinear = kvp.Value;
+
+                        // Ensure we have a symbol for the target linear address.
+                        if (!globalSymbols.TryGetValue(targetLinear, out var symName))
+                        {
+                            // Try to map linear back to obj+off for a better name if it's not already in globals.
+                            if (TryMapLinearToObject(objects, targetLinear, out var tobj, out var toff))
+                                symName = $"obj{tobj}_0x{toff:X}";
+                            else
+                                symName = $"g_{targetLinear:X8}";
+                            globalSymbols[targetLinear] = symName;
+                        }
+
+                        // Also ensure the SITE VALUE maps to that symbol, so ApplyGlobalSymbolRewrites works.
+                        if (!globalSymbols.ContainsKey(siteValue))
+                        {
+                            globalSymbols[siteValue] = symName;
+                        }
                     }
+
+                    // (We skip printing a per-object EQU table here to avoid incorrectEQU entries mapping site-values to linear names without context).
                 }
 
                 // dispatchTableNotes/dispatchTableSymbols are per-run caches (declared above).
@@ -1553,7 +1618,7 @@ namespace DOSRE.Dasm
                     var fixupsHere = haveFixups ? GetFixupsForInstruction(sortedFixups, ins, ref fixupIdx) : new List<LEFixup>(0);
 
                     if (leGlobals && globalSymbols != null && globalSymbols.Count > 0 && fixupsHere.Count > 0)
-                        insText = ApplyGlobalSymbolRewrites(ins, insText, fixupsHere, globalSymbols);
+                        insText = ApplyGlobalSymbolRewrites(ins, insText, fixupsHere, globalSymbols, objects);
 
                     if (leInsights)
                     {

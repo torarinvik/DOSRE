@@ -285,7 +285,7 @@ namespace DOSRE.Dasm
             if (ioff < 0 || ioff + 4 > bytes.Length)
                 return false;
 
-            value = ReadUInt32(bytes, ioff);
+            value = ReadLEUInt32(bytes, ioff);
             return true;
         }
 

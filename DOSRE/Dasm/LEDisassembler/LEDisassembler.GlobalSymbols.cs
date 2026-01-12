@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text.RegularExpressions;
 using SharpDisasm;
 
@@ -347,11 +348,11 @@ namespace DOSRE.Dasm
             return false;
         }
 
-        private static Dictionary<uint, string> CollectGlobalSymbols(List<Instruction> instructions, List<LEFixup> sortedFixups)
+        private static Dictionary<uint, uint> CollectGlobalSymbols(List<Instruction> instructions, List<LEFixup> sortedFixups, List<LEObject> objects = null)
         {
-            var globals = new Dictionary<uint, string>();
+            var result = new Dictionary<uint, uint>();
             if (instructions == null || sortedFixups == null || sortedFixups.Count == 0)
-                return globals;
+                return result;
 
             var idx = 0;
             foreach (var ins in instructions)
@@ -360,22 +361,36 @@ namespace DOSRE.Dasm
                 foreach (var f in fixupsHere)
                 {
                     // Only globalize memory absolute displacements.
-                    if (!f.Value32.HasValue || !f.TargetObject.HasValue)
+                    if (!f.Value32.HasValue)
                         continue;
+
                     var delta = unchecked((int)(f.SiteLinear - (uint)ins.Offset));
                     if (!TryClassifyFixupKind(ins, delta, out var kind) || kind != "disp32")
                         continue;
 
-                    var addr = f.Value32.Value;
-                    if (!globals.ContainsKey(addr))
-                        globals[addr] = $"g_{addr:X8}";
+                    var siteValue = f.Value32.Value;
+                    if (result.ContainsKey(siteValue))
+                        continue;
+
+                    // Compute the target linear address.
+                    uint targetLinear = siteValue; // Default to site value for external fixups.
+                    if (f.TargetObject.HasValue && f.TargetOffset.HasValue && objects != null)
+                    {
+                        var targetObj = objects.FirstOrDefault(o => o.Index == (uint)f.TargetObject.Value);
+                        if (targetObj.Index != 0)
+                        {
+                            targetLinear = unchecked(targetObj.BaseAddress + f.TargetOffset.Value);
+                        }
+                    }
+
+                    result[siteValue] = targetLinear;
                 }
             }
 
-            return globals;
+            return result;
         }
 
-        private static string ApplyGlobalSymbolRewrites(Instruction ins, string insText, List<LEFixup> fixupsHere, Dictionary<uint, string> globals)
+        private static string ApplyGlobalSymbolRewrites(Instruction ins, string insText, List<LEFixup> fixupsHere, Dictionary<uint, string> globals, List<LEObject> objects)
         {
             if (string.IsNullOrEmpty(insText) || fixupsHere == null || fixupsHere.Count == 0 || globals == null || globals.Count == 0)
                 return insText;
@@ -383,7 +398,34 @@ namespace DOSRE.Dasm
             var rewritten = insText;
             foreach (var f in fixupsHere)
             {
-                if (!f.Value32.HasValue || !globals.TryGetValue(f.Value32.Value, out var sym))
+                if (!f.Value32.HasValue)
+                    continue;
+
+                // Determine the symbol name for this target.
+                string sym = null;
+
+                // 1) If it's an internal fixup, compute the target linear address and look it up FIRST.
+                // This is more accurate than looking up by the raw site value.
+                if (f.TargetObject.HasValue && f.TargetOffset.HasValue && objects != null)
+                {
+                    var targetObj = objects.FirstOrDefault(o => o.Index == (uint)f.TargetObject.Value);
+                    if (targetObj.Index != 0)
+                    {
+                        var targetLinear = unchecked(targetObj.BaseAddress + f.TargetOffset.Value);
+                        if (globals.TryGetValue(targetLinear, out var s2))
+                        {
+                            sym = s2;
+                        }
+                    }
+                }
+
+                // 2) Fallback to site value lookup (for external fixups or cases where site value IS the target linear).
+                if (sym == null && globals.TryGetValue(f.Value32.Value, out var s1))
+                {
+                    sym = s1;
+                }
+
+                if (sym == null)
                     continue;
 
                 var delta = unchecked((int)(f.SiteLinear - (uint)ins.Offset));
@@ -393,6 +435,14 @@ namespace DOSRE.Dasm
                 // SharpDisasm tends to render these as 0x????? (lowercase hex). Replace both just in case.
                 var needleLower = $"0x{f.Value32.Value:x}";
                 var needleUpper = $"0x{f.Value32.Value:X}";
+                
+                // Special case for zero: SharpDisasm may just use "0" without 0x.
+                if (f.Value32.Value == 0)
+                {
+                    // Be careful with replacing '0' as it appears in registers, etc.
+                    // But if it's a disp32 fixup on a [0], then 0x0 should be there.
+                }
+
                 rewritten = rewritten.Replace(needleLower, sym).Replace(needleUpper, sym);
             }
 

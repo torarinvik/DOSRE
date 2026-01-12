@@ -23,6 +23,7 @@ namespace DOSRE.Dasm
         private struct LEHeader
         {
             public int HeaderOffset;
+            public string ModuleName;
             public uint ModuleFlags;
             public uint NumberOfPages;
             public uint EntryEipObject;
@@ -40,6 +41,9 @@ namespace DOSRE.Dasm
             public uint ImportModuleTableEntries;
             public uint ImportProcTableOffset;
             public uint DataPagesOffset;
+            public uint ResidentNameTableOffset;
+            public uint NonResidentNameTableOffset;
+            public uint EntryTableOffset;
         }
 
         private struct LEObject

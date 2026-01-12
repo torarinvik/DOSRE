@@ -33,7 +33,7 @@ namespace DOSRE.Dasm
             var isMz = fileBytes[0] == (byte)'M' && fileBytes[1] == (byte)'Z';
             if (isMz)
             {
-                var lfanew = (int)ReadUInt32(fileBytes, 0x3C);
+                var lfanew = (int)ReadLEUInt32(fileBytes, 0x3C);
                 var lfanewLooksInvalid = lfanew <= 0 || lfanew + 4 > fileBytes.Length;
                 if (!lfanewLooksInvalid)
                 {
@@ -100,8 +100,8 @@ namespace DOSRE.Dasm
 
             // Compute the overlay base (load module size) from the outer MZ header.
             // This intentionally avoids scanning the MZ stub body.
-            var eCblp = ReadUInt16(fileBytes, 0x02);
-            var eCp = ReadUInt16(fileBytes, 0x04);
+            var eCblp = ReadLEUInt16(fileBytes, 0x02);
+            var eCp = ReadLEUInt16(fileBytes, 0x04);
             if (eCp == 0)
                 return false;
 
@@ -134,8 +134,8 @@ namespace DOSRE.Dasm
                 return false;
 
             // Compute the overlay base (load module size) from the outer MZ header.
-            var eCblp = ReadUInt16(fileBytes, 0x02);
-            var eCp = ReadUInt16(fileBytes, 0x04);
+            var eCblp = ReadLEUInt16(fileBytes, 0x02);
+            var eCp = ReadLEUInt16(fileBytes, 0x04);
             if (eCp == 0)
                 return false;
 
@@ -148,7 +148,7 @@ namespace DOSRE.Dasm
             if (fileBytes[overlayBase] != (byte)'B' || fileBytes[overlayBase + 1] != (byte)'W')
                 return false;
 
-            var bwHeaderLen = (int)ReadUInt16(fileBytes, overlayBase + 2);
+            var bwHeaderLen = (int)ReadLEUInt16(fileBytes, overlayBase + 2);
             if (bwHeaderLen <= 0 || bwHeaderLen > 64 * 1024)
                 return false;
             if (overlayBase + bwHeaderLen > fileBytes.Length)
@@ -157,7 +157,7 @@ namespace DOSRE.Dasm
             // Heuristic: scan BW header u32 fields for a relative pointer to an embedded MZ which itself is bound to LE.
             for (var fieldOff = 0; fieldOff + 4 <= bwHeaderLen; fieldOff += 4)
             {
-                var rel = ReadUInt32(fileBytes, overlayBase + fieldOff);
+                var rel = ReadLEUInt32(fileBytes, overlayBase + fieldOff);
                 if (rel == 0)
                     continue;
 
@@ -169,7 +169,7 @@ namespace DOSRE.Dasm
                 if (fileBytes[innerMzOff] != (byte)'M' || fileBytes[innerMzOff + 1] != (byte)'Z')
                     continue;
 
-                var innerLfanew = ReadUInt32(fileBytes, innerMzOff + 0x3C);
+                var innerLfanew = ReadLEUInt32(fileBytes, innerMzOff + 0x3C);
                 if (innerLfanew < 0x40)
                     continue;
 
@@ -209,8 +209,8 @@ namespace DOSRE.Dasm
             }
 
             // byte order + word order are 0 for little endian
-            var byteOrder = ReadUInt16(fileBytes, headerOffset + 0x02);
-            var wordOrder = ReadUInt16(fileBytes, headerOffset + 0x04);
+            var byteOrder = ReadLEUInt16(fileBytes, headerOffset + 0x02);
+            var wordOrder = ReadLEUInt16(fileBytes, headerOffset + 0x04);
             if (byteOrder != 0 || wordOrder != 0)
             {
                 error = "Unsupported LE byte/word order";
@@ -219,41 +219,54 @@ namespace DOSRE.Dasm
 
             header.HeaderOffset = headerOffset;
 
-            header.ModuleFlags = ReadUInt32(fileBytes, headerOffset + 0x10);
-            header.NumberOfPages = ReadUInt32(fileBytes, headerOffset + 0x14);
-            header.EntryEipObject = ReadUInt32(fileBytes, headerOffset + 0x18);
-            header.EntryEip = ReadUInt32(fileBytes, headerOffset + 0x1C);
-            header.EntryEspObject = ReadUInt32(fileBytes, headerOffset + 0x20);
-            header.EntryEsp = ReadUInt32(fileBytes, headerOffset + 0x24);
-            header.PageSize = ReadUInt32(fileBytes, headerOffset + 0x28);
-            header.LastPageSize = ReadUInt32(fileBytes, headerOffset + 0x2C);
+            header.ModuleFlags = ReadLEUInt32(fileBytes, headerOffset + 0x10);
+            header.NumberOfPages = ReadLEUInt32(fileBytes, headerOffset + 0x14);
+            header.EntryEipObject = ReadLEUInt32(fileBytes, headerOffset + 0x18);
+            header.EntryEip = ReadLEUInt32(fileBytes, headerOffset + 0x1C);
+            header.EntryEspObject = ReadLEUInt32(fileBytes, headerOffset + 0x20);
+            header.EntryEsp = ReadLEUInt32(fileBytes, headerOffset + 0x24);
+            header.PageSize = ReadLEUInt32(fileBytes, headerOffset + 0x28);
+            header.LastPageSize = ReadLEUInt32(fileBytes, headerOffset + 0x2C);
 
-            header.ObjectTableOffset = ReadUInt32(fileBytes, headerOffset + 0x40);
-            header.ObjectCount = ReadUInt32(fileBytes, headerOffset + 0x44);
-            header.ObjectPageMapOffset = ReadUInt32(fileBytes, headerOffset + 0x48);
+            header.ObjectTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x40);
+            header.ObjectCount = ReadLEUInt32(fileBytes, headerOffset + 0x44);
+            header.ObjectPageMapOffset = ReadLEUInt32(fileBytes, headerOffset + 0x48);
 
-            header.FixupPageTableOffset = ReadUInt32(fileBytes, headerOffset + 0x68);
-            header.FixupRecordTableOffset = ReadUInt32(fileBytes, headerOffset + 0x6C);
-
-            // Best-effort: import tables (offsets are relative to LE header)
-            // Heuristic for some Watcom variants: check alternate positions for import table.
-            var impModOff = ReadUInt32(fileBytes, headerOffset + 0x58);
-            var impModCnt = ReadUInt32(fileBytes, headerOffset + 0x7C);
+            // Heuristic for flavor detection:
+            // IBM LX has Resident Name Table at 0x58, Entry Table at 0x5C, Imports at 0x70.
+            // Standard/Watcom LE often has Resident Name at 0x50, Entry at 0x54, Imports at 0x58.
             
-            if (impModOff > 0 && impModOff < header.DataPagesOffset && (impModCnt > 0 && impModCnt < 100))
+            var resNameLE = ReadLEUInt32(fileBytes, headerOffset + 0x50);
+            var resNameLX = ReadLEUInt32(fileBytes, headerOffset + 0x58);
+            
+            if (resNameLE > 0 && resNameLE < header.PageSize && (resNameLX == 0 || resNameLX > 0x1000))
             {
-                header.ImportModuleTableOffset = impModOff;
-                header.ImportModuleTableEntries = impModCnt;
+                // Likely Standard LE layout
+                header.ResidentNameTableOffset = resNameLE;
+                header.EntryTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x54);
+                header.ImportModuleTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x58);
+                header.ImportModuleTableEntries = ReadLEUInt32(fileBytes, headerOffset + 0x5C);
+                header.NonResidentNameTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x88); // Still 0x88?
             }
             else
             {
-                header.ImportModuleTableOffset = ReadUInt32(fileBytes, headerOffset + 0x70);
-                header.ImportModuleTableEntries = ReadUInt32(fileBytes, headerOffset + 0x74);
+                // Likely IBM LX layout
+                header.ResidentNameTableOffset = resNameLX;
+                header.EntryTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x5C);
+                header.ImportModuleTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x70);
+                header.ImportModuleTableEntries = ReadLEUInt32(fileBytes, headerOffset + 0x74);
+                header.NonResidentNameTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x88);
             }
 
-            header.ImportProcTableOffset = ReadUInt32(fileBytes, headerOffset + 0x78);
+            header.FixupPageTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x68);
+            header.FixupRecordTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x6C);
+            header.ImportProcTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x78);
+            header.DataPagesOffset = ReadLEUInt32(fileBytes, headerOffset + 0x80);
 
-            header.DataPagesOffset = ReadUInt32(fileBytes, headerOffset + 0x80);
+            _logger.Info($"LE Header: FixupPageTableOffset=0x{header.FixupPageTableOffset:X}, FixupRecordTableOffset=0x{header.FixupRecordTableOffset:X}");
+
+            // Extract module name from Resident/Non-Resident tables
+            header.ModuleName = ExtractModuleName(fileBytes, header);
 
             if (header.PageSize == 0 || header.ObjectCount == 0 || header.NumberOfPages == 0)
             {
@@ -267,6 +280,28 @@ namespace DOSRE.Dasm
 
             _logger.Info($"Detected LE header at 0x{headerOffset:X} (Objects={header.ObjectCount}, Pages={header.NumberOfPages}, PageSize={header.PageSize})");
             return true;
+        }
+
+        private static string ExtractModuleName(byte[] fileBytes, LEHeader header)
+        {
+            if (header.ResidentNameTableOffset == 0)
+                return "UNKNOWN";
+
+            var start = header.HeaderOffset + (int)header.ResidentNameTableOffset;
+            if (start < 0 || start >= fileBytes.Length)
+                return "UNKNOWN";
+
+            // Resident Name Table format:
+            // 1 byte: length
+            // N bytes: name
+            // 2 bytes: ordinal (0 for module name)
+            // Ends with length 0.
+            
+            int len = fileBytes[start];
+            if (len == 0 || start + 1 + len > fileBytes.Length)
+                return "UNKNOWN";
+
+            return Encoding.ASCII.GetString(fileBytes, start + 1, len).ToUpperInvariant();
         }
 
         private static List<string> TryParseImportModules(byte[] fileBytes, LEHeader header)
@@ -357,7 +392,7 @@ namespace DOSRE.Dasm
                     var off = pageTableStart + i * 4;
                     if (off + 4 > fileBytes.Length)
                         return false;
-                    offsets[i] = ReadUInt32(fileBytes, off);
+                    offsets[i] = ReadLEUInt32(fileBytes, off);
                 }
 
                 var total = offsets[count - 1];
@@ -418,11 +453,11 @@ namespace DOSRE.Dasm
                     break;
 
                 // LE object entry is 6x uint32
-                var virtualSize = ReadUInt32(fileBytes, entryOffset + 0x00);
-                var baseAddress = ReadUInt32(fileBytes, entryOffset + 0x04);
-                var flags = ReadUInt32(fileBytes, entryOffset + 0x08);
-                var pageMapIndex = ReadUInt32(fileBytes, entryOffset + 0x0C);
-                var pageCount = ReadUInt32(fileBytes, entryOffset + 0x10);
+                var virtualSize = ReadLEUInt32(fileBytes, entryOffset + 0x00);
+                var baseAddress = ReadLEUInt32(fileBytes, entryOffset + 0x04);
+                var flags = ReadLEUInt32(fileBytes, entryOffset + 0x08);
+                var pageMapIndex = ReadLEUInt32(fileBytes, entryOffset + 0x0C);
+                var pageCount = ReadLEUInt32(fileBytes, entryOffset + 0x10);
 
                 objects.Add(new LEObject
                 {
@@ -450,9 +485,22 @@ namespace DOSRE.Dasm
                     break;
 
                 // LE object page map entries are 4 bytes.
-                // For DOS4GW-style LEs, the physical page number is stored as a 16-bit value in the upper word.
-                // (The lower word is typically flags.)
-                map[i] = ReadUInt16(fileBytes, off + 2);
+                // Standard LE: 3-byte 1-based page index (0-23) + 1-byte flags (24-31).
+                // IBM LX or some Watcom variants: Flags in low bytes, Page index in high bytes.
+                var raw = ReadLEUInt32(fileBytes, off);
+                
+                // Heuristic: if lower 24 bits are non-zero and reasonable, assume Standard LE.
+                // Otherwise, assume the 16-bit-high variant.
+                var standardIdx = raw & 0xFFFFFF;
+                if (standardIdx > 0 && standardIdx <= header.NumberOfPages)
+                {
+                    map[i] = standardIdx;
+                }
+                else
+                {
+                    var highIdx = raw >> 16;
+                    map[i] = highIdx;
+                }
             }
 
             return map;
@@ -491,12 +539,12 @@ namespace DOSRE.Dasm
             return buf;
         }
 
-        private static ushort ReadUInt16(byte[] data, int offset)
+        private static ushort ReadLEUInt16(byte[] data, int offset)
         {
             return (ushort)(data[offset] | (data[offset + 1] << 8));
         }
 
-        private static uint ReadUInt32(byte[] data, int offset)
+        private static uint ReadLEUInt32(byte[] data, int offset)
         {
             return (uint)(data[offset] |
                           (data[offset + 1] << 8) |

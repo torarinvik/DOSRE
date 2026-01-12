@@ -47,11 +47,38 @@ namespace DOSRE.Dasm
                 p += 2;
             }
 
-            int objSize = (rec.TargetFlags & 0x10) != 0 ? 2 : 1;
-            int offSize = 0;
-            if ((rec.TargetFlags & 0x40) != 0) offSize = 1;
-            else if ((rec.TargetFlags & 0x20) != 0) offSize = 4;
-            else offSize = 2;
+            int objSize = 1;
+            int offSize = 2;
+
+            // Heuristic for LE variants:
+            // Standard LX: Bit 4=16-bit Obj, Bit 5=32-bit Off.
+            // Some Watcom/DOS4GW LEs: Bit 4=32-bit Off, Bit 5=16-bit Obj.
+            // We use the presence of Bit 5 in a small-object binary to guess it's LX, 
+            // but if we see Bit 4 and it results in a huge object number, we pivot.
+            
+            bool isLX = true; // Default to LX-style bits
+            if ((rec.TargetFlags & 0x10) != 0) {
+                // If Bit 4 is set, check the next byte. If it's 0 (most objects are < 256),
+                // it's ambiguous. But if we assume bit 4 is 32-bit offset, offSize=4, objSize=1.
+                // Let's try to detect based on record length or other clues.
+                // For now, let's look at the actual byte at p+1 if objSize=2.
+                if (p + 2 <= end && data[p+1] != 0 && data[p+1] != 0xFF) {
+                    // If the high byte of a 16-bit object is non-zero, it's likely actually an offset byte.
+                    isLX = false;
+                }
+            }
+
+            if (isLX) {
+                objSize = (rec.TargetFlags & 0x10) != 0 ? 2 : 1;
+                if ((rec.TargetFlags & 0x40) != 0) offSize = 1;
+                else if ((rec.TargetFlags & 0x20) != 0) offSize = 4;
+                else offSize = 2;
+            } else {
+                objSize = (rec.TargetFlags & 0x20) != 0 ? 2 : 1;
+                if ((rec.TargetFlags & 0x40) != 0) offSize = 1;
+                else if ((rec.TargetFlags & 0x10) != 0) offSize = 4;
+                else offSize = 2;
+            }
 
             var targetType = rec.TargetType;
             // Ordinal target? (1 or 2)
@@ -70,7 +97,7 @@ namespace DOSRE.Dasm
             if (p + offSize > end) return null;
             if (offSize == 1) rec.TargetOffset = data[p++];
             else if (offSize == 2) { rec.TargetOffset = (ushort)(data[p] | (data[p + 1] << 8)); p += 2; }
-            else { rec.TargetOffset = ReadUInt32(data, p); p += 4; }
+            else { rec.TargetOffset = ReadLEUInt32(data, p); p += 4; }
 
             if (rec.SourceCount > 1)
             {

@@ -26,9 +26,6 @@ namespace DOSRE.Dasm
             // like an internal pointer.
             var fixups = new List<LEFixup>();
 
-            if (objBytes == null || objBytes.Length == 0)
-                return fixups;
-
             for (var i = 0; i < obj.PageCount; i++)
             {
                 // IMPORTANT: Fixup page table is indexed by the logical page-map entry index,
@@ -100,13 +97,13 @@ namespace DOSRE.Dasm
                         int? mappedObj = null;
                         uint mappedOff = 0;
 
-                        if (objOffset >= 0)
+                        if (objOffset >= 0 && objBytes != null)
                         {
                             // Prefer mapped in-module pointers. If we find one at a nearby delta (records can be off-by-a-few),
                             // treat that delta as the actual relocated field start.
                             var currentObjIsExecutable = (obj.Flags & 0x0004) != 0;
 
-                            for (var delta = -3; delta <= 3; delta++)
+                            for (var delta = -3; delta <= 4; delta++)
                             {
                                 var off = objOffset + delta;
                                 if (off < 0)
@@ -114,7 +111,7 @@ namespace DOSRE.Dasm
                                 if (off + 4 > objBytes.Length)
                                     continue;
 
-                                var v = ReadUInt32(objBytes, off);
+                                var v = ReadLEUInt32(objBytes, off);
                                 if (TryMapLinearToObject(objects, v, out var tobj, out var toff))
                                 {
                                     // If the record has an explicit target object, prioritize matches to that object.
@@ -140,6 +137,20 @@ namespace DOSRE.Dasm
                                     if (recTargetObj.HasValue && tobj == recTargetObj.Value)
                                         break;
                                 }
+
+                                // NEW: If the record gives us an explicit target and offset, check if the site value
+                                // matches that offset or is 0.
+                                if (recTargetObj.HasValue && recTargetOff.HasValue)
+                                {
+                                    if (v == recTargetOff.Value || (v == 0 && delta == 0))
+                                    {
+                                        value32 = v;
+                                        chosenDelta = delta;
+                                        mappedObj = recTargetObj;
+                                        mappedOff = recTargetOff.Value;
+                                        if (v == recTargetOff.Value) break; // Perfect match
+                                    }
+                                }
                             }
 
                             // If the record gave us an explicit target but we didn't find a mapped linear address at the site,
@@ -155,15 +166,22 @@ namespace DOSRE.Dasm
                             if (!value32.HasValue)
                             {
                                 if (objOffset + 4 <= objBytes.Length)
-                                    value32 = ReadUInt32(objBytes, objOffset);
+                                    value32 = ReadLEUInt32(objBytes, objOffset);
                                 else if (objOffset + 2 <= objBytes.Length)
-                                    value16 = ReadUInt16(objBytes, objOffset);
+                                    value16 = ReadLEUInt16(objBytes, objOffset);
 
                                 // Keep small object-relative offsets only when they come from the actual record site.
                                 // Avoid scanning neighboring bytes for these, as it can accidentally interpret opcode/disp/imm overlap.
                                 if (value32.HasValue && value32.Value >= 0x10000 && !recTargetObj.HasValue)
                                     value32 = null;
                             }
+                        }
+
+                        // Ensure we capture internal targets from the record even if we aren't probing site bytes (e.g. global symbols pass).
+                        if (!mappedObj.HasValue && recTargetObj.HasValue)
+                        {
+                            mappedObj = recTargetObj;
+                            mappedOff = recTargetOff ?? 0;
                         }
 
                         string importModule = null;
@@ -181,6 +199,11 @@ namespace DOSRE.Dasm
                                 else if (rec.TargetType == 1) // Import by Ordinal
                                 {
                                     importProc = $"ord_{rec.TargetOffset}";
+                                }
+
+                                if (importModule != null && importModule.Equals(header.ModuleName, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    importModule = "[SELF]";
                                 }
                             }
                         }
@@ -394,7 +417,7 @@ namespace DOSRE.Dasm
                     uint? _specU32 = null;
                     if (stride >= 6) { _specU16 = (ushort)(fixupRecordStream[p + 4] | (fixupRecordStream[p + 5] << 8)); }
                     if (stride >= 8) { _specU16b = (ushort)(fixupRecordStream[p + 6] | (fixupRecordStream[p + 7] << 8)); }
-                    if (stride >= 10) { _specU32 = ReadUInt32(fixupRecordStream, p + 6); }
+                    if (stride >= 10) { _specU32 = ReadLEUInt32(fixupRecordStream, p + 6); }
 
                     string targetKind = "unknown";
                     int? targetObj = null;
@@ -452,7 +475,7 @@ namespace DOSRE.Dasm
                                 var off = objOffset + delta;
                                 if (off < 0 || off + 4 > objBytes.Length) continue;
 
-                                var v = ReadUInt32(objBytes, off);
+                                var v = ReadLEUInt32(objBytes, off);
                                 if (v != 0 && TryMapLinearToObject(objects, v, out var tobj, out var toff))
                                 {
                                     siteV32 = v;
@@ -473,7 +496,7 @@ namespace DOSRE.Dasm
                              {
                                 var off = objOffset + delta;
                                 if (off < 0 || off + 4 > objBytes.Length) continue;
-                                var v = ReadUInt32(objBytes, off);
+                                var v = ReadLEUInt32(objBytes, off);
                                 if (TryMapLinearToObject(objects, v, out var tobj, out var toff) && tobj == targetObj)
                                 {
                                     siteV32 = v;
@@ -486,8 +509,8 @@ namespace DOSRE.Dasm
                         // Fallback site reads.
                         if (!siteV32.HasValue)
                         {
-                            if (objOffset + 4 <= objBytes.Length) siteV32 = ReadUInt32(objBytes, objOffset);
-                            else if (objOffset + 2 <= objBytes.Length) siteV16 = ReadUInt16(objBytes, objOffset);
+                            if (objOffset + 4 <= objBytes.Length) siteV32 = ReadLEUInt32(objBytes, objOffset);
+                            else if (objOffset + 2 <= objBytes.Length) siteV16 = ReadLEUInt16(objBytes, objOffset);
                         }
                     }
 
