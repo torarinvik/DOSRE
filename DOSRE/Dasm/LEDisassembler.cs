@@ -11185,6 +11185,67 @@ namespace DOSRE.Dasm
                         }
                     }
 
+                    // Some DOS4GW fixup record families appear to encode an explicit object index in the high byte of specU16,
+                    // and an object-relative offset in specU32 (when present). We only decode when:
+                    // - objIdx is explicit and in-range
+                    // - specU16 low byte looks like a small sub-type (<= 0x0F)
+                    // - when specU32 is present, its low16 matches specU16b (possibly with a byte swap)
+                    // - offsets are plausible vs object size (+slack)
+                    if (targetKind == "unknown" && hasSpecU16 && hasSpecU16b)
+                    {
+                        var objIdx = (int)(unchecked((_specU16 >> 8) & 0x00FF));
+                        var sub = (byte)unchecked(_specU16 & 0x00FF);
+                        if (sub <= 0x0F && objIdx >= 1 && objIdx <= objects.Count)
+                        {
+                            var allowNoSpecU32 = (srcType == 0x00 && flags == 0x07);
+                            var canDecode = hasSpecU32 || allowNoSpecU32;
+                            if (canDecode)
+                            {
+                                uint off;
+
+                                if (hasSpecU32)
+                                {
+                                    var lo = (ushort)unchecked(_specU32 & 0xFFFF);
+                                    if (lo != _specU16b)
+                                    {
+                                        var swappedLo = (ushort)((lo >> 8) | (lo << 8));
+                                        if (swappedLo != _specU16b)
+                                            goto SkipHiByteObjIdxDecode;
+                                    }
+                                    off = _specU32;
+                                }
+                                else
+                                {
+                                    off = _specU16b;
+                                }
+
+                                var sz = ObjSize(objects, objIdx);
+                                if (sz != 0 && off > sz + 0x1000)
+                                {
+                                    // For the no-specU32 variant, try a byte swap only when it becomes plausible.
+                                    if (!hasSpecU32)
+                                    {
+                                        var swappedOff = (uint)(ushort)((_specU16b >> 8) | (_specU16b << 8));
+                                        if (swappedOff <= sz + 0x1000)
+                                            off = swappedOff;
+                                    }
+                                }
+
+                                if (sz == 0 || off <= sz + 0x1000)
+                                {
+                                    targetKind = "internal";
+                                    targetObj = objIdx;
+                                    targetOff = off;
+                                    var baseAddr = ObjBase(objects, objIdx);
+                                    if (baseAddr != 0)
+                                        targetLinear = unchecked(baseAddr + off);
+                                }
+                            }
+                        }
+                    }
+
+                SkipHiByteObjIdxDecode:;
+
                     // Some DOS4GW fixup records appear to be 8 bytes (no specU32) and carry a byte-swapped 16-bit
                     // object-relative offset in specU16. For a small remaining bucket we can classify safely when:
                     // - type/flags match a known family
