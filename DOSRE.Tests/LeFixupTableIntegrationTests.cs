@@ -123,8 +123,8 @@ namespace DOSRE.Tests
             var unknown = payload.fixups?.Count(f => string.Equals(f.targetKind, "unknown", StringComparison.Ordinal)) ?? 0;
 
             // Historically HELLO had the vast majority of fixups classified as unknown.
-            // This assertion is intentionally loose: it should stay true as decoding improves further.
-            Assert.True(unknown < 100, $"Too many unknown fixups: {unknown}");
+            // Keep this somewhat loose (to avoid brittleness), but it should remain very low as decoding improves.
+            Assert.True(unknown <= 5, $"Too many unknown fixups: {unknown}");
         }
     }
 }

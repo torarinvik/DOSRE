@@ -10971,6 +10971,46 @@ namespace DOSRE.Dasm
                 return true;
             }
 
+            static bool TryMapOffsetToSingleObjectStrict(List<LEObject> objs, uint off, out int objIndex, out uint linear)
+            {
+                objIndex = 0;
+                linear = 0;
+
+                if (objs == null || objs.Count == 0)
+                    return false;
+
+                const uint slack = 0x1000;
+                int matches = 0;
+                int matchObj = 0;
+                uint matchBase = 0;
+
+                foreach (var o in objs)
+                {
+                    if (o.VirtualSize == 0)
+                        continue;
+                    if (off > unchecked(o.VirtualSize + slack))
+                        continue;
+                    if (o.BaseAddress == 0)
+                        continue;
+
+                    matches++;
+                    matchObj = o.Index;
+                    matchBase = o.BaseAddress;
+
+                    if (matches > 1)
+                        break;
+                }
+
+                if (matches != 1)
+                    return false;
+
+                objIndex = matchObj;
+                linear = unchecked(matchBase + off);
+                return true;
+            }
+
+            static ushort Swap16(ushort v) => (ushort)((v >> 8) | (v << 8));
+
             static bool TryReadU16(byte[] b, int off, int end, out ushort v)
             {
                 v = 0;
@@ -11128,6 +11168,32 @@ namespace DOSRE.Dasm
                                 }
                             }
                         }
+
+                        // Observed: some 8-byte records encode the target object index in specU16b with high bits set,
+                        // and the target object-relative offset in specU16. Decode only when the object index is explicit
+                        // and in-range.
+                        if (targetKind == "unknown" && srcType == 0x40 && flags == 0x09)
+                        {
+                            // Treat 0xC000 as a tag and the low 14 bits as an object index.
+                            if (unchecked((_specU16b & 0xC000)) == 0xC000)
+                            {
+                                var objIdx = (int)(unchecked(_specU16b & 0x3FFF));
+                                if (objIdx >= 1 && objIdx <= objects.Count)
+                                {
+                                    var off = (uint)_specU16;
+                                    var sz = ObjSize(objects, objIdx);
+                                    if (sz == 0 || off <= sz + 0x1000)
+                                    {
+                                        targetKind = "internal";
+                                        targetObj = objIdx;
+                                        targetOff = off;
+                                        var baseAddr = ObjBase(objects, objIdx);
+                                        if (baseAddr != 0)
+                                            targetLinear = unchecked(baseAddr + off);
+                                    }
+                                }
+                            }
+                        }
                     }
 
 
@@ -11245,6 +11311,45 @@ namespace DOSRE.Dasm
                                 siteV32 = ReadUInt32(objBytes, objOffset);
                             else if (objOffset + 2 <= objBytes.Length)
                                 siteV16 = ReadUInt16(objBytes, objOffset);
+                        }
+
+                        // Some remaining DOS4GW records (often 8-byte stride) appear to encode a 16-bit object-relative
+                        // target offset in specU16/specU16b (sometimes byte-swapped), while the site value is 0.
+                        // Decode only when there is exactly one unambiguous (field,endian) candidate that maps strictly
+                        // to exactly one object.
+                        if (targetKind == "unknown" && !hasSpecU32 && siteV32.HasValue && siteV32.Value == 0 && (hasSpecU16 || hasSpecU16b))
+                        {
+                            var seen = new HashSet<uint>();
+                            var mapped = new List<(int obj, uint off, uint lin)>();
+
+                            void ConsiderU16(ushort v)
+                            {
+                                var a = (uint)v;
+                                if (a != 0)
+                                    seen.Add(a);
+                                var s = (uint)Swap16(v);
+                                if (s != 0)
+                                    seen.Add(s);
+                            }
+
+                            if (hasSpecU16)
+                                ConsiderU16(_specU16);
+                            if (hasSpecU16b)
+                                ConsiderU16(_specU16b);
+
+                            foreach (var cand in seen)
+                            {
+                                if (TryMapOffsetToSingleObjectStrict(objects, cand, out var tobj, out var tlin))
+                                    mapped.Add((tobj, cand, tlin));
+                            }
+
+                            if (mapped.Count == 1)
+                            {
+                                targetKind = "internal";
+                                targetObj = mapped[0].obj;
+                                targetOff = mapped[0].off;
+                                targetLinear = mapped[0].lin;
+                            }
                         }
                     }
 
