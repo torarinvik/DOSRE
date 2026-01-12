@@ -11146,6 +11146,45 @@ namespace DOSRE.Dasm
                         }
                     }
 
+                    // Some record families appear to encode the target object index in the low byte of specU16,
+                    // and the object-relative offset in specU16b. Decode only when the object index is explicit
+                    // and in-range.
+                    if (targetKind == "unknown" && hasSpecU16 && hasSpecU16b)
+                    {
+                        if (srcType == 0x07 && flags == 0x10)
+                        {
+                            // Most observed records for this family also carry a 32-bit spec word with hi16 == 0x0700.
+                            // Treat any other hi16 as suspicious and don't decode.
+                            if (!hasSpecU32 || unchecked((_specU32 >> 16) & 0xFFFF) == 0x0700)
+                            {
+                                var objIdx = (int)(unchecked(_specU16 & 0x00FF));
+                                if (objIdx >= 1 && objIdx <= objects.Count)
+                                {
+                                    var off = (uint)_specU16b;
+
+                                    // If the offset looks implausible, try a byte-swap (but only when it becomes plausible).
+                                    var sz = ObjSize(objects, objIdx);
+                                    if (sz != 0 && off > sz + 0x1000)
+                                    {
+                                        var swappedOff = (uint)(ushort)((_specU16b >> 8) | (_specU16b << 8));
+                                        if (swappedOff <= sz + 0x1000)
+                                            off = swappedOff;
+                                    }
+
+                                    if (sz == 0 || off <= sz + 0x1000)
+                                    {
+                                        targetKind = "internal";
+                                        targetObj = objIdx;
+                                        targetOff = off;
+                                        var baseAddr = ObjBase(objects, objIdx);
+                                        if (baseAddr != 0)
+                                            targetLinear = unchecked(baseAddr + off);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Some DOS4GW fixup records appear to be 8 bytes (no specU32) and carry a byte-swapped 16-bit
                     // object-relative offset in specU16. For a small remaining bucket we can classify safely when:
                     // - type/flags match a known family
