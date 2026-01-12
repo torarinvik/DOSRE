@@ -236,8 +236,21 @@ namespace DOSRE.Dasm
             header.FixupRecordTableOffset = ReadUInt32(fileBytes, headerOffset + 0x6C);
 
             // Best-effort: import tables (offsets are relative to LE header)
-            header.ImportModuleTableOffset = ReadUInt32(fileBytes, headerOffset + 0x70);
-            header.ImportModuleTableEntries = ReadUInt32(fileBytes, headerOffset + 0x74);
+            // Heuristic for some Watcom variants: check alternate positions for import table.
+            var impModOff = ReadUInt32(fileBytes, headerOffset + 0x58);
+            var impModCnt = ReadUInt32(fileBytes, headerOffset + 0x7C);
+            
+            if (impModOff > 0 && impModOff < header.DataPagesOffset && (impModCnt > 0 && impModCnt < 100))
+            {
+                header.ImportModuleTableOffset = impModOff;
+                header.ImportModuleTableEntries = impModCnt;
+            }
+            else
+            {
+                header.ImportModuleTableOffset = ReadUInt32(fileBytes, headerOffset + 0x70);
+                header.ImportModuleTableEntries = ReadUInt32(fileBytes, headerOffset + 0x74);
+            }
+
             header.ImportProcTableOffset = ReadUInt32(fileBytes, headerOffset + 0x78);
 
             header.DataPagesOffset = ReadUInt32(fileBytes, headerOffset + 0x80);

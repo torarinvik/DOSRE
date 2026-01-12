@@ -49,24 +49,37 @@ namespace DOSRE.Dasm
                 var delta = unchecked((int)(f.SiteLinear - insStart));
                 var kind = TryClassifyFixupKind(ins, delta, out var k) ? k : "unk";
 
-                var mapped = string.Empty;
-                if (f.TargetObject.HasValue && f.TargetOffset.HasValue)
+                var targetStr = string.Empty;
+                if (f.TargetType == 0 || f.TargetType == 3) // Internal
                 {
-                    mapped = $" => obj{f.TargetObject.Value}+0x{f.TargetOffset.Value:X}";
-                    if (objects != null)
+                    targetStr = "[internal]";
+                    if (f.TargetObject.HasValue && f.TargetOffset.HasValue)
                     {
-                        var oi = objects.FindIndex(o => o.Index == (uint)f.TargetObject.Value);
-                        if (oi >= 0)
+                        targetStr += $" obj{f.TargetObject.Value}+0x{f.TargetOffset.Value:X}";
+                        if (objects != null)
                         {
-                            var linear = objects[oi].BaseAddress + (ulong)f.TargetOffset.Value;
-                            mapped += $" (linear 0x{linear:X8})";
+                            var oi = objects.FindIndex(o => o.Index == (uint)f.TargetObject.Value);
+                            if (oi >= 0)
+                            {
+                                var baseAddr = objects[oi].BaseAddress;
+                                var linear = baseAddr + (ulong)f.TargetOffset.Value;
+                                targetStr += $" (linear 0x{linear:X8})";
+                            }
                         }
                     }
                 }
+                else if (f.TargetType == 1 || f.TargetType == 2) // Import
+                {
+                    targetStr = $"[import {f.ImportModule ?? "?"}:{f.ImportProc ?? "?"}]";
+                    if (f.Value32.HasValue)
+                        targetStr += $" (site_val 0x{f.Value32.Value:X8})";
+                }
 
-                var v32 = f.Value32.HasValue ? $" val32=0x{f.Value32.Value:X8}" : string.Empty;
+                var v32 = f.Value32.HasValue && (f.TargetType == 0 || f.TargetType == 3) ? $" val32=0x{f.Value32.Value:X8}" : string.Empty;
 
-                parts.Add($"{kind} site+{delta} type=0x{f.Type:X2} flags=0x{f.Flags:X2}{v32}{mapped}");
+                // Reduce noise for common 32-bit linear fixups.
+                if (kind != "unk" || f.TargetOffset > 0)
+                    parts.Add($"{kind} site+{delta} {targetStr} type=0x{f.Type:X2} flags=0x{f.Flags:X2}{v32}");
             }
 
             if (parts.Count == 0)

@@ -14,6 +14,10 @@ namespace DOSRE.Dasm
             public uint? TargetOffset;
             public byte Type;
             public byte Flags;
+
+            public byte TargetType;
+            public string ImportModule;
+            public string ImportProc;
         }
 
         private struct LEHeader
