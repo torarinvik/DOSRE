@@ -22,7 +22,7 @@ namespace DOSRE.Dasm
             public int RecordStreamOffset;
         }
 
-        private static LeFixupRecord? DecipherFixupRecord(byte[] data, int start, int end)
+        private static LeFixupRecord? DecipherFixupRecord(byte[] data, int start, int end, bool assumeLX)
         {
             if (data == null || start < 0 || start + 4 > end) return null;
             var rec = new LeFixupRecord();
@@ -56,8 +56,8 @@ namespace DOSRE.Dasm
             // We use the presence of Bit 5 in a small-object binary to guess it's LX, 
             // but if we see Bit 4 and it results in a huge object number, we pivot.
             
-            bool isLX = true; // Default to LX-style bits
-            if ((rec.TargetFlags & 0x10) != 0) {
+            bool isLX = assumeLX; 
+            if (!assumeLX && (rec.TargetFlags & 0x10) != 0) {
                 // If Bit 4 is set, check the next byte. If it's 0 (most objects are < 256),
                 // it's ambiguous. But if we assume bit 4 is 32-bit offset, offSize=4, objSize=1.
                 // Let's try to detect based on record length or other clues.
@@ -114,12 +114,12 @@ namespace DOSRE.Dasm
             return rec;
         }
 
-        private static List<LeFixupRecord> ParseAllRecordsForPage(byte[] stream, int start, int end)
+        private static List<LeFixupRecord> ParseAllRecordsForPage(byte[] stream, int start, int end, bool assumeLX)
         {
             var results = new List<LeFixupRecord>();
             var p = start;
             while (p < end) {
-                var rec = DecipherFixupRecord(stream, p, end);
+                var rec = DecipherFixupRecord(stream, p, end, assumeLX);
                 if (rec == null || rec.Value.RecordLength <= 0) break;
                 results.Add(rec.Value);
                 p += rec.Value.RecordLength;

@@ -221,6 +221,13 @@ namespace DOSRE.UI.impl
         private bool _bLeInsights;
 
         /// <summary>
+        ///     Export reconstructed LE object bytes.
+        ///     Specified with -LEEXPORTOBJ <index> <file.bin>
+        /// </summary>
+        private int? _leExportObjIndex;
+        private string _leExportObjFile;
+
+        /// <summary>
         ///     LE (DOS4GW) decompile (pseudo-C)
         ///     Specified with the -ledecomp or -ledecompile argument
         ///     For LE inputs, emits best-effort pseudo-C derived from the LE disassembly output.
@@ -370,6 +377,15 @@ namespace DOSRE.UI.impl
                             break;
                         case "LEINSIGHTS":
                             _bLeInsights = true;
+                            break;
+                        case "LEEXPORTOBJ":
+                            if (i + 2 >= _args.Length)
+                                throw new Exception("Error: -LEEXPORTOBJ requires <index> <file.bin>");
+                            if (!int.TryParse(_args[i + 1], out var objIdx) || objIdx <= 0)
+                                throw new Exception("Error: -LEEXPORTOBJ <index> must be a positive integer");
+                            _leExportObjIndex = objIdx;
+                            _leExportObjFile = _args[i + 2];
+                            i += 2;
                             break;
                         case "LERENDERLIMIT":
                             if (i + 1 >= _args.Length)
@@ -889,6 +905,18 @@ namespace DOSRE.UI.impl
 
                 if (leOk)
                 {
+                    if (_leExportObjIndex.HasValue && !string.IsNullOrWhiteSpace(_leExportObjFile))
+                    {
+                        if (LEDisassembler.TryExportObjectBytes(_sInputFile, _bLeScanMz, _leExportObjIndex.Value, _leExportObjFile, out var expErr))
+                        {
+                            _logger.Info($"LE: Exported object {_leExportObjIndex.Value} bytes to {_leExportObjFile}");
+                        }
+                        else
+                        {
+                            _logger.Warn($"Warning: failed to export object {_leExportObjIndex.Value}: {expErr}");
+                        }
+                    }
+
                     if (wantLeCallGraph)
                     {
                         var analysis = LEDisassembler.GetLastAnalysis();

@@ -30,6 +30,83 @@ namespace DOSRE.Dasm
     {
         private static readonly Logger _logger = LogManager.GetCurrentClassLogger(typeof(CustomLogger));
 
+        public static bool TryExportObjectBytes(string inputFile, bool leScanMzOverlayFallback, int objectIndex, string outputFile, out string error)
+        {
+            error = string.Empty;
+
+            if (string.IsNullOrWhiteSpace(inputFile) || !File.Exists(inputFile))
+            {
+                error = "Input file not found";
+                return false;
+            }
+
+            if (objectIndex <= 0)
+            {
+                error = "Object index must be >= 1";
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(outputFile))
+            {
+                error = "Output file is required";
+                return false;
+            }
+
+            try
+            {
+                var fileBytes = File.ReadAllBytes(inputFile);
+                if (!TryFindLEHeaderOffset(fileBytes, allowMzOverlayScanFallback: leScanMzOverlayFallback, out var leHeaderOffset))
+                {
+                    error = "LE header not found";
+                    return false;
+                }
+
+                if (!TryParseHeader(fileBytes, leHeaderOffset, out var header, out error))
+                    return false;
+
+                var objects = ParseObjects(fileBytes, header);
+                var obj = objects.FirstOrDefault(o => o.Index == (uint)objectIndex);
+                if (obj.Index == 0)
+                {
+                    error = $"Object {objectIndex} not found";
+                    return false;
+                }
+
+                if (obj.VirtualSize == 0 || obj.PageCount == 0)
+                {
+                    error = $"Object {objectIndex} has no data (vsize/pages are zero)";
+                    return false;
+                }
+
+                var pageMap = ParseObjectPageMap(fileBytes, header);
+                var dataPagesBase = header.HeaderOffset + (int)header.DataPagesOffset;
+                if (dataPagesBase <= 0 || dataPagesBase >= fileBytes.Length)
+                {
+                    error = "Invalid LE data pages offset";
+                    return false;
+                }
+
+                var bytes = ReconstructObjectBytes(fileBytes, header, pageMap, dataPagesBase, obj);
+                if (bytes == null || bytes.Length == 0)
+                {
+                    error = $"Failed to reconstruct object {objectIndex} bytes";
+                    return false;
+                }
+
+                var dir = Path.GetDirectoryName(outputFile);
+                if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+
+                File.WriteAllBytes(outputFile, bytes);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
         public static bool TryBuildReachabilityMap(string inputFile, bool leScanMzOverlayFallback, out LeReachabilityInfo map, out string error)
         {
             map = null;
@@ -65,6 +142,16 @@ namespace DOSRE.Dasm
                     return false;
                 }
 
+                // Fixup table references
+                byte[] fixupRecordStream = null;
+                uint[] fixupPageOffsets = null;
+                if (header.FixupPageTableOffset > 0 && header.FixupRecordTableOffset > 0)
+                {
+                    TryGetFixupStreams(fileBytes, header, out fixupPageOffsets, out fixupRecordStream);
+                }
+
+                var importModules = TryParseImportModules(fileBytes, header);
+
                 var objBytesByIndex = new Dictionary<int, byte[]>();
                 foreach (var o in objects)
                 {
@@ -82,6 +169,7 @@ namespace DOSRE.Dasm
                 var execObjStarts = new Dictionary<int, uint[]>();
                 var execObjLens = new Dictionary<int, ushort[]>();
                 var execObjDecodedEndLinear = new Dictionary<int, uint>();
+                var execObjFixupsByInsAddr = new Dictionary<int, Dictionary<uint, List<LEFixup>>>();
 
                 foreach (var obj in objects)
                 {
@@ -117,6 +205,17 @@ namespace DOSRE.Dasm
                         insIndexByAddr[off] = ii;
                         starts[ii] = off;
                         lens[ii] = (ushort)Math.Max(1, instructions[ii].Length);
+                    }
+
+                    // Collect fixups for instruction-aware branch target resolution.
+                    if (fixupRecordStream != null && fixupPageOffsets != null)
+                    {
+                        var objFixups = ParseFixupsForWindow(header, objects, pageMap, importModules, fileBytes, fixupPageOffsets, fixupRecordStream, objBytes, obj, startLinear, unchecked(startLinear + (uint)maxLen));
+                        if (objFixups.Count > 0)
+                        {
+                            var fixLookup = BuildFixupLookupByInstruction(instructions, objFixups.OrderBy(f => f.SiteLinear).ToList());
+                            execObjFixupsByInsAddr[obj.Index] = fixLookup;
+                        }
                     }
 
                     execObjIndices.Add(obj.Index);
@@ -222,7 +321,11 @@ namespace DOSRE.Dasm
                     if (idx + 1 < instructions.Count)
                         next = (uint)instructions[idx + 1].Offset;
 
-                    if (TryGetRelativeBranchTarget(ins, out var target, out var isCall))
+                    List<LEFixup> fixupsHere = null;
+                    if (execObjFixupsByInsAddr.TryGetValue(objIndex, out var fixLookup))
+                        fixLookup.TryGetValue((uint)ins.Offset, out fixupsHere);
+
+                    if (TryGetRelativeBranchTarget(ins, fixupsHere, out var target, out var isCall))
                     {
                         if (isCall)
                         {
@@ -505,6 +608,7 @@ namespace DOSRE.Dasm
             }
         }
         private static void BuildBasicBlocks(List<Instruction> instructions, uint startLinear, uint endLinear, HashSet<uint> functionStarts, HashSet<uint> labelTargets,
+            Dictionary<uint, List<LEFixup>> fixupsByInsAddr,
             out HashSet<uint> blockStarts, out Dictionary<uint, List<uint>> blockPreds)
         {
             blockStarts = new HashSet<uint>();
@@ -525,7 +629,10 @@ namespace DOSRE.Dasm
                 var addr = (uint)ins.Offset;
                 var nextAddr = addr + (uint)ins.Length;
 
-                if (TryGetRelativeBranchTarget(ins, out var target, out var isCall))
+                List<LEFixup> fixupsHere = null;
+                fixupsByInsAddr?.TryGetValue(addr, out fixupsHere);
+
+                if (TryGetRelativeBranchTarget(ins, fixupsHere, out var target, out var isCall))
                 {
                     if (!isCall)
                     {
@@ -565,7 +672,8 @@ namespace DOSRE.Dasm
             HashSet<uint> blockStarts,
             Dictionary<uint, List<LEFixup>> fixupsByInsAddr,
             Dictionary<uint, string> globalSymbols,
-            Dictionary<uint, string> stringSymbols)
+            Dictionary<uint, string> stringSymbols,
+            List<LEObject> objects = null)
         {
             var summaries = new Dictionary<uint, FunctionSummary>();
             if (instructions == null || instructions.Count == 0 || functionStarts == null || functionStarts.Count == 0)
@@ -621,20 +729,40 @@ namespace DOSRE.Dasm
 
                     summary.InstructionCount++;
 
-                    if (TryGetRelativeBranchTarget(ins, out var target, out var isCall) && isCall)
+                    List<LEFixup> fixupsHere = null;
+                    fixupsByInsAddr?.TryGetValue(addr, out fixupsHere);
+
+                    if (TryGetRelativeBranchTarget(ins, fixupsHere, out var target, out var isCall) && isCall)
                         summary.Calls.Add(target);
 
-                    if (fixupsByInsAddr != null && fixupsByInsAddr.TryGetValue(addr, out var fx) && fx != null && fx.Count > 0)
+                    if (fixupsHere != null && fixupsHere.Count > 0)
                     {
-                        foreach (var f in fx)
+                        foreach (var f in fixupsHere)
                         {
-                            if (!f.Value32.HasValue)
-                                continue;
+                            // Prefer internal target linear when available.
+                            if (objects != null && (f.TargetType == 0 || f.TargetType == 3) && f.TargetObject.HasValue && f.TargetOffset.HasValue)
+                            {
+                                var targetObj = objects.FirstOrDefault(o => o.Index == (uint)f.TargetObject.Value);
+                                if (targetObj.Index != 0)
+                                {
+                                    var targetLinear = unchecked(targetObj.BaseAddress + f.TargetOffset.Value);
+                                    if (globalSymbols != null && globalSymbols.TryGetValue(targetLinear, out var g2))
+                                        summary.Globals.Add(g2);
+                                    if (stringSymbols != null && stringSymbols.TryGetValue(targetLinear, out var s2))
+                                        summary.Strings.Add(s2);
+                                    continue;
+                                }
+                            }
 
-                            if (globalSymbols != null && globalSymbols.TryGetValue(f.Value32.Value, out var g))
-                                summary.Globals.Add(g);
-                            if (stringSymbols != null && stringSymbols.TryGetValue(f.Value32.Value, out var s))
-                                summary.Strings.Add(s);
+                            // Fallback: use site value.
+                            if (f.Value32.HasValue)
+                            {
+                                var v = f.Value32.Value;
+                                if (globalSymbols != null && globalSymbols.TryGetValue(v, out var g))
+                                    summary.Globals.Add(g);
+                                if (stringSymbols != null && stringSymbols.TryGetValue(v, out var s))
+                                    summary.Strings.Add(s);
+                            }
                         }
                     }
                 }

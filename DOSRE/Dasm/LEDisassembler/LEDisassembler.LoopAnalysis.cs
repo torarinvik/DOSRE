@@ -26,6 +26,7 @@ namespace DOSRE.Dasm
             uint endAddrExclusive,
             int startIdx,
             int endIdxExclusive,
+            Dictionary<uint, List<LEFixup>> fixupsByInsAddr,
             out List<LoopSummary> loops)
         {
             loops = new List<LoopSummary>();
@@ -44,7 +45,10 @@ namespace DOSRE.Dasm
                 if (addr < startAddr || addr >= endAddrExclusive)
                     continue;
 
-                if (!TryGetRelativeBranchTarget(ins, out var target, out var isCall) || isCall)
+                List<LEFixup> fixupsHere = null;
+                fixupsByInsAddr?.TryGetValue(addr, out fixupsHere);
+
+                if (!TryGetRelativeBranchTarget(ins, fixupsHere, out var target, out var isCall) || isCall)
                     continue;
 
                 if (target < startAddr || target >= endAddrExclusive)

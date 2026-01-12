@@ -7,6 +7,54 @@ namespace DOSRE.Dasm
 {
     public static partial class LEDisassembler
     {
+        private static bool TryGetFixupFieldStartDelta32(Instruction ins, LEFixup f, out int fieldDelta, out string kind)
+        {
+            fieldDelta = 0;
+            kind = string.Empty;
+
+            if (ins?.Bytes == null || ins.Bytes.Length < 4 || f == null)
+                return false;
+
+            var insStart = (uint)ins.Offset;
+            var rawDelta = unchecked((int)(f.SiteLinear - insStart));
+            if (rawDelta < 0 || rawDelta >= ins.Bytes.Length)
+                return false;
+
+            // Watcom/DOS4GW LE/LX fixup sites are not always aligned to the field start.
+            // We have observed sites at the *end* of a 32-bit field (need to probe backwards)
+            // and also sites earlier in the instruction than the field (need to probe forwards).
+            var candidates = new[]
+            {
+                rawDelta,
+                rawDelta - 1,
+                rawDelta - 2,
+                rawDelta - 3,
+                rawDelta + 1,
+                rawDelta + 2,
+                rawDelta + 3,
+            };
+
+            foreach (var cand in candidates)
+            {
+                if (cand < 0)
+                    continue;
+                if (cand + 4 > ins.Bytes.Length)
+                    continue;
+
+                if (!TryClassifyFixupKind(ins, cand, out var k))
+                    continue;
+
+                if (k == "disp32" || k == "imm32" || k == "imm32?")
+                {
+                    fieldDelta = cand;
+                    kind = k;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         private static List<LEFixup> GetFixupsForInstruction(List<LEFixup> fixups, Instruction ins, ref int idx)
         {
             if (fixups == null || fixups.Count == 0 || ins == null)
@@ -48,6 +96,11 @@ namespace DOSRE.Dasm
             {
                 var delta = unchecked((int)(f.SiteLinear - insStart));
                 var kind = TryClassifyFixupKind(ins, delta, out var k) ? k : "unk";
+                if (kind == "unk" && TryGetFixupFieldStartDelta32(ins, f, out var d2, out var k2))
+                {
+                    delta = d2;
+                    kind = k2;
+                }
 
                 var targetStr = string.Empty;
                 if (f.TargetType == 0 || f.TargetType == 3) // Internal

@@ -202,9 +202,10 @@ namespace DOSRE.Dasm
                 return false;
             }
 
-            if (fileBytes[headerOffset] != (byte)'L' || fileBytes[headerOffset + 1] != (byte)'E')
+            if ((fileBytes[headerOffset] != (byte)'L' || (fileBytes[headerOffset + 1] != (byte)'E' && fileBytes[headerOffset + 1] != (byte)'X')) &&
+                (fileBytes[headerOffset] != (byte)'L' || fileBytes[headerOffset + 1] != (byte)'C'))
             {
-                error = "Invalid LE signature";
+                error = "Invalid LE/LX/LC signature";
                 return false;
             }
 
@@ -218,6 +219,10 @@ namespace DOSRE.Dasm
             }
 
             header.HeaderOffset = headerOffset;
+            header.Signature = ReadLEUInt16(fileBytes, headerOffset);
+
+            var isLX = fileBytes[headerOffset + 1] == (byte)'X';
+            var isLC = fileBytes[headerOffset + 1] == (byte)'C';
 
             header.ModuleFlags = ReadLEUInt32(fileBytes, headerOffset + 0x10);
             header.NumberOfPages = ReadLEUInt32(fileBytes, headerOffset + 0x14);
@@ -232,26 +237,19 @@ namespace DOSRE.Dasm
             header.ObjectCount = ReadLEUInt32(fileBytes, headerOffset + 0x44);
             header.ObjectPageMapOffset = ReadLEUInt32(fileBytes, headerOffset + 0x48);
 
-            // Heuristic for flavor detection:
-            // IBM LX has Resident Name Table at 0x58, Entry Table at 0x5C, Imports at 0x70.
-            // Standard/Watcom LE often has Resident Name at 0x50, Entry at 0x54, Imports at 0x58.
-            
-            var resNameLE = ReadLEUInt32(fileBytes, headerOffset + 0x50);
-            var resNameLX = ReadLEUInt32(fileBytes, headerOffset + 0x58);
-            
-            if (resNameLE > 0 && resNameLE < header.PageSize && (resNameLX == 0 || resNameLX > 0x1000))
+            if (!isLX)
             {
-                // Likely Standard LE layout
-                header.ResidentNameTableOffset = resNameLE;
+                // Standard/Watcom LE layout
+                header.ResidentNameTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x50);
                 header.EntryTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x54);
                 header.ImportModuleTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x58);
                 header.ImportModuleTableEntries = ReadLEUInt32(fileBytes, headerOffset + 0x5C);
-                header.NonResidentNameTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x88); // Still 0x88?
+                header.NonResidentNameTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x88);
             }
             else
             {
-                // Likely IBM LX layout
-                header.ResidentNameTableOffset = resNameLX;
+                // IBM LX layout
+                header.ResidentNameTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x58);
                 header.EntryTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x5C);
                 header.ImportModuleTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x70);
                 header.ImportModuleTableEntries = ReadLEUInt32(fileBytes, headerOffset + 0x74);
@@ -260,7 +258,7 @@ namespace DOSRE.Dasm
 
             header.FixupPageTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x68);
             header.FixupRecordTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x6C);
-            header.ImportProcTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x78);
+            header.ImportProcTableOffset = !isLX ? ReadLEUInt32(fileBytes, headerOffset + 0x60) : ReadLEUInt32(fileBytes, headerOffset + 0x78);
             header.DataPagesOffset = ReadLEUInt32(fileBytes, headerOffset + 0x80);
 
             _logger.Info($"LE Header: FixupPageTableOffset=0x{header.FixupPageTableOffset:X}, FixupRecordTableOffset=0x{header.FixupRecordTableOffset:X}");

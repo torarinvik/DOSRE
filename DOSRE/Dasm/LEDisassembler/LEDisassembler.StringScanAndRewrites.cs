@@ -130,10 +130,14 @@ namespace DOSRE.Dasm
             var rewritten = insText;
             foreach (var f in fixupsHere)
             {
-                if (!f.Value32.HasValue)
+                if (!TryGetFixupFieldStartDelta32(ins, f, out var delta, out var kind))
                     continue;
 
-                var raw = f.Value32.Value;
+                // Strings typically appear as imm32 addresses (push/mov) but can be disp32 too.
+                if (kind != "imm32" && kind != "imm32?" && kind != "disp32")
+                    continue;
+
+                var raw = BitConverter.ToUInt32(ins.Bytes, delta);
                 string sym = null;
 
                 // Common case: raw already equals a linear string address.
@@ -164,14 +168,6 @@ namespace DOSRE.Dasm
                 }
 
                 if (string.IsNullOrEmpty(sym))
-                    continue;
-
-                var delta = unchecked((int)(f.SiteLinear - (uint)ins.Offset));
-                if (!TryClassifyFixupKind(ins, delta, out var kind))
-                    continue;
-
-                // Strings typically appear as imm32 addresses (push/mov) but can be disp32 too.
-                if (kind != "imm32" && kind != "imm32?" && kind != "disp32")
                     continue;
 
                 var needleLower = $"0x{raw:x}";

@@ -57,7 +57,7 @@ namespace DOSRE.Dasm
                 if (recEnd > fixupRecordStream.Length)
                     continue;
 
-                foreach (var rec in ParseAllRecordsForPage(fixupRecordStream, recStart, recEnd))
+                foreach (var rec in ParseAllRecordsForPage(fixupRecordStream, recStart, recEnd, header.Signature == 0x584C))
                 {
                     var srcType = rec.SourceType;
                     var flags = rec.TargetFlags;
@@ -211,6 +211,13 @@ namespace DOSRE.Dasm
                         // Only keep fixups within the current disassembly window.
                         if (sourceLinear >= startLinear && sourceLinear < endLinear)
                         {
+                            uint? targetLinear = null;
+                            if (mappedObj.HasValue && mappedObj.Value > 0 && mappedObj.Value <= objects.Count)
+                            {
+                                var targObj = objects[mappedObj.Value - 1];
+                                targetLinear = targObj.BaseAddress + mappedOff;
+                            }
+
                             // Only shift the site address if we actually found a mapped in-module pointer at a nearby delta.
                             // Otherwise, keep the original record site (more stable, avoids misattributing to opcode bytes).
                             var siteLinear = mappedObj.HasValue ? unchecked(sourceLinear + (uint)chosenDelta) : sourceLinear;
@@ -224,6 +231,7 @@ namespace DOSRE.Dasm
                                 Value32 = value32,
                                 TargetObject = mappedObj,
                                 TargetOffset = mappedObj.HasValue ? (uint?)mappedOff : null,
+                                TargetLinear = targetLinear,
                                 Type = srcType,
                                 Flags = flags,
                                 TargetType = rec.TargetType,
@@ -394,7 +402,7 @@ namespace DOSRE.Dasm
                 if (recEnd > fixupRecordStream.Length)
                     continue;
 
-                foreach (var rec in ParseAllRecordsForPage(fixupRecordStream, recStart, recEnd))
+                foreach (var rec in ParseAllRecordsForPage(fixupRecordStream, recStart, recEnd, header.Signature == 0x584C))
                 {
                     var p = rec.RecordStreamOffset;
                     var stride = rec.RecordLength;

@@ -17,23 +17,41 @@ namespace DOSRE.Dasm
         }
 
         private static void RecordSymbolXrefs(Dictionary<string, HashSet<uint>> symXrefs, uint from, List<LEFixup> fixupsHere,
-            Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> resourceSymbols)
+            Dictionary<uint, string> globalSymbols, Dictionary<uint, string> stringSymbols, Dictionary<uint, string> resourceSymbols, List<LEObject> objects = null)
         {
             if (symXrefs == null || fixupsHere == null || fixupsHere.Count == 0)
                 return;
 
             foreach (var f in fixupsHere)
             {
-                if (!f.Value32.HasValue)
-                    continue;
+                // Prefer target linear for internal fixups.
+                if (objects != null && (f.TargetType == 0 || f.TargetType == 3) && f.TargetObject.HasValue && f.TargetOffset.HasValue)
+                {
+                    var targetObj = objects.Find(o => o.Index == (uint)f.TargetObject.Value);
+                    if (targetObj.Index != 0)
+                    {
+                        var v2 = unchecked(targetObj.BaseAddress + f.TargetOffset.Value);
+                        if (globalSymbols != null && globalSymbols.TryGetValue(v2, out var g2))
+                            AddXref(symXrefs, g2, from);
+                        if (stringSymbols != null && stringSymbols.TryGetValue(v2, out var s2))
+                            AddXref(symXrefs, s2, from);
+                        if (resourceSymbols != null && resourceSymbols.TryGetValue(v2, out var r2))
+                            AddXref(symXrefs, r2, from);
+                        continue;
+                    }
+                }
 
-                var v = f.Value32.Value;
-                if (globalSymbols != null && globalSymbols.TryGetValue(v, out var g))
-                    AddXref(symXrefs, g, from);
-                if (stringSymbols != null && stringSymbols.TryGetValue(v, out var s))
-                    AddXref(symXrefs, s, from);
-                if (resourceSymbols != null && resourceSymbols.TryGetValue(v, out var r))
-                    AddXref(symXrefs, r, from);
+                // Fallback: use raw value when present.
+                if (f.Value32.HasValue)
+                {
+                    var v = f.Value32.Value;
+                    if (globalSymbols != null && globalSymbols.TryGetValue(v, out var g))
+                        AddXref(symXrefs, g, from);
+                    if (stringSymbols != null && stringSymbols.TryGetValue(v, out var s))
+                        AddXref(symXrefs, s, from);
+                    if (resourceSymbols != null && resourceSymbols.TryGetValue(v, out var r))
+                        AddXref(symXrefs, r, from);
+                }
             }
         }
 

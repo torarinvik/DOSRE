@@ -370,6 +370,15 @@ namespace DOSRE.Dasm
                 var instructions = execObjInstructions[obj.Index];
                 var insIndexByAddr = execObjInsIndexByAddr[obj.Index];
 
+                List<LEFixup> objFixups = null;
+                Dictionary<uint, List<LEFixup>> fixupsByInsAddr = null;
+                if (leFixups && fixupRecordStream != null && fixupPageOffsets != null)
+                {
+                    objFixups = ParseFixupsForWindow(header, objects, pageMap, importModules, fileBytes, fixupPageOffsets, fixupRecordStream, null, obj, startLinear, endLinear);
+                    if (objFixups != null && objFixups.Count > 0)
+                        fixupsByInsAddr = BuildFixupLookupByInstruction(instructions, objFixups.OrderBy(f => f.SiteLinear).ToList());
+                }
+
                 // Add obvious prologues as function starts (best-effort sequence scan).
                 if (leInsights)
                 {
@@ -386,7 +395,10 @@ namespace DOSRE.Dasm
 
                 foreach (var ins in instructions)
                 {
-                    if (TryGetRelativeBranchTarget(ins, out var target, out var isCall))
+                    List<LEFixup> fixupsHere = null;
+                    fixupsByInsAddr?.TryGetValue((uint)ins.Offset, out fixupsHere);
+
+                    if (TryGetRelativeBranchTarget(ins, fixupsHere, out var target, out var isCall))
                     {
                         // Map targets across objects; only keep ones that land in executable objects we decoded.
                         if (TryMapLinearToObject(objects, target, out var targetObjIndex, out var _) && execObjIndices.Contains(targetObjIndex))
@@ -598,6 +610,11 @@ namespace DOSRE.Dasm
                         jumpXrefs[kv.Key] = kv.Value;
                 }
 
+                // Map instruction offset -> fixups that touch bytes within that instruction.
+                Dictionary<uint, List<LEFixup>> fixupsByInsAddr = null;
+                if (leInsights && objFixups != null && objFixups.Count > 0)
+                    fixupsByInsAddr = BuildFixupLookupByInstruction(instructions, objFixups.OrderBy(f => f.SiteLinear).ToList());
+
                 // Function boundary refinement (best-effort): split merged adjacent functions by
                 // detecting a classic prolog right after a RET (contiguous code layout).
                 if (leInsights && functionStarts.Count > 0)
@@ -619,7 +636,7 @@ namespace DOSRE.Dasm
                 Dictionary<uint, List<uint>> blockPreds = null;
                 if (leInsights)
                 {
-                    BuildBasicBlocks(instructions, startLinear, endLinear, functionStarts, labelTargets, out blockStarts, out blockPreds);
+                    BuildBasicBlocks(instructions, startLinear, endLinear, functionStarts, labelTargets, fixupsByInsAddr, out blockStarts, out blockPreds);
 
                     // Snapshot per-function CFG for exporters (best-effort, derived from relative branches only).
                     if (analysis != null && functionStarts.Count > 0 && blockStarts != null && blockStarts.Count > 0 && blockPreds != null && blockPreds.Count > 0)
@@ -628,11 +645,6 @@ namespace DOSRE.Dasm
 
                 // Second pass: render with labels and inline xref hints.
                 var sortedFixups = objFixups == null ? null : objFixups.OrderBy(f => f.SiteLinear).ToList();
-
-                // Map instruction offset -> fixups that touch bytes within that instruction.
-                Dictionary<uint, List<LEFixup>> fixupsByInsAddr = null;
-                if (leInsights && sortedFixups != null && sortedFixups.Count > 0)
-                    fixupsByInsAddr = BuildFixupLookupByInstruction(instructions, sortedFixups);
 
                 HashSet<uint> resourceGetterTargets = null;
                 if (leInsights)
@@ -657,12 +669,6 @@ namespace DOSRE.Dasm
                                 symName = $"g_{targetLinear:X8}";
                             globalSymbols[targetLinear] = symName;
                         }
-
-                        // Also ensure the SITE VALUE maps to that symbol, so ApplyGlobalSymbolRewrites works.
-                        if (!globalSymbols.ContainsKey(siteValue))
-                        {
-                            globalSymbols[siteValue] = symName;
-                        }
                     }
 
                     // (We skip printing a per-object EQU table here to avoid incorrectEQU entries mapping site-values to linear names without context).
@@ -683,7 +689,7 @@ namespace DOSRE.Dasm
                 {
                     var swSumm = Stopwatch.StartNew();
                     _logger.Info($"LE: Summarizing {functionStarts.Count} functions (insights)...");
-                    funcSummaries = SummarizeFunctions(instructions, functionStarts, blockStarts, fixupsByInsAddr, globalSymbols, stringSymbols);
+                    funcSummaries = SummarizeFunctions(instructions, functionStarts, blockStarts, fixupsByInsAddr, globalSymbols, stringSymbols, objects);
                     _logger.Info($"LE: Function summaries complete in {swSumm.ElapsedMilliseconds} ms");
 
                     if (analysis != null && funcSummaries != null && funcSummaries.Count > 0)
@@ -1052,7 +1058,7 @@ namespace DOSRE.Dasm
                             {
                                 var endAddr = (si + 1 < sortedStarts.Count) ? sortedStarts[si + 1] : uint.MaxValue;
                                 var l0 = Stopwatch.GetTimestamp();
-                                InferLoopsForFunction(instructions, insIndexByAddr, sortedBlockStarts, startAddr, endAddr, startIdx, endIdx, out var loops);
+                                InferLoopsForFunction(instructions, insIndexByAddr, sortedBlockStarts, startAddr, endAddr, startIdx, endIdx, fixupsByInsAddr, out var loops);
                                 var l1 = Stopwatch.GetTimestamp();
                                 var lt = l1 - l0;
                                 if (lt > 0)
@@ -1157,7 +1163,7 @@ namespace DOSRE.Dasm
                             if (blockStarts != null)
                             {
                                 var endAddr = (si + 1 < sortedStarts.Count) ? sortedStarts[si + 1] : uint.MaxValue;
-                                InferLoopsForFunction(instructions, insIndexByAddr, sortedBlockStarts, startAddr, endAddr, startIdx, endIdx, out var loops);
+                                InferLoopsForFunction(instructions, insIndexByAddr, sortedBlockStarts, startAddr, endAddr, startIdx, endIdx, fixupsByInsAddr, out var loops);
                                 loopSum = FormatLoopSummaryForFunction(loops);
 
                                 if (loops != null && loops.Count > 0)
@@ -1624,7 +1630,10 @@ namespace DOSRE.Dasm
                     // Update IO tracking on the best-effort rewritten instruction text (so it can capture g_... symbols).
                     UpdateIoTrackingFromInstruction(insText, ref lastDxImm16, ref lastDxSource, ref lastAlImm8, ref lastAxImm16);
 
-                    if (TryGetRelativeBranchTarget(ins, out var branchTarget, out var isCall2))
+                    var haveFixups = sortedFixups != null && sortedFixups.Count > 0;
+                    var fixupsHere = haveFixups ? GetFixupsForInstruction(sortedFixups, ins, ref fixupIdx) : new List<LEFixup>(0);
+
+                    if (TryGetRelativeBranchTarget(ins, fixupsHere, out var branchTarget, out var isCall2))
                     {
                         string label;
                         if (isCall2 && analysis != null && analysis.ExportedNames.TryGetValue(branchTarget, out var expName))
@@ -1637,9 +1646,6 @@ namespace DOSRE.Dasm
 
                     if (leInsights && currentFunctionStart != 0 && funcLoopLatchHints != null && funcLoopLatchHints.TryGetValue(currentFunctionStart, out var byLatch2) && byLatch2 != null && byLatch2.TryGetValue(addr, out var ll) && !string.IsNullOrWhiteSpace(ll))
                         insText += $" ; {ll}";
-
-                    var haveFixups = sortedFixups != null && sortedFixups.Count > 0;
-                    var fixupsHere = haveFixups ? GetFixupsForInstruction(sortedFixups, ins, ref fixupIdx) : new List<LEFixup>(0);
 
                     if (leGlobals && globalSymbols != null && globalSymbols.Count > 0 && fixupsHere.Count > 0)
                         insText = ApplyGlobalSymbolRewrites(ins, insText, fixupsHere, globalSymbols, objects);
@@ -1655,7 +1661,7 @@ namespace DOSRE.Dasm
 
                         // Record xrefs from fixups -> symbols
                         if (symXrefs != null && fixupsHere.Count > 0)
-                            RecordSymbolXrefs(symXrefs, (uint)ins.Offset, fixupsHere, globalSymbols, stringSymbols, resourceSymbols);
+                            RecordSymbolXrefs(symXrefs, (uint)ins.Offset, fixupsHere, globalSymbols, stringSymbols, resourceSymbols, objects);
 
                         var callHint = TryGetCallArgHint(instructions, insIndexByAddr, ins, fixupsHere, globalSymbols, stringSymbols);
                         if (!string.IsNullOrEmpty(callHint))
@@ -2035,6 +2041,46 @@ namespace DOSRE.Dasm
             if (instructions == null || instructions.Count == 0 || sortedFixups == null || sortedFixups.Count == 0)
                 return null;
 
+            static bool Is32BitRelocKind(string kind)
+            {
+                if (string.IsNullOrWhiteSpace(kind))
+                    return false;
+                kind = kind.Trim();
+                return kind == "imm32" || kind == "imm32?" || kind == "disp32";
+            }
+
+            static bool TryNormalizeFixupSiteToFieldStart(Instruction ins, LEFixup f)
+            {
+                if (ins.Bytes == null || ins.Bytes.Length < 4)
+                    return false;
+
+                var begin = (uint)ins.Offset;
+                var rawDelta = unchecked((int)(f.SiteLinear - begin));
+                if (rawDelta < 0 || rawDelta >= ins.Bytes.Length)
+                    return false;
+
+                // Some LE/LX fixup records (notably Watcom/DOS4GW variants) appear to report the *end* of the relocated field.
+                // Try shifting back up to 3 bytes so the delta lands on a recognizable 32-bit field start.
+                for (var back = 0; back <= 3; back++)
+                {
+                    var candDelta = rawDelta - back;
+                    if (candDelta < 0)
+                        continue;
+                    if (candDelta + 4 > ins.Bytes.Length)
+                        continue;
+
+                    if (!TryClassifyFixupKind(ins, candDelta, out var kind) || !Is32BitRelocKind(kind))
+                        continue;
+
+                    f.SiteDelta = (sbyte)Math.Min(sbyte.MaxValue, Math.Max(sbyte.MinValue, candDelta - rawDelta));
+                    f.SiteLinear = unchecked(begin + (uint)candDelta);
+                    f.Value32 = BitConverter.ToUInt32(ins.Bytes, candDelta);
+                    return true;
+                }
+
+                return false;
+            }
+
             // Build a sorted list of instruction start addresses for binary search.
             var starts = new uint[instructions.Count];
             for (var i = 0; i < instructions.Count; i++)
@@ -2059,6 +2105,10 @@ namespace DOSRE.Dasm
                 // Site must fall within the instruction byte range.
                 if (site < begin || site >= begin + len)
                     continue;
+
+                // Normalize the site to the start of the relocated field when possible.
+                // This improves operand rewriting (globals/strings) and avoids spurious replacements.
+                TryNormalizeFixupSiteToFieldStart(ins, f);
 
                 if (!map.TryGetValue(begin, out var list))
                     map[begin] = list = new List<LEFixup>();

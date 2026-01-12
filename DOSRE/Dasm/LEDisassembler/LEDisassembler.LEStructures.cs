@@ -14,6 +14,7 @@ namespace DOSRE.Dasm
             public uint? Value32;
             public int? TargetObject;
             public uint? TargetOffset;
+            public uint? TargetLinear;
             public byte Type;
             public byte Flags;
 
@@ -24,6 +25,7 @@ namespace DOSRE.Dasm
 
         private struct LEHeader
         {
+            public ushort Signature;
             public int HeaderOffset;
             public string ModuleName;
             public uint ModuleFlags;

@@ -7,6 +7,39 @@ namespace DOSRE.Dasm
 {
     public static partial class LEDisassembler
     {
+        private static bool TryGetRelativeBranchTarget(Instruction ins, List<LEFixup> fixupsHere, out uint target, out bool isCall)
+        {
+            target = 0;
+            isCall = false;
+
+            if (ins == null || ins.Bytes == null || ins.Bytes.Length < 2)
+                return false;
+
+            // NEW: If we have a fixup at this site that provides a target, use it.
+            // This is critical for LE because relative branches often encode dummy
+            // targets (like 0x0 or un-relocated file offsets) that the loader replaces.
+            if (fixupsHere != null && fixupsHere.Count > 0)
+            {
+                foreach (var fix in fixupsHere)
+                {
+                    if (fix.TargetLinear.HasValue && (fix.Type == 0x05 || fix.Type == 0x06 || fix.Type == 0x07))
+                    {
+                        // Check if the fixup site overlaps with the typical displacement field of the instruction.
+                        // For most calls/jmps, it starts after the opcode at index 1.
+                        if (fix.SiteLinear >= (uint)ins.Offset + 1 && fix.SiteLinear < (uint)ins.Offset + (uint)ins.Length)
+                        {
+                            target = fix.TargetLinear.Value;
+                            isCall = ins.Mnemonic == ud_mnemonic_code.UD_Icall;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // Fallback to standard relativo logic if no fixup resolved it.
+            return TryGetRelativeBranchTarget(ins, out target, out isCall);
+        }
+
         private static bool TryGetRelativeBranchTarget(Instruction ins, out uint target, out bool isCall)
         {
             target = 0;
