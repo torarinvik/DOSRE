@@ -11276,12 +11276,10 @@ namespace DOSRE.Dasm
 
                 SkipHiByteObjIdxDecode:;
 
-                    // Some DOS4GW fixup records appear to be 8 bytes (no specU32) and carry a byte-swapped 16-bit
-                    // object-relative offset in specU16. For a small remaining bucket we can classify safely when:
-                    // - type/flags match a known family
-                    // - the fixup site value is 0 (placeholder)
-                    // - the inferred offset maps uniquely into exactly one object
-                    if (targetKind == "unknown" && hasSpecU16 && hasSpecU16b && !hasSpecU32)
+                    // Some DOS4GW fixup record families appear to carry a byte-swapped 16-bit object-relative offset
+                    // in specU16 and a tagged u16 in specU16b. For a small remaining bucket we can classify safely
+                    // when type/flags match and the inferred offset maps uniquely into exactly one object.
+                    if (targetKind == "unknown" && hasSpecU16 && hasSpecU16b)
                     {
                         if (srcType == 0x07 && flags == 0x00)
                         {
@@ -11302,7 +11300,7 @@ namespace DOSRE.Dasm
                         // Observed: some 8-byte records encode the target object index in specU16b with high bits set,
                         // and the target object-relative offset in specU16. Decode only when the object index is explicit
                         // and in-range.
-                        if (targetKind == "unknown" && srcType == 0x40 && flags == 0x09)
+                        if (targetKind == "unknown" && !hasSpecU32 && srcType == 0x40 && flags == 0x09)
                         {
                             // Treat 0xC000 as a tag and the low 14 bits as an object index.
                             if (unchecked((_specU16b & 0xC000)) == 0xC000)
@@ -11463,6 +11461,25 @@ namespace DOSRE.Dasm
                                 targetKind = "far";
                                 // Pack as selector:offset (hi16:lo16) for stable diffing; targetLinear/targetObject remain null.
                                 targetOff = unchecked(((uint)sel16 << 16) | (uint)off16);
+                            }
+                        }
+
+                        // Another observed DOS4GW family appears to pack a 16:16 payload directly in specU32, with
+                        // lo16 == specU16b (selector) and hi16 == offset. Keep this strictly scoped and only classify
+                        // when we also see a 0 placeholder at the fixup site.
+                        if (targetKind == "unknown" && srcType == 0x09 && flags == 0x01 && hasSpecU32 && hasSpecU16b && siteV32.HasValue && siteV32.Value == 0)
+                        {
+                            // Require internal consistency: lo16(specU32) mirrors specU16b.
+                            if (unchecked((ushort)(_specU32 & 0xFFFF)) == _specU16b)
+                            {
+                                var off16 = (ushort)unchecked((_specU32 >> 16) & 0xFFFF);
+                                var sel16 = _specU16b;
+
+                                if (off16 != 0 || sel16 != 0)
+                                {
+                                    targetKind = "far";
+                                    targetOff = unchecked(((uint)sel16 << 16) | (uint)off16);
+                                }
                             }
                         }
 
