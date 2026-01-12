@@ -102,8 +102,10 @@ namespace DOSRE.Dasm
 
                     if (objOffset >= 0)
                     {
-                        // Recover small object-relative offsets first (common for DOS4GW resource/string regions like 0xE0000+off).
-                        // This avoids accidentally treating opcode+imm byte sequences as in-module pointers.
+                        // Prefer mapped in-module pointers. If we find one at a nearby delta (records can be off-by-a-few),
+                        // treat that delta as the actual relocated field start.
+                        var currentObjIsExecutable = (obj.Flags & 0x0004) != 0;
+
                         for (var delta = -3; delta <= 3; delta++)
                         {
                             var off = objOffset + delta;
@@ -111,35 +113,23 @@ namespace DOSRE.Dasm
                                 continue;
                             if (off + 4 > objBytes.Length)
                                 continue;
+
                             var v = ReadUInt32(objBytes, off);
-                            if (v != 0 && v < 0x10000)
+                            if (TryMapLinearToObject(objects, v, out var tobj, out var toff))
                             {
+                                if (currentObjIsExecutable)
+                                {
+                                    var tgt = objects.FirstOrDefault(o => o.Index == (uint)tobj);
+                                    var targetIsExecutable = tgt.Index != 0 && (tgt.Flags & 0x0004) != 0;
+                                    if (targetIsExecutable)
+                                        continue;
+                                }
+
                                 value32 = v;
                                 chosenDelta = delta;
+                                mappedObj = tobj;
+                                mappedOff = toff;
                                 break;
-                            }
-                        }
-
-                        // If no small offset candidate, try to find a 32-bit in-module pointer near the fixup site.
-                        // Some records point into the middle of an imm32/disp32 field, so probe both backward and forward.
-                        if (!value32.HasValue)
-                        {
-                            for (var delta = -3; delta <= 3; delta++)
-                            {
-                                var off = objOffset + delta;
-                                if (off < 0)
-                                    continue;
-                                if (off + 4 > objBytes.Length)
-                                    continue;
-                                var v = ReadUInt32(objBytes, off);
-                                if (TryMapLinearToObject(objects, v, out var tobj, out var toff))
-                                {
-                                    value32 = v;
-                                    chosenDelta = delta;
-                                    mappedObj = tobj;
-                                    mappedOff = toff;
-                                    break;
-                                }
                             }
                         }
 
@@ -150,15 +140,13 @@ namespace DOSRE.Dasm
                                 value32 = ReadUInt32(objBytes, objOffset);
                             else if (objOffset + 2 <= objBytes.Length)
                                 value16 = ReadUInt16(objBytes, objOffset);
+
+                            // Keep small object-relative offsets only when they come from the actual record site.
+                            // Avoid scanning neighboring bytes for these, as it can accidentally interpret opcode/disp/imm overlap.
+                            if (value32.HasValue && value32.Value >= 0x10000)
+                                value32 = null;
                         }
                     }
-
-                    // For DOS4GW/MS-DOS game workflows we mostly care about internal pointers.
-                    // If we couldn't map a 32-bit value into a known object, it often represents
-                    // opcode bytes or plain constants. However, DOS4GW fixups frequently also
-                    // carry small object-relative offsets (e.g., into a C/D/E/F0000 string/resource region).
-                    if (value32.HasValue && !mappedObj.HasValue && value32.Value >= 0x10000)
-                        value32 = null;
 
                     var desc = $"type=0x{srcType:X2} flags=0x{flags:X2} stride={stride}";
 
@@ -203,7 +191,9 @@ namespace DOSRE.Dasm
                     // Only keep fixups within the current disassembly window.
                     if (sourceLinear >= startLinear && sourceLinear < endLinear)
                     {
-                        var siteLinear = unchecked(sourceLinear + (uint)chosenDelta);
+                        // Only shift the site address if we actually found a mapped in-module pointer at a nearby delta.
+                        // Otherwise, keep the original record site (more stable, avoids misattributing to opcode bytes).
+                        var siteLinear = mappedObj.HasValue ? unchecked(sourceLinear + (uint)chosenDelta) : sourceLinear;
                         fixups.Add(new LEFixup
                         {
                             SourceLinear = sourceLinear,

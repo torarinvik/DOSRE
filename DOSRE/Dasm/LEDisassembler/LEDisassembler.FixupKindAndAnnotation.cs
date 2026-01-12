@@ -109,6 +109,177 @@ namespace DOSRE.Dasm
             if (p >= b.Length)
                 return false;
 
+            static bool TryGetModrmAndSibDisp32(byte[] bytes, int modrmIndex, out int dispOff)
+            {
+                dispOff = 0;
+                if (bytes == null)
+                    return false;
+                if (modrmIndex < 0 || modrmIndex >= bytes.Length)
+                    return false;
+
+                var modrm = bytes[modrmIndex];
+                var mod = (modrm >> 6) & 0x3;
+                var rm = modrm & 0x7;
+
+                // mod=00 rm=101 => disp32
+                if (mod == 0 && rm == 5)
+                {
+                    dispOff = modrmIndex + 1;
+                    return dispOff + 4 <= bytes.Length;
+                }
+
+                // SIB present when rm==100 (in 32-bit addr mode)
+                if (rm == 4)
+                {
+                    var sibIndex = modrmIndex + 1;
+                    if (sibIndex >= bytes.Length)
+                        return false;
+                    var sib = bytes[sibIndex];
+                    var baseReg = sib & 0x7;
+
+                    // mod=00 base=101 => disp32
+                    if (mod == 0 && baseReg == 5)
+                    {
+                        dispOff = sibIndex + 1;
+                        return dispOff + 4 <= bytes.Length;
+                    }
+
+                    // mod=10 => disp32 after SIB (base+index+disp32)
+                    if (mod == 2)
+                    {
+                        dispOff = sibIndex + 1;
+                        return dispOff + 4 <= bytes.Length;
+                    }
+
+                    return false;
+                }
+
+                // mod=10 => disp32 after ModRM
+                if (mod == 2)
+                {
+                    dispOff = modrmIndex + 1;
+                    return dispOff + 4 <= bytes.Length;
+                }
+
+                return false;
+            }
+
+            static bool TryGetDispOffset(byte[] bytes, int modrmIndex, out int dispOff, out int dispSize)
+            {
+                dispOff = 0;
+                dispSize = 0;
+                if (bytes == null)
+                    return false;
+                if (modrmIndex < 0 || modrmIndex >= bytes.Length)
+                    return false;
+
+                var modrm = bytes[modrmIndex];
+                var mod = (modrm >> 6) & 0x3;
+                var rm = modrm & 0x7;
+
+                var p0 = modrmIndex + 1;
+
+                if (rm == 4)
+                {
+                    // SIB present
+                    var sibIndex = p0;
+                    if (sibIndex >= bytes.Length)
+                        return false;
+                    var sib = bytes[sibIndex];
+                    var baseReg = sib & 0x7;
+
+                    if (mod == 0 && baseReg == 5)
+                    {
+                        dispOff = sibIndex + 1;
+                        dispSize = 4;
+                        return dispOff + dispSize <= bytes.Length;
+                    }
+                    if (mod == 1)
+                    {
+                        dispOff = sibIndex + 1;
+                        dispSize = 1;
+                        return dispOff + dispSize <= bytes.Length;
+                    }
+                    if (mod == 2)
+                    {
+                        dispOff = sibIndex + 1;
+                        dispSize = 4;
+                        return dispOff + dispSize <= bytes.Length;
+                    }
+
+                    return false;
+                }
+
+                if (mod == 0 && rm == 5)
+                {
+                    dispOff = modrmIndex + 1;
+                    dispSize = 4;
+                    return dispOff + dispSize <= bytes.Length;
+                }
+
+                if (mod == 1)
+                {
+                    dispOff = modrmIndex + 1;
+                    dispSize = 1;
+                    return dispOff + dispSize <= bytes.Length;
+                }
+
+                if (mod == 2)
+                {
+                    dispOff = modrmIndex + 1;
+                    dispSize = 4;
+                    return dispOff + dispSize <= bytes.Length;
+                }
+
+                return false;
+            }
+
+            static bool TryGetImmOffsetAfterModrm(byte[] bytes, int modrmIndex, out int immOff)
+            {
+                immOff = 0;
+                if (bytes == null)
+                    return false;
+                if (modrmIndex < 0 || modrmIndex >= bytes.Length)
+                    return false;
+
+                var modrm = bytes[modrmIndex];
+                var mod = (modrm >> 6) & 0x3;
+                var rm = modrm & 0x7;
+                var p = modrmIndex + 1;
+
+                // SIB
+                if (rm == 4)
+                {
+                    if (p >= bytes.Length)
+                        return false;
+                    var sib = bytes[p];
+                    var baseReg = sib & 0x7;
+                    p++;
+
+                    // disp sizes with SIB
+                    if (mod == 0 && baseReg == 5)
+                        p += 4;
+                    else if (mod == 1)
+                        p += 1;
+                    else if (mod == 2)
+                        p += 4;
+
+                    immOff = p;
+                    return immOff <= bytes.Length;
+                }
+
+                // disp sizes without SIB
+                if (mod == 0 && rm == 5)
+                    p += 4;
+                else if (mod == 1)
+                    p += 1;
+                else if (mod == 2)
+                    p += 4;
+
+                immOff = p;
+                return immOff <= bytes.Length;
+            }
+
             var op0 = b[p];
 
             // MOV moffs: A0-A3 (disp32 right after opcode in 32-bit addr mode)
@@ -118,6 +289,28 @@ namespace DOSRE.Dasm
                 if (fixupDelta == dispOff)
                 {
                     kind = "disp32";
+                    return true;
+                }
+            }
+
+            // MOV reg, imm32: B8-BF
+            if (op0 >= 0xB8 && op0 <= 0xBF)
+            {
+                var immOff = p + 1;
+                if (fixupDelta == immOff)
+                {
+                    kind = "imm32";
+                    return true;
+                }
+            }
+
+            // PUSH imm32: 68
+            if (op0 == 0x68)
+            {
+                var immOff = p + 1;
+                if (fixupDelta == immOff)
+                {
+                    kind = "imm32";
                     return true;
                 }
             }
@@ -142,38 +335,29 @@ namespace DOSRE.Dasm
             if (op0 == 0x80 || op0 == 0x81 || op0 == 0x83 || op0 == 0xC6 || op0 == 0xC7)
             {
                 var modrmIndex = opIndexEnd;
-                var modrm = b[modrmIndex];
-                var mod = (modrm >> 6) & 0x3;
-                var rm = modrm & 0x7;
-
-                // Only handle the simple disp32 form: mod=00 rm=101 (no SIB)
-                if (mod == 0 && rm == 5)
+                if (TryGetDispOffset(b, modrmIndex, out var dispOffAny, out var dispSizeAny) && fixupDelta == dispOffAny)
                 {
-                    var dispOff = modrmIndex + 1;
-                    var afterDisp = dispOff + 4;
+                    kind = dispSizeAny == 1 ? "disp8" : "disp32";
+                    return true;
+                }
+                if (TryGetModrmAndSibDisp32(b, modrmIndex, out var dispOff) && fixupDelta == dispOff)
+                {
+                    kind = "disp32";
+                    return true;
+                }
 
-                    if (fixupDelta == dispOff)
+                if (TryGetImmOffsetAfterModrm(b, modrmIndex, out var immOff))
+                {
+                    // Immediate offset depends on opcode.
+                    if ((op0 == 0x81 || op0 == 0xC7) && fixupDelta == immOff)
                     {
-                        kind = "disp32";
+                        kind = "imm32";
                         return true;
                     }
-
-                    // Immediate offset depends on opcode.
-                    if (op0 == 0x81 || op0 == 0xC7)
+                    if ((op0 == 0x80 || op0 == 0x83 || op0 == 0xC6) && fixupDelta == immOff)
                     {
-                        if (fixupDelta == afterDisp)
-                        {
-                            kind = "imm32";
-                            return true;
-                        }
-                    }
-                    else if (op0 == 0x80 || op0 == 0x83 || op0 == 0xC6)
-                    {
-                        if (fixupDelta == afterDisp)
-                        {
-                            kind = "imm8";
-                            return true;
-                        }
+                        kind = "imm8";
+                        return true;
                     }
                 }
             }
@@ -182,20 +366,15 @@ namespace DOSRE.Dasm
             if (op0 == 0x8B || op0 == 0x89 || op0 == 0x8D)
             {
                 var modrmIndex = opIndexEnd;
-                if (modrmIndex < b.Length)
+                if (TryGetDispOffset(b, modrmIndex, out var dispOffAny, out var dispSizeAny) && fixupDelta == dispOffAny)
                 {
-                    var modrm = b[modrmIndex];
-                    var mod = (modrm >> 6) & 0x3;
-                    var rm = modrm & 0x7;
-                    if (mod == 0 && rm == 5)
-                    {
-                        var dispOff = modrmIndex + 1;
-                        if (fixupDelta == dispOff)
-                        {
-                            kind = "disp32";
-                            return true;
-                        }
-                    }
+                    kind = dispSizeAny == 1 ? "disp8" : "disp32";
+                    return true;
+                }
+                if (TryGetModrmAndSibDisp32(b, modrmIndex, out var dispOff) && fixupDelta == dispOff)
+                {
+                    kind = "disp32";
+                    return true;
                 }
             }
 
