@@ -11183,6 +11183,36 @@ namespace DOSRE.Dasm
                                 }
                             }
                         }
+
+                        // Observed DOS4GW family: the low byte of specU16 mirrors the record type, specU16b encodes an
+                        // explicit object index in its high byte (and a small sub-type/flags byte in its low byte), and
+                        // specU32 packs (lo16 == specU16b) and (hi16 == object-relative offset).
+                        // Decode only when these internal consistency checks pass.
+                        if (targetKind == "unknown" && srcType == 0x10 && flags == 0x05 && hasSpecU32)
+                        {
+                            if (unchecked((byte)(_specU16 & 0x00FF)) == srcType)
+                            {
+                                var objIdx = (int)(unchecked((_specU16b >> 8) & 0x00FF));
+                                var sub = (byte)unchecked(_specU16b & 0x00FF);
+                                if (sub <= 0x0F && objIdx >= 1 && objIdx <= objects.Count)
+                                {
+                                    if (unchecked((ushort)(_specU32 & 0xFFFF)) == _specU16b)
+                                    {
+                                        var off = (uint)unchecked((_specU32 >> 16) & 0xFFFF);
+                                        var sz = ObjSize(objects, objIdx);
+                                        if (sz == 0 || off <= sz + 0x1000)
+                                        {
+                                            targetKind = "internal";
+                                            targetObj = objIdx;
+                                            targetOff = off;
+                                            var baseAddr = ObjBase(objects, objIdx);
+                                            if (baseAddr != 0)
+                                                targetLinear = unchecked(baseAddr + off);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Some DOS4GW fixup record families appear to encode an explicit object index in the high byte of specU16,
