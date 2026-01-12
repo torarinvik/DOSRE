@@ -59,13 +59,15 @@ namespace DOSRE.Dasm
             public readonly HashSet<uint> Calls = new HashSet<uint>();
             public readonly HashSet<string> Globals = new HashSet<string>(StringComparer.Ordinal);
             public readonly HashSet<string> Strings = new HashSet<string>(StringComparer.Ordinal);
+            public readonly HashSet<ushort> IoPorts = new HashSet<ushort>();
 
             public string ToComment()
             {
                 var calls = Calls.Count > 0 ? string.Join(", ", Calls.OrderBy(x => x).Take(12).Select(x => $"func_{x:X8}")) : "(none)";
                 var globs = Globals.Count > 0 ? string.Join(", ", Globals.OrderBy(x => x).Take(12)) : "(none)";
                 var strs = Strings.Count > 0 ? string.Join(", ", Strings.OrderBy(x => x).Take(12)) : "(none)";
-                return $"; SUMMARY: ins={InstructionCount} blocks={BlockCount} calls={calls} globals={globs} strings={strs}";
+                var ioports = IoPorts.Count > 0 ? string.Join(", ", IoPorts.OrderBy(x => x).Take(6).Select(x => KnownIoPorts.TryGetValue(x, out var name) ? $"{name}(0x{x:X})" : $"0x{x:X}")) : "(none)";
+                return $"; SUMMARY: ins={InstructionCount} blocks={BlockCount} calls={calls} globals={globs} strings={strs} IO={ioports}";
             }
         }
 

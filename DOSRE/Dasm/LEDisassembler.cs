@@ -718,6 +718,7 @@ namespace DOSRE.Dasm
                 if (startIdx > endIdx)
                     (startIdx, endIdx) = (endIdx, startIdx);
 
+                ushort? currentDx = null;
                 for (var ii = startIdx; ii < endIdx; ii++)
                 {
                     var ins = instructions[ii];
@@ -726,6 +727,12 @@ namespace DOSRE.Dasm
                         continue;
                     if (addr >= end)
                         break;
+
+                    var raw = InsText(ins);
+                    if (TryParseMovDxImmediate(raw, out var dxImm))
+                        currentDx = dxImm;
+                    if (TryParseIoAccess(raw, currentDx, out var port, out _, out _))
+                        summary.IoPorts.Add(port);
 
                     summary.InstructionCount++;
 
@@ -875,37 +882,28 @@ namespace DOSRE.Dasm
             }
 
             // Best-effort register-arg note (common in Watcom/DOS4GW style code)
-            // This doesn't assume a calling convention; it simply records obvious setup like "movzx edx, word [0x....]" right before call.
             var regArgNotes = new List<string>();
-            var regsToTrack = new[] { "edx", "eax", "ebx", "ecx" };
+            var regsToTrack = new[] { "edx", "eax", "ebx", "ecx", "esi", "edi" };
 
             foreach (var r in regsToTrack)
             {
-                for (var i = idx - 1; i >= 0 && i >= idx - 6; i--)
+                if (TryResolveRegisterValueBefore(instructions, idx, r, out var rawLit))
                 {
-                    var t = InsText(instructions[i]).Trim();
-                    if (TryParseSimpleRegSetup(t, r, out var rhs))
+                    var note = $"{r}=0x{rawLit:X}";
+
+                    if (TryResolveStringAddressFromRaw(rawLit, stringSymbols, objects, out var _, out var sym))
                     {
-                        var note = $"{r}={rhs}";
-                        
-                        // Heuristic: if rhs is a hex literal, try to resolve it to a string preview.
-                        var m = HexLiteralRegex.Match(rhs);
-                        if (m.Success && TryParseHexUInt(m.Value, out var rawLit))
-                        {
-                            if (TryResolveStringAddressFromRaw(rawLit, stringSymbols, objects, out var _, out var sym))
-                            {
-                                if (stringPreview != null && stringPreview.TryGetValue(rawLit, out var preview))
-                                    note = $"{r}={sym} (\"{preview}\")";
-                                else
-                                    note = $"{r}={sym}";
-                            }
-                        }
-                        
-                        regArgNotes.Add(note);
-                        break;
+                        if (stringPreview != null && stringPreview.TryGetValue(rawLit, out var preview))
+                            note = $"{r}={sym} (\"{preview}\")";
+                        else
+                            note = $"{r}={sym}";
                     }
-                    if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase))
-                        break;
+                    else if (globalSymbols != null && globalSymbols.TryGetValue(rawLit, out var gsym))
+                    {
+                        note = $"{r}={gsym}";
+                    }
+                    
+                    regArgNotes.Add(note);
                 }
             }
 

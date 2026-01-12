@@ -35,8 +35,24 @@ namespace DOSRE.Dasm
             // PIC / PIT (IRQ/timers)
             [0x0020] = "PIC1 Command",
             [0x0021] = "PIC1 Data",
+            [0x00A0] = "PIC2 Command",
+            [0x00A1] = "PIC2 Data",
             [0x0040] = "PIT Channel 0 Data",
+            [0x0041] = "PIT Channel 1 Data",
+            [0x0042] = "PIT Channel 2 Data",
             [0x0043] = "PIT Mode/Command",
+
+            // Sound / Game ports
+            [0x0201] = "Game Port",
+            [0x0388] = "AdLib FM Synthesis",
+            [0x0220] = "SoundBlaster Base (220h)",
+            [0x0224] = "SoundBlaster Mixer Board Index",
+            [0x0225] = "SoundBlaster Mixer Board Data",
+            [0x0226] = "SoundBlaster DSP Reset",
+            [0x022A] = "SoundBlaster DSP Read Data",
+            [0x022C] = "SoundBlaster DSP Write Data/Command",
+            [0x022E] = "SoundBlaster DSP Read Buffer Status",
+            [0x0330] = "MPU-401 (MIDI)",
         };
 
         private static bool TryParseMovDxImmediate(string insText, out ushort dxImm)

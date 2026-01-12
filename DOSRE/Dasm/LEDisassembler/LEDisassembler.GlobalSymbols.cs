@@ -149,17 +149,45 @@ namespace DOSRE.Dasm
                     continue;
                 }
 
-                // lea r, [base+0xdisp] or lea r, [base+disp]
-                var mlea = Regex.Match(t, @"^lea\s+(?<dst>e[a-z]{2}),\s*\[(?<base>e[a-z]{2})\+0x(?<disp>[0-9a-fA-F]+)\]$", RegexOptions.IgnoreCase);
+                // lea r, [base+0xdisp] or lea r, [base+disp] or lea r, [base-disp]
+                var mlea = Regex.Match(t, @"^lea\s+(?<dst>e[a-z]{2}),\s*\[(?<base>e[a-z]{2})(?:\s*(?<sign>[\+\-])\s*(?<disp>0x[0-9a-fA-F]+|[0-9]+))?\]$", RegexOptions.IgnoreCase);
                 if (mlea.Success)
                 {
                     var dst = mlea.Groups["dst"].Value.ToLowerInvariant();
                     var bas = mlea.Groups["base"].Value.ToLowerInvariant();
-                    var disp = Convert.ToUInt32(mlea.Groups["disp"].Value, 16);
+                    var sign = mlea.Groups["sign"].Value;
+                    var dispStr = mlea.Groups["disp"].Value;
+                    uint disp = 0;
+                    if (!string.IsNullOrEmpty(dispStr))
+                    {
+                        if (dispStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                            disp = Convert.ToUInt32(dispStr[2..], 16);
+                        else
+                            disp = uint.Parse(dispStr);
+                    }
+
                     if (known.TryGetValue(bas, out var baseKnown) && baseKnown && vals.TryGetValue(bas, out var baseVal))
                     {
                         known[dst] = true;
-                        vals[dst] = unchecked(baseVal + disp);
+                        vals[dst] = sign == "-" ? unchecked(baseVal - disp) : unchecked(baseVal + disp);
+                    }
+                    else
+                    {
+                        known[dst] = false;
+                    }
+                    continue;
+                }
+
+                // lea r, [0xabs] or lea r, [abs]
+                var mleaAbs = Regex.Match(t, @"^lea\s+(?<dst>e[a-z]{2}),\s*\[(?<abs>0x[0-9a-fA-F]+|[0-9]+)\]$", RegexOptions.IgnoreCase);
+                if (mleaAbs.Success)
+                {
+                    var dst = mleaAbs.Groups["dst"].Value.ToLowerInvariant();
+                    var absStr = mleaAbs.Groups["abs"].Value;
+                    if (TryParseImm32(absStr, out var abs))
+                    {
+                        known[dst] = true;
+                        vals[dst] = abs;
                     }
                     else
                     {

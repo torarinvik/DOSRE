@@ -61,14 +61,67 @@ namespace DOSRE.Dasm
             if (MatchesPattern(body, "mov ah, 0x2c", "int 0x21"))
                 return "__get_time";
 
+            // Pattern: mov ah, 0x2a; int 0x21
+            if (MatchesPattern(body, "mov ah, 0x2a", "int 0x21"))
+                return "__get_date";
+
             // Pattern: mov ah, 0x30; int 0x21
             if (MatchesPattern(body, "mov ah, 0x30", "int 0x21"))
                 return "__get_dos_version";
 
-            // Pattern: mov eax, 0x0800; int 0x31 (Physical Address Mapping)
+            // Pattern: mov ax, 0x35XX; int 0x21 (Get Interrupt Vector)
+            if (MatchesPattern(body, "mov ah, 0x35", "int 0x21"))
+                return "__get_interrupt_vector";
+
+            // Pattern: mov ax, 0x25XX; int 0x21 (Set Interrupt Vector)
+            if (MatchesPattern(body, "mov ah, 0x25", "int 0x21"))
+                return "__set_interrupt_vector";
+
+            // Pattern: mov ah, 0x3d; int 0x21 (Open File)
+            if (MatchesPattern(body, "mov ah, 0x3d", "int 0x21"))
+                return "__open_file";
+
+            // Pattern: mov ah, 0x3e; int 0x21 (Close File)
+            if (MatchesPattern(body, "mov ah, 0x3e", "int 0x21"))
+                return "__close_file";
+
+            // Pattern: mov ah, 0x3f; int 0x21 (Read File)
+            if (MatchesPattern(body, "mov ah, 0x3f", "int 0x21"))
+                return "__read_file";
+
+            // Pattern: mov ah, 0x40; int 0x21 (Write File)
+            if (MatchesPattern(body, "mov ah, 0x40", "int 0x21"))
+                return "__write_file";
+
+            // Pattern: mov ax, 0x0800; int 0x31 (Physical Address Mapping)
             if (MatchesPattern(body, "mov ax, 0x0800", "int 0x31") ||
                 MatchesPattern(body, "mov eax, 0x00000800", "int 0x31"))
                 return "__dpmi_map_physical";
+
+            // Pattern: mov ax, 0x0000; int 0x31 (Allocate LDT Descriptor)
+            if (MatchesPattern(body, "mov ax, 0x0000", "int 0x31") ||
+                MatchesPattern(body, "mov eax, 0x00000000", "int 0x31"))
+                return "__dpmi_allocate_ldt_descriptors";
+
+            // Pattern: mov ax, 0x0501; int 0x31 (Allocate Memory Block)
+            if (MatchesPattern(body, "mov ax, 0x0501", "int 0x31") ||
+                MatchesPattern(body, "mov eax, 0x00000501", "int 0x31"))
+                return "__dpmi_allocate_memory_block";
+
+            // Pattern: mov ax, 0x0502; int 0x31 (Free Memory Block)
+            if (MatchesPattern(body, "mov ax, 0x0502", "int 0x31") ||
+                MatchesPattern(body, "mov eax, 0x00000502", "int 0x31"))
+                return "__dpmi_free_memory_block";
+
+            // Watcom stack check pattern:
+            //   cmp esp, [....]
+            //   jae ....
+            //   call __STK
+            if (MatchesPattern(body, "cmp esp", "jae", "call"))
+            {
+                // This is likely the stack overflow handler.
+                // We don't name the function itself __STK, but if it calls it...
+            }
 
             return null;
         }
