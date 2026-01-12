@@ -68,6 +68,18 @@ namespace DOSRE.Dasm
                 ? new LeAnalysis { InputFile = inputFile, EntryLinear = entryLinear }
                 : null;
 
+            if (analysis != null)
+            {
+                var entryPoints = ParseEntryPoints(fileBytes, header, objects);
+                foreach (var kvp in header.Exports)
+                {
+                    if (kvp.Key != 0 && entryPoints.TryGetValue(kvp.Key, out var addr))
+                    {
+                        analysis.ExportedNames[addr] = kvp.Value;
+                    }
+                }
+            }
+
             List<string> importModules = null;
             byte[] fixupRecordStream = null;
             uint[] fixupPageOffsets = null;
@@ -1412,7 +1424,14 @@ namespace DOSRE.Dasm
                     if (functionStarts.Contains(addr))
                     {
                         sb.AppendLine();
-                        sb.AppendLine($"func_{addr:X8}:");
+                        if (analysis != null && analysis.ExportedNames.TryGetValue(addr, out var expName))
+                        {
+                            sb.AppendLine($"{expName}: ; func_{addr:X8}");
+                        }
+                        else
+                        {
+                            sb.AppendLine($"func_{addr:X8}:");
+                        }
 
                         currentFunctionStart = addr;
 
@@ -1607,7 +1626,12 @@ namespace DOSRE.Dasm
 
                     if (TryGetRelativeBranchTarget(ins, out var branchTarget, out var isCall2))
                     {
-                        var label = isCall2 ? $"func_{branchTarget:X8}" : $"loc_{branchTarget:X8}";
+                        string label;
+                        if (isCall2 && analysis != null && analysis.ExportedNames.TryGetValue(branchTarget, out var expName))
+                            label = expName;
+                        else
+                            label = isCall2 ? $"func_{branchTarget:X8}" : $"loc_{branchTarget:X8}";
+
                         insText += $" ; {(isCall2 ? "call" : "jmp")} {label}";
                     }
 

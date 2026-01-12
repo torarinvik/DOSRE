@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+
 namespace DOSRE.Dasm
 {
     public static partial class LEDisassembler
@@ -44,6 +46,7 @@ namespace DOSRE.Dasm
             public uint ResidentNameTableOffset;
             public uint NonResidentNameTableOffset;
             public uint EntryTableOffset;
+            public Dictionary<ushort, string> Exports;
         }
 
         private struct LEObject

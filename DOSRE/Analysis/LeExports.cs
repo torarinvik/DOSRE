@@ -296,13 +296,20 @@ namespace DOSRE.Analysis
             if (analysis == null)
                 throw new ArgumentNullException(nameof(analysis));
 
+            string GetFuncName(uint addr)
+            {
+                if (analysis.ExportedNames != null && analysis.ExportedNames.TryGetValue(addr, out var name))
+                    return name;
+                return FuncName(addr);
+            }
+
             var functions = (analysis.Functions ?? new Dictionary<uint, LEDisassembler.LeFunctionInfo>())
                 .Values
                 .OrderBy(f => f.Start)
                 .Select(f => new LeCallGraphFunction
                 {
                     addr = Hex(f.Start),
-                    name = FuncName(f.Start),
+                    name = GetFuncName(f.Start),
                     ins = f.InstructionCount,
                     blocks = f.BlockCount,
                     calls = (f.Calls ?? new List<uint>()).OrderBy(x => x).Select(Hex).ToArray(),
@@ -354,7 +361,7 @@ namespace DOSRE.Analysis
                 .ThenBy(kv => kv.Key)
                 .Take(20)
                 .Where(kv => kv.Value > 0)
-                .Select(kv => new LeCallGraphTopEntry { addr = Hex(kv.Key), name = FuncName(kv.Key), count = kv.Value })
+                .Select(kv => new LeCallGraphTopEntry { addr = Hex(kv.Key), name = GetFuncName(kv.Key), count = kv.Value })
                 .ToArray();
 
             var topFanOut = outDegree
@@ -362,7 +369,7 @@ namespace DOSRE.Analysis
                 .ThenBy(kv => kv.Key)
                 .Take(20)
                 .Where(kv => kv.Value > 0)
-                .Select(kv => new LeCallGraphTopEntry { addr = Hex(kv.Key), name = FuncName(kv.Key), count = kv.Value })
+                .Select(kv => new LeCallGraphTopEntry { addr = Hex(kv.Key), name = GetFuncName(kv.Key), count = kv.Value })
                 .ToArray();
 
             var sccAll = ComputeSccs(outEdges, nodes);
@@ -376,7 +383,7 @@ namespace DOSRE.Analysis
             {
                 input = analysis.InputFile,
                 entry = Hex(analysis.EntryLinear),
-                entryName = FuncName(analysis.EntryLinear),
+                entryName = GetFuncName(analysis.EntryLinear),
                 functions = functions,
                 roots = roots.Length > 0 ? roots : null,
                 orphans = orphans.Length > 0 ? orphans : null,

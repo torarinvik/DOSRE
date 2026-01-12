@@ -265,8 +265,27 @@ namespace DOSRE.Dasm
 
             _logger.Info($"LE Header: FixupPageTableOffset=0x{header.FixupPageTableOffset:X}, FixupRecordTableOffset=0x{header.FixupRecordTableOffset:X}");
 
-            // Extract module name from Resident/Non-Resident tables
-            header.ModuleName = ExtractModuleName(fileBytes, header);
+            // Parse Resident and Non-Resident name tables.
+            // Resident name table is relative to header.
+            header.Exports = ParseNameTable(fileBytes, header.HeaderOffset, header.ResidentNameTableOffset);
+            if (header.Exports.Count > 1) // 0 is always module name
+                _logger.Info($"LE: Found {header.Exports.Count - 1} resident names");
+            
+            // Non-resident name table is absolute file offset.
+            var nonResExports = ParseNameTable(fileBytes, 0, header.NonResidentNameTableOffset);
+            if (nonResExports.Count > 0)
+                _logger.Info($"LE: Found {nonResExports.Count} non-resident names");
+
+            foreach (var kvp in nonResExports)
+            {
+                if (!header.Exports.ContainsKey(kvp.Key))
+                    header.Exports[kvp.Key] = kvp.Value;
+            }
+
+            if (header.Exports.TryGetValue(0, out var modName))
+                header.ModuleName = modName.ToUpperInvariant();
+            else
+                header.ModuleName = "UNKNOWN";
 
             if (header.PageSize == 0 || header.ObjectCount == 0 || header.NumberOfPages == 0)
             {
@@ -282,26 +301,122 @@ namespace DOSRE.Dasm
             return true;
         }
 
-        private static string ExtractModuleName(byte[] fileBytes, LEHeader header)
+        private static Dictionary<ushort, string> ParseNameTable(byte[] fileBytes, int baseOffset, uint tableOffset)
         {
-            if (header.ResidentNameTableOffset == 0)
-                return "UNKNOWN";
+            var results = new Dictionary<ushort, string>();
+            if (tableOffset == 0)
+                return results;
 
-            var start = header.HeaderOffset + (int)header.ResidentNameTableOffset;
+            var start = baseOffset + (int)tableOffset;
             if (start < 0 || start >= fileBytes.Length)
-                return "UNKNOWN";
+                return results;
 
-            // Resident Name Table format:
-            // 1 byte: length
-            // N bytes: name
-            // 2 bytes: ordinal (0 for module name)
-            // Ends with length 0.
-            
-            int len = fileBytes[start];
-            if (len == 0 || start + 1 + len > fileBytes.Length)
-                return "UNKNOWN";
+            var pos = start;
+            while (pos < fileBytes.Length)
+            {
+                int len = fileBytes[pos];
+                if (len == 0)
+                    break;
 
-            return Encoding.ASCII.GetString(fileBytes, start + 1, len).ToUpperInvariant();
+                pos++;
+                if (pos + len + 2 > fileBytes.Length)
+                    break;
+
+                var name = Encoding.ASCII.GetString(fileBytes, pos, len);
+                pos += len;
+
+                var ordinal = ReadLEUInt16(fileBytes, pos);
+                pos += 2;
+
+                // Demangle if it looks like a Watcom symbol
+                name = DemangleWatcom(name);
+
+                if (!results.ContainsKey(ordinal))
+                    results[ordinal] = name;
+            }
+
+            return results;
+        }
+
+        private static Dictionary<ushort, uint> ParseEntryPoints(byte[] fileBytes, LEHeader header, List<LEObject> objects)
+        {
+            var results = new Dictionary<ushort, uint>();
+            if (header.EntryTableOffset == 0)
+                return results;
+
+            var start = header.HeaderOffset + (int)header.EntryTableOffset;
+            if (start < 0 || start >= fileBytes.Length)
+                return results;
+
+            var pos = start;
+            ushort ordinalBase = 1;
+
+            while (pos < fileBytes.Length)
+            {
+                var cnt = fileBytes[pos++];
+                if (cnt == 0)
+                    break;
+
+                var type = fileBytes[pos++];
+
+                if (type == 0x00) // Unused
+                {
+                    ordinalBase += cnt;
+                    continue;
+                }
+
+                for (var i = 0; i < cnt; i++)
+                {
+                    var ordinal = (ushort)(ordinalBase + i);
+
+                    if (type == 0x01 || type == 0x81) // 16-bit
+                    {
+                        var objIdx = fileBytes[pos++];
+                        pos++; // flags
+                        var off = ReadLEUInt16(fileBytes, pos);
+                        pos += 2;
+
+                        var obj = objects.Find(o => o.Index == objIdx);
+                        if (obj.Index != 0)
+                            results[ordinal] = unchecked((uint)(obj.BaseAddress + (uint)off));
+                    }
+                    else if (type == 0x03 || type == 0x83) // 32-bit
+                    {
+                        var objIdx = fileBytes[pos++];
+                        pos++; // flags
+                        var off = ReadLEUInt32(fileBytes, pos);
+                        pos += 4;
+
+                        var obj = objects.Find(o => o.Index == objIdx);
+                        if (obj.Index != 0)
+                            results[ordinal] = unchecked((uint)(obj.BaseAddress + off));
+                    }
+                    else if (type == 0x02 || type == 0x82) // Callgate
+                    {
+                        pos += 6;
+                    }
+                    else if (type == 0x04 || type == 0x84) // Forwarder
+                    {
+                        pos += 2; // mod index
+                        pos += 4; // value
+                    }
+                    else if (type == 0x05 || type == 0x85) // Absolute 32
+                    {
+                        var off = ReadLEUInt32(fileBytes, pos);
+                        pos += 4;
+                        results[ordinal] = off;
+                    }
+                    else
+                    {
+                        // Unknown bundle type
+                        break;
+                    }
+                }
+
+                ordinalBase += cnt;
+            }
+
+            return results;
         }
 
         private static List<string> TryParseImportModules(byte[] fileBytes, LEHeader header)
@@ -360,7 +475,8 @@ namespace DOSRE.Dasm
                     return string.Empty;
                 if (off + len > fileBytes.Length)
                     return string.Empty;
-                return Encoding.ASCII.GetString(fileBytes, off, len);
+                var name = Encoding.ASCII.GetString(fileBytes, off, len);
+                return DemangleWatcom(name);
             }
             catch
             {

@@ -32,6 +32,7 @@ namespace DOSRE.Dasm
         {
             public string InputFile { get; set; }
             public uint EntryLinear { get; set; }
+            public Dictionary<uint, string> ExportedNames { get; } = new Dictionary<uint, string>();
             public Dictionary<uint, LeFunctionInfo> Functions { get; } = new Dictionary<uint, LeFunctionInfo>();
             public Dictionary<uint, LeFunctionCfg> CfgByFunction { get; } = new Dictionary<uint, LeFunctionCfg>();
         }
