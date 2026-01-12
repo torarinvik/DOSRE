@@ -215,7 +215,7 @@ namespace DOSRE.Dasm
             // main.c can load the original image into guest linear memory and initialize esp.
             LEHeader leHeader = default;
             List<LEObject> leObjects = null;
-            uint[] lePageMap = null;
+            LEPageMapEntry[] lePageMap = null;
             bool haveLeMeta = false;
             string leOrigFilename = null;
             uint leDataPagesBase = 0;
@@ -1339,7 +1339,16 @@ namespace DOSRE.Dasm
                     for (var i = 0; i < lePageMap.Length; i++)
                     {
                         if (i % 16 == 0) mainSb.Append("    ");
-                        mainSb.Append($"0x{(ushort)lePageMap[i]:X4}, ");
+                        mainSb.Append($"0x{(ushort)lePageMap[i].Index:X4}, ");
+                        if (i % 16 == 15 || i == lePageMap.Length - 1) mainSb.AppendLine();
+                    }
+                    mainSb.AppendLine("};");
+                    mainSb.AppendLine();
+                    mainSb.AppendLine("static const uint8_t __le_page_map_flags[] = {");
+                    for (var i = 0; i < lePageMap.Length; i++)
+                    {
+                        if (i % 16 == 0) mainSb.Append("    ");
+                        mainSb.Append($"0x{lePageMap[i].Flags:X2}, ");
                         if (i % 16 == 15 || i == lePageMap.Length - 1) mainSb.AppendLine();
                     }
                     mainSb.AppendLine("};");
@@ -1778,6 +1787,9 @@ namespace DOSRE.Dasm
                     var stmt = TranslateInstructionToPseudoC(item, labelByAddr, pending, fn, functionsByName, otherFunctions, state);
                     if (!string.IsNullOrWhiteSpace(stmt))
                     {
+                        var fixups = ParseFixupsFromComment(item.Comment);
+                        stmt = ApplyFixupsToPseudoC(stmt, fixups, item, labelByAddr); // Applying Universal Fixup Resolver
+                        
                         // Only track labels referenced by actual code, not by the trailing commentSuffix ("// jmp loc_...").
                         // Otherwise, unresolved-target annotations would incorrectly fabricate "missing label" stubs.
                         var labelScanText = stmt;
@@ -2869,6 +2881,115 @@ namespace DOSRE.Dasm
             return false;
         }
 
+        private struct ParsedFixup
+        {
+            public string Kind;
+            public int Delta;
+            public string TargetKind;
+            public string TargetDesc;
+            public uint? TargetLinear;
+        }
+
+        private static List<ParsedFixup> ParseFixupsFromComment(string comment)
+        {
+            var results = new List<ParsedFixup>();
+            if (string.IsNullOrWhiteSpace(comment)) return results;
+
+            // Example: FIXUP: imm32 site+1 [import KERNEL32:ExitProcess] type=0x07 flags=0x10 | disp32 site+2 [internal] obj1+0x1000 (linear 0x01234567) ...
+            var fixupPart = comment;
+            var idx = comment.IndexOf("FIXUP:", StringComparison.OrdinalIgnoreCase);
+            if (idx >= 0) fixupPart = comment.Substring(idx + 6);
+            else if (comment.Contains("site+")) { /* internal record maybe */ }
+            else return results;
+
+            var parts = fixupPart.Split('|');
+            foreach (var p in parts)
+            {
+                var t = p.Trim();
+                // Regex for: kind site+N [target] ... (linear 0x...)
+                var m = Regex.Match(t, @"(?<kind>\w+)\s+site\+(?<delta>\d+)\s+\[(?<tk>[^\]]+)\](?<tdesc>[^(]*)(?:\(linear 0x(?<linear>[0-9A-Fa-f]+)\))?");
+                if (m.Success)
+                {
+                    var f = new ParsedFixup
+                    {
+                        Kind = m.Groups["kind"].Value,
+                        Delta = int.Parse(m.Groups["delta"].Value),
+                        TargetKind = m.Groups["tk"].Value,
+                        TargetDesc = m.Groups["tdesc"].Value.Trim()
+                    };
+                    if (m.Groups["linear"].Success)
+                        f.TargetLinear = uint.Parse(m.Groups["linear"].Value, System.Globalization.NumberStyles.HexNumber);
+                    results.Add(f);
+                }
+            }
+            return results;
+        }
+
+        private static string ApplyFixupsToPseudoC(string code, List<ParsedFixup> fixups, ParsedInsOrComment ins, Dictionary<string, string> labelByAddr)
+        {
+            if (fixups == null || fixups.Count == 0 || string.IsNullOrEmpty(code))
+                return code;
+
+            var result = code;
+            var isCall = ins.Mnemonic?.Equals("call", StringComparison.OrdinalIgnoreCase) == true;
+
+            foreach (var f in fixups)
+            {
+                if (f.TargetKind.StartsWith("import", StringComparison.OrdinalIgnoreCase))
+                {
+                    var impParts = f.TargetKind.Split(' ');
+                    if (impParts.Length > 1)
+                    {
+                        var proc = impParts[1].TrimEnd(']');
+                        if (proc.Contains(':')) proc = proc.Split(':')[1];
+                        
+                        // Heuristic: if it's a call, replace the whole target expr.
+                        if (isCall)
+                        {
+                            // code: target(args); // comment
+                            var callMatch = Regex.Match(result, @"^(?<target>.*)\((?<args>.*)\);(?<rem>.*)$");
+                            if (callMatch.Success)
+                            {
+                                result = $"{proc}({callMatch.Groups["args"].Value});{callMatch.Groups["rem"].Value}";
+                                continue;
+                            }
+                        }
+
+                        // Otherwise replace the hex literal.
+                        var hexMatch = Regex.Match(result, @"0x[0-9A-Fa-f]{4,8}u?");
+                        if (hexMatch.Success)
+                        {
+                            result = result.Replace(hexMatch.Value, proc);
+                        }
+                    }
+                }
+                else if (f.TargetLinear.HasValue)
+                {
+                    var hex = f.TargetLinear.Value.ToString("X8").ToUpperInvariant();
+                    string sym = null;
+                    if (_addrToString.TryGetValue(hex, out var s)) sym = s;
+                    else if (_addrToGlobal.TryGetValue(hex, out var g)) sym = g;
+                    else if (labelByAddr.TryGetValue(hex, out var lbl)) sym = $"(uintptr_t){lbl}";
+
+                    if (sym != null)
+                    {
+                        var hexLit = "0x" + hex + "u";
+                        if (result.Contains(hexLit))
+                        {
+                            result = result.Replace(hexLit, sym);
+                        }
+                        else
+                        {
+                            // Try variations without leading zeros or 'u'
+                            var shortHex = "0x" + f.TargetLinear.Value.ToString("X").ToUpperInvariant();
+                            result = result.Replace(shortHex, sym);
+                        }
+                    }
+                }
+            }
+            return result;
+        }
+
         private static string TranslateInstructionToPseudoC(
             ParsedInsOrComment ins,
             Dictionary<string, string> labelByAddr,
@@ -2881,6 +3002,8 @@ namespace DOSRE.Dasm
             var asm = ins.Asm;
             if (string.IsNullOrWhiteSpace(asm))
                 return string.Empty;
+
+            var fixups = ParseFixupsFromComment(ins.Comment);
 
             var commentSuffix = (string.IsNullOrWhiteSpace(ins.Comment) ? string.Empty : " // " + ins.Comment) + (string.IsNullOrWhiteSpace(ins.BytesHex) ? string.Empty : $" /* RAW: {ins.BytesHex} */");
 

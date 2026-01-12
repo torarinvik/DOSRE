@@ -9,7 +9,7 @@ namespace DOSRE.Dasm
         private static List<LEFixup> ParseFixupsForWindow(
             LEHeader header,
             List<LEObject> objects,
-            uint[] pageMap,
+            LEPageMapEntry[] pageMap,
             List<string> importModules,
             byte[] fileBytes,
             uint[] fixupPageOffsets,
@@ -38,7 +38,7 @@ namespace DOSRE.Dasm
                 if (logicalPageNumber1 == 0 || logicalPageNumber1 > header.NumberOfPages)
                     continue;
 
-                var physicalPage = pageMap[logicalPageIndex0]; // may be 0
+                var physicalPage = pageMap[logicalPageIndex0].Index; // may be 0
                 var pageLinearBase = unchecked(obj.BaseAddress + (uint)(i * header.PageSize));
 
                 // quick window reject
@@ -262,7 +262,7 @@ namespace DOSRE.Dasm
         private static List<LeFixupRecordInfo> ParseFixupTableForObject(
             LEHeader header,
             List<LEObject> objects,
-            uint[] pageMap,
+            LEPageMapEntry[] pageMap,
             List<string> importModules,
             byte[] fileBytes,
             uint[] fixupPageOffsets,
@@ -401,7 +401,7 @@ namespace DOSRE.Dasm
                 if (logicalPageNumber1 == 0 || logicalPageNumber1 > header.NumberOfPages)
                     continue;
 
-                var physicalPage = pageMap[logicalPageIndex0];
+                var physicalPage = pageMap[logicalPageIndex0].Index;
                 var pageLinearBase = unchecked(obj.BaseAddress + (uint)(i * header.PageSize));
 
                 var pageIndex0 = (int)(logicalPageNumber1 - 1);

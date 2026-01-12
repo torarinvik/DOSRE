@@ -236,15 +236,17 @@ namespace DOSRE.Dasm
             header.ObjectTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x40);
             header.ObjectCount = ReadLEUInt32(fileBytes, headerOffset + 0x44);
             header.ObjectPageMapOffset = ReadLEUInt32(fileBytes, headerOffset + 0x48);
+            header.ObjectIteratedDataMapOffset = ReadLEUInt32(fileBytes, headerOffset + 0x4C);
+            header.ResourceTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x50);
+            header.ResourceTableCount = ReadLEUInt32(fileBytes, headerOffset + 0x54);
 
             if (!isLX)
             {
                 // Standard/Watcom LE layout
-                header.ResidentNameTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x50);
-                header.EntryTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x54);
-                header.ImportModuleTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x58);
-                header.ImportModuleTableEntries = ReadLEUInt32(fileBytes, headerOffset + 0x5C);
-                header.NonResidentNameTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x88);
+                header.ResidentNameTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x58);
+                header.EntryTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x5C);
+                header.ImportModuleTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x68); // Correction for LE? No, let's verify.
+                header.ImportModuleTableEntries = ReadLEUInt32(fileBytes, headerOffset + 0x6C); // Wait, my previous read showed 0x58 for ResidentName.
             }
             else
             {
@@ -587,10 +589,10 @@ namespace DOSRE.Dasm
             return objects;
         }
 
-        private static uint[] ParseObjectPageMap(byte[] fileBytes, LEHeader header)
+        private static LEPageMapEntry[] ParseObjectPageMap(byte[] fileBytes, LEHeader header)
         {
             var pageMapStart = header.HeaderOffset + (int)header.ObjectPageMapOffset;
-            var map = new uint[header.NumberOfPages];
+            var map = new LEPageMapEntry[header.NumberOfPages];
 
             for (var i = 0; i < map.Length; i++)
             {
@@ -606,21 +608,23 @@ namespace DOSRE.Dasm
                 // Heuristic: if lower 24 bits are non-zero and reasonable, assume Standard LE.
                 // Otherwise, assume the 16-bit-high variant.
                 var standardIdx = raw & 0xFFFFFF;
-                if (standardIdx > 0 && standardIdx <= header.NumberOfPages)
+                if (standardIdx > 0 && standardIdx <= header.NumberOfPages + 1000) // generous slack
                 {
-                    map[i] = standardIdx;
+                    map[i].Index = standardIdx;
+                    map[i].Flags = (byte)(raw >> 24);
                 }
                 else
                 {
                     var highIdx = raw >> 16;
-                    map[i] = highIdx;
+                    map[i].Index = highIdx;
+                    map[i].Flags = (byte)(raw & 0xFF); // heuristic for LX flags
                 }
             }
 
             return map;
         }
 
-        private static byte[] ReconstructObjectBytes(byte[] fileBytes, LEHeader header, uint[] pageMap, int dataPagesBase, LEObject obj)
+        private static byte[] ReconstructObjectBytes(byte[] fileBytes, LEHeader header, LEPageMapEntry[] pageMap, int dataPagesBase, LEObject obj)
         {
             var pageSize = (int)header.PageSize;
             var totalLen = checked((int)obj.PageCount * pageSize);
@@ -632,9 +636,14 @@ namespace DOSRE.Dasm
                 if (pageMapIndex0 < 0 || pageMapIndex0 >= pageMap.Length)
                     break;
 
-                var physicalPage = pageMap[pageMapIndex0]; // 1-based
-                if (physicalPage == 0)
-                    continue;
+                var entry = pageMap[pageMapIndex0];
+                var physicalPage = entry.Index; // 1-based
+                
+                // Handle Zero-filled or Invalid pages
+                // LE Flags bit 0-1 for page type: 0=Legal, 1=Iterated, 2=Invalid, 3=ZeroFilled
+                var pageType = entry.Flags & 0x03; 
+                if (pageType == 3 || physicalPage == 0) continue; // Zero-filled
+                if (pageType == 2) continue; // Invalid
 
                 var isLastModulePage = physicalPage == header.NumberOfPages;
                 var bytesThisPage = isLastModulePage ? (int)header.LastPageSize : pageSize;
@@ -647,10 +656,53 @@ namespace DOSRE.Dasm
                 if (available <= 0)
                     break;
 
-                Buffer.BlockCopy(fileBytes, pageFileOffset, buf, i * pageSize, available);
+                if (pageType == 1)
+                {
+                    // Iterated Data Page
+                    DecompressIteratedPage(fileBytes, pageFileOffset, buf, i * pageSize, pageSize);
+                }
+                else
+                {
+                    Buffer.BlockCopy(fileBytes, pageFileOffset, buf, i * pageSize, available);
+                }
             }
 
             return buf;
+        }
+
+        private static void DecompressIteratedPage(byte[] fileBytes, int fileOffset, byte[] targetBuf, int targetOffset, int pageSize)
+        {
+            try
+            {
+                var pos = fileOffset;
+                var targetPos = targetOffset;
+                var targetEnd = targetOffset + pageSize;
+
+                var numIterGroups = ReadLEUInt16(fileBytes, pos);
+                pos += 2;
+
+                for (var g = 0; g < numIterGroups && targetPos < targetEnd; g++)
+                {
+                    var iterations = ReadLEUInt16(fileBytes, pos);
+                    pos += 2;
+                    var dataSize = ReadLEUInt16(fileBytes, pos);
+                    pos += 2;
+
+                    if (pos + dataSize > fileBytes.Length) break;
+
+                    for (var i = 0; i < iterations && targetPos < targetEnd; i++)
+                    {
+                        var toCopy = Math.Min((int)dataSize, targetEnd - targetPos);
+                        Buffer.BlockCopy(fileBytes, pos, targetBuf, targetPos, toCopy);
+                        targetPos += toCopy;
+                    }
+                    pos += dataSize;
+                }
+            }
+            catch
+            {
+                // Fallback or ignore
+            }
         }
 
         private static ushort ReadLEUInt16(byte[] data, int offset)

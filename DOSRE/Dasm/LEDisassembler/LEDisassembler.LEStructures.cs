@@ -23,6 +23,12 @@ namespace DOSRE.Dasm
             public string ImportProc;
         }
 
+        private struct LEPageMapEntry
+        {
+            public uint Index; // 1-based
+            public byte Flags;
+        }
+
         private struct LEHeader
         {
             public ushort Signature;
@@ -39,6 +45,9 @@ namespace DOSRE.Dasm
             public uint ObjectTableOffset;
             public uint ObjectCount;
             public uint ObjectPageMapOffset;
+            public uint ObjectIteratedDataMapOffset;
+            public uint ResourceTableOffset;
+            public uint ResourceTableCount;
             public uint FixupPageTableOffset;
             public uint FixupRecordTableOffset;
             public uint ImportModuleTableOffset;
