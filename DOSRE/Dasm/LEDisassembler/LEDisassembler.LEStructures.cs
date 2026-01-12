@@ -29,6 +29,15 @@ namespace DOSRE.Dasm
             public byte Flags;
         }
 
+        private struct LEResourceRecord
+        {
+            public ushort TypeId;
+            public ushort NameId;
+            public uint Size;
+            public ushort Object;
+            public uint Offset;
+        }
+
         private struct LEHeader
         {
             public ushort Signature;
@@ -58,6 +67,7 @@ namespace DOSRE.Dasm
             public uint NonResidentNameTableOffset;
             public uint EntryTableOffset;
             public Dictionary<ushort, string> Exports;
+            public List<LEResourceRecord> Resources;
         }
 
         private struct LEObject

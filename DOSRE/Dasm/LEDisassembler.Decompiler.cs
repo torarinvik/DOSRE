@@ -286,6 +286,8 @@ namespace DOSRE.Dasm
                             if (leSuggestedMemSize < 0x200000u) leSuggestedMemSize = 0x200000u;
 
                             haveLeMeta = leEntryEipLinear != 0 && leEntryEspLinear != 0 && leSuggestedMemSize != 0;
+                            if (haveLeMeta)
+                                entryLinear = leEntryEipLinear;
                         }
                     }
                 }
@@ -374,6 +376,34 @@ namespace DOSRE.Dasm
                      _addrToGlobal[addr] = $"g_{addr}";
                 }
             }
+
+            // Ensure the entry point (and its containing instruction) is considered a function start
+            // even if the disassembler didn't label it as such (e.g. if it was a mid-instruction entry).
+            if (entryLinear.HasValue)
+            {
+                var entryAddrHex = entryLinear.Value.ToString("X8");
+
+                // If the entry point isn't explicitly labeled, try to find the instruction it lands in
+                // and promote that instruction's start to a function start.
+                if (!_addrToFuncName.ContainsKey(entryAddrHex))
+                {
+                    foreach (var rawLine in lines)
+                    {
+                        var ins = TryParseAsmInstructionLine(rawLine);
+                        if (ins != null)
+                        {
+                            var addr = uint.Parse(ins.AddrHex, System.Globalization.NumberStyles.HexNumber);
+                            var len = (uint)(ins.BytesHex.Length / 2);
+                            if (entryLinear.Value >= addr && entryLinear.Value < addr + len)
+                            {
+                                _addrToFuncName[ins.AddrHex] = $"func_{ins.AddrHex}";
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
             if (_addrToString.Count > 0 || _addrToGlobal.Count > 0 || _addrToFuncName.Count > 0)
                 Console.Error.WriteLine($"[DECOMP] Found {_addrToString.Count} strings, {_addrToGlobal.Count} globals and {_addrToFuncName.Count} functions.");
 
@@ -382,6 +412,35 @@ namespace DOSRE.Dasm
             ParsedBlock currentBlock = null;
             var skipUntilNextFunction = false;
 
+            // Ensure the entry point (and its containing instruction) is considered a function start
+            // even if the disassembler didn't label it as such (e.g. if it was a mid-instruction entry).
+            var forcedFuncStarts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (entryLinear.HasValue)
+            {
+                var entryAddrHex = entryLinear.Value.ToString("X8");
+                forcedFuncStarts.Add(entryAddrHex);
+
+                // If the entry point isn't explicitly labeled, try to find the instruction it lands in
+                // and promote that instruction's start to a function start.
+                if (!_addrToFuncName.ContainsKey(entryAddrHex))
+                {
+                    foreach (var rawLine in lines)
+                    {
+                        var ins = TryParseAsmInstructionLine(rawLine);
+                        if (ins != null)
+                        {
+                            var addr = uint.Parse(ins.AddrHex, System.Globalization.NumberStyles.HexNumber);
+                            var len = (uint)(ins.BytesHex.Length / 2);
+                            if (entryLinear.Value >= addr && entryLinear.Value < addr + len)
+                            {
+                                _addrToFuncName[ins.AddrHex] = $"func_{ins.AddrHex}";
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
             for (var i = 0; i < lines.Length; i++)
             {
                 var line = lines[i];
@@ -389,19 +448,40 @@ namespace DOSRE.Dasm
                 if (line.Trim().StartsWith(";")) continue;
                 var t = line.TrimEnd();
 
-                var funcHdr = Regex.Match(t.Trim(), @"^func_(?<addr>[0-9A-Fa-f]{8}):\s*$");
+                var tTrim = t.Trim();
+                var funcHdr = Regex.Match(tTrim, @"^func_(?<addr>[0-9A-Fa-f]{8}):\s*$");
+                string capturedAddr = null;
                 if (funcHdr.Success)
+                {
+                    capturedAddr = funcHdr.Groups["addr"].Value.ToUpperInvariant();
+                }
+                else
+                {
+                    // If this line is an instruction that we've promoted to a function start,
+                    // treat it as if we just saw a func_ label.
+                    var ins = TryParseAsmInstructionLine(t);
+                    if (ins != null && _addrToFuncName.TryGetValue(ins.AddrHex, out var fName) && !functions.Any(f => f.Name == fName))
+                    {
+                        capturedAddr = ins.AddrHex;
+                    }
+                }
+
+                if (capturedAddr != null)
                 {
                     currentFunc = new ParsedFunction
                     {
-                        Name = $"func_{funcHdr.Groups["addr"].Value.ToUpperInvariant()}",
+                        Name = $"func_{capturedAddr}",
                         HeaderComments = new List<string>(),
                         Blocks = new List<ParsedBlock>()
                     };
                     functions.Add(currentFunc);
                     currentBlock = null;
                     skipUntilNextFunction = false;
-                    continue;
+                    
+                    // If we synthetic-captured this from an instruction line, don't 'continue' yet,
+                    // we need to process the instruction below.
+                    if (!funcHdr.Success) { /* fall through to instruction parsing */ }
+                    else continue;
                 }
 
                 if (skipUntilNextFunction)
@@ -816,70 +896,114 @@ namespace DOSRE.Dasm
 
             if (entryLinear.HasValue)
             {
-                var entryName = $"func_{entryLinear.Value:X8}";
-                if (functions.Any(f => string.Equals(f.Name, entryName, StringComparison.OrdinalIgnoreCase)))
-                {
-                    entryDirectFunc = entryName;
-                }
-                else
-                {
-                    ParsedFunction best = null;
-                    uint bestStart = 0;
-                    var entry = entryLinear.Value;
+                var entry = entryLinear.Value;
+                ParsedFunction best = null;
+                uint bestStart = 0;
 
-                    foreach (var fn in functions)
+                // 1. Try to find a function where the entry address is exactly an instruction start.
+                foreach (var fn in functions)
+                {
+                    foreach (var b in fn.Blocks)
                     {
-                        uint min = uint.MaxValue;
-                        uint max = 0;
-                        var any = false;
-                        foreach (var b in fn.Blocks)
+                        foreach (var l in b.Lines)
                         {
-                            foreach (var l in b.Lines)
+                            if (l.Kind != ParsedLineKind.Instruction) continue;
+                            uint a = (uint)l.Address;
+                            if (a == entry)
                             {
-                                if (l.Kind != ParsedLineKind.Instruction) continue;
-                                var a = (uint)l.Address;
-                                any = true;
-                                if (a < min) min = a;
-                                if (a > max) max = a;
+                                // If it's the very first instruction of the function, it's a direct entry.
+                                if (fn.Blocks.Count > 0 && fn.Blocks[0].Lines.Count > 0 && fn.Blocks[0].Lines[0] == l)
+                                {
+                                    entryDirectFunc = fn.Name;
+                                    goto found_entry;
+                                }
+                                else
+                                {
+                                    // It's in the middle of a function, but on an instruction boundary.
+                                    entryContainerFunc = fn.Name;
+                                    entryJumpAddr = a;
+                                    goto found_entry;
+                                }
                             }
-                        }
-                        if (!any) continue;
-                        if (entry < min || entry > max) continue;
-
-                        if (best == null || min > bestStart)
-                        {
-                            best = fn;
-                            bestStart = min;
                         }
                     }
+                }
 
-                    if (best != null)
+                // 2. Fallback: maybe it lands mid-instruction?
+                foreach (var fn in functions)
+                {
+                    foreach (var b in fn.Blocks)
                     {
-                        entryContainerFunc = best.Name;
-
-                        var addrs = new List<uint>();
-                        foreach (var b in best.Blocks)
+                        foreach (var l in b.Lines)
                         {
-                            foreach (var l in b.Lines)
+                            if (l.Kind != ParsedLineKind.Instruction) continue;
+                            uint a = (uint)l.Address;
+                            uint len = (uint)((l.BytesHex?.Length ?? 0) / 2);
+                            if (entry >= a && entry < a + len)
                             {
-                                if (l.Kind != ParsedLineKind.Instruction) continue;
-                                addrs.Add((uint)l.Address);
+                                // Lands in this instruction.
+                                // We MUST jump to 'entry' (the mid-instruction address).
+                                // Our C emitter for the function handles __entry_jump checks.
+                                entryContainerFunc = fn.Name;
+                                entryJumpAddr = entry;
+                                goto found_entry;
                             }
                         }
-                        addrs.Sort();
-
-                        foreach (var a in addrs)
-                        {
-                            if (a >= entry)
-                            {
-                                entryJumpAddr = a;
-                                break;
-                            }
-                        }
-                        if (!entryJumpAddr.HasValue && addrs.Count > 0)
-                            entryJumpAddr = addrs[addrs.Count - 1];
                     }
                 }
+
+                // 3. Final fallback: find the nearest instruction at or AFTER entry in any function.
+                // (Old logic, kept for robustness)
+                foreach (var fn in functions)
+                {
+                    uint min = uint.MaxValue;
+                    uint max = 0;
+                    var any = false;
+                    foreach (var b in fn.Blocks)
+                    {
+                        foreach (var l in b.Lines)
+                        {
+                            if (l.Kind != ParsedLineKind.Instruction) continue;
+                            var a = (uint)l.Address;
+                            any = true;
+                            if (a < min) min = a;
+                            if (a > max) max = a;
+                        }
+                    }
+                    if (!any) continue;
+                    // Note: entry < min is allowed here for the 'nearest' logic.
+                    // But we only want functions that might plausibly contain it.
+                    if (entry > max + 1024) continue; 
+
+                    if (best == null || (min <= entry && (bestStart == 0 || min > bestStart)))
+                    {
+                        best = fn;
+                        bestStart = min;
+                    }
+                }
+
+                if (best != null)
+                {
+                    entryContainerFunc = best.Name;
+                    var addrs = new List<uint>();
+                    foreach (var b in best.Blocks)
+                    {
+                        foreach (var l in b.Lines)
+                        {
+                            if (l.Kind != ParsedLineKind.Instruction) continue;
+                            addrs.Add((uint)l.Address);
+                        }
+                    }
+                    addrs.Sort();
+                    foreach (var a in addrs)
+                    {
+                        if (a >= entry) { entryJumpAddr = a; break; }
+                    }
+                    if (!entryJumpAddr.HasValue && addrs.Count > 0)
+                        entryJumpAddr = addrs[addrs.Count - 1];
+                }
+
+            found_entry:;
             }
 
             if (chunkSize <= 0)
@@ -1353,6 +1477,33 @@ namespace DOSRE.Dasm
                     }
                     mainSb.AppendLine("};");
                     mainSb.AppendLine();
+                    mainSb.AppendLine("static void __decompress_iterated_page(FILE* f, uint8_t* dst, uint32_t pageSize)");
+                    mainSb.AppendLine("{");
+                    mainSb.AppendLine("    uint16_t numIterGroups = 0;");
+                    mainSb.AppendLine("    if (fread(&numIterGroups, 2, 1, f) != 1) return;");
+                    mainSb.AppendLine("    uint32_t targetPos = 0;");
+                    mainSb.AppendLine("    for (uint16_t g = 0; g < numIterGroups && targetPos < pageSize; g++)");
+                    mainSb.AppendLine("    {");
+                    mainSb.AppendLine("        uint16_t iterations = 0; fread(&iterations, 2, 1, f);");
+                    mainSb.AppendLine("        uint16_t dataSize = 0; fread(&dataSize, 2, 1, f);");
+                    mainSb.AppendLine("        if (dataSize > 0)");
+                    mainSb.AppendLine("        {");
+                    mainSb.AppendLine("            uint8_t* groupData = (uint8_t*)malloc(dataSize);");
+                    mainSb.AppendLine("            if (fread(groupData, 1, dataSize, f) == dataSize)");
+                    mainSb.AppendLine("            {");
+                    mainSb.AppendLine("                for (uint16_t i = 0; i < iterations && targetPos < pageSize; i++)");
+                    mainSb.AppendLine("                {");
+                    mainSb.AppendLine("                    uint32_t toCopy = (dataSize < (pageSize - targetPos)) ? dataSize : (pageSize - targetPos);");
+                    mainSb.AppendLine("                    memcpy(dst + targetPos, groupData, toCopy);");
+                    mainSb.AppendLine("                    targetPos += toCopy;");
+                    mainSb.AppendLine("                }");
+                    mainSb.AppendLine("            }");
+                    mainSb.AppendLine("            free(groupData);");
+                    mainSb.AppendLine("        }");
+                    mainSb.AppendLine("        else { targetPos += iterations; } // Should not happen in valid LE");
+                    mainSb.AppendLine("    }");
+                    mainSb.AppendLine("}");
+                    mainSb.AppendLine();
                     mainSb.AppendLine("static int __load_le_image(const char* path)");
                     mainSb.AppendLine("{");
                     mainSb.AppendLine("    FILE* f = __fopen_le(path);");
@@ -1367,13 +1518,25 @@ namespace DOSRE.Dasm
                     mainSb.AppendLine("            uint32_t mapIndex0 = (o->pageMapIndex - 1u) + i;");
                     mainSb.AppendLine("            if (mapIndex0 >= (uint32_t)(sizeof(__le_page_map)/sizeof(__le_page_map[0]))) break;");
                     mainSb.AppendLine("            uint32_t phys = (uint32_t)__le_page_map[mapIndex0]; /* 1-based physical page */");
-                    mainSb.AppendLine("            if (phys == 0) continue; /* zero-fill */");
+                    mainSb.AppendLine("            uint8_t flags = __le_page_map_flags[mapIndex0];");
+                    mainSb.AppendLine("            ");
+                    mainSb.AppendLine("            if (flags == 3 || phys == 0) continue; /* zero-fill */");
+                    mainSb.AppendLine("            if (flags == 2) continue; /* invalid */");
+                    mainSb.AppendLine("");
                     mainSb.AppendLine("            uint32_t bytesThisPage = (phys == __le_num_pages) ? __le_last_page_size : __le_page_size;");
                     mainSb.AppendLine("            uint32_t fileOff = __le_data_pages_base + (phys - 1u) * __le_page_size;");
                     mainSb.AppendLine("            if (fseek(f, (long)fileOff, SEEK_SET) != 0) { fclose(f); return 0; }");
                     mainSb.AppendLine("            void* dst = __ptr(o->base + i * __le_page_size);");
                     mainSb.AppendLine("            if (!dst) { fclose(f); return 0; }");
-                    mainSb.AppendLine("            if (fread(dst, 1, (size_t)bytesThisPage, f) != (size_t)bytesThisPage) { fclose(f); return 0; }");
+                    mainSb.AppendLine("");
+                    mainSb.AppendLine("            if (flags == 1) // Iterated Data");
+                    mainSb.AppendLine("            {");
+                    mainSb.AppendLine("                __decompress_iterated_page(f, (uint8_t*)dst, __le_page_size);");
+                    mainSb.AppendLine("            }");
+                    mainSb.AppendLine("            else");
+                    mainSb.AppendLine("            {");
+                    mainSb.AppendLine("                if (fread(dst, 1, (size_t)bytesThisPage, f) != (size_t)bytesThisPage) { fclose(f); return 0; }");
+                    mainSb.AppendLine("            }");
                     mainSb.AppendLine("        }");
                     mainSb.AppendLine("    }");
                     mainSb.AppendLine("    fclose(f);");

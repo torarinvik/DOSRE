@@ -1,0 +1,147 @@
+#include "blst.h"
+#include <ctype.h>
+
+/* NOTE: guest linear memory backing is allocated at runtime into __mem. */
+/* NOTE: this build expects the original LE EXE to be present next to the rebuilt program. */
+
+typedef struct { uint32_t base; uint32_t vsize; uint32_t flags; uint32_t pageMapIndex; uint32_t pageCount; } __le_obj;
+static const uint32_t __le_page_size = 0x1000u;
+static const uint32_t __le_last_page_size = 0x354u;
+static const uint32_t __le_num_pages = 0x3u;
+static const uint32_t __le_data_pages_base = 0x844u;
+static const uint32_t __le_entry_esp = 0x00030380u;
+static const uint32_t __le_entry_eip = 0x000100A0u;
+static const char* __le_orig_exe = "HELLO.EXE";
+
+// Best-effort DOS 8.3 fallback: try BASE~N.EXT when long filenames are not accessible.
+static FILE* __fopen_le(const char* path)
+{
+    FILE* f = fopen(path, "rb");
+    if (f) return f;
+
+    const char* dot = strrchr(path, '.');
+    if (!dot || dot == path) return (FILE*)0;
+
+    char base6[7]; char ext3[4];
+    unsigned bi = 0, ei = 0;
+    memset(base6, 0, sizeof(base6));
+    memset(ext3, 0, sizeof(ext3));
+    for (const char* p = path; p < dot && bi < 6; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (isalnum(c)) base6[bi++] = (char)toupper(c);
+    }
+    for (const char* p = dot + 1; *p && ei < 3; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (isalnum(c)) ext3[ei++] = (char)toupper(c);
+    }
+    if (bi == 0 || ei == 0) return (FILE*)0;
+
+    char sfn[16];
+    for (unsigned n = 1; n <= 9; n++) {
+        sprintf(sfn, "%s~%u.%s", base6, n, ext3);
+        f = fopen(sfn, "rb");
+        if (f) return f;
+    }
+    return (FILE*)0;
+}
+
+static const __le_obj __le_objs[] = {
+    { 0x00010000u, 0x1BA2u, 0x00002045u, 0x1u, 0x2u },
+    { 0x00020000u, 0x10380u, 0x00002043u, 0x3u, 0x1u },
+};
+
+static const uint16_t __le_page_map[] = {
+    0x0001, 0x0002, 0x0003, 
+};
+
+static const uint8_t __le_page_map_flags[] = {
+    0x00, 0x00, 0x00, 
+};
+
+static void __decompress_iterated_page(FILE* f, uint8_t* dst, uint32_t pageSize)
+{
+    uint16_t numIterGroups = 0;
+    if (fread(&numIterGroups, 2, 1, f) != 1) return;
+    uint32_t targetPos = 0;
+    for (uint16_t g = 0; g < numIterGroups && targetPos < pageSize; g++)
+    {
+        uint16_t iterations = 0; fread(&iterations, 2, 1, f);
+        uint16_t dataSize = 0; fread(&dataSize, 2, 1, f);
+        if (dataSize > 0)
+        {
+            uint8_t* groupData = (uint8_t*)malloc(dataSize);
+            if (fread(groupData, 1, dataSize, f) == dataSize)
+            {
+                for (uint16_t i = 0; i < iterations && targetPos < pageSize; i++)
+                {
+                    uint32_t toCopy = (dataSize < (pageSize - targetPos)) ? dataSize : (pageSize - targetPos);
+                    memcpy(dst + targetPos, groupData, toCopy);
+                    targetPos += toCopy;
+                }
+            }
+            free(groupData);
+        }
+        else { targetPos += iterations; } // Should not happen in valid LE
+    }
+}
+
+static int __load_le_image(const char* path)
+{
+    FILE* f = __fopen_le(path);
+    if (!f) return 0;
+    unsigned oi;
+    uint32_t i;
+    for (oi = 0; oi < (unsigned)(sizeof(__le_objs)/sizeof(__le_objs[0])); oi++)
+    {
+        const __le_obj* o = &__le_objs[oi];
+        for (i = 0; i < o->pageCount; i++)
+        {
+            uint32_t mapIndex0 = (o->pageMapIndex - 1u) + i;
+            if (mapIndex0 >= (uint32_t)(sizeof(__le_page_map)/sizeof(__le_page_map[0]))) break;
+            uint32_t phys = (uint32_t)__le_page_map[mapIndex0]; /* 1-based physical page */
+            uint8_t flags = __le_page_map_flags[mapIndex0];
+            
+            if (flags == 3 || phys == 0) continue; /* zero-fill */
+            if (flags == 2) continue; /* invalid */
+
+            uint32_t bytesThisPage = (phys == __le_num_pages) ? __le_last_page_size : __le_page_size;
+            uint32_t fileOff = __le_data_pages_base + (phys - 1u) * __le_page_size;
+            if (fseek(f, (long)fileOff, SEEK_SET) != 0) { fclose(f); return 0; }
+            void* dst = __ptr(o->base + i * __le_page_size);
+            if (!dst) { fclose(f); return 0; }
+
+            if (flags == 1) // Iterated Data
+            {
+                __decompress_iterated_page(f, (uint8_t*)dst, __le_page_size);
+            }
+            else
+            {
+                if (fread(dst, 1, (size_t)bytesThisPage, f) != (size_t)bytesThisPage) { fclose(f); return 0; }
+            }
+        }
+    }
+    fclose(f);
+    return 1;
+}
+
+
+int main(int argc, char** argv)
+{
+    /* Allocate guest linear memory window based on LE object layout. */
+    __mem_size = 0x200000u;
+    __mem = (uint8_t*)malloc(__mem_size);
+    if (!__mem) return 1;
+    memset(__mem, 0, __mem_size);
+    const char* __img = __le_orig_exe;
+    if (argc > 1 && argv && argv[1] && argv[1][0]) __img = argv[1];
+    if (!__load_le_image(__img)) return 2;
+    esp = __le_entry_esp;
+    ebp = esp;
+
+    __entry_jump_enabled = 0;
+    __entry_jump_target = 0;
+    __entry_jump_addr = 0;
+
+    func_000100A0();
+    return 0;
+}

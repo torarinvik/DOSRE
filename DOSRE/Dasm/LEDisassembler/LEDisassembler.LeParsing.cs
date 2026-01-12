@@ -239,28 +239,30 @@ namespace DOSRE.Dasm
             header.ObjectIteratedDataMapOffset = ReadLEUInt32(fileBytes, headerOffset + 0x4C);
             header.ResourceTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x50);
             header.ResourceTableCount = ReadLEUInt32(fileBytes, headerOffset + 0x54);
+            header.ResidentNameTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x58);
+            header.EntryTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x5C);
 
             if (!isLX)
             {
                 // Standard/Watcom LE layout
-                header.ResidentNameTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x58);
-                header.EntryTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x5C);
-                header.ImportModuleTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x68); // Correction for LE? No, let's verify.
-                header.ImportModuleTableEntries = ReadLEUInt32(fileBytes, headerOffset + 0x6C); // Wait, my previous read showed 0x58 for ResidentName.
+                header.ImportProcTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x60);
+                header.FixupPageTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x68);
+                header.FixupRecordTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x6C);
+                header.ImportModuleTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x70);
+                header.ImportModuleTableEntries = ReadLEUInt32(fileBytes, headerOffset + 0x74);
+                header.NonResidentNameTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x84);
             }
             else
             {
                 // IBM LX layout
-                header.ResidentNameTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x58);
-                header.EntryTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x5C);
+                header.ImportProcTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x78);
+                header.FixupPageTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x68);
+                header.FixupRecordTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x6C);
                 header.ImportModuleTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x70);
                 header.ImportModuleTableEntries = ReadLEUInt32(fileBytes, headerOffset + 0x74);
                 header.NonResidentNameTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x88);
             }
 
-            header.FixupPageTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x68);
-            header.FixupRecordTableOffset = ReadLEUInt32(fileBytes, headerOffset + 0x6C);
-            header.ImportProcTableOffset = !isLX ? ReadLEUInt32(fileBytes, headerOffset + 0x60) : ReadLEUInt32(fileBytes, headerOffset + 0x78);
             header.DataPagesOffset = ReadLEUInt32(fileBytes, headerOffset + 0x80);
 
             _logger.Info($"LE Header: FixupPageTableOffset=0x{header.FixupPageTableOffset:X}, FixupRecordTableOffset=0x{header.FixupRecordTableOffset:X}");
@@ -296,6 +298,39 @@ namespace DOSRE.Dasm
             // If last page size is 0, treat it as full page size per spec conventions.
             if (header.LastPageSize == 0)
                 header.LastPageSize = header.PageSize;
+
+            // Parse Resource Table
+            header.Resources = new List<LEResourceRecord>();
+            if (header.ResourceTableOffset != 0 && header.ResourceTableCount > 0)
+            {
+                var resStart = header.HeaderOffset + (int)header.ResourceTableOffset;
+                var entrySize = isLX ? 14 : 8; // Heuristic
+                for (int i = 0; i < (int)header.ResourceTableCount; i++)
+                {
+                    var off = resStart + i * entrySize;
+                    if (off + entrySize > fileBytes.Length) break;
+
+                    var res = new LEResourceRecord
+                    {
+                        TypeId = ReadLEUInt16(fileBytes, off),
+                        NameId = ReadLEUInt16(fileBytes, off + 2),
+                        Size = ReadLEUInt32(fileBytes, off + 4)
+                    };
+                    if (isLX)
+                    {
+                        res.Object = ReadLEUInt16(fileBytes, off + 8);
+                        res.Offset = ReadLEUInt32(fileBytes, off + 10);
+                    }
+                    else
+                    {
+                        // In LE, resources are often just entries in the data pages, 
+                        // and the table might just be Type/Name/Size.
+                        // We'll need to investigate if we find any binary with LE resources.
+                    }
+                    header.Resources.Add(res);
+                }
+                _logger.Info($"LE: Found {header.Resources.Count} resources");
+            }
 
             _logger.Info($"Detected LE header at 0x{headerOffset:X} (Objects={header.ObjectCount}, Pages={header.NumberOfPages}, PageSize={header.PageSize})");
             return true;

@@ -206,21 +206,16 @@ namespace DOSRE.Dasm
 
             // Global symbol table (linear address -> symbol) from fixups
             var leGlobalSymbols = new Dictionary<uint, string>();
-            if (leGlobals && fixupRecordStream != null && fixupPageOffsets != null)
+            var globalFixupTargets = new HashSet<uint>();
+            if (fixupRecordStream != null && fixupPageOffsets != null)
             {
                 var swGlob = Stopwatch.StartNew();
-                _logger.Info("LE: Collecting global symbols from fixup table...");
+                _logger.Info("LE: Collecting global symbols and targets from fixup table...");
                 foreach (var obj in objects)
                 {
                     if (obj.VirtualSize == 0 || obj.PageCount == 0) continue;
                     // Pass null for objBytes to just get targets from the record stream without site probing.
                     var gFixups = ParseFixupsForWindow(header, objects, pageMap, importModules, fileBytes, fixupPageOffsets, fixupRecordStream, null, obj, 0, uint.MaxValue);
-                    _logger.Info($"LE: Object {obj.Index} found {gFixups.Count} fixups for globals.");
-                    if (gFixups.Count > 0)
-                    {
-                        var first = gFixups[0];
-                        _logger.Info($"LE: SAMPLE FIXUP: Type={first.TargetType}, Obj={first.TargetObject}, Off={first.TargetOffset}");
-                    }
                     foreach (var f in gFixups)
                     {
                         if ((f.TargetType == 0 || f.TargetType == 3) && f.TargetObject.HasValue && f.TargetOffset.HasValue)
@@ -229,9 +224,13 @@ namespace DOSRE.Dasm
                             if (targetObj.Index != 0)
                             {
                                 var targetLinear = unchecked(targetObj.BaseAddress + f.TargetOffset.Value);
-                                if (targetLinear != 0 && !leGlobalSymbols.ContainsKey(targetLinear))
+                                if (targetLinear != 0)
                                 {
-                                    leGlobalSymbols[targetLinear] = $"obj{f.TargetObject.Value}_0x{f.TargetOffset.Value:X}";
+                                    globalFixupTargets.Add(targetLinear);
+                                    if (leGlobals && !leGlobalSymbols.ContainsKey(targetLinear))
+                                    {
+                                        leGlobalSymbols[targetLinear] = $"obj{f.TargetObject.Value}_0x{f.TargetOffset.Value:X}";
+                                    }
                                 }
                             }
                         }
@@ -346,6 +345,26 @@ namespace DOSRE.Dasm
 
             var globalFunctionStarts = new HashSet<uint>();
             var globalLabelTargets = new HashSet<uint>();
+
+            // Seed from Fixup Table targets (highly reliable cross-references).
+            if (globalFixupTargets != null)
+            {
+                foreach (var t in globalFixupTargets)
+                {
+                    if (TryMapLinearToObject(objects, t, out var tObjIdx, out var _))
+                    {
+                        var tObj = objects.FirstOrDefault(o => o.Index == tObjIdx);
+                        if (tObj.Index != 0)
+                        {
+                            if ((tObj.Flags & 0x0004) != 0) // Executable
+                                globalFunctionStarts.Add(t);
+                            else
+                                globalLabelTargets.Add(t);
+                        }
+                    }
+                }
+            }
+
             var globalCallXrefs = new Dictionary<uint, List<uint>>();
             var globalJumpXrefs = new Dictionary<uint, List<uint>>();
 
