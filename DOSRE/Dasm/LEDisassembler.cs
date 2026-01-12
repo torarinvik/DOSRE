@@ -97,7 +97,7 @@ namespace DOSRE.Dasm
             public uint? siteValue32 { get; set; }
             public ushort? siteValue16 { get; set; }
 
-            public string targetKind { get; set; } // "internal", "import", "unknown"
+            public string targetKind { get; set; } // "internal", "import", "far", "unknown"
             public int? targetObject { get; set; }
             public uint? targetOffset { get; set; }
             public uint? targetLinear { get; set; }
@@ -11441,6 +11441,29 @@ namespace DOSRE.Dasm
                                 siteV32 = ReadUInt32(objBytes, objOffset);
                             else if (objOffset + 2 <= objBytes.Length)
                                 siteV16 = ReadUInt16(objBytes, objOffset);
+                        }
+
+                        // Some DOS4GW fixup families appear to represent a 16:16 far pointer payload (offset16:selector16)
+                        // rather than a linear (LE object) target. We keep this strictly scoped and avoid guessing an
+                        // internal object mapping.
+                        //
+                        // Heuristic contract (conservative):
+                        // - type/flags identify the family
+                        // - specU32 exists (record length >= 10)
+                        // - the fixup site currently contains a 0 placeholder (common for loader-filled far pointers)
+                        // - interpret specU32.hi16 as offset16 and specU16b as selector16
+                        if (targetKind == "unknown" && srcType == 0x05 && flags == 0x00 && hasSpecU32 && hasSpecU16b && siteV32.HasValue && siteV32.Value == 0)
+                        {
+                            var off16 = (ushort)unchecked((_specU32 >> 16) & 0xFFFF);
+                            var sel16 = _specU16b;
+
+                            // Require at least one of the two words to be non-zero to avoid classifying pure zeros.
+                            if (off16 != 0 || sel16 != 0)
+                            {
+                                targetKind = "far";
+                                // Pack as selector:offset (hi16:lo16) for stable diffing; targetLinear/targetObject remain null.
+                                targetOff = unchecked(((uint)sel16 << 16) | (uint)off16);
+                            }
                         }
 
                         // Some remaining DOS4GW records (often 8-byte stride) appear to encode a 16-bit object-relative
