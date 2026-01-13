@@ -1265,6 +1265,7 @@ namespace DOSRE.Dasm
                 h.AppendLine("static inline void* __ptr(uint32_t addr) { return (addr < __mem_size) ? (void*)(__mem + addr) : (void*)0; }");
                 h.AppendLine("static inline uint32_t __pop32(uint32_t *esp_) { uint32_t v = *(uint32_t*)__ptr(*esp_); *esp_ += 4; return v; }");
                 h.AppendLine("extern uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp;");
+                h.AppendLine("extern uint32_t unk; /* placeholder for unknown values */");
                 h.AppendLine("#define ax (*(uint16_t*)&eax)");
                 h.AppendLine("#define al (*(uint8_t*)&eax)");
                 h.AppendLine("#define ah (*((uint8_t*)&eax + 1))");
@@ -1352,10 +1353,15 @@ namespace DOSRE.Dasm
                 foreach (var fn in functions.OrderBy(x => x.Name))
                 {
                     var p = fn.Proto.Replace("(void)", "()");
+                    if (p.Length > 120) p = p.Replace(", ", ",\r\n    ");
                     h.AppendLine($"{p};");
                 }
                 foreach (var kvp in otherFunctions.OrderBy(x => x.Key))
-                    h.AppendLine($"{kvp.Value.proto};");
+                {
+                    var p = kvp.Value.proto.Replace("(void)", "()");
+                    if (p.Length > 120) p = p.Replace(", ", ",\r\n    ");
+                    h.AppendLine($"{p};");
+                }
 
                 var functionsByName = functions.ToDictionary(f => f.Name, f => f, StringComparer.OrdinalIgnoreCase);
                 var sortedFuncs = functions.ToList();
@@ -1376,9 +1382,9 @@ namespace DOSRE.Dasm
                 buildBat.Append("@echo off\r\n");
                 buildBat.Append("call C:\\WATCOM\\OWSETENV.BAT\r\n");
                 buildBat.Append("echo Compiling data...\r\n");
-                buildBat.Append("wcc386 -zastd=c99 -6r -s -zq -fo=bdata.obj bdata.c\r\n");
+                buildBat.Append("wcc386 -zastd=c99 -6r -s -fo=bdata.obj bdata.c\r\n");
                 buildBat.Append("echo Compiling main...\r\n");
-                buildBat.Append("wcc386 -zastd=c99 -6r -s -zq -fo=main.obj main.c\r\n");
+                buildBat.Append("wcc386 -zastd=c99 -6r -s -fo=main.obj main.c\r\n");
 
                 // Host-friendly build script (clang/gcc). Uses LF line endings for Unix shells.
                 var buildSh = new StringBuilder();
@@ -1642,7 +1648,7 @@ namespace DOSRE.Dasm
                     files[$"b{partNum}.c"] = csb.ToString();
                     
                     buildBat.Append($"echo Compiling chunk {partNum}...\r\n");
-                    buildBat.Append($"wcc386 -zastd=c99 -6r -s -zq -fo=b{partNum}.obj b{partNum}.c\r\n");
+                    buildBat.Append($"wcc386 -zastd=c99 -6r -s -fo=b{partNum}.obj b{partNum}.c\r\n");
                     linkerRsp.Append($"file b{partNum}.obj\r\n");
                 }
                 
@@ -1697,6 +1703,7 @@ namespace DOSRE.Dasm
                 d.AppendLine("uint8_t* __mem; uint32_t __mem_size;");
                 d.AppendLine();
                 d.AppendLine("uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp;");
+                d.AppendLine("uint32_t unk; /* placeholder for unknown values */");
                 d.AppendLine("uint32_t cs, ds, es, fs, gs, ss, dr0, dr1, dr2, dr3, dr6, dr7, _this, carry;");
                 d.AppendLine("int jz, jnz, je, jne, jg, jge, jl, jle, ja, jae, jb, jbe, jo, jno, js, jns;");
                 d.AppendLine("uint32_t __entry_jump_enabled, __entry_jump_target, __entry_jump_addr;");
@@ -1772,7 +1779,8 @@ namespace DOSRE.Dasm
                 }
             }
 
-            sb.AppendLine(proto + "");
+            var wrappedProto = proto.Length > 120 ? proto.Replace(", ", ",\r\n    ") : proto;
+            sb.AppendLine(wrappedProto + "");
             sb.AppendLine("{");
             if (!string.IsNullOrEmpty(hashStr))
             {
@@ -1798,7 +1806,18 @@ namespace DOSRE.Dasm
                 var byType = stackVars.GroupBy(v => fn.InferredTypes.GetValueOrDefault(v, "uint32_t"));
                 foreach (var g in byType.OrderBy(x => x.Key))
                 {
-                    sb.AppendLine($"    {g.Key} " + string.Join(", ", g.OrderBy(v => v)) + ";");
+                    var vars = g.OrderBy(x => x).ToList();
+                    sb.Append($"    {g.Key} ");
+                    for (int i = 0; i < vars.Count; i++)
+                    {
+                        sb.Append(vars[i]);
+                        if (i < vars.Count - 1)
+                        {
+                            sb.Append(", ");
+                            if (i % 8 == 7) sb.Append("\r\n        ");
+                        }
+                    }
+                    sb.AppendLine(";");
                 }
             }
 
@@ -2325,7 +2344,9 @@ namespace DOSRE.Dasm
                 }
             }
 
-            var callStr = $"{target}({string.Join(", ", argList)})";
+            var callStrJoin = string.Join(", ", argList);
+            if (callStrJoin.Length > 100) callStrJoin = string.Join(",\r\n        ", argList);
+            var callStr = $"{target}({callStrJoin})";
             pending.ClearAll();
 
             if (retMatch.Success)

@@ -21,6 +21,8 @@
 [Rr]eleases/
 /screenshots/
 /Artifacts
+/EXES/
+/Dosbox-Bridge/
 x64/
 x86/
 bld/

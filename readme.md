@@ -177,7 +177,9 @@ The project makes use of [SharpDiasm](https://github.com/spazzarama/SharpDisasm)
 
 # License / Copyright
 
-DOSRE is Copyright (c) 2017 Eric Nusbaum and is distributed under the 2-clause "Simplified BSD License". 
+DOSRE is Copyright (c) 2026 Torarin Vik Bjarkø and is distributed under the 2-clause "Simplified BSD License". 
+
+MBBSDASM is Copyright (c) 2017 Eric Nusbaum and is distributed under the 2-clause "Simplified BSD License".
 
 SharpDisam is Copyright (c) 2015 Justin Stenning and is distributed under the 2-clause "Simplified BSD License". 
 
