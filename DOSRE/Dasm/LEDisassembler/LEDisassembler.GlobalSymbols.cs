@@ -424,7 +424,26 @@ namespace DOSRE.Dasm
                 if (!TryGetFixupFieldStartDelta32(ins, f, out var delta, out var kind) || (kind != "disp32" && kind != "imm32" && kind != "imm32?"))
                     continue;
 
+                // Heuristics to avoid rewriting non-address immediates (common false positives):
+                // - "imm32?" is explicitly uncertain, so skip.
+                // - Very small imm32 values are overwhelmingly flags/lengths/stack allocs, not addresses.
+                // - Stack adjustments are almost never addresses.
+                if (kind == "imm32?")
+                    continue;
+
                 var raw = BitConverter.ToUInt32(ins.Bytes, delta);
+
+                // Extremely small literals are almost always non-address constants in this codebase.
+                // Rewriting them based on fixups can corrupt semantics (e.g. 0xFF masks, small stack alloc sizes).
+                if (raw < 0x1000u)
+                    continue;
+
+                if (kind == "imm32")
+                {
+                    // Avoid rewriting stack adjust immediates (e.g. sub esp, 0x58).
+                    if (Regex.IsMatch(rewritten, @"\b(sub|add)\s+esp\s*,\s*0x[0-9a-fA-F]+", RegexOptions.IgnoreCase))
+                        continue;
+                }
 
                 // Determine the symbol name for this target.
                 string sym = null;

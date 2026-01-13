@@ -229,7 +229,10 @@ namespace DOSRE.Dasm
                                     globalFixupTargets.Add(targetLinear);
                                     if (leGlobals && !leGlobalSymbols.ContainsKey(targetLinear))
                                     {
-                                        leGlobalSymbols[targetLinear] = $"obj{f.TargetObject.Value}_0x{f.TargetOffset.Value:X}";
+                                        // Use a self-describing linear-address symbol so downstream decompile output can
+                                        // define it as a simple numeric constant without needing an object-base mapping.
+                                        // This also matches the documented -LEGLOBALS intent (g_XXXXXXXX EQU 0xXXXXXXXX).
+                                        leGlobalSymbols[targetLinear] = $"g_{targetLinear:X8}";
                                     }
                                 }
                             }
@@ -714,11 +717,8 @@ namespace DOSRE.Dasm
                         // Ensure we have a symbol for the target linear address.
                         if (!globalSymbols.TryGetValue(targetLinear, out var symName))
                         {
-                            // Try to map linear back to obj+off for a better name if it's not already in globals.
-                            if (TryMapLinearToObject(objects, targetLinear, out var tobj, out var toff))
-                                symName = $"obj{tobj}_0x{toff:X}";
-                            else
-                                symName = $"g_{targetLinear:X8}";
+                            // Use linear-address symbols so the output can define them as numeric constants.
+                            symName = $"g_{targetLinear:X8}";
                             globalSymbols[targetLinear] = symName;
                         }
                     }

@@ -20,13 +20,43 @@ namespace DOSRE.Dasm
             // targets (like 0x0 or un-relocated file offsets) that the loader replaces.
             if (fixupsHere != null && fixupsHere.Count > 0)
             {
+                // Only consider fixups for actual relative control-flow instructions.
+                // Otherwise we end up incorrectly treating arbitrary imm32 fixups (e.g. stack allocs)
+                // as jump targets.
+                int? dispStart = null;
+                int dispSize = 0;
+
+                if (ins.Bytes[0] == 0xE8 || ins.Bytes[0] == 0xE9)
+                {
+                    // CALL/JMP rel32
+                    dispStart = 1;
+                    dispSize = 4;
+                }
+                else if (ins.Bytes[0] == 0xEB || (ins.Bytes[0] >= 0x70 && ins.Bytes[0] <= 0x7F))
+                {
+                    // JMP rel8 / Jcc rel8
+                    dispStart = 1;
+                    dispSize = 1;
+                }
+                else if (ins.Bytes[0] == 0x0F && ins.Bytes.Length >= 2 && ins.Bytes[1] >= 0x80 && ins.Bytes[1] <= 0x8F)
+                {
+                    // Jcc rel32
+                    dispStart = 2;
+                    dispSize = 4;
+                }
+
+                if (dispStart == null)
+                    return false;
+
+                var dispAbsStart = (uint)ins.Offset + (uint)dispStart.Value;
+                var dispAbsEndExclusive = dispAbsStart + (uint)dispSize;
+
                 foreach (var fix in fixupsHere)
                 {
                     if (fix.TargetLinear.HasValue && (fix.Type == 0x05 || fix.Type == 0x06 || fix.Type == 0x07))
                     {
-                        // Check if the fixup site overlaps with the typical displacement field of the instruction.
-                        // For most calls/jmps, it starts after the opcode at index 1.
-                        if (fix.SiteLinear >= (uint)ins.Offset + 1 && fix.SiteLinear < (uint)ins.Offset + (uint)ins.Length)
+                        // Only accept fixups that overlap the displacement field of this relative branch.
+                        if (fix.SiteLinear >= dispAbsStart && fix.SiteLinear < dispAbsEndExclusive)
                         {
                             target = fix.TargetLinear.Value;
                             isCall = ins.Mnemonic == ud_mnemonic_code.UD_Icall;

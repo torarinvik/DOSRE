@@ -1124,6 +1124,13 @@ namespace DOSRE.Dasm
                     sbSingle.AppendLine("}");
                 }
 
+                // Address symbols referenced in code must be numeric constants.
+                // Keep them as macros so arithmetic like (g_XXXXXXXX + 0x10) stays correct.
+                foreach (var bg in byteGlobals.OrderBy(x => x.addr))
+                {
+                    sbSingle.AppendLine($"#define {bg.sym} 0x{bg.addr:X8}u");
+                }
+
                 foreach (var gsym in otherGlobals.OrderBy(x => x))
                 {
                     sbSingle.AppendLine($"static uint8_t {gsym}[1];");
@@ -1324,8 +1331,27 @@ namespace DOSRE.Dasm
                     h.AppendLine("}");
                 }
 
+                // Address symbols referenced in code must be numeric constants.
+                // Emit them as macros so arithmetic like (g_XXXXXXXX + 0x10) stays correct.
+                foreach (var bg in byteGlobals.OrderBy(x => x.addr))
+                {
+                    h.AppendLine($"#define {bg.sym} 0x{bg.addr:X8}u");
+                }
+
                 foreach (var gsym in otherGlobals.OrderBy(x => x))
-                    h.AppendLine($"extern uint8_t {gsym}[1];");
+                {
+                    // Global address symbols (e.g. g_0000AC34) must be numeric constants.
+                    // Declaring them as extern arrays would cause host-pointer misuse.
+                    var m = Regex.Match(gsym, @"^g_([0-9A-Fa-f]+)$");
+                    if (m.Success)
+                    {
+                        h.AppendLine($"#define {gsym} 0x{m.Groups[1].Value}u");
+                    }
+                    else
+                    {
+                        h.AppendLine($"extern uint8_t {gsym}[1];");
+                    }
+                }
 
                 foreach (var kvp in _addrToString.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
                 {

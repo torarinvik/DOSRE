@@ -187,6 +187,10 @@ namespace DOSRE.Dasm
                 var mod = (modrm >> 6) & 0x3;
                 var rm = modrm & 0x7;
 
+                // Register-direct addressing: no displacement/SIB.
+                if (mod == 3)
+                    return false;
+
                 // mod=00 rm=101 => disp32
                 if (mod == 0 && rm == 5)
                 {
@@ -242,6 +246,10 @@ namespace DOSRE.Dasm
                 var modrm = bytes[modrmIndex];
                 var mod = (modrm >> 6) & 0x3;
                 var rm = modrm & 0x7;
+
+                // Register-direct addressing: no displacement/SIB.
+                if (mod == 3)
+                    return false;
 
                 var p0 = modrmIndex + 1;
 
@@ -314,7 +322,8 @@ namespace DOSRE.Dasm
                 var p = modrmIndex + 1;
 
                 // SIB
-                if (rm == 4)
+                // NOTE: rm==4 is SIB *only* when mod != 3 (register-direct uses rm==4 for ESP).
+                if (rm == 4 && mod != 3)
                 {
                     if (p >= bytes.Length)
                         return false;
