@@ -102,6 +102,18 @@ namespace DOSRE.UI.impl
     ///     Specified with -LEREACHJSON <file.json>
     /// </summary>
     private string _leReachJson;
+
+    /// <summary>
+    ///     Optional: import IDA .map symbol names and append as end-of-line hints (best-effort).
+    ///     Specified with -LEIDAMAP <file.map>
+    /// </summary>
+    private string _leIdaMapFile;
+
+    /// <summary>
+    ///     Optional: import Binary Ninja IR text export and append as end-of-line hints (best-effort).
+    ///     Specified with -LEBNIR <file.txt>
+    /// </summary>
+    private string _leBinaryNinjaIrFile;
         ///     Logger Implementation
         /// </summary>
         protected static readonly Logger _logger = LogManager.GetCurrentClassLogger(typeof(CustomLogger));
@@ -384,6 +396,19 @@ namespace DOSRE.UI.impl
                         case "LEINSIGHTS":
                             _bLeInsights = true;
                             break;
+                        case "LEIDAMAP":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LEIDAMAP requires a <file.map>");
+                            _leIdaMapFile = _args[i + 1];
+                            i++;
+                            break;
+                        case "LEBNIR":
+                        case "LEBINARYNINJAIR":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -LEBNIR requires a <file.txt>");
+                            _leBinaryNinjaIrFile = _args[i + 1];
+                            i++;
+                            break;
                         case "LEEXPORTOBJ":
                             if (i + 2 >= _args.Length)
                                 throw new Exception("Error: -LEEXPORTOBJ requires <index> <file.bin>");
@@ -609,6 +634,10 @@ namespace DOSRE.UI.impl
                                 "-LEGLOBALS -- (LE inputs) Emit g_XXXXXXXX EQU 0xXXXXXXXX from disp32 fixups + rewrite operands (LLM-friendly)");
                             Console.WriteLine(
                                 "-LEINSIGHTS -- (LE inputs) Best-effort function/CFG/xref/stack-var/string analysis (more LLM-friendly)");
+                            Console.WriteLine(
+                                "-LEIDAMAP <file.map> -- (LE inputs) Import IDA .map names and append as hints (best-effort)");
+                            Console.WriteLine(
+                                "-LEBNIR <file.txt> -- (LE inputs) Import Binary Ninja IR text names and append as hints (best-effort)");
                             Console.WriteLine(
                                 "-LERENDERLIMIT <n> -- (LE inputs) Max instructions per object to emit (0 = no instruction render; insights-only)");
                             Console.WriteLine(
@@ -851,6 +880,8 @@ namespace DOSRE.UI.impl
                             _toolchainHint,
                             _leStartLinear,
                             _bLeScanMz,
+                            _leIdaMapFile,
+                            _leBinaryNinjaIrFile,
                             out var asm,
                             out leError);
 
@@ -887,6 +918,8 @@ namespace DOSRE.UI.impl
                                 _toolchainHint,
                                 _leStartLinear,
                                 _bLeScanMz,
+                                _leIdaMapFile,
+                                _leBinaryNinjaIrFile,
                                 out var asm,
                                 out leError);
 
@@ -910,7 +943,7 @@ namespace DOSRE.UI.impl
                     }
                     else
                     {
-                        leOk = LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _leRenderLimit, _leJobs, _bLeFixups, _bLeGlobals, leInsightsForRun, _toolchainHint, _leStartLinear, _bLeScanMz, out leOutput, out leError);
+                        leOk = LEDisassembler.TryDisassembleToString(_sInputFile, _bLeFull, _leBytesLimit, _leRenderLimit, _leJobs, _bLeFixups, _bLeGlobals, leInsightsForRun, _toolchainHint, _leStartLinear, _bLeScanMz, _leIdaMapFile, _leBinaryNinjaIrFile, out leOutput, out leError);
                     }
                 }
 

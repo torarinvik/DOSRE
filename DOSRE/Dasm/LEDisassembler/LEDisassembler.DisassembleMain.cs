@@ -18,6 +18,51 @@ namespace DOSRE.Dasm
 {
     public static partial class LEDisassembler
     {
+        public static bool TryDisassembleToString(
+            string inputFile,
+            bool leFull,
+            int? leBytesLimit,
+            int? leRenderLimit,
+            int leJobs,
+            bool leFixups,
+            bool leGlobals,
+            bool leInsights,
+            EnumToolchainHint toolchainHint,
+            uint? leStartLinear,
+            bool leScanMzOverlayFallback,
+            string leIdaMapFile,
+            string leBinaryNinjaIrFile,
+            out string output,
+            out string error)
+        {
+            var prevIda = s_externalIdaMapPath;
+            var prevBn = s_externalBinaryNinjaIrPath;
+            s_externalIdaMapPath = leIdaMapFile;
+            s_externalBinaryNinjaIrPath = leBinaryNinjaIrFile;
+            try
+            {
+                return TryDisassembleToString(
+                    inputFile,
+                    leFull,
+                    leBytesLimit,
+                    leRenderLimit,
+                    leJobs,
+                    leFixups,
+                    leGlobals,
+                    leInsights,
+                    toolchainHint,
+                    leStartLinear,
+                    leScanMzOverlayFallback,
+                    out output,
+                    out error);
+            }
+            finally
+            {
+                s_externalIdaMapPath = prevIda;
+                s_externalBinaryNinjaIrPath = prevBn;
+            }
+        }
+
         public static bool TryDisassembleToString(string inputFile, bool leFull, int? leBytesLimit, bool leFixups, bool leGlobals, bool leInsights, EnumToolchainHint toolchainHint, out string output, out string error)
         {
             return TryDisassembleToString(inputFile, leFull, leBytesLimit, leRenderLimit: null, leJobs: 1, leFixups, leGlobals, leInsights, toolchainHint, leStartLinear: null, out output, out error);
@@ -171,6 +216,7 @@ namespace DOSRE.Dasm
             // String symbol table (linear address -> symbol)
             Dictionary<uint, string> stringSymbols = null;
             Dictionary<uint, string> stringPreview = null;
+            Dictionary<uint, List<string>> externalNameHintsByLinear = null;
             Dictionary<uint, string> resourceSymbols = null;
             Dictionary<uint, string> vtblSymbols = null;
             Dictionary<uint, Dictionary<uint, uint>> vtblSlots = null;
@@ -182,6 +228,10 @@ namespace DOSRE.Dasm
                 _logger.Info("LE: Scanning strings (insights)...");
                 ScanStrings(objects, objBytesByIndex, out stringSymbols, out stringPreview);
                 _logger.Info($"LE: String scan complete: {stringSymbols?.Count ?? 0} strings in {swStrings.ElapsedMilliseconds} ms");
+
+                // Optional: external name hints from reverse engineering tools (IDA map / Binary Ninja IR).
+                // Uses string preview matches to infer address deltas where possible.
+                externalNameHintsByLinear = BuildExternalNameHintsByLinear(objects, stringPreview, s_externalIdaMapPath, s_externalBinaryNinjaIrPath);
                 resourceSymbols = new Dictionary<uint, string>();
                 vtblSymbols = new Dictionary<uint, string>();
                 vtblSlots = new Dictionary<uint, Dictionary<uint, uint>>();
@@ -193,10 +243,14 @@ namespace DOSRE.Dasm
                     foreach (var kvp in stringSymbols.OrderBy(k => k.Key).Take(512))
                     {
                         var prev = stringPreview.TryGetValue(kvp.Key, out var p) ? p : string.Empty;
+                        string line;
                         if (!string.IsNullOrEmpty(prev))
-                            AppendWrappedDisasmLine(sb, string.Empty, $"{kvp.Value} EQU 0x{kvp.Key:X8} ; \"{prev}\"", commentColumn: 40, maxWidth: 160);
+                            line = $"{kvp.Value} EQU 0x{kvp.Key:X8} ; \"{prev}\"";
                         else
-                            sb.AppendLine($"{kvp.Value} EQU 0x{kvp.Key:X8}");
+                            line = $"{kvp.Value} EQU 0x{kvp.Key:X8}";
+
+                        AppendExternalNameHintSuffix(ref line, kvp.Key, externalNameHintsByLinear);
+                        AppendWrappedDisasmLine(sb, string.Empty, line, commentColumn: 40, maxWidth: 160);
                     }
                     if (stringSymbols.Count > 512)
                         AppendWrappedDisasmLine(sb, string.Empty, $" ; (strings truncated: {stringSymbols.Count} total)", commentColumn: 0, maxWidth: 160);
@@ -561,6 +615,21 @@ namespace DOSRE.Dasm
 
                 if (tables.Count > 0)
                     _logger.Info($"LE: Thunk/vector scan: {tables.Count} tables, {thunkTargets.Count} unique targets (seeded as function starts)");
+            }
+
+            // Filter noisy external hints (data_*, byte_*, etc.) unless they are "interesting"
+            // (referenced by code or known string/function starts).
+            if (externalNameHintsByLinear != null)
+            {
+                var interestingForHints = new HashSet<uint>(globalFunctionStarts);
+                interestingForHints.UnionWith(globalLabelTargets);
+                interestingForHints.UnionWith(globalCallXrefs.Keys);
+                interestingForHints.UnionWith(globalJumpXrefs.Keys);
+                interestingForHints.UnionWith(globalFixupTargets);
+                if (stringSymbols != null) interestingForHints.UnionWith(stringSymbols.Keys);
+                if (analysis != null) interestingForHints.UnionWith(analysis.ExportedNames.Keys);
+
+                FilterNoisyExternalHints(externalNameHintsByLinear, interestingForHints);
             }
 
             foreach (var obj in objects)
@@ -1921,6 +1990,9 @@ namespace DOSRE.Dasm
                         if (!string.IsNullOrEmpty(fixupText))
                             insText += $" ; FIXUP: {fixupText}";
                     }
+
+                    // Append external name hints last so they're easy to spot and don't interfere with other heuristics.
+                    AppendExternalNameHintSuffix(ref insText, (uint)ins.Offset, externalNameHintsByLinear);
 
                     var prefix = $"{ins.Offset:X8}h {bytes.PadRight(Constants.MAX_INSTRUCTION_LENGTH, ' ')} ";
                     AppendWrappedDisasmLine(sb, prefix, insText, commentColumn: 56, maxWidth: 160);
