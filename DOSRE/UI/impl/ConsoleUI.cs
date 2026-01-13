@@ -1425,6 +1425,28 @@ namespace DOSRE.UI.impl
                     }
                     else
                     {
+                        // If we're in LE decompile mode and the user provided an output DIRECTORY,
+                        // write all generated multipart files there (main.c, b*.c, blst.h, etc).
+                        // This keeps the common workflow `-LEDECOMP -O <dir>` working.
+                        if (_bLeDecompile
+                            && leDecompFiles != null
+                            && leDecompFiles.Count > 0
+                            && (Directory.Exists(_sOutputFile)
+                                || _sOutputFile.EndsWith(Path.DirectorySeparatorChar)
+                                || _sOutputFile.EndsWith(Path.AltDirectorySeparatorChar)))
+                        {
+                            var outDir = _sOutputFile;
+                            Directory.CreateDirectory(outDir);
+                            _logger.Info($"{DateTime.Now} Writing LE decomp outputs to {outDir}");
+                            foreach (var kvp in leDecompFiles)
+                            {
+                                var outPath = Path.Combine(outDir, kvp.Key);
+                                File.WriteAllText(outPath, kvp.Value);
+                            }
+                            _logger.Info($"{DateTime.Now} Done!");
+                            return;
+                        }
+
                         if (_bMacros)
                             leOutput = MacroDeduper.Apply(leOutput);
                         if (_splitKb.HasValue)

@@ -412,6 +412,24 @@ namespace DOSRE.Dasm
             ParsedBlock currentBlock = null;
             var skipUntilNextFunction = false;
 
+            // Track last instruction to detect mid-block "func_XXXXXXXX" entry labels.
+            uint? __lastInsEndAddr = null;
+            bool __lastInsHardTerminator = false;
+
+            static bool IsHardBlockTerminator(string asm)
+            {
+                if (string.IsNullOrWhiteSpace(asm)) return false;
+                var a = asm.TrimStart();
+                // Conservative approximation: treat non-fallthrough transfers as boundaries.
+                return a.StartsWith("ret", StringComparison.OrdinalIgnoreCase)
+                    || a.StartsWith("retn", StringComparison.OrdinalIgnoreCase)
+                    || a.StartsWith("retf", StringComparison.OrdinalIgnoreCase)
+                    || a.StartsWith("iret", StringComparison.OrdinalIgnoreCase)
+                    || a.StartsWith("jmp", StringComparison.OrdinalIgnoreCase)
+                    || a.StartsWith("ljmp", StringComparison.OrdinalIgnoreCase)
+                    || a.StartsWith("call", StringComparison.OrdinalIgnoreCase);
+            }
+
             // Ensure the entry point (and its containing instruction) is considered a function start
             // even if the disassembler didn't label it as such (e.g. if it was a mid-instruction entry).
             var forcedFuncStarts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -462,12 +480,56 @@ namespace DOSRE.Dasm
                     var ins = TryParseAsmInstructionLine(t);
                     if (ins != null && _addrToFuncName.TryGetValue(ins.AddrHex, out var fName) && !functions.Any(f => f.Name == fName))
                     {
-                        capturedAddr = ins.AddrHex;
+                        var insAddrU = uint.Parse(ins.AddrHex, System.Globalization.NumberStyles.HexNumber);
+
+                        // If we are already inside a function and the previous instruction falls through
+                        // into this address, do NOT start a new function here. This avoids splitting a
+                        // straight-line basic block into multiple functions (common in LE entrypoints and
+                        // in cases where insights over-label internal targets as func_XXXX).
+                        var fallsThrough = currentFunc != null
+                            && __lastInsEndAddr.HasValue
+                            && __lastInsEndAddr.Value == insAddrU
+                            && !__lastInsHardTerminator;
+
+                        if (!fallsThrough)
+                            capturedAddr = ins.AddrHex;
                     }
                 }
 
                 if (capturedAddr != null)
                 {
+                    var capU = Convert.ToUInt32(capturedAddr, 16);
+
+                    // Special-case: if the LE entrypoint is labeled as func_XXXXXXXX but appears
+                    // immediately after a non-terminating instruction inside an existing function,
+                    // treat it as a local label. This enables __entry_jump injection to jump into
+                    // the containing function instead of generating an invalid split.
+                    if (entryLinear.HasValue
+                        && capU == entryLinear.Value
+                        && currentFunc != null
+                        && __lastInsEndAddr.HasValue
+                        && __lastInsEndAddr.Value == capU
+                        && !__lastInsHardTerminator)
+                    {
+                        labelByAddr[capturedAddr] = $"loc_{capturedAddr}";
+                        var demotedLabel = $"loc_{capturedAddr}";
+                        var existing = currentFunc.Blocks.FirstOrDefault(b => b.Label.Equals(demotedLabel, StringComparison.OrdinalIgnoreCase));
+                        if (existing != null)
+                        {
+                            currentBlock = existing;
+                        }
+                        else
+                        {
+                            currentBlock = new ParsedBlock
+                            {
+                                Label = demotedLabel,
+                                Lines = new List<ParsedInsOrComment>()
+                            };
+                            currentFunc.Blocks.Add(currentBlock);
+                        }
+                        continue;
+                    }
+
                     currentFunc = new ParsedFunction
                     {
                         Name = $"func_{capturedAddr}",
@@ -477,7 +539,11 @@ namespace DOSRE.Dasm
                     functions.Add(currentFunc);
                     currentBlock = null;
                     skipUntilNextFunction = false;
-                    
+
+                    // Reset last-instruction tracking at function boundaries.
+                    __lastInsEndAddr = null;
+                    __lastInsHardTerminator = false;
+
                     // If we synthetic-captured this from an instruction line, don't 'continue' yet,
                     // we need to process the instruction below.
                     if (!funcHdr.Success) { /* fall through to instruction parsing */ }
@@ -499,12 +565,21 @@ namespace DOSRE.Dasm
                     var blockHdr = Regex.Match(t.Trim(), @"^(?<kind>bb|loc)_(?<addr>[0-9A-Fa-f]{8}):\s*$");
                     if (blockHdr.Success)
                     {
-                        currentBlock = new ParsedBlock
+                        var label = $"{blockHdr.Groups["kind"].Value}_{blockHdr.Groups["addr"].Value.ToUpperInvariant()}";
+                        var existing = currentFunc.Blocks.FirstOrDefault(b => b.Label.Equals(label, StringComparison.OrdinalIgnoreCase));
+                        if (existing != null)
                         {
-                            Label = $"{blockHdr.Groups["kind"].Value}_{blockHdr.Groups["addr"].Value.ToUpperInvariant()}",
-                            Lines = new List<ParsedInsOrComment>()
-                        };
-                        currentFunc.Blocks.Add(currentBlock);
+                            currentBlock = existing;
+                        }
+                        else
+                        {
+                            currentBlock = new ParsedBlock
+                            {
+                                Label = label,
+                                Lines = new List<ParsedInsOrComment>()
+                            };
+                            currentFunc.Blocks.Add(currentBlock);
+                        }
                         continue;
                     }
 
@@ -521,6 +596,11 @@ namespace DOSRE.Dasm
 
                         currentBlock.Lines.Add(ins);
 
+                        // Update last-instruction tracking for entrypoint split heuristics.
+                        var len = (uint)((ins.BytesHex?.Length ?? 0) / 2);
+                        __lastInsEndAddr = unchecked((uint)ins.Address + len);
+                        __lastInsHardTerminator = IsHardBlockTerminator(ins.Asm);
+
                         // If this is a known no-return DOS exit interrupt, stop consuming further lines
                         // in this function. Tiny LE programs often place data (e.g., strings) immediately
                         // after the exit and would otherwise be decoded as garbage instructions.
@@ -529,6 +609,8 @@ namespace DOSRE.Dasm
                             skipUntilNextFunction = true;
                             currentFunc = null;
                             currentBlock = null;
+                            __lastInsEndAddr = null;
+                            __lastInsHardTerminator = false;
                         }
                         continue;
                     }
@@ -1629,14 +1711,20 @@ namespace DOSRE.Dasm
 
                 if (!string.IsNullOrWhiteSpace(entryDirectFunc))
                 {
-                    mainSb.AppendLine($"    {SanitizeLabel(entryDirectFunc)}();");
+                    var argsStr = "";
+                    if (functionsByName.TryGetValue(entryDirectFunc, out var entryDirectParsedFn) && entryDirectParsedFn.ArgCount > 0)
+                        argsStr = string.Join(", ", Enumerable.Repeat("0", entryDirectParsedFn.ArgCount));
+                    mainSb.AppendLine($"    {SanitizeLabel(entryDirectFunc)}({argsStr});");
                 }
                 else if (entryLinear.HasValue && !string.IsNullOrWhiteSpace(entryContainerFunc) && entryJumpAddr.HasValue)
                 {
                     mainSb.AppendLine("    __entry_jump_enabled = 1;");
                     mainSb.AppendLine($"    __entry_jump_target = 0x{entryLinear.Value:X8}u;");
                     mainSb.AppendLine($"    __entry_jump_addr = 0x{entryJumpAddr.Value:X8}u;");
-                    mainSb.AppendLine($"    {SanitizeLabel(entryContainerFunc)}();");
+                    var argsStr = "";
+                    if (functionsByName.TryGetValue(entryContainerFunc, out var entryContainerParsedFn) && entryContainerParsedFn.ArgCount > 0)
+                        argsStr = string.Join(", ", Enumerable.Repeat("0", entryContainerParsedFn.ArgCount));
+                    mainSb.AppendLine($"    {SanitizeLabel(entryContainerFunc)}({argsStr});");
                 }
                 else
                 {
@@ -1759,7 +1847,13 @@ namespace DOSRE.Dasm
                     d.AppendLine("    __entry_jump_enabled = 1;");
                     d.AppendLine($"    __entry_jump_target = 0x{entryLinear.Value:X8}u;");
                     d.AppendLine($"    __entry_jump_addr = 0x{entryJumpAddr.Value:X8}u;");
-                    d.AppendLine($"    return {SanitizeLabel(entryContainerFunc)}();");
+                    var argsStr = "";
+                    if (functionsByName.TryGetValue(entryContainerFunc, out var entryContainerParsedFn) && entryContainerParsedFn.ArgCount > 0)
+                        argsStr = string.Join(", ", Enumerable.Repeat("0", entryContainerParsedFn.ArgCount));
+                    if (functionsByName.TryGetValue(entryContainerFunc, out var entryContainerParsedFn2) && entryContainerParsedFn2.RetType == "void")
+                        d.AppendLine($"    {SanitizeLabel(entryContainerFunc)}({argsStr}); return 0;");
+                    else
+                        d.AppendLine($"    return {SanitizeLabel(entryContainerFunc)}({argsStr});");
                     d.AppendLine("}");
                     d.AppendLine();
                 }
@@ -3748,6 +3842,10 @@ namespace DOSRE.Dasm
             {
                 pending.Clear(dstIsEax);
                 var target = ResolveTarget(ops, labelByAddr);
+                if (target.StartsWith("func_", StringComparison.OrdinalIgnoreCase))
+                {
+                    return $"// {asm} (cross-function target: {target})" + commentSuffix;
+                }
                 if ((target.StartsWith("loc_", StringComparison.OrdinalIgnoreCase) || target.StartsWith("bb_", StringComparison.OrdinalIgnoreCase))
                     && !fn.Blocks.Any(b => target.Equals(b.Label, StringComparison.OrdinalIgnoreCase)))
                 {
@@ -3798,6 +3896,15 @@ namespace DOSRE.Dasm
                 var target = ResolveTarget(ops, labelByAddr);
                 var cond = TryMakeConditionFromPending(mn, pending);
                 pending.Clear(dstIsEax);
+
+                // We cannot `goto` another C function label. If analysis labeled the branch target as
+                // a function start, keep it as an unresolved/cross-function marker instead.
+                if (target.StartsWith("func_", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!string.IsNullOrWhiteSpace(cond))
+                        return $"if ({cond}) {{ /* {mn} {ops} (cross-function target: {target}) */ }}{commentSuffix}";
+                    return $"if (0 /* unknown: {mn} */) {{ /* {mn} {ops} (cross-function target: {target}) */ }}{commentSuffix}";
+                }
 
                 var targetIsKnown = !(target.StartsWith("loc_", StringComparison.OrdinalIgnoreCase) || target.StartsWith("bb_", StringComparison.OrdinalIgnoreCase))
                     || fn.Blocks.Any(b => target.Equals(b.Label, StringComparison.OrdinalIgnoreCase));
