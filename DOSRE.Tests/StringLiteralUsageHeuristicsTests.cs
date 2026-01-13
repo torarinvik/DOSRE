@@ -91,5 +91,43 @@ namespace DOSRE.Tests
             Assert.Contains("s_00002000", hint);
             Assert.Contains("\"via_reg\"", hint);
         }
+
+        [Fact]
+        public void TryAnnotateCallStringLiteralArgs_StackSlotWrite_ResolvesMovEspPlusDispImm32()
+        {
+            // sub esp, 0x8
+            // mov dword [esp+0x4], 0x00002000
+            // call +0
+            var code = new byte[]
+            {
+                0x83, 0xEC, 0x08,
+                0xC7, 0x44, 0x24, 0x04, 0x00, 0x20, 0x00, 0x00,
+                0xE8, 0x00, 0x00, 0x00, 0x00,
+            };
+
+            var instructions = Disassemble(code, 0x3000);
+            var callIdx = instructions.Count - 1;
+
+            var stringSymbols = new Dictionary<uint, string>
+            {
+                [0x00002000] = "s_00002000",
+            };
+
+            var stringPreview = new Dictionary<uint, string>
+            {
+                [0x00002000] = "stack_slot",
+            };
+
+            var hint = DOSRE.Dasm.LEDisassembler.TryAnnotateCallStringLiteralArgsForTest(
+                instructions,
+                callIdx,
+                stringSymbols,
+                stringPreview);
+
+            Assert.Contains("STRARGS:", hint);
+            Assert.Contains("[esp+0x4]", hint);
+            Assert.Contains("s_00002000", hint);
+            Assert.Contains("\"stack_slot\"", hint);
+        }
     }
 }

@@ -705,6 +705,12 @@ namespace DOSRE.Dasm
             // Collect pushes immediately preceding this call.
             // Scan backwards; the first push we see is arg0 (cdecl-style: last push before call is first argument).
             var resolved = new List<(string Sym, string Preview)>();
+
+            // Stack-slot argument setup (common when caller reserves an arg area with `sub esp, N`):
+            //   mov [esp+0x0], <op>
+            //   mov dword [esp+0x4], <op>
+            // We store by slot offset, then emit in ascending offset order.
+            var stackSlots = new Dictionary<uint, (string Sym, string Preview)>();
             for (var i = callIdx - 1; i >= 0 && i >= callIdx - Math.Max(1, maxLookback); i--)
             {
                 var t = InsText(instructions[i]).Trim();
@@ -716,6 +722,26 @@ namespace DOSRE.Dasm
 
                 if (t.StartsWith("add esp", StringComparison.OrdinalIgnoreCase) || t.StartsWith("sub esp", StringComparison.OrdinalIgnoreCase))
                     break;
+
+                // Track stack-slot writes for outgoing args: mov [esp+disp], src
+                // Keep scanning even if we don't resolve this one.
+                // Note: operand order is AT&T-ish? In this output it is Intel: mov dest, src
+                var mMovEsp = Regex.Match(t, @"^mov\s+(?:dword\s+)?\[(?<base>esp)(?<disp>\+0x[0-9a-fA-F]{1,8})?\],\s*(?<src>.+)$", RegexOptions.IgnoreCase);
+                if (mMovEsp.Success)
+                {
+                    var disp = mMovEsp.Groups["disp"].Success ? mMovEsp.Groups["disp"].Value.Substring(1) : "0x0"; // drop leading '+'
+                    if (TryParseImm32(disp, out var slot))
+                    {
+                        var src = mMovEsp.Groups["src"].Value.Trim();
+                        if (TryResolveStringSymFromOperand(instructions, callIdx, src, stringSymbols, stringPreview, objects, objBytesByIndex, resourceGetterTargets, out var symMov, out var prevMov) &&
+                            !string.IsNullOrEmpty(prevMov))
+                        {
+                            // Keep the first resolved assignment for this slot in the lookback window.
+                            if (!stackSlots.ContainsKey(slot))
+                                stackSlots[slot] = (symMov, prevMov);
+                        }
+                    }
+                }
 
                 if (!t.StartsWith("push ", StringComparison.OrdinalIgnoreCase))
                     continue;
@@ -730,7 +756,32 @@ namespace DOSRE.Dasm
                 }
             }
 
-            if (resolved.Count == 0)
+            // Also support register-passed string literals (common in Watcom-style codegen):
+            //   mov eax, s_... ; call ...
+            // If we got no stack args (or even if we did), try to resolve a few likely arg regs.
+            var resolvedRegs = new List<(string Reg, string Sym, string Preview)>();
+            foreach (var reg in new[] { "eax", "edx", "ecx", "ebx" })
+            {
+                if (!TryResolveStringSymFromOperand(instructions, callIdx, reg, stringSymbols, stringPreview, objects, objBytesByIndex, resourceGetterTargets, out var sym, out var prev))
+                    continue;
+                if (string.IsNullOrEmpty(prev))
+                    continue;
+
+                // Avoid duplicating the same (sym/preview) already found via pushes.
+                var dup = false;
+                for (var k = 0; k < resolved.Count; k++)
+                {
+                    if (StringComparer.OrdinalIgnoreCase.Equals(resolved[k].Sym, sym) && StringComparer.Ordinal.Equals(resolved[k].Preview, prev))
+                    {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup)
+                    resolvedRegs.Add((reg, sym, prev));
+            }
+
+            if (resolved.Count == 0 && stackSlots.Count == 0 && resolvedRegs.Count == 0)
                 return string.Empty;
 
             // Emit in arg order: arg0 is the last push before the call.
@@ -742,6 +793,26 @@ namespace DOSRE.Dasm
                 if (string.IsNullOrEmpty(sym))
                     sym = "(str)";
                 sb.Append($" arg{k}={sym} \"{prev}\"");
+            }
+
+            if (stackSlots.Count > 0)
+            {
+                foreach (var kvp in stackSlots.OrderBy(kvp => kvp.Key).Take(Math.Max(0, maxArgs - resolved.Count)))
+                {
+                    var slot = kvp.Key;
+                    var (sym, prev) = kvp.Value;
+                    if (string.IsNullOrEmpty(sym))
+                        sym = "(str)";
+                    sb.Append($" [esp+0x{slot:X}]={sym} \"{prev}\"");
+                }
+            }
+
+            for (var k = 0; k < resolvedRegs.Count; k++)
+            {
+                var (reg, sym, prev) = resolvedRegs[k];
+                if (string.IsNullOrEmpty(sym))
+                    sym = "(str)";
+                sb.Append($" {reg}={sym} \"{prev}\"");
             }
             return sb.ToString();
         }
