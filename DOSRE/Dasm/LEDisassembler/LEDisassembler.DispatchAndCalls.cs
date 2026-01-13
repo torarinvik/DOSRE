@@ -692,8 +692,8 @@ namespace DOSRE.Dasm
             List<LEObject> objects,
             Dictionary<int, byte[]> objBytesByIndex,
             HashSet<uint> resourceGetterTargets = null,
-            int maxLookback = 16,
-            int maxArgs = 4)
+            int maxLookback = 32,
+            int maxArgs = 6)
         {
             if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
                 return string.Empty;
@@ -829,6 +829,46 @@ namespace DOSRE.Dasm
                 stringPreview,
                 objects: null,
                 objBytesByIndex: null,
+                resourceGetterTargets: null);
+        }
+
+        // Test helper with a minimal synthetic memory model (linear base + bytes) so we can validate pointer indirections.
+        internal static string TryAnnotateCallStringLiteralArgsForTestWithMemory(List<Instruction> instructions, int callIdx,
+            Dictionary<uint, string> stringSymbols,
+            Dictionary<uint, string> stringPreview,
+            List<(uint baseAddress, uint virtualSize, byte[] bytes)> memoryObjects)
+        {
+            List<LEObject> objects = null;
+            Dictionary<int, byte[]> objBytesByIndex = null;
+
+            if (memoryObjects != null && memoryObjects.Count > 0)
+            {
+                objects = new List<LEObject>(memoryObjects.Count);
+                objBytesByIndex = new Dictionary<int, byte[]>(memoryObjects.Count);
+                for (var i = 0; i < memoryObjects.Count; i++)
+                {
+                    var (baseAddress, virtualSize, bytes) = memoryObjects[i];
+                    var idx = i + 1;
+                    objects.Add(new LEObject
+                    {
+                        Index = idx,
+                        BaseAddress = baseAddress,
+                        VirtualSize = virtualSize == 0 ? (uint)(bytes?.Length ?? 0) : virtualSize,
+                        Flags = 0,
+                        PageCount = 1,
+                        PageMapIndex = 1,
+                    });
+                    objBytesByIndex[idx] = bytes ?? Array.Empty<byte>();
+                }
+            }
+
+            return TryAnnotateCallStringLiteralArgs(
+                instructions,
+                callIdx,
+                stringSymbols,
+                stringPreview,
+                objects,
+                objBytesByIndex,
                 resourceGetterTargets: null);
         }
 

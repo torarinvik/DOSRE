@@ -165,5 +165,92 @@ namespace DOSRE.Tests
             Assert.Contains("s_000C0025", hint);
             Assert.Contains("\"offset_base\"", hint);
         }
+
+        [Fact]
+        public void TryAnnotateCallStringLiteralArgs_RegisterDerefPointerTable_Resolves()
+        {
+            // mov eax, 0x00003000
+            // mov eax, [eax]          ; eax = *(uint*)0x3000 = 0x00002000
+            // push eax
+            // call +0
+            var code = new byte[]
+            {
+                0xB8, 0x00, 0x30, 0x00, 0x00,
+                0x8B, 0x00,
+                0x50,
+                0xE8, 0x00, 0x00, 0x00, 0x00,
+            };
+
+            var instructions = Disassemble(code, 0x5000);
+            var callIdx = instructions.Count - 1;
+
+            var stringSymbols = new Dictionary<uint, string>
+            {
+                [0x00002000] = "s_00002000",
+            };
+
+            var stringPreview = new Dictionary<uint, string>
+            {
+                [0x00002000] = "ptr_deref",
+            };
+
+            // Memory at 0x3000 contains a pointer to 0x2000.
+            var mem = new List<(uint baseAddress, uint virtualSize, byte[] bytes)>
+            {
+                (0x00003000u, 0x100u, new byte[] { 0x00, 0x20, 0x00, 0x00 }),
+            };
+
+            var hint = DOSRE.Dasm.LEDisassembler.TryAnnotateCallStringLiteralArgsForTestWithMemory(
+                instructions,
+                callIdx,
+                stringSymbols,
+                stringPreview,
+                mem);
+
+            Assert.Contains("STRARGS:", hint);
+            Assert.Contains("s_00002000", hint);
+            Assert.Contains("\"ptr_deref\"", hint);
+        }
+
+        [Fact]
+        public void TryAnnotateCallStringLiteralArgs_PushMemoryPointerTable_Resolves()
+        {
+            // push dword [0x00003000]  ; *(uint*)0x3000 = 0x00002000
+            // call +0
+            var code = new byte[]
+            {
+                0xFF, 0x35, 0x00, 0x30, 0x00, 0x00,
+                0xE8, 0x00, 0x00, 0x00, 0x00,
+            };
+
+            var instructions = Disassemble(code, 0x6000);
+            var callIdx = instructions.Count - 1;
+
+            var stringSymbols = new Dictionary<uint, string>
+            {
+                [0x00002000] = "s_00002000",
+            };
+
+            var stringPreview = new Dictionary<uint, string>
+            {
+                [0x00002000] = "ptr_pushmem",
+            };
+
+            var mem = new List<(uint baseAddress, uint virtualSize, byte[] bytes)>
+            {
+                (0x00003000u, 0x100u, new byte[] { 0x00, 0x20, 0x00, 0x00 }),
+            };
+
+            var hint = DOSRE.Dasm.LEDisassembler.TryAnnotateCallStringLiteralArgsForTestWithMemory(
+                instructions,
+                callIdx,
+                stringSymbols,
+                stringPreview,
+                mem);
+
+            Assert.Contains("STRARGS:", hint);
+            Assert.Contains("s_00002000", hint);
+            Assert.Contains("\"ptr_pushmem\"", hint);
+        }
     }
 }

@@ -8,6 +8,153 @@ namespace DOSRE.Dasm
 {
     public static partial class LEDisassembler
     {
+        private static bool TryReadU32AtLinear(List<LEObject> objects, Dictionary<int, byte[]> objBytesByIndex, uint addr, out uint value)
+        {
+            value = 0;
+            if (objects == null || objBytesByIndex == null)
+                return false;
+
+            foreach (var obj in objects)
+            {
+                if (addr < obj.BaseAddress)
+                    continue;
+                var end = obj.BaseAddress + obj.VirtualSize;
+                if (addr >= end)
+                    continue;
+
+                if (!objBytesByIndex.TryGetValue(obj.Index, out var bytes) || bytes == null || bytes.Length == 0)
+                    return false;
+
+                var start = (int)(addr - obj.BaseAddress);
+                if (start < 0 || start + 4 > bytes.Length)
+                    return false;
+
+                var maxLen = Math.Min(bytes.Length, (int)Math.Min(obj.VirtualSize, (uint)bytes.Length));
+                if (start + 4 > maxLen)
+                    return false;
+
+                value = BitConverter.ToUInt32(bytes, start);
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryResolveStringFromPointerAt(uint ptrAddr,
+            Dictionary<uint, string> stringSymbols,
+            Dictionary<uint, string> stringPreview,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
+            out uint resolvedAddr,
+            out string sym,
+            out string preview)
+        {
+            resolvedAddr = 0;
+            sym = string.Empty;
+            preview = string.Empty;
+
+            if (!TryReadU32AtLinear(objects, objBytesByIndex, ptrAddr, out var pval))
+                return false;
+
+            // Pointer value itself may be a raw offset or a linear address.
+            if (stringSymbols != null && TryResolveStringAddressFromRaw(pval, stringSymbols, objects, out var mapped, out var mappedSym))
+                resolvedAddr = mapped;
+            else
+                resolvedAddr = pval;
+
+            if (!TryGetStringPreviewAt(resolvedAddr, stringPreview, objects, objBytesByIndex, out var p) || string.IsNullOrEmpty(p))
+                return false;
+
+            preview = p;
+            sym = stringSymbols != null
+                ? stringSymbols.TryGetValue(resolvedAddr, out var s0) ? s0 : (stringSymbols[resolvedAddr] = $"s_{resolvedAddr:X8}")
+                : $"s_{resolvedAddr:X8}";
+            return true;
+        }
+
+        private static bool TryResolveRegisterStringViaLastWrite(
+            List<Instruction> instructions,
+            int indexExclusive,
+            string reg,
+            Dictionary<uint, string> stringSymbols,
+            Dictionary<uint, string> stringPreview,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
+            HashSet<uint> resourceGetterTargets,
+            out string sym,
+            out string preview)
+        {
+            sym = string.Empty;
+            preview = string.Empty;
+            if (instructions == null || indexExclusive <= 0 || !IsRegister32(reg))
+                return false;
+
+            var start = Math.Min(indexExclusive - 1, instructions.Count - 1);
+            var stop = Math.Max(0, start - 64);
+
+            for (var i = start; i >= stop; i--)
+            {
+                var t = InsText(instructions[i]).Trim();
+                if (string.IsNullOrEmpty(t))
+                    continue;
+
+                // Stop at control-flow barriers.
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) || (t.StartsWith("j", StringComparison.OrdinalIgnoreCase) && !t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase)))
+                {
+                    break;
+                }
+
+                // mov reg, [0xADDR]
+                var mm0 = Regex.Match(t, $@"^mov\s+{Regex.Escape(reg)},\s*(?:dword\s+)?\[(?<addr>0x[0-9a-fA-F]{{1,8}})\]$", RegexOptions.IgnoreCase);
+                if (mm0.Success && TryParseImm32(mm0.Groups["addr"].Value, out var paddr) &&
+                    TryResolveStringFromPointerAt(paddr, stringSymbols, stringPreview, objects, objBytesByIndex, out _, out var s0, out var p0))
+                {
+                    sym = s0;
+                    preview = p0;
+                    return true;
+                }
+
+                // mov reg, [g_XXXXXXXX]
+                var mmg = Regex.Match(t, $@"^mov\s+{Regex.Escape(reg)},\s*(?:dword\s+)?\[(?<g>g_[0-9a-fA-F]{{8}})\]$", RegexOptions.IgnoreCase);
+                if (mmg.Success)
+                {
+                    var gtok = mmg.Groups["g"].Value;
+                    var hex = gtok.Substring(2);
+                    var gaddr = Convert.ToUInt32(hex, 16);
+                    if (TryResolveStringFromPointerAt(gaddr, stringSymbols, stringPreview, objects, objBytesByIndex, out _, out var sg, out var pg))
+                    {
+                        sym = sg;
+                        preview = pg;
+                        return true;
+                    }
+                }
+
+                // mov reg, [baseReg(+disp)]
+                var mm1 = Regex.Match(t, $@"^mov\s+{Regex.Escape(reg)},\s*(?:dword\s+)?\[(?<base>e[a-z]{{2}})(?<disp>\+0x[0-9a-fA-F]{{1,8}})?\]$", RegexOptions.IgnoreCase);
+                if (mm1.Success)
+                {
+                    var baseReg = mm1.Groups["base"].Value.ToLowerInvariant();
+                    var disp = 0u;
+                    if (mm1.Groups["disp"].Success)
+                        TryParseImm32("0x" + mm1.Groups["disp"].Value.Substring(3), out disp); // +0xNNN -> 0xNNN
+
+                    if (TryResolveRegisterValueBefore(instructions, i, baseReg, out var baseVal, resourceGetterTargets))
+                    {
+                        var addr = unchecked(baseVal + disp);
+                        if (TryResolveStringFromPointerAt(addr, stringSymbols, stringPreview, objects, objBytesByIndex, out _, out var s1, out var p1))
+                        {
+                            sym = s1;
+                            preview = p1;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
+        }
+
         private static string TryInlineStringPreview(string insText,
             Dictionary<uint, string> stringPreview,
             List<LEObject> objects,
@@ -127,6 +274,22 @@ namespace DOSRE.Dasm
                     preview = rp2;
                     return true;
                 }
+
+                // One level of pointer indirection: reg contains address of a pointer-to-string.
+                if (TryResolveStringFromPointerAt(raddr, stringSymbols, stringPreview, objects, objBytesByIndex, out _, out var psym, out var pprev))
+                {
+                    sym = psym;
+                    preview = pprev;
+                    return true;
+                }
+            }
+
+            // Register operand but not tracked as a constant: try to resolve via last-write dereference patterns.
+            if (IsRegister32(op) && TryResolveRegisterStringViaLastWrite(instructions, callIdx, op.ToLowerInvariant(), stringSymbols, stringPreview, objects, objBytesByIndex, resourceGetterTargets, out var wsym, out var wprev))
+            {
+                sym = wsym;
+                preview = wprev;
+                return true;
             }
 
             // Immediate literal (0x...)
@@ -145,6 +308,14 @@ namespace DOSRE.Dasm
                     ? stringSymbols.TryGetValue(imm2, out var s1) ? s1 : (stringSymbols[imm2] = $"s_{imm2:X8}")
                     : $"s_{imm2:X8}";
                 preview = ip2;
+                return true;
+            }
+
+            // Immediate as pointer-to-string location (e.g., passing &g_ptr where g_ptr points at a string).
+            if (TryParseImm32(op, out var immPtr) && TryResolveStringFromPointerAt(immPtr, stringSymbols, stringPreview, objects, objBytesByIndex, out _, out var isym2, out var ip3))
+            {
+                sym = isym2;
+                preview = ip3;
                 return true;
             }
 
@@ -167,6 +338,15 @@ namespace DOSRE.Dasm
                     ? stringSymbols.TryGetValue(rawLit2, out var s2) ? s2 : (stringSymbols[rawLit2] = $"s_{rawLit2:X8}")
                     : $"s_{rawLit2:X8}";
                 preview = hp2;
+                return true;
+            }
+
+            // Embedded literal as pointer-to-string location.
+            if (hm.Success && TryParseHexUInt(hm.Value, out var rawPtr) &&
+                TryResolveStringFromPointerAt(rawPtr, stringSymbols, stringPreview, objects, objBytesByIndex, out _, out var psym2, out var pprev2))
+            {
+                sym = psym2;
+                preview = pprev2;
                 return true;
             }
 
@@ -205,7 +385,20 @@ namespace DOSRE.Dasm
                     }
                 }
 
-                // Fallback: check common hard-coded bases.
+                // Fallback: common 64KB-aligned bases used by Watcom/DOS4GW outputs.
+                // Many programs treat pointers as 16-bit offsets relative to a segment base like 0x20000, 0x30000, etc.
+                // We only accept the mapping if it lands on a known string address.
+                for (var baseAddr = 0x00010000u; baseAddr <= 0x000F0000u; baseAddr += 0x00010000u)
+                {
+                    var candidate = unchecked(baseAddr + raw);
+                    if (stringSymbols.TryGetValue(candidate, out sym))
+                    {
+                        addr = candidate;
+                        return true;
+                    }
+                }
+
+                // Legacy: also try common higher bases seen in some DOS4GW layouts.
                 foreach (var baseAddr in new[] { 0x000C0000u, 0x000D0000u, 0x000E0000u, 0x000F0000u })
                 {
                     var candidate = unchecked(baseAddr + raw);

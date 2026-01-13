@@ -149,6 +149,46 @@ namespace DOSRE.Dasm
                     continue;
                 }
 
+                // or r, 0x...
+                var mor = Regex.Match(t, @"^or\s+(?<dst>e[a-z]{2}),\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                if (mor.Success)
+                {
+                    var dst = mor.Groups["dst"].Value.ToLowerInvariant();
+                    if (TryParseImm32(mor.Groups["imm"].Value, out var imm) && known.TryGetValue(dst, out var dstKnown) && dstKnown && vals.TryGetValue(dst, out var cur))
+                    {
+                        vals[dst] = cur | imm;
+                    }
+                    continue;
+                }
+
+                // and r, 0x...
+                var mand = Regex.Match(t, @"^and\s+(?<dst>e[a-z]{2}),\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                if (mand.Success)
+                {
+                    var dst = mand.Groups["dst"].Value.ToLowerInvariant();
+                    if (TryParseImm32(mand.Groups["imm"].Value, out var imm) && known.TryGetValue(dst, out var dstKnown) && dstKnown && vals.TryGetValue(dst, out var cur))
+                    {
+                        vals[dst] = cur & imm;
+                    }
+                    continue;
+                }
+
+                // shl/shr r, 0x...
+                var msh = Regex.Match(t, @"^(?<op>shl|shr)\s+(?<dst>e[a-z]{2}),\s*(?<imm>0x[0-9a-fA-F]{1,8})$", RegexOptions.IgnoreCase);
+                if (msh.Success)
+                {
+                    var op = msh.Groups["op"].Value;
+                    var dst = msh.Groups["dst"].Value.ToLowerInvariant();
+                    if (TryParseImm32(msh.Groups["imm"].Value, out var imm) && known.TryGetValue(dst, out var dstKnown) && dstKnown && vals.TryGetValue(dst, out var cur))
+                    {
+                        var sh = (int)(imm & 0x1F);
+                        vals[dst] = op.Equals("shr", StringComparison.OrdinalIgnoreCase)
+                            ? (cur >> sh)
+                            : unchecked(cur << sh);
+                    }
+                    continue;
+                }
+
                 // lea r, [base+0xdisp] or lea r, [base+disp] or lea r, [base-disp]
                 var mlea = Regex.Match(t, @"^lea\s+(?<dst>e[a-z]{2}),\s*\[(?<base>e[a-z]{2})(?:\s*(?<sign>[\+\-])\s*(?<disp>0x[0-9a-fA-F]+|[0-9]+))?\]$", RegexOptions.IgnoreCase);
                 if (mlea.Success)
