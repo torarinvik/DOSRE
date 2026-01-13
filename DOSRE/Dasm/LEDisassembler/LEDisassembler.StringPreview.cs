@@ -186,14 +186,29 @@ namespace DOSRE.Dasm
                 return true;
             }
 
-            // Common DOS4GW convention: strings live in C/D/E/F0000 regions and code references them by 16-bit offsets.
-            // Heuristic: check if this raw value is an offset into any object that resolves to a string.
-            // IMPORTANT: avoid treating NULL / tiny constants as string offsets.
-            if (raw >= 0x100 && raw < 0x20000 && objects != null)
+            // Common DOS4GW convention: strings live in C/D/E/F0000-ish regions and code references them by 16-bit offsets.
+            // Heuristic: check if this raw value is an offset into any object (or typical segment bases) that resolves to a string.
+            // IMPORTANT: avoid treating NULL / tiny constants as string offsets, but do allow small offsets when they
+            // actually map to a known string symbol.
+            if (raw >= 0x10 && raw < 0x20000)
             {
-                foreach (var obj in objects)
+                if (objects != null)
                 {
-                    var candidate = unchecked(obj.BaseAddress + raw);
+                    foreach (var obj in objects)
+                    {
+                        var candidate = unchecked(obj.BaseAddress + raw);
+                        if (stringSymbols.TryGetValue(candidate, out sym))
+                        {
+                            addr = candidate;
+                            return true;
+                        }
+                    }
+                }
+
+                // Fallback: check common hard-coded bases.
+                foreach (var baseAddr in new[] { 0x000C0000u, 0x000D0000u, 0x000E0000u, 0x000F0000u })
+                {
+                    var candidate = unchecked(baseAddr + raw);
                     if (stringSymbols.TryGetValue(candidate, out sym))
                     {
                         addr = candidate;

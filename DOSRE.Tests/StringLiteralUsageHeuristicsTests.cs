@@ -129,5 +129,41 @@ namespace DOSRE.Tests
             Assert.Contains("s_00002000", hint);
             Assert.Contains("\"stack_slot\"", hint);
         }
+
+        [Fact]
+        public void TryAnnotateCallStringLiteralArgs_RegisterOffsetIntoTypicalDos4gwBase_Resolves()
+        {
+            // ANIMATE-style pattern: register holds a small offset that is actually relative to a typical DOS4GW base.
+            // mov ebx, 0x25
+            // call +0
+            var code = new byte[]
+            {
+                0xBB, 0x25, 0x00, 0x00, 0x00,
+                0xE8, 0x00, 0x00, 0x00, 0x00,
+            };
+
+            var instructions = Disassemble(code, 0x4000);
+            var callIdx = instructions.Count - 1;
+
+            var stringSymbols = new Dictionary<uint, string>
+            {
+                [0x000C0025] = "s_000C0025",
+            };
+
+            var stringPreview = new Dictionary<uint, string>
+            {
+                [0x000C0025] = "offset_base",
+            };
+
+            var hint = DOSRE.Dasm.LEDisassembler.TryAnnotateCallStringLiteralArgsForTest(
+                instructions,
+                callIdx,
+                stringSymbols,
+                stringPreview);
+
+            Assert.Contains("STRARGS:", hint);
+            Assert.Contains("s_000C0025", hint);
+            Assert.Contains("\"offset_base\"", hint);
+        }
     }
 }
