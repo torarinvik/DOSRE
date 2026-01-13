@@ -683,6 +683,84 @@ namespace DOSRE.Dasm
             return $"STRCALL: text={bestSym} args~{pushedOperands.Count}";
         }
 
+        // Heuristic: for CALL sites, try to surface any immediately-pushed string literal arguments.
+        // This is intentionally conservative: it only scans a short window and only emits when it can
+        // resolve at least one argument to a known (or readable) C-string.
+        private static string TryAnnotateCallStringLiteralArgs(List<Instruction> instructions, int callIdx,
+            Dictionary<uint, string> stringSymbols,
+            Dictionary<uint, string> stringPreview,
+            List<LEObject> objects,
+            Dictionary<int, byte[]> objBytesByIndex,
+            HashSet<uint> resourceGetterTargets = null,
+            int maxLookback = 16,
+            int maxArgs = 4)
+        {
+            if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)
+                return string.Empty;
+
+            var callText = InsText(instructions[callIdx]).Trim();
+            if (!callText.StartsWith("call ", StringComparison.OrdinalIgnoreCase))
+                return string.Empty;
+
+            // Collect pushes immediately preceding this call.
+            // Scan backwards; the first push we see is arg0 (cdecl-style: last push before call is first argument).
+            var resolved = new List<(string Sym, string Preview)>();
+            for (var i = callIdx - 1; i >= 0 && i >= callIdx - Math.Max(1, maxLookback); i--)
+            {
+                var t = InsText(instructions[i]).Trim();
+
+                // Stop at obvious barriers (avoid crossing control flow / stack frame adjustments).
+                if (t.StartsWith("call ", StringComparison.OrdinalIgnoreCase) || t.StartsWith("ret", StringComparison.OrdinalIgnoreCase) ||
+                    t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase) || (t.StartsWith("j", StringComparison.OrdinalIgnoreCase) && !t.StartsWith("jmp", StringComparison.OrdinalIgnoreCase)))
+                    break;
+
+                if (t.StartsWith("add esp", StringComparison.OrdinalIgnoreCase) || t.StartsWith("sub esp", StringComparison.OrdinalIgnoreCase))
+                    break;
+
+                if (!t.StartsWith("push ", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var op = t.Substring(5).Trim();
+                if (TryResolveStringSymFromOperand(instructions, callIdx, op, stringSymbols, stringPreview, objects, objBytesByIndex, resourceGetterTargets, out var sym, out var prev) &&
+                    !string.IsNullOrEmpty(prev))
+                {
+                    resolved.Add((sym, prev));
+                    if (resolved.Count >= Math.Max(1, maxArgs))
+                        break;
+                }
+            }
+
+            if (resolved.Count == 0)
+                return string.Empty;
+
+            // Emit in arg order: arg0 is the last push before the call.
+            var sb = new StringBuilder();
+            sb.Append("STRARGS:");
+            for (var k = 0; k < resolved.Count; k++)
+            {
+                var (sym, prev) = resolved[k];
+                if (string.IsNullOrEmpty(sym))
+                    sym = "(str)";
+                sb.Append($" arg{k}={sym} \"{prev}\"");
+            }
+            return sb.ToString();
+        }
+
+        // Test-friendly wrapper (avoids exposing private LEObject in a public/internal signature).
+        internal static string TryAnnotateCallStringLiteralArgsForTest(List<Instruction> instructions, int callIdx,
+            Dictionary<uint, string> stringSymbols,
+            Dictionary<uint, string> stringPreview)
+        {
+            return TryAnnotateCallStringLiteralArgs(
+                instructions,
+                callIdx,
+                stringSymbols,
+                stringPreview,
+                objects: null,
+                objBytesByIndex: null,
+                resourceGetterTargets: null);
+        }
+
         private static string TryAnnotateCallStackCleanup(List<Instruction> instructions, int callIdx)
         {
             if (instructions == null || callIdx < 0 || callIdx >= instructions.Count)

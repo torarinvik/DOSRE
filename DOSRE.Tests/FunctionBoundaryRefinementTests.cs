@@ -114,9 +114,12 @@ public class FunctionBoundaryRefinementTests
 
         var instructions = disassembler.Disassemble().ToList();
 
-        Assert.Contains(instructions, ins =>
-            (uint)ins.Offset == baseAddress + 2 &&
-            (ins.ToString()?.Trim() ?? string.Empty).StartsWith("push edx", StringComparison.OrdinalIgnoreCase));
+        // We expect the normalized 0x00 padding byte to decode as a `nop`,
+        // and for the next byte (the real prologue) to remain aligned.
+        Assert.True(instructions.Count >= 3);
+        Assert.StartsWith("ret", (instructions[0].ToString()?.Trim() ?? string.Empty), StringComparison.OrdinalIgnoreCase);
+        Assert.StartsWith("nop", (instructions[1].ToString()?.Trim() ?? string.Empty), StringComparison.OrdinalIgnoreCase);
+        Assert.StartsWith("push edx", (instructions[2].ToString()?.Trim() ?? string.Empty), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

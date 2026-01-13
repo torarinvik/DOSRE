@@ -1746,6 +1746,10 @@ namespace DOSRE.Dasm
                         if (!string.IsNullOrEmpty(callHint))
                             insText += $" ; CALLHINT: {callHint}";
 
+                        var strArgsHint = TryAnnotateCallStringLiteralArgs(instructions, insLoopIndex, stringSymbols, stringPreview, objects, objBytesByIndex, resourceGetterTargets);
+                        if (!string.IsNullOrEmpty(strArgsHint))
+                            insText += $" ; {strArgsHint}";
+
                         var stackHint = TryAnnotateCallStackCleanup(instructions, insLoopIndex);
                         if (!string.IsNullOrEmpty(stackHint))
                             insText += $" ; {stackHint}";
