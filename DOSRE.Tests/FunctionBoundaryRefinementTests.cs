@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using SharpDisasm;
 using SharpDisasm.Udis86;
 using Xunit;
@@ -74,5 +75,87 @@ public class FunctionBoundaryRefinementTests
 
         Assert.Equal(0, added);
         Assert.DoesNotContain(baseAddress + 2, functionStarts);
+    }
+
+    [Fact]
+    public void NormalizePostRetZeroPaddingToNops_RetThenZero_DoesNotSwallowPrologByte()
+    {
+        // Real-world failure mode this targets:
+        //   ret
+        //   00        (padding)
+        //   53 51 ... (real code)
+        // Linear decode starting at the 0x00 can produce `add [ebx+0x51], dl` (00 53 51)
+        // and then all subsequent code is shifted.
+
+        var code = new byte[]
+        {
+            0xC3,       // ret
+            0x00,       // padding byte
+            0x52,       // push edx (representative real prologue byte)
+            0x83, 0xEC, 0x04, // sub esp, 4
+            0xC3,       // ret
+        };
+
+        const uint baseAddress = 0x1000;
+
+        var decode = (byte[])code.Clone();
+        var normalizedAddrs = new HashSet<uint>();
+        var count = DOSRE.Dasm.LEDisassembler.NormalizePostRetZeroPaddingToNops(decode, baseAddress, normalizedAddrs, maxRun: 8);
+
+        Assert.Equal(1, count);
+        Assert.Equal(0x90, decode[1]);
+        Assert.Contains(baseAddress + 1, normalizedAddrs);
+
+        var disassembler = new Disassembler(
+            decode,
+            ArchitectureMode.x86_32,
+            baseAddress,
+            vendor: Vendor.Any);
+
+        var instructions = disassembler.Disassemble().ToList();
+
+        Assert.Contains(instructions, ins =>
+            (uint)ins.Offset == baseAddress + 2 &&
+            (ins.ToString()?.Trim() ?? string.Empty).StartsWith("push edx", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void NormalizePostRetZeroPaddingToNops_RetImm16ThenZero_DoesNotModifyImmediate()
+    {
+        // Ensure we only normalize bytes AFTER the ret imm16, not the imm16 itself.
+        //   C2 0C 00   ret 0x0C
+        //   00         padding
+        //   53 51 ...  real code
+
+        var code = new byte[]
+        {
+            0xC2, 0x0C, 0x00, // ret 0x000C
+            0x00,             // padding byte after the ret instruction
+            0x53, 0x51,       // push ebx; push ecx
+            0xC3,
+        };
+
+        const uint baseAddress = 0x2000;
+
+        var decode = (byte[])code.Clone();
+        var normalizedAddrs = new HashSet<uint>();
+        var count = DOSRE.Dasm.LEDisassembler.NormalizePostRetZeroPaddingToNops(decode, baseAddress, normalizedAddrs, maxRun: 8);
+
+        Assert.Equal(1, count);
+        Assert.Equal(0x00, decode[2]); // imm16 low byte must remain intact
+        Assert.Equal(0x90, decode[3]); // padding after ret normalized
+        Assert.Contains(baseAddress + 3, normalizedAddrs);
+
+        var disassembler = new Disassembler(
+            decode,
+            ArchitectureMode.x86_32,
+            baseAddress,
+            vendor: Vendor.Any);
+
+        var instructions = disassembler.Disassemble().ToList();
+
+        Assert.Contains(instructions, ins =>
+            (uint)ins.Offset == baseAddress + 4 &&
+            (ins.ToString()?.Trim() ?? string.Empty).StartsWith("push ebx", StringComparison.OrdinalIgnoreCase));
     }
 }

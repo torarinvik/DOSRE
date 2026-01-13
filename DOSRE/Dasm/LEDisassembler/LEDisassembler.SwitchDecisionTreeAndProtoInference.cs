@@ -517,6 +517,59 @@ namespace DOSRE.Dasm
             return false;
         }
 
+        // Decode heuristic: linear sweep disassembly can be thrown off by a single 0x00 byte of
+        // padding immediately after a RET/RETF/IRET. Opcode 0x00 consumes the next byte (ModRM),
+        // which means the true entrypoint at the next byte becomes "inside" a decoded instruction.
+        //
+        // To avoid that class of 1-byte misalignment, normalize a short run of 0x00 bytes
+        // immediately after return instructions to 0x90 (NOP) for decoding only.
+        // The caller can track `normalizedByteAddrs` and render them as `db 0x00`.
+        internal static int NormalizePostRetZeroPaddingToNops(
+            byte[] code,
+            uint baseAddress,
+            HashSet<uint> normalizedByteAddrs,
+            int maxRun = 32)
+        {
+            if (code == null || code.Length == 0 || maxRun <= 0)
+                return 0;
+
+            var normalized = 0;
+
+            for (var i = 0; i < code.Length; i++)
+            {
+                var b = code[i];
+                var retLen = b switch
+                {
+                    0xC3 => 1, // ret
+                    0xCB => 1, // retf
+                    0xCF => 1, // iret
+                    0xC2 => 3, // ret imm16
+                    0xCA => 3, // retf imm16
+                    _ => 0,
+                };
+
+                if (retLen == 0)
+                    continue;
+
+                var j = i + retLen;
+                var run = 0;
+                while (j < code.Length && run < maxRun && code[j] == 0x00)
+                {
+                    code[j] = 0x90; // nop (decode-only)
+                    normalizedByteAddrs?.Add(baseAddress + (uint)j);
+                    normalized++;
+                    run++;
+                    j++;
+                }
+
+                // Continue scanning from the end of the run to avoid O(n^2) on large padding.
+                if (j > i)
+                    i = j - 1;
+            }
+
+            return normalized;
+        }
+
         internal static int RefineFunctionStartsByPrologAfterRet(List<Instruction> instructions, HashSet<uint> functionStarts)
         {
             if (instructions == null || instructions.Count < 4 || functionStarts == null)

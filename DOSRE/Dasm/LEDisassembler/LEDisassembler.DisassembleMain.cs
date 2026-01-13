@@ -266,6 +266,10 @@ namespace DOSRE.Dasm
             var execObjInstructions = new Dictionary<int, List<Instruction>>();
             var execObjInsIndexByAddr = new Dictionary<int, Dictionary<uint, int>>();
             var execObjDecodeMs = new Dictionary<int, long>();
+            // Heuristic bookkeeping: addresses of 0x00 bytes immediately after RET/RETF/IRET
+            // that we normalize to 0x90 for decoding (to prevent 1-byte misalignment).
+            // Rendering uses this to emit `db 0x00` instead of a misleading `nop`.
+            var execObjPostRetZeroPadAddrs = new Dictionary<int, HashSet<uint>>();
 
             foreach (var obj in objects)
             {
@@ -327,8 +331,15 @@ namespace DOSRE.Dasm
                 var startLinear = obj.BaseAddress + (uint)startOffsetWithinObject;
                 var endLinear = startLinear + (uint)codeLen;
 
+                // Decode heuristic: normalize short runs of 0x00 padding immediately after a RET.
+                // Without this, the linear decoder can start at the 0x00 and consume the first
+                // real prologue byte, producing a shifted stream (classic: 00 53 51 => `add [...]`).
+                var decodeCode = (byte[])code.Clone();
+                var postRetZeroPadAddrs = new HashSet<uint>();
+                NormalizePostRetZeroPaddingToNops(decodeCode, startLinear, postRetZeroPadAddrs, maxRun: 32);
+
                 var swDis = Stopwatch.StartNew();
-                var dis = new SharpDisasm.Disassembler(code, ArchitectureMode.x86_32, startLinear, true);
+                var dis = new SharpDisasm.Disassembler(decodeCode, ArchitectureMode.x86_32, startLinear, true);
                 var instructions = dis.Disassemble().ToList();
                 swDis.Stop();
 
@@ -344,6 +355,8 @@ namespace DOSRE.Dasm
                 execObjInstructions[obj.Index] = instructions;
                 execObjInsIndexByAddr[obj.Index] = insIndexByAddr;
                 execObjDecodeMs[obj.Index] = swDis.ElapsedMilliseconds;
+                if (postRetZeroPadAddrs.Count > 0)
+                    execObjPostRetZeroPadAddrs[obj.Index] = postRetZeroPadAddrs;
             }
 
             var globalFunctionStarts = new HashSet<uint>();
@@ -664,6 +677,10 @@ namespace DOSRE.Dasm
                     if (kv.Key >= startLinear && kv.Key < endLinear)
                         jumpXrefs[kv.Key] = kv.Value;
                 }
+
+                // Addresses of bytes that were normalized (0x00 -> 0x90) for decoding.
+                // Rendering uses this to show the true byte(s) as `db 0x00`.
+                execObjPostRetZeroPadAddrs.TryGetValue(obj.Index, out var postRetZeroPadAddrsForObj);
 
                 // Map instruction offset -> fixups that touch bytes within that instruction.
                 Dictionary<uint, List<LEFixup>> fixupsByInsAddr = null;
@@ -1642,6 +1659,15 @@ namespace DOSRE.Dasm
                                 emittedSwitchSigs.Add(swSig);
                             }
                         }
+                    }
+
+                    // If this address was normalized for decode, render as data/padding instead of
+                    // the synthetic `nop` that only exists in the decode buffer.
+                    if (postRetZeroPadAddrsForObj != null && postRetZeroPadAddrsForObj.Contains(addr))
+                    {
+                        var padPrefix = $"{ins.Offset:X8}h {"00".PadRight(Constants.MAX_INSTRUCTION_LENGTH, ' ')} ";
+                        AppendWrappedDisasmLine(sb, padPrefix, "db 0x00 ; PAD: 0x00 after RET (alignment heuristic)", commentColumn: 56, maxWidth: 160);
+                        continue;
                     }
 
                     var bytes = BitConverter.ToString(ins.Bytes).Replace("-", string.Empty);
