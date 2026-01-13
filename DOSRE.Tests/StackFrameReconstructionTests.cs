@@ -5,14 +5,14 @@ namespace DOSRE.Tests;
 public class StackFrameReconstructionTests
 {
     [Theory]
-    [InlineData("[ebp-0x10]", "(uint32_t)(uintptr_t)(&local_10)")]
-    [InlineData("dword ptr [ebp-10h]", "(uint32_t)(uintptr_t)(&local_10)")]
-    [InlineData("[ebp+0x8]", "(uint32_t)(uintptr_t)(&arg_0)")]
-    [InlineData("[ebp+0xC]", "(uint32_t)(uintptr_t)(&arg_1)")]
-    [InlineData("[local_20]", "(uint32_t)(uintptr_t)(&local_20)")]
-    [InlineData("[arg_2]", "(uint32_t)(uintptr_t)(&arg_2)")]
-    [InlineData("[arg2]", "(uint32_t)(uintptr_t)(&arg_2)")]
-    [InlineData("[localA]", "(uint32_t)(uintptr_t)(&local_a)")]
+    [InlineData("[ebp-0x10]", "(ebp - 0x10u)")]
+    [InlineData("dword ptr [ebp-10h]", "(ebp - 0x10u)")]
+    [InlineData("[ebp+0x8]", "(ebp + 0x8u)")]
+    [InlineData("[ebp+0xC]", "(ebp + 0xCu)")]
+    [InlineData("[local_20]", "(ebp - 0x20u)")]
+    [InlineData("[arg_2]", "(ebp + 0x10u)")]
+    [InlineData("[arg2]", "(ebp + 0x10u)")]
+    [InlineData("[localA]", "(ebp - 0xAu)")]
     public void NormalizeLeaRhsToAddressExpr_MapsFrameSlotsToStableVars(string rhsRaw, string expected)
     {
         var got = DOSRE.Dasm.LEDisassembler.NormalizeLeaRhsToAddressExpr(rhsRaw);

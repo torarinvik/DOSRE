@@ -1250,12 +1250,15 @@ namespace DOSRE.Dasm
                 h.AppendLine("#elif defined(__WATCOMC__) && defined(__386__)");
                 h.AppendLine("#include <i86.h>");
                 h.AppendLine("#define DOS_INT(intno) do { \\");
-                h.AppendLine("    union REGS __inr, __outr; memset(&__inr, 0, sizeof(__inr)); memset(&__outr, 0, sizeof(__outr)); \\");
+                h.AppendLine("    union REGS __inr, __outr; struct SREGS __s; \\");
+                h.AppendLine("    memset(&__inr, 0, sizeof(__inr)); memset(&__outr, 0, sizeof(__outr)); memset(&__s, 0, sizeof(__s)); \\");
                 h.AppendLine("    __inr.x.eax = (unsigned long)eax; __inr.x.ebx = (unsigned long)ebx; __inr.x.ecx = (unsigned long)ecx; __inr.x.edx = (unsigned long)edx; \\");
                 h.AppendLine("    __inr.x.esi = (unsigned long)esi; __inr.x.edi = (unsigned long)edi; \\");
-                h.AppendLine("    int386((intno), &__inr, &__outr); \\");
+                h.AppendLine("    __s.cs = (unsigned short)cs; __s.ds = (unsigned short)ds; __s.es = (unsigned short)es; __s.ss = (unsigned short)ss; __s.fs = (unsigned short)fs; __s.gs = (unsigned short)gs; \\");
+                h.AppendLine("    int386x((intno), &__inr, &__outr, &__s); \\");
                 h.AppendLine("    eax = (uint32_t)__outr.x.eax; ebx = (uint32_t)__outr.x.ebx; ecx = (uint32_t)__outr.x.ecx; edx = (uint32_t)__outr.x.edx; \\");
                 h.AppendLine("    esi = (uint32_t)__outr.x.esi; edi = (uint32_t)__outr.x.edi; \\");
+                h.AppendLine("    cs = (uint32_t)__s.cs; ds = (uint32_t)__s.ds; es = (uint32_t)__s.es; ss = (uint32_t)__s.ss; fs = (uint32_t)__s.fs; gs = (uint32_t)__s.gs; \\");
                 h.AppendLine("} while(0)");
                 h.AppendLine("#else");
                 h.AppendLine("#define DOS_INT(intno) do { (void)(intno); } while(0)");
@@ -1553,6 +1556,20 @@ namespace DOSRE.Dasm
                 mainSb.AppendLine();
                 mainSb.AppendLine("int main(int argc, char** argv)");
                 mainSb.AppendLine("{");
+                mainSb.AppendLine("    /* Initialize selector globals from the real runtime environment (Watcom/DOS4G).\n       Early startup code reads cs/ds/es/ss/fs/gs via these globals. */");
+                mainSb.AppendLine("#if defined(__WATCOMC__) && defined(__386__)");
+                mainSb.AppendLine("    {");
+                mainSb.AppendLine("        struct SREGS __s;");
+                mainSb.AppendLine("        segread(&__s);");
+                mainSb.AppendLine("        cs = (uint32_t)__s.cs;");
+                mainSb.AppendLine("        ds = (uint32_t)__s.ds;");
+                mainSb.AppendLine("        es = (uint32_t)__s.es;");
+                mainSb.AppendLine("        ss = (uint32_t)__s.ss;");
+                mainSb.AppendLine("        fs = (uint32_t)__s.fs;");
+                mainSb.AppendLine("        gs = (uint32_t)__s.gs;");
+                mainSb.AppendLine("    }");
+                mainSb.AppendLine("#endif");
+                mainSb.AppendLine("");
                 if (haveLeMeta)
                 {
                     mainSb.AppendLine("    /* Allocate guest linear memory window based on LE object layout. */");
@@ -4050,11 +4067,18 @@ namespace DOSRE.Dasm
 
             var localTok = Regex.Match(s, @"^local_(?<off>[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase);
             if (localTok.Success)
-                return "(uint32_t)(uintptr_t)(&local_" + localTok.Groups["off"].Value.ToLowerInvariant() + ")";
+            {
+                var off = Convert.ToUInt32(localTok.Groups["off"].Value, 16);
+                return $"(ebp - 0x{off:X}u)";
+            }
 
             var argTok = Regex.Match(s, @"^arg_(?<idx>[0-9A-Fa-f]+)$", RegexOptions.IgnoreCase);
             if (argTok.Success)
-                return "(uint32_t)(uintptr_t)(&arg_" + argTok.Groups["idx"].Value.ToLowerInvariant() + ")";
+            {
+                var idx = Convert.ToUInt32(argTok.Groups["idx"].Value, 16);
+                var off = 8u + idx * 4u;
+                return $"(ebp + 0x{off:X}u)";
+            }
 
             var ebp = Regex.Match(s, @"^ebp\s*(?<sign>[\+\-])\s*(?<off>0x[0-9A-Fa-f]+|[0-9]+|(?<hexoff>[0-9A-Fa-f]+)h)$", RegexOptions.IgnoreCase);
             if (ebp.Success)
@@ -4070,11 +4094,11 @@ namespace DOSRE.Dasm
                     off = uint.Parse(offStr);
 
                 if (sign == "-")
-                    return $"(uint32_t)(uintptr_t)(&local_{off:x})";
+                    return $"(ebp - 0x{off:X}u)";
 
                 // Args: [ebp+8] is arg_0. Only map clean dword slots.
                 if (off >= 8 && ((off - 8) % 4u) == 0)
-                    return $"(uint32_t)(uintptr_t)(&arg_{((off - 8) / 4u):x})";
+                    return $"(ebp + 0x{off:X}u)";
             }
 
             return null;
