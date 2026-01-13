@@ -16,15 +16,14 @@ namespace DOSRE.Dasm
                 return;
 
             // Very lightweight string scan: runs of printable bytes terminated by 0.
-            // To reduce noise, prefer scanning non-executable objects (data-ish).
-            foreach (var obj in objects)
-            {
-                var isExecutable = (obj.Flags & 0x0004) != 0;
-                if (isExecutable)
-                    continue;
+            // To reduce noise, prefer scanning non-executable objects (data-ish) first.
+            // Some binaries embed useful strings inside CODE objects; if we find none in data,
+            // do a conservative fallback scan over executable objects as well.
 
-                if (!objBytesByIndex.TryGetValue(obj.Index, out var bytes) || bytes == null || bytes.Length == 0)
-                    continue;
+            static void ScanObjectBytes(LEObject obj, byte[] bytes, Dictionary<uint, string> syms, Dictionary<uint, string> prev)
+            {
+                if (bytes == null || bytes.Length == 0)
+                    return;
 
                 var maxLen = (int)Math.Min(obj.VirtualSize, (uint)bytes.Length);
                 var i = 0;
@@ -51,16 +50,43 @@ namespace DOSRE.Dasm
                     if (nul && s.Length >= 4 && LooksLikeHumanString(s))
                     {
                         var linear = obj.BaseAddress + (uint)start;
-                        if (!symbols.ContainsKey(linear))
+                        if (!syms.ContainsKey(linear))
                         {
-                            symbols[linear] = $"s_{linear:X8}";
-                            preview[linear] = EscapeForComment(s);
+                            syms[linear] = $"s_{linear:X8}";
+                            prev[linear] = EscapeForComment(s);
                         }
                     }
 
                     // Skip the terminator if present.
                     if (nul)
                         i++;
+                }
+            }
+
+            foreach (var obj in objects)
+            {
+                var isExecutable = (obj.Flags & 0x0004) != 0;
+                if (isExecutable)
+                    continue;
+
+                if (!objBytesByIndex.TryGetValue(obj.Index, out var bytes))
+                    continue;
+
+                ScanObjectBytes(obj, bytes, symbols, preview);
+            }
+
+            if (symbols.Count == 0)
+            {
+                foreach (var obj in objects)
+                {
+                    var isExecutable = (obj.Flags & 0x0004) != 0;
+                    if (!isExecutable)
+                        continue;
+
+                    if (!objBytesByIndex.TryGetValue(obj.Index, out var bytes))
+                        continue;
+
+                    ScanObjectBytes(obj, bytes, symbols, preview);
                 }
             }
         }

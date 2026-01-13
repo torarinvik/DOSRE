@@ -17,11 +17,17 @@ namespace DOSRE.Dasm
             Dictionary<uint, string> stringSymbols,
             HashSet<uint> resourceGetterTargets)
         {
-            if (string.IsNullOrEmpty(insText) || stringPreview == null || stringPreview.Count == 0)
+            if (string.IsNullOrEmpty(insText) || stringPreview == null)
                 return string.Empty;
 
+            // NOTE: insText is the *rendered* line (often including address/bytes prefix).
+            // Use the raw instruction text for mnemonic checks to avoid missing matches.
+            var rawText = (instructions != null && insIdx >= 0 && insIdx < instructions.Count)
+                ? InsText(instructions[insIdx])
+                : insText;
+
             // Keep this conservative to avoid spam.
-            var lower = insText.TrimStart();
+            var lower = rawText.TrimStart();
             if (!lower.StartsWith("push ", StringComparison.OrdinalIgnoreCase) &&
                 !lower.StartsWith("lea ", StringComparison.OrdinalIgnoreCase) &&
                 !lower.StartsWith("mov ", StringComparison.OrdinalIgnoreCase) &&
@@ -49,8 +55,7 @@ namespace DOSRE.Dasm
             if (instructions == null || insIdx < 0 || insIdx >= instructions.Count)
                 return string.Empty;
 
-            var raw = InsText(instructions[insIdx]);
-            if (TryResolveStringFromInstruction(instructions, insIdx, raw, stringSymbols, stringPreview, objects, objBytesByIndex, resourceGetterTargets, out var p1))
+            if (TryResolveStringFromInstruction(instructions, insIdx, rawText, stringSymbols, stringPreview, objects, objBytesByIndex, resourceGetterTargets, out var p1))
                 return $"STR: \"{p1}\"";
 
             return string.Empty;
@@ -71,7 +76,7 @@ namespace DOSRE.Dasm
             sym = string.Empty;
             preview = string.Empty;
 
-            if (stringSymbols == null || stringSymbols.Count == 0 || stringPreview == null || stringPreview.Count == 0)
+            if (stringPreview == null)
                 return false;
 
             if (string.IsNullOrWhiteSpace(operandText))
@@ -105,17 +110,27 @@ namespace DOSRE.Dasm
             // Register operand (e.g. push eax)
             if (IsRegister32(op) && TryResolveRegisterValueBefore(instructions, callIdx, op, out var raddr, resourceGetterTargets))
             {
-                if (TryResolveStringAddressFromRaw(raddr, stringSymbols, objects, out var resolvedAddr, out var resolvedSym) &&
+                if (stringSymbols != null && TryResolveStringAddressFromRaw(raddr, stringSymbols, objects, out var resolvedAddr, out var resolvedSym) &&
                     TryGetStringPreviewAt(resolvedAddr, stringPreview, objects, objBytesByIndex, out var rp) && !string.IsNullOrEmpty(rp))
                 {
                     sym = resolvedSym;
                     preview = rp;
                     return true;
                 }
+
+                // Fallback: treat the resolved register value as a direct linear address.
+                if (TryGetStringPreviewAt(raddr, stringPreview, objects, objBytesByIndex, out var rp2) && !string.IsNullOrEmpty(rp2))
+                {
+                    sym = stringSymbols != null
+                        ? stringSymbols.TryGetValue(raddr, out var s0) ? s0 : (stringSymbols[raddr] = $"s_{raddr:X8}")
+                        : $"s_{raddr:X8}";
+                    preview = rp2;
+                    return true;
+                }
             }
 
             // Immediate literal (0x...)
-            if (TryParseImm32(op, out var imm) && TryResolveStringAddressFromRaw(imm, stringSymbols, objects, out var iaddr, out var isym) &&
+            if (TryParseImm32(op, out var imm) && stringSymbols != null && TryResolveStringAddressFromRaw(imm, stringSymbols, objects, out var iaddr, out var isym) &&
                 TryGetStringPreviewAt(iaddr, stringPreview, objects, objBytesByIndex, out var ip) && !string.IsNullOrEmpty(ip))
             {
                 sym = isym;
@@ -123,14 +138,35 @@ namespace DOSRE.Dasm
                 return true;
             }
 
+            // Fallback: immediate might already be a linear address.
+            if (TryParseImm32(op, out var imm2) && TryGetStringPreviewAt(imm2, stringPreview, objects, objBytesByIndex, out var ip2) && !string.IsNullOrEmpty(ip2))
+            {
+                sym = stringSymbols != null
+                    ? stringSymbols.TryGetValue(imm2, out var s1) ? s1 : (stringSymbols[imm2] = $"s_{imm2:X8}")
+                    : $"s_{imm2:X8}";
+                preview = ip2;
+                return true;
+            }
+
             // Embedded literal (e.g. dword [0x4988])
             var hm = HexLiteralRegex.Match(operandText);
             if (hm.Success && TryParseHexUInt(hm.Value, out var rawLit) &&
-                TryResolveStringAddressFromRaw(rawLit, stringSymbols, objects, out var haddr, out var hsym) &&
+                stringSymbols != null && TryResolveStringAddressFromRaw(rawLit, stringSymbols, objects, out var haddr, out var hsym) &&
                 TryGetStringPreviewAt(haddr, stringPreview, objects, objBytesByIndex, out var hp) && !string.IsNullOrEmpty(hp))
             {
                 sym = hsym;
                 preview = hp;
+                return true;
+            }
+
+            // Fallback: embedded literal might already be a linear address.
+            if (hm.Success && TryParseHexUInt(hm.Value, out var rawLit2) &&
+                TryGetStringPreviewAt(rawLit2, stringPreview, objects, objBytesByIndex, out var hp2) && !string.IsNullOrEmpty(hp2))
+            {
+                sym = stringSymbols != null
+                    ? stringSymbols.TryGetValue(rawLit2, out var s2) ? s2 : (stringSymbols[rawLit2] = $"s_{rawLit2:X8}")
+                    : $"s_{rawLit2:X8}";
+                preview = hp2;
                 return true;
             }
 
@@ -181,7 +217,7 @@ namespace DOSRE.Dasm
             out string preview)
         {
             preview = string.Empty;
-            if (stringSymbols == null || stringSymbols.Count == 0 || stringPreview == null || stringPreview.Count == 0)
+            if (stringPreview == null)
                 return false;
             if (string.IsNullOrWhiteSpace(rawInstruction))
                 return false;
