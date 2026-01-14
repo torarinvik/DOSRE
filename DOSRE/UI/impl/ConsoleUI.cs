@@ -304,6 +304,24 @@ namespace DOSRE.UI.impl
         private EnumToolchainHint _toolchainHint = EnumToolchainHint.None;
 
         /// <summary>
+        ///     Flat 16-bit binary mode (COM-like / raw binary)
+        ///     Specified with -BIN16
+        /// </summary>
+        private bool _bBin16;
+
+        /// <summary>
+        ///     Flat binary origin (base address)
+        ///     Specified with -BINORG <hex>
+        /// </summary>
+        private uint _binOrigin = 0x100;
+
+        /// <summary>
+        ///     Flat binary bytes limit
+        ///     Specified with -BINBYTES <n>
+        /// </summary>
+        private int? _binBytesLimit;
+
+        /// <summary>
         ///     Default Constructor
         /// </summary>
         /// <param name="args">string - Command Line Arguments</param>
@@ -374,6 +392,30 @@ namespace DOSRE.UI.impl
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -DOSVER requires a value (example: 6.22)");
                             _dosVersion = _args[i + 1];
+                            i++;
+                            break;
+                        case "BIN16":
+                            _bBin16 = true;
+                            break;
+                        case "BINORG":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINORG requires a value (hex, e.g. 100 or 0x100)");
+                            {
+                                var sOrg = _args[i + 1].Trim();
+                                if (sOrg.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                                    sOrg = sOrg.Substring(2);
+                                if (!uint.TryParse(sOrg, System.Globalization.NumberStyles.HexNumber, null, out var org))
+                                    throw new Exception("Error: -BINORG must be a hex number (e.g. 100 or 0x100)");
+                                _binOrigin = org;
+                            }
+                            i++;
+                            break;
+                        case "BINBYTES":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINBYTES requires a value");
+                            if (!int.TryParse(_args[i + 1], out var binBytesLimit) || binBytesLimit <= 0)
+                                throw new Exception("Error: -BINBYTES must be a positive integer");
+                            _binBytesLimit = binBytesLimit;
                             i++;
                             break;
                         case "LEFULL":
@@ -617,6 +659,9 @@ namespace DOSRE.UI.impl
                             Console.WriteLine("-LE <file> -- Input File (alias for -I; commonly used for LE/DOS4GW EXEs)");
                             Console.WriteLine("-I <file> -- Input File to DisassembleSegment");
                             Console.WriteLine("-O <file> -- Output File for Disassembly (Default ConsoleUI)");
+                            Console.WriteLine("-BIN16 -- Treat input as a flat 16-bit binary (COM-like / raw blob; no MZ/NE/LE header)");
+                            Console.WriteLine("-BINORG <hex> -- (with -BIN16) Base address/origin for the disassembly (default 0x100)");
+                            Console.WriteLine("-BINBYTES <n> -- (with -BIN16) Limit disassembly to n bytes from start of file");
                             Console.WriteLine("-MINIMAL -- Minimal Disassembler Output");
                             Console.WriteLine(
                                 "-ANALYSIS -- Additional Analysis on Imported Functions (if available)");
@@ -734,6 +779,30 @@ namespace DOSRE.UI.impl
                     {
                         _logger.Warn($"-LEUNWRAP requested but unwrap failed: {unwrapError}");
                     }
+                }
+
+                // Flat binary mode: bypass all format detection and render a straightforward 16-bit decode.
+                if (_bBin16)
+                {
+                    if (!Bin16Disassembler.TryDisassembleToString(_sInputFile, _binOrigin, _binBytesLimit, out var binOut, out var binErr))
+                        throw new Exception(binErr);
+
+                    if (string.IsNullOrEmpty(_sOutputFile))
+                    {
+                        if (_splitKb.HasValue)
+                            _logger.Warn("Warning: -splitkb requires -o, ignoring");
+                        Console.WriteLine(binOut);
+                    }
+                    else
+                    {
+                        if (_splitKb.HasValue)
+                            WriteSplitFiles(_sOutputFile, binOut, _splitKb.Value);
+                        else
+                            File.WriteAllText(_sOutputFile, binOut);
+                    }
+
+                    _logger.Info($"{DateTime.Now} Done!");
+                    return;
                 }
 
                 //LE/DOS4GW support (minimal): bypass NE-specific pipeline
