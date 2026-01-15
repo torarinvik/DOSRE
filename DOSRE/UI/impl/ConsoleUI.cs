@@ -310,6 +310,24 @@ namespace DOSRE.UI.impl
         private bool _bBin16;
 
         /// <summary>
+        ///     Flat binary insights (best-effort string literal scanning + annotations)
+        ///     Specified with -BININSIGHTS
+        /// </summary>
+        private bool _bBinInsights;
+
+        /// <summary>
+        ///     Emit inline string labels (str_XXXX:) at referenced string addresses.
+        ///     Specified with -BINSTRLABELS
+        /// </summary>
+        private bool _bBinStrLabels;
+
+        /// <summary>
+        ///     Emit MASM/WASM-compatible assembly output for BIN16 (default).
+        ///     Specified with -BINMASM / -BINWASM; disabled with -BINLISTING.
+        /// </summary>
+        private bool _bBinMasmCompat = true;
+
+        /// <summary>
         ///     Flat binary origin (base address)
         ///     Specified with -BINORG <hex>
         /// </summary>
@@ -396,6 +414,30 @@ namespace DOSRE.UI.impl
                             break;
                         case "BIN16":
                             _bBin16 = true;
+                            // Convenience: allow `-BIN16 <file>` as an alias for `-I <file> -BIN16`.
+                            // Only consume the next arg if it does not look like another switch.
+                            if (string.IsNullOrWhiteSpace(_sInputFile) && i + 1 < _args.Length)
+                            {
+                                var next = _args[i + 1];
+                                if (!string.IsNullOrWhiteSpace(next) && next.Length > 0 && next[0] != '-' && next[0] != '/')
+                                {
+                                    _sInputFile = next;
+                                    i++;
+                                }
+                            }
+                            break;
+                        case "BININSIGHTS":
+                            _bBinInsights = true;
+                            break;
+                        case "BINSTRLABELS":
+                            _bBinStrLabels = true;
+                            break;
+                        case "BINMASM":
+                        case "BINWASM":
+                            _bBinMasmCompat = true;
+                            break;
+                        case "BINLISTING":
+                            _bBinMasmCompat = false;
                             break;
                         case "BINORG":
                             if (i + 1 >= _args.Length)
@@ -659,9 +701,13 @@ namespace DOSRE.UI.impl
                             Console.WriteLine("-LE <file> -- Input File (alias for -I; commonly used for LE/DOS4GW EXEs)");
                             Console.WriteLine("-I <file> -- Input File to DisassembleSegment");
                             Console.WriteLine("-O <file> -- Output File for Disassembly (Default ConsoleUI)");
-                            Console.WriteLine("-BIN16 -- Treat input as a flat 16-bit binary (COM-like / raw blob; no MZ/NE/LE header)");
+                            Console.WriteLine("-BIN16 [file] -- Treat input as a flat 16-bit binary (COM-like / raw blob; no MZ/NE/LE header). Use -I <file> or pass [file] here.");
                             Console.WriteLine("-BINORG <hex> -- (with -BIN16) Base address/origin for the disassembly (default 0x100)");
                             Console.WriteLine("-BINBYTES <n> -- (with -BIN16) Limit disassembly to n bytes from start of file");
+                            Console.WriteLine("-BININSIGHTS -- (with -BIN16) Best-effort string literal scan + inline string annotations");
+                            Console.WriteLine("-BINSTRLABELS -- (with -BIN16/-BININSIGHTS) Emit inline str_XXXX: labels at referenced string addresses");
+                            Console.WriteLine("-BINMASM / -BINWASM -- (with -BIN16) Emit MASM/WASM-compatible assembly source (default)");
+                            Console.WriteLine("-BINLISTING -- (with -BIN16) Emit analysis listing format (NOT assembler-ready)");
                             Console.WriteLine("-MINIMAL -- Minimal Disassembler Output");
                             Console.WriteLine(
                                 "-ANALYSIS -- Additional Analysis on Imported Functions (if available)");
@@ -784,7 +830,7 @@ namespace DOSRE.UI.impl
                 // Flat binary mode: bypass all format detection and render a straightforward 16-bit decode.
                 if (_bBin16)
                 {
-                    if (!Bin16Disassembler.TryDisassembleToString(_sInputFile, _binOrigin, _binBytesLimit, out var binOut, out var binErr))
+                    if (!Bin16Disassembler.TryDisassembleToString(_sInputFile, _binOrigin, _binBytesLimit, _bBinMasmCompat, _bBinInsights, _bBinStrLabels, out var binOut, out var binErr))
                         throw new Exception(binErr);
 
                     if (string.IsNullOrEmpty(_sOutputFile))
