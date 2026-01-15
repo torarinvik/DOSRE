@@ -94,7 +94,6 @@ namespace DOSRE.Dasm
 
             static string ToMasmHexU32NoPad(uint value) => ToMasmHexU32(value, 0);
             static string ToMasmHexByte(byte value) => value == 0 ? "00h" : ToMasmHexU32(value, 2);
-            static string ToMasmHexU16(ushort value) => ToMasmHexU32(value, 4);
 
             static string NormalizeHexLiteralsToMasm(string text)
             {
@@ -122,64 +121,6 @@ namespace DOSRE.Dasm
                     RegexOptions.CultureInvariant);
 
                 return text;
-            }
-
-            static bool HasPtrQualifier(string text) => text.IndexOf(" ptr ", StringComparison.OrdinalIgnoreCase) >= 0;
-
-            static bool TryQualifyAmbiguousMemOp(string insText, byte[] insBytes, out string qualified)
-            {
-                qualified = insText;
-                if (string.IsNullOrWhiteSpace(insText) || insBytes == null || insBytes.Length == 0)
-                    return false;
-
-                if (!insText.Contains("[", StringComparison.Ordinal) || HasPtrQualifier(insText))
-                    return false;
-
-                // If a register operand implies size (e.g. mov al, [mem]), MASM can infer it.
-                // We only try to fix the common ambiguous cases where a mem operand is paired with an immediate.
-                var hasImmediate = Regex.IsMatch(insText, @"[,\s]\-?(?:[0-9]+|[0-9A-Fa-f]+h)\b", RegexOptions.CultureInvariant);
-                if (!hasImmediate)
-                    return false;
-
-                // Determine operand size from opcode for common groups.
-                var op0 = insBytes[0];
-                string ptr;
-                switch (op0)
-                {
-                    // mov r/m8, imm8
-                    case 0xC6:
-                    // GRP1 r/m8, imm8
-                    case 0x80:
-                    // GRP3 r/m8, imm8 (test)
-                    case 0xF6:
-                    // inc/dec r/m8
-                    case 0xFE:
-                        ptr = "byte ptr ";
-                        break;
-
-                    // mov r/m16, imm16
-                    case 0xC7:
-                    // GRP1 r/m16, imm16
-                    case 0x81:
-                    // GRP1 r/m16, imm8 (sign-extended)
-                    case 0x83:
-                    // GRP3 r/m16, imm16 (test)
-                    case 0xF7:
-                    // inc/dec/call/jmp/push r/m16
-                    case 0xFF:
-                        ptr = "word ptr ";
-                        break;
-
-                    default:
-                        return false;
-                }
-
-                var idx = insText.IndexOf('[', StringComparison.Ordinal);
-                if (idx < 0)
-                    return false;
-
-                qualified = insText.Insert(idx, ptr);
-                return true;
             }
 
             Dictionary<uint, BinString> stringsByAddr = null;
