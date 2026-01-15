@@ -125,7 +125,7 @@ namespace DOSRE.Dasm
 
             Dictionary<uint, BinString> stringsByAddr = null;
             if (binInsights)
-                stringsByAddr = ScanStrings(fileBytes, origin, minLen: 6, maxCount: 2048);
+                stringsByAddr = ScanStrings(fileBytes, origin, minLen: 6, maxCount: 2048, allowTokens: masmCompat);
 
             var dis = new SharpDisasm.Disassembler(code, ArchitectureMode.x86_16, origin, true);
             var instructions = dis.Disassemble().ToList();
@@ -335,6 +335,112 @@ namespace DOSRE.Dasm
                             break;
                         }
                     }
+                }
+            }
+
+            // Additional best-effort: many games reference text via pointer tables, not direct immediates.
+            // If we can spot word tables that point at detected strings, treat those string addresses as referenced
+            // so inline string carving can kick in.
+            if (binInsights && emitInlineStringLabels && stringsByAddr != null && stringsByAddr.Count > 0)
+            {
+                bool TryDetectStringPointerTable(int startPos, out int byteLen, out bool relative)
+                {
+                    byteLen = 0;
+                    relative = false;
+                    if (startPos < 0 || startPos + 32 > code.Length)
+                        return false;
+
+                    // Word tables are typically even-aligned.
+                    var a = origin + (uint)startPos;
+                    if ((a & 1) != 0)
+                        return false;
+
+                    var windowLen = 64;
+                    if (startPos + windowLen > code.Length)
+                        windowLen = code.Length - startPos;
+                    if (windowLen < 32)
+                        return false;
+
+                    var words = windowLen / 2;
+                    var absHits = 0;
+                    var relHits = 0;
+                    var considered = 0;
+
+                    for (var w = 0; w < words; w++)
+                    {
+                        var lo = code[startPos + (w * 2)];
+                        var hi = code[startPos + (w * 2) + 1];
+                        var val = (ushort)(lo | (hi << 8));
+                        if (val == 0x0000 || val == 0xFFFF)
+                            continue;
+                        considered++;
+
+                        var abs = (uint)val;
+                        var rel = origin + abs;
+                        if (stringsByAddr.ContainsKey(abs))
+                            absHits++;
+                        if (stringsByAddr.ContainsKey(rel))
+                            relHits++;
+                    }
+
+                    if (considered < 8)
+                        return false;
+
+                    // Require a decent density of string pointers.
+                    var best = Math.Max(absHits, relHits);
+                    if (best < 6 || best < (int)(considered * 0.50))
+                        return false;
+
+                    relative = relHits > absHits;
+
+                    // Extend while entries keep pointing at strings (allowing occasional 0/FFFF).
+                    var len = words * 2;
+                    while (startPos + len + 2 <= code.Length && len < 512)
+                    {
+                        var lo = code[startPos + len];
+                        var hi = code[startPos + len + 1];
+                        var val = (ushort)(lo | (hi << 8));
+                        if (val == 0x0000 || val == 0xFFFF)
+                        {
+                            len += 2;
+                            continue;
+                        }
+
+                        var abs = (uint)val;
+                        var tgt = relative ? (origin + abs) : abs;
+                        if (!stringsByAddr.ContainsKey(tgt))
+                            break;
+
+                        len += 2;
+                    }
+
+                    byteLen = len;
+                    return byteLen >= 32;
+                }
+
+                for (var p = 0; p + 32 <= code.Length;)
+                {
+                    if (TryDetectStringPointerTable(p, out var tblLen, out var relMode))
+                    {
+                        var words = tblLen / 2;
+                        for (var w = 0; w < words; w++)
+                        {
+                            var lo = code[p + (w * 2)];
+                            var hi = code[p + (w * 2) + 1];
+                            var val = (ushort)(lo | (hi << 8));
+                            if (val == 0x0000 || val == 0xFFFF)
+                                continue;
+                            var abs = (uint)val;
+                            var tgt = relMode ? (origin + abs) : abs;
+                            if (stringsByAddr.ContainsKey(tgt))
+                                referencedStringAddrs.Add(tgt);
+                        }
+
+                        p += tblLen;
+                        continue;
+                    }
+
+                    p += 2;
                 }
             }
 
@@ -638,7 +744,7 @@ namespace DOSRE.Dasm
                 var maxLen = Math.Min(256, code.Length - startPos);
                 var windowLen = Math.Min(64, maxLen);
 
-                // Reject ASCII-heavy regions.
+                // Reject ASCII-heavy regions (very likely text blocks, not numeric tables).
                 var printable = 0;
                 for (var i = 0; i < windowLen; i++)
                 {
@@ -646,7 +752,7 @@ namespace DOSRE.Dasm
                     if (bb >= 0x20 && bb <= 0x7E)
                         printable++;
                 }
-                if (printable >= (int)(windowLen * 0.50))
+                if (printable >= (int)(windowLen * 0.70))
                     return false;
 
                 // Bit-pattern heavy blocks often represent packed sprite/bitmap/tile data.
@@ -833,6 +939,122 @@ namespace DOSRE.Dasm
                 return null;
             }
 
+            static bool TryDetectLenPrefixedTextBlock(byte[] bytes, int start, int maxLen, out int byteLen, out List<(uint addr, int len, string preview)> segments)
+            {
+                byteLen = 0;
+                segments = null;
+
+                if (bytes == null || start < 0 || start >= bytes.Length)
+                    return false;
+                if (maxLen <= 0)
+                    return false;
+
+                // Format (best-effort, observed in Decathlon):
+                //   03 <len> <len bytes payload> 00 03 <len> ... 00 ...
+                // Payload is usually ASCII with a few token bytes >= 80h.
+                var i = start;
+                var end = Math.Min(bytes.Length, start + maxLen);
+                var found = new List<(uint addr, int len, string preview)>();
+
+                // Allow a small NUL prefix before the first 03 <len> segment.
+                var prefix = 0;
+                while (i < end && bytes[i] == 0x00 && prefix < 8)
+                {
+                    i++;
+                    prefix++;
+                }
+
+                while (i + 2 <= end)
+                {
+                    if (bytes[i] != 0x03)
+                        break;
+                    if (i + 2 > end)
+                        break;
+
+                    var len = bytes[i + 1];
+                    // Keep this conservative; long blocks are handled via multiple segments.
+                    if (len == 0 || len > 160)
+                        break;
+
+                    var payloadStart = i + 2;
+                    var payloadEnd = payloadStart + len;
+                    if (payloadEnd > end)
+                        break;
+
+                    // Reject if payload contains NULs; those are more likely binary tables.
+                    var printableOrToken = 0;
+                    var weird = 0;
+                    var sbPreview = new StringBuilder(len);
+                    for (var j = payloadStart; j < payloadEnd; j++)
+                    {
+                        var b = bytes[j];
+                        if (b == 0x00)
+                        {
+                            weird += 10;
+                            sbPreview.Append("<00>");
+                            continue;
+                        }
+
+                        if (b >= 0x20 && b <= 0x7E)
+                        {
+                            printableOrToken++;
+                            sbPreview.Append((char)b);
+                        }
+                        else if (b == 0x0D)
+                        {
+                            printableOrToken++;
+                            sbPreview.Append("\\r");
+                        }
+                        else if (b == 0x0A)
+                        {
+                            printableOrToken++;
+                            sbPreview.Append("\\n");
+                        }
+                        else if (b >= 0x80)
+                        {
+                            // Treat high-bit bytes as in-band tokens (e.g. special key glyphs).
+                            printableOrToken++;
+                            sbPreview.Append($"<{b:X2}>");
+                        }
+                        else
+                        {
+                            weird++;
+                            sbPreview.Append($"<{b:X2}>");
+                        }
+                    }
+
+                    // Require mostly readable payload and low weirdness.
+                    if (printableOrToken < Math.Max(4, (int)(len * 0.70)) || weird > 6)
+                        break;
+
+                    found.Add((0, len, sbPreview.ToString()));
+                    i = payloadEnd;
+
+                    // Optional separator NUL(s) between segments.
+                    var nulCount = 0;
+                    while (i < end && bytes[i] == 0x00 && nulCount < 8)
+                    {
+                        i++;
+                        nulCount++;
+                    }
+
+                    // Next segment must start with 03, otherwise end block.
+                    if (i >= end || bytes[i] != 0x03)
+                        break;
+                }
+
+                if (found.Count < 3)
+                    return false;
+
+                var totalLen = i - start;
+                if (totalLen < 24)
+                    return false;
+
+                byteLen = totalLen;
+                segments = found;
+                return true;
+            }
+
             var posInCode = 0;
             while (posInCode < code.Length)
             {
@@ -884,20 +1106,74 @@ namespace DOSRE.Dasm
                 }
 
                 // Data heuristics (only when insights enabled, and only if this address isn't a known control-flow target).
-                if (binInsights && !functionStarts.Contains(addr) && !labelTargets.Contains(addr) && (reachableInsAddrs.Count == 0 || !reachableInsAddrs.Contains(addr)))
+                if (binInsights && !functionStarts.Contains(addr) && !labelTargets.Contains(addr))
                 {
                     var clampLimit = nextCarveStart != uint.MaxValue && nextCarveStart > addr
                         ? (int)Math.Min(int.MaxValue, nextCarveStart - addr)
                         : int.MaxValue;
 
-                    if (TryGetFillRun(posInCode, out var fillVal, out var fillLen))
+                    // Decathlon-style text resources often appear as 03 <len> <payload> 00 ... blocks.
+                    if (TryDetectLenPrefixedTextBlock(code, posInCode, clampLimit, out var msgLen, out var msgSegments))
                     {
-                        fillLen = Math.Min(fillLen, clampLimit);
-                        sb.AppendLine($"; heuristic: padding/fill {(masmCompat ? ToMasmHexByte(fillVal) : $"0x{fillVal:X2}")} x{fillLen}");
-                        EmitDbBytes(addr, fillLen);
-                        posInCode += fillLen;
+                        sb.AppendLine();
+                        sb.AppendLine($"msgblk_{addr:X5}: ; heuristic: len-prefixed text block segments={msgSegments.Count} bytes={msgLen}");
+                        var segAddr = addr;
+                        var cursor = posInCode;
+
+                        // Skip the same small NUL prefix the detector allows.
+                        var prefix = 0;
+                        while (cursor < code.Length && code[cursor] == 0x00 && prefix < 8)
+                        {
+                            cursor++;
+                            segAddr++;
+                            prefix++;
+                        }
+
+                        foreach (var seg in msgSegments)
+                        {
+                            if (cursor + 2 > code.Length)
+                                break;
+                            if (code[cursor] != 0x03)
+                                break;
+                            var len = code[cursor + 1];
+                            var preview = seg.preview;
+                            if (preview.Length > 80)
+                                preview = preview.Substring(0, 80) + "...";
+                            sb.AppendLine($";   msg @{segAddr:X5} len={len:X2} \"{preview.Replace("\"", "'")}\"");
+
+                            segAddr += (uint)(2 + len);
+                            cursor += (2 + len);
+                            // account for NUL separators (same bound as in detection)
+                            var nulCount = 0;
+                            while (cursor < code.Length && code[cursor] == 0x00 && nulCount < 8)
+                            {
+                                segAddr += 1;
+                                cursor += 1;
+                                nulCount++;
+                            }
+                        }
+
+                        EmitDbBytes(addr, msgLen);
+                        posInCode += msgLen;
                         continue;
                     }
+
+                    // The remaining heuristics are more speculative; avoid overriding addresses already marked reachable.
+                    if (reachableInsAddrs.Count != 0 && reachableInsAddrs.Contains(addr))
+                    {
+                        // Fall through to instruction decoding.
+                    }
+                    else
+                    {
+
+                        if (TryGetFillRun(posInCode, out var fillVal, out var fillLen))
+                        {
+                            fillLen = Math.Min(fillLen, clampLimit);
+                            sb.AppendLine($"; heuristic: padding/fill {(masmCompat ? ToMasmHexByte(fillVal) : $"0x{fillVal:X2}")} x{fillLen}");
+                            EmitDbBytes(addr, fillLen);
+                            posInCode += fillLen;
+                            continue;
+                        }
 
                     if (TryDetectWordPointerTable(posInCode, out var tableLen))
                     {
@@ -921,7 +1197,7 @@ namespace DOSRE.Dasm
                                 var span = code.AsSpan(posInCode, Math.Min(wordLen, code.Length - posInCode));
                                 var rowW = GuessRepeatingRowWidth(span);
                                 cmt = rowW.HasValue
-                                    ? $"16-bit word table (bit-pattern heavy; likely sprite/bitmap/tile data) rowsize={rowW.Value}B"
+                                    ? $"16-bit word table (bit-pattern heavy; likely sprite/bitmap/tile data) rowsize={rowW.Value}B width~{rowW.Value * 8}px@1bpp/{rowW.Value * 4}px@2bpp/{rowW.Value * 2}px@4bpp rows~{Math.Max(1, wordLen / rowW.Value)}"
                                     : "16-bit word table (bit-pattern heavy; likely sprite/bitmap/tile data)";
                             }
                             else
@@ -939,11 +1215,15 @@ namespace DOSRE.Dasm
                         lowEntLen = Math.Min(lowEntLen, clampLimit);
                         var span = code.AsSpan(posInCode, Math.Min(lowEntLen, code.Length - posInCode));
                         var rowW = GuessRepeatingRowWidth(span);
-                        var rowNote = rowW.HasValue ? $" rowsize={rowW.Value}B" : string.Empty;
+                        var rowNote = rowW.HasValue
+                            ? $" rowsize={rowW.Value}B width~{rowW.Value * 8}px@1bpp/{rowW.Value * 4}px@2bpp/{rowW.Value * 2}px@4bpp rows~{Math.Max(1, lowEntLen / rowW.Value)}"
+                            : string.Empty;
                         sb.AppendLine($"; heuristic: low-entropy block (likely bitmap/tile/pattern data) bytes={lowEntLen}{rowNote}");
                         EmitDbBytes(addr, lowEntLen);
                         posInCode += lowEntLen;
                         continue;
+                    }
+
                     }
                 }
 
@@ -1164,7 +1444,7 @@ namespace DOSRE.Dasm
             return insText;
         }
 
-        private static Dictionary<uint, BinString> ScanStrings(byte[] bytes, uint origin, int minLen, int maxCount)
+        private static Dictionary<uint, BinString> ScanStrings(byte[] bytes, uint origin, int minLen, int maxCount, bool allowTokens = false)
         {
             var map = new Dictionary<uint, BinString>();
             if (bytes == null || bytes.Length == 0)
@@ -1172,26 +1452,138 @@ namespace DOSRE.Dasm
 
             bool IsPrintable(byte b) => b >= 0x20 && b <= 0x7E;
 
+            bool LooksLikeStart(int idx)
+            {
+                if (idx < 0 || idx >= bytes.Length)
+                    return false;
+
+                if (IsPrintable(bytes[idx]))
+                    return true;
+
+                if (!allowTokens)
+                    return false;
+
+                // Common: a control prefix (03 xx) followed by printable text.
+                if (bytes[idx] == 0x03 && idx + 2 < bytes.Length && IsPrintable(bytes[idx + 2]))
+                    return true;
+
+                return false;
+            }
+
             for (var i = 0; i < bytes.Length && map.Count < maxCount; i++)
             {
-                if (!IsPrintable(bytes[i]))
+                if (!LooksLikeStart(i))
                     continue;
 
                 var start = i;
-                while (i < bytes.Length && IsPrintable(bytes[i]))
-                    i++;
+
+                var printableCount = 0;
+                var tokenCount = 0;
+                var preview = new StringBuilder(160);
+
+                while (i < bytes.Length)
+                {
+                    var b = bytes[i];
+
+                    // NUL terminator ends the string.
+                    if (b == 0x00)
+                        break;
+
+                    if (IsPrintable(b))
+                    {
+                        printableCount++;
+                        if (preview.Length < 120)
+                            preview.Append((char)b);
+                        i++;
+                        continue;
+                    }
+
+                    if (!allowTokens)
+                        break;
+
+                    // Treat CR/LF as printable escapes.
+                    if (b == 0x0D)
+                    {
+                        printableCount++;
+                        if (preview.Length < 118)
+                            preview.Append("\\r");
+                        i++;
+                        continue;
+                    }
+                    if (b == 0x0A)
+                    {
+                        printableCount++;
+                        if (preview.Length < 118)
+                            preview.Append("\\n");
+                        i++;
+                        continue;
+                    }
+
+                    // In-band control sequence: 03 xx
+                    if (b == 0x03 && i + 1 < bytes.Length)
+                    {
+                        tokenCount += 2;
+                        var arg = bytes[i + 1];
+                        if (preview.Length < 110)
+                        {
+                            if (arg == 0x0A)
+                                preview.Append("\\n");
+                            else if (arg == 0x0D)
+                                preview.Append("\\r");
+                            else
+                                preview.Append($"<03{arg:X2}>");
+                        }
+                        i += 2;
+                        continue;
+                    }
+
+                    // High-bit tokens (special glyphs / key icons).
+                    if (b >= 0x80)
+                    {
+                        tokenCount++;
+                        if (preview.Length < 116)
+                            preview.Append($"<{b:X2}>");
+                        i++;
+                        continue;
+                    }
+
+                    // Other control bytes terminate the string scan.
+                    break;
+                }
 
                 var len = i - start;
                 if (len < minLen)
                     continue;
 
+                // Reduce false positives: require a decent amount of ASCII and cap token noise.
+                if (allowTokens)
+                {
+                    if (printableCount < 8)
+                        continue;
+                    // Must be at least ~40% readable (len counts raw bytes, control sequences consume bytes too).
+                    if (printableCount < (int)(len * 0.40))
+                        continue;
+                    // Don't let token noise dominate.
+                    if (tokenCount > (printableCount * 3))
+                        continue;
+                }
+
                 // Avoid absurdly long runs (often graphics tables that happen to be printable-ish)
                 var take = Math.Min(len, 120);
-                var s = Encoding.ASCII.GetString(bytes, start, take);
 
-                // Sanitize for one-line comments
-                s = s.Replace("\r", "\\r").Replace("\n", "\\n");
-                s = s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+                string s;
+                if (!allowTokens)
+                {
+                    s = Encoding.ASCII.GetString(bytes, start, take);
+
+                    // Sanitize for one-line comments
+                    s = s.Replace("\r", "\\r").Replace("\n", "\\n");
+                    s = s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+                }
+                else
+                {
+                    s = preview.ToString();
+                }
 
                 var addr = origin + (uint)start;
                 if (!map.ContainsKey(addr))
