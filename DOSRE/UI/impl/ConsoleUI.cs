@@ -298,6 +298,24 @@ namespace DOSRE.UI.impl
         private bool _bMzInsights;
 
         /// <summary>
+        ///     MZ byte-perfect reassembly export (NASM -f bin style)
+        ///     Specified with -MZREASM <file.asm>
+        /// </summary>
+        private string _mzReasmAsm;
+
+        /// <summary>
+        ///     Optional JSON metadata export for -MZREASM
+        ///     Specified with -MZREASMJSON <file.json>
+        /// </summary>
+        private string _mzReasmJson;
+
+        /// <summary>
+        ///     MZ byte-perfect reassembly export (OpenWatcom WASM/MASM compatible)
+        ///     Specified with -MZREASMWASM <file.asm>
+        /// </summary>
+        private string _mzReasmAsmWasm;
+
+        /// <summary>
         ///     Toolchain hint (best-effort heuristics)
         ///     Specified with -borland or -watcom
         /// </summary>
@@ -328,6 +346,25 @@ namespace DOSRE.UI.impl
         private bool _bBinMasmCompat = true;
 
         /// <summary>
+        ///     In BIN16 MASM/WASM mode, emit decoded instruction mnemonics instead of `db ... ; disasm` lines.
+        ///     Specified with -BININSTR.
+        /// </summary>
+        private bool _bBinInstr;
+
+        /// <summary>
+        ///     In BIN16 MASM/WASM mode, keep output byte-perfect by always emitting `db ...`,
+        ///     but include the decoded mnemonic as a comment for readability.
+        ///     Specified with -BININSTRDB.
+        /// </summary>
+        private bool _bBinInstrDb;
+
+        /// <summary>
+        ///     Emit a best-effort code/data map as comments at the end of BIN16 output.
+        ///     Specified with -BINMAP.
+        /// </summary>
+        private bool _bBinMap;
+
+        /// <summary>
         ///     Flat binary origin (base address)
         ///     Specified with -BINORG <hex>
         /// </summary>
@@ -338,6 +375,48 @@ namespace DOSRE.UI.impl
         ///     Specified with -BINBYTES <n>
         /// </summary>
         private int? _binBytesLimit;
+
+        /// <summary>
+        ///     BIN16 byte-perfect reassembly export (NASM -f bin style)
+        ///     Specified with -BINREASM <file.asm>
+        /// </summary>
+        private string _binReasmAsm;
+
+        /// <summary>
+        ///     BIN16 byte-perfect reassembly export (OpenWatcom WASM/MASM compatible)
+        ///     Specified with -BINREASMWASM <file.asm>
+        /// </summary>
+        private string _binReasmAsmWasm;
+
+        /// <summary>
+        ///     Optional JSON metadata export for -BINREASM
+        ///     Specified with -BINREASMJSON <file.json>
+        /// </summary>
+        private string _binReasmJson;
+
+        /// <summary>
+        ///     Batch BIN16 reassembly export input directory
+        ///     Specified with -BINDIRREASM <inDir> <outDir>
+        /// </summary>
+        private string _binDirReasmInDir;
+
+        /// <summary>
+        ///     Batch BIN16 reassembly export output directory
+        ///     Specified with -BINDIRREASM <inDir> <outDir>
+        /// </summary>
+        private string _binDirReasmOutDir;
+
+        /// <summary>
+        ///     Batch BIN16 reassembly export output directory (OpenWatcom WASM/MASM compatible)
+        ///     Specified with -BINDIRREASMWASM <inDir> <outDir>
+        /// </summary>
+        private string _binDirReasmOutDirWasm;
+
+        /// <summary>
+        ///     Optional extension filter for -BINDIRREASM (example: .ovl)
+        ///     Specified with -BINDIREXT <ext>
+        /// </summary>
+        private string _binDirReasmExt;
 
         /// <summary>
         ///     Default Constructor
@@ -419,7 +498,8 @@ namespace DOSRE.UI.impl
                             if (string.IsNullOrWhiteSpace(_sInputFile) && i + 1 < _args.Length)
                             {
                                 var next = _args[i + 1];
-                                if (!string.IsNullOrWhiteSpace(next) && next.Length > 0 && next[0] != '-' && next[0] != '/')
+                                if (!string.IsNullOrWhiteSpace(next) && next.Length > 0 &&
+                                    (File.Exists(next) || (next[0] != '-' && next[0] != '/')))
                                 {
                                     _sInputFile = next;
                                     i++;
@@ -435,6 +515,18 @@ namespace DOSRE.UI.impl
                         case "BINMASM":
                         case "BINWASM":
                             _bBinMasmCompat = true;
+                            break;
+                        case "BININSTR":
+                            _bBinInstr = true;
+                            break;
+                        case "BININSTRDB":
+                            // Byte-perfect mnemonic mode: keep bytes as db but include mnemonics in comments.
+                            // If both are set, prefer byte-perfect mode.
+                            _bBinInstrDb = true;
+                            _bBinInstr = false;
+                            break;
+                        case "BINMAP":
+                            _bBinMap = true;
                             break;
                         case "BINLISTING":
                             _bBinMasmCompat = false;
@@ -458,6 +550,44 @@ namespace DOSRE.UI.impl
                             if (!int.TryParse(_args[i + 1], out var binBytesLimit) || binBytesLimit <= 0)
                                 throw new Exception("Error: -BINBYTES must be a positive integer");
                             _binBytesLimit = binBytesLimit;
+                            i++;
+                            break;
+                        case "BINREASM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINREASM requires a <file.asm>");
+                            _binReasmAsm = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINREASMWASM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINREASMWASM requires a <file.asm>");
+                            _binReasmAsmWasm = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINREASMJSON":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINREASMJSON requires a <file.json>");
+                            _binReasmJson = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINDIRREASM":
+                            if (i + 2 >= _args.Length)
+                                throw new Exception("Error: -BINDIRREASM requires <inDir> <outDir>");
+                            _binDirReasmInDir = _args[i + 1];
+                            _binDirReasmOutDir = _args[i + 2];
+                            i += 2;
+                            break;
+                        case "BINDIRREASMWASM":
+                            if (i + 2 >= _args.Length)
+                                throw new Exception("Error: -BINDIRREASMWASM requires <inDir> <outDir>");
+                            _binDirReasmInDir = _args[i + 1];
+                            _binDirReasmOutDirWasm = _args[i + 2];
+                            i += 2;
+                            break;
+                        case "BINDIREXT":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINDIREXT requires an extension (example: .ovl)");
+                            _binDirReasmExt = _args[i + 1];
                             i++;
                             break;
                         case "LEFULL":
@@ -637,6 +767,24 @@ namespace DOSRE.UI.impl
                         case "MZINSIGHTS":
                             _bMzInsights = true;
                             break;
+                        case "MZREASM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -MZREASM requires a <file.asm>");
+                            _mzReasmAsm = _args[i + 1];
+                            i++;
+                            break;
+                        case "MZREASMWASM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -MZREASMWASM requires a <file.asm>");
+                            _mzReasmAsmWasm = _args[i + 1];
+                            i++;
+                            break;
+                        case "MZREASMJSON":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -MZREASMJSON requires a <file.json>");
+                            _mzReasmJson = _args[i + 1];
+                            i++;
+                            break;
                         case "BORLAND":
                             if (_toolchainHint != EnumToolchainHint.None && _toolchainHint != EnumToolchainHint.Borland)
                                 throw new Exception("Error: -BORLAND and -WATCOM are mutually exclusive");
@@ -707,7 +855,16 @@ namespace DOSRE.UI.impl
                             Console.WriteLine("-BININSIGHTS -- (with -BIN16) Best-effort string literal scan + inline string annotations");
                             Console.WriteLine("-BINSTRLABELS -- (with -BIN16/-BININSIGHTS) Emit inline str_XXXX: labels at referenced string addresses");
                             Console.WriteLine("-BINMASM / -BINWASM -- (with -BIN16) Emit MASM/WASM-compatible assembly source (default)");
+                            Console.WriteLine("-BININSTR -- (with -BIN16 and -BINMASM/-BINWASM) Emit decoded instruction mnemonics instead of db-lines (best-effort)");
+                            Console.WriteLine("-BININSTRDB -- (with -BIN16 and -BINMASM/-BINWASM) Emit byte-perfect db-lines, with decoded mnemonics as comments (assemblable + readable)");
+                            Console.WriteLine("-BINMAP -- (with -BIN16) Append a best-effort code/data map (ranges + reasons) as comments");
                             Console.WriteLine("-BINLISTING -- (with -BIN16) Emit analysis listing format (NOT assembler-ready)");
+                            Console.WriteLine("-BINREASM <file.asm> -- (with -BIN16) Export byte-perfect NASM -f bin reconstruction (db), using -BINORG for the org directive");
+                            Console.WriteLine("-BINREASMJSON <file.json> -- (with -BIN16) Export BIN16 metadata (origin + size) for the -BINREASM output");
+                            Console.WriteLine("-BINREASMWASM <file.asm> -- (with -BIN16) Export byte-perfect reassembly in OpenWatcom WASM/MASM-compatible syntax (db + 8086 directives)");
+                            Console.WriteLine("-BINDIRREASM <inDir> <outDir> -- Batch export BIN16 reassembly (db) + JSON for all non-MZ files in <inDir> (skips MZ/NE/LE/PE); uses -BINORG for org");
+                            Console.WriteLine("-BINDIRREASMWASM <inDir> <outDir> -- Batch export BIN16 reassembly in OpenWatcom WASM/MASM-compatible syntax (db + JSON)");
+                            Console.WriteLine("-BINDIREXT <ext> -- (with -BINDIRREASM) Only export files with this extension (example: .ovl)");
                             Console.WriteLine("-MINIMAL -- Minimal Disassembler Output");
                             Console.WriteLine(
                                 "-ANALYSIS -- Additional Analysis on Imported Functions (if available)");
@@ -776,6 +933,12 @@ namespace DOSRE.UI.impl
                             Console.WriteLine(
                                 "-MZINSIGHTS -- (MZ inputs) Best-effort labels/xrefs/strings for 16-bit MZ binaries");
                             Console.WriteLine(
+                                "-MZREASM <file.asm> -- (MZ inputs) Export byte-perfect NASM -f bin reconstruction (db/dw), preserving relocation table bytes");
+                            Console.WriteLine(
+                                "-MZREASMJSON <file.json> -- (MZ inputs) Export MZ header + relocation metadata for the -MZREASM output");
+                            Console.WriteLine(
+                                "-MZREASMWASM <file.asm> -- (MZ inputs) Export byte-perfect reassembly in OpenWatcom WASM/MASM-compatible syntax (db/dw + 8086 directives)");
+                            Console.WriteLine(
                                 "-BORLAND -- Toolchain hint: use Borland/Turbo-era heuristics (best-effort; currently impacts MZ output)");
                             Console.WriteLine(
                                 "-WATCOM -- Toolchain hint: use Watcom-era heuristics (best-effort; currently impacts MZ output)");
@@ -789,6 +952,123 @@ namespace DOSRE.UI.impl
                                 "-MACROS -- Replace repeated straight-line chunks with macros (best-effort, readability)");
                             return;
                     }
+                }
+
+                // Batch BIN16 reassembly export: bypass input file requirements and all format detection/disassembly.
+                if (!string.IsNullOrWhiteSpace(_binDirReasmInDir) ||
+                    !string.IsNullOrWhiteSpace(_binDirReasmOutDir) ||
+                    !string.IsNullOrWhiteSpace(_binDirReasmOutDirWasm))
+                {
+                    var wantNasm = !string.IsNullOrWhiteSpace(_binDirReasmOutDir);
+                    var wantWasm = !string.IsNullOrWhiteSpace(_binDirReasmOutDirWasm);
+
+                    if (string.IsNullOrWhiteSpace(_binDirReasmInDir) || (!wantNasm && !wantWasm))
+                        throw new Exception("Error: -BINDIRREASM requires <inDir> <outDir> (or use -BINDIRREASMWASM <inDir> <outDir>)");
+                    if (!Directory.Exists(_binDirReasmInDir))
+                        throw new Exception($"Error: input directory does not exist: {_binDirReasmInDir}");
+
+                    string normExt = null;
+                    if (!string.IsNullOrWhiteSpace(_binDirReasmExt))
+                    {
+                        normExt = _binDirReasmExt.Trim();
+                        if (!normExt.StartsWith('.'))
+                            normExt = "." + normExt;
+                        normExt = normExt.ToLowerInvariant();
+                    }
+
+                    if (wantNasm)
+                        Directory.CreateDirectory(_binDirReasmOutDir);
+                    if (wantWasm)
+                        Directory.CreateDirectory(_binDirReasmOutDirWasm);
+
+                    static bool HasMZHeader(string path)
+                    {
+                        try
+                        {
+                            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                            if (fs.Length < 2)
+                                return false;
+                            var b0 = fs.ReadByte();
+                            var b1 = fs.ReadByte();
+                            return b0 == 'M' && b1 == 'Z';
+                        }
+                        catch
+                        {
+                            return false;
+                        }
+                    }
+
+                    var ok = 0;
+                    var skipped = 0;
+                    var skippedEmpty = 0;
+                    var failed = 0;
+
+                    foreach (var file in Directory.EnumerateFiles(_binDirReasmInDir, "*", SearchOption.TopDirectoryOnly))
+                    {
+                        try
+                        {
+                            var len = new FileInfo(file).Length;
+                            if (len == 0)
+                            {
+                                skippedEmpty++;
+                                continue;
+                            }
+                        }
+                        catch
+                        {
+                            // If we can't stat the file, just attempt export and let it report a failure.
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(normExt))
+                        {
+                            var ext = (Path.GetExtension(file) ?? string.Empty).ToLowerInvariant();
+                            if (ext != normExt)
+                                continue;
+                        }
+
+                        if (HasMZHeader(file))
+                        {
+                            skipped++;
+                            continue;
+                        }
+
+                        var baseName = Path.GetFileName(file);
+
+                        var fileOk = true;
+
+                        if (wantNasm)
+                        {
+                            var outAsm = Path.Combine(_binDirReasmOutDir, baseName + ".bin16.reasm.asm");
+                            var outJson = Path.Combine(_binDirReasmOutDir, baseName + ".bin16.reasm.json");
+                            if (!Bin16Disassembler.TryExportReassembly(file, _binOrigin, outAsm, outJson, out var reasmErr))
+                            {
+                                fileOk = false;
+                                _logger.Warn($"-BINDIRREASM failed for {file}: {reasmErr}");
+                            }
+                        }
+
+                        if (wantWasm)
+                        {
+                            var outAsm = Path.Combine(_binDirReasmOutDirWasm, baseName + ".bin16.reasm.asm");
+                            var outJson = Path.Combine(_binDirReasmOutDirWasm, baseName + ".bin16.reasm.json");
+                            if (!Bin16Disassembler.TryExportReassembly(file, _binOrigin, outAsm, outJson, wasmCompat: true, out var reasmErr))
+                            {
+                                fileOk = false;
+                                _logger.Warn($"-BINDIRREASMWASM failed for {file}: {reasmErr}");
+                            }
+                        }
+
+                        if (fileOk)
+                            ok++;
+                        else
+                            failed++;
+                    }
+
+                    if (failed > 0)
+                        throw new Exception($"Error: -BINDIRREASM completed with failures (ok={ok} skipped_mz={skipped} skipped_empty={skippedEmpty} failed={failed})");
+
+                    _logger.Info($"{DateTime.Now} -BINDIRREASM done (ok={ok} skipped_mz={skipped} skipped_empty={skippedEmpty} origin=0x{_binOrigin:X})");
+                    return;
                 }
 
                 //Verify Input File is Valid (unless decompiling from an asm file)
@@ -830,7 +1110,38 @@ namespace DOSRE.UI.impl
                 // Flat binary mode: bypass all format detection and render a straightforward 16-bit decode.
                 if (_bBin16)
                 {
-                    if (!Bin16Disassembler.TryDisassembleToString(_sInputFile, _binOrigin, _binBytesLimit, _bBinMasmCompat, _bBinInsights, _bBinStrLabels, out var binOut, out var binErr))
+                    if (!string.IsNullOrEmpty(_binReasmAsm) || !string.IsNullOrEmpty(_binReasmAsmWasm) || !string.IsNullOrEmpty(_binReasmJson))
+                    {
+                        if (!string.IsNullOrEmpty(_binReasmAsm) || !string.IsNullOrEmpty(_binReasmJson))
+                        {
+                            if (Bin16Disassembler.TryExportReassembly(_sInputFile, _binOrigin, _binReasmAsm, _binReasmJson, out var reasmErr))
+                            {
+                                if (!string.IsNullOrEmpty(_binReasmAsm))
+                                    _logger.Info($"{DateTime.Now} Wrote BIN16 reassembly export to {_binReasmAsm}");
+                                if (!string.IsNullOrEmpty(_binReasmJson))
+                                    _logger.Info($"{DateTime.Now} Wrote BIN16 reassembly metadata to {_binReasmJson}");
+                            }
+                            else
+                            {
+                                throw new Exception($"Error: -BINREASM export failed: {reasmErr}");
+                            }
+                        }
+
+                        if (!string.IsNullOrEmpty(_binReasmAsmWasm))
+                        {
+                            if (Bin16Disassembler.TryExportReassembly(_sInputFile, _binOrigin, _binReasmAsmWasm, outJsonFile: null, wasmCompat: true, out var reasmErr))
+                            {
+                                _logger.Info($"{DateTime.Now} Wrote BIN16 reassembly export (WASM) to {_binReasmAsmWasm}");
+                            }
+                            else
+                            {
+                                throw new Exception($"Error: -BINREASMWASM export failed: {reasmErr}");
+                            }
+                        }
+                    }
+
+                    var emitInstr = _bBinInstr && !_bBinInstrDb;
+                    if (!Bin16Disassembler.TryDisassembleToString(_sInputFile, _binOrigin, _binBytesLimit, _bBinMasmCompat, _bBinInsights, _bBinStrLabels, emitInstr, _bBinInstrDb, _bBinMap, out var binOut, out var binErr))
                         throw new Exception(binErr);
 
                     if (string.IsNullOrEmpty(_sOutputFile))
@@ -1650,6 +1961,36 @@ namespace DOSRE.UI.impl
                 var mzFull = _bMzFull || _bLeFull;
                 var mzBytes = _mzBytesLimit ?? _leBytesLimit;
                 var mzInsights = _bMzInsights || _bLeInsights || _bAnalysis;
+
+                if (!string.IsNullOrEmpty(_mzReasmAsm) || !string.IsNullOrEmpty(_mzReasmAsmWasm) || !string.IsNullOrEmpty(_mzReasmJson))
+                {
+                    if (!string.IsNullOrEmpty(_mzReasmAsm) || !string.IsNullOrEmpty(_mzReasmJson))
+                    {
+                        if (MZDisassembler.TryExportReassembly(_sInputFile, _mzReasmAsm, _mzReasmJson, out var reasmErr))
+                        {
+                            if (!string.IsNullOrEmpty(_mzReasmAsm))
+                                _logger.Info($"{DateTime.Now} Wrote MZ reassembly export to {_mzReasmAsm}");
+                            if (!string.IsNullOrEmpty(_mzReasmJson))
+                                _logger.Info($"{DateTime.Now} Wrote MZ reassembly metadata to {_mzReasmJson}");
+                        }
+                        else
+                        {
+                            throw new Exception($"Error: -MZREASM export failed: {reasmErr}");
+                        }
+                    }
+
+                    if (!string.IsNullOrEmpty(_mzReasmAsmWasm))
+                    {
+                        if (MZDisassembler.TryExportReassembly(_sInputFile, _mzReasmAsmWasm, outJsonFile: null, wasmCompat: true, out var reasmErr))
+                        {
+                            _logger.Info($"{DateTime.Now} Wrote MZ reassembly export (WASM) to {_mzReasmAsmWasm}");
+                        }
+                        else
+                        {
+                            throw new Exception($"Error: -MZREASMWASM export failed: {reasmErr}");
+                        }
+                    }
+                }
                 if (MZDisassembler.TryDisassembleToString(_sInputFile, mzFull, mzBytes, mzInsights, _toolchainHint, out var mzOutput, out var mzError))
                 {
                     if (_toolchainHint != EnumToolchainHint.None)
