@@ -42,6 +42,15 @@ struct Candidate {
     std::string originalLine;
 };
 
+struct DbLineMeta {
+    size_t lineIndex{};
+    std::string indent;
+    uint32_t logicalAddr{};   // parsed from comment AAAAAAAAh
+    std::string addr8;        // 8 hex digits
+    std::string hexbytes;     // hex string (no separators)
+    size_t commentPos{};      // index of ';' in the original line
+};
+
 struct Options {
     std::string inAsm;
     std::string origBin;
@@ -155,6 +164,8 @@ static bool isHexChar(char c) {
 static bool isAlpha(char c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
 }
+
+static std::optional<uint32_t> parseHexU32(std::string_view s);
 
 static std::optional<uint32_t> parseNumberToken(std::string_view tok) {
     tok = rtrimView(ltrimView(tok));
@@ -309,6 +320,57 @@ static std::optional<Candidate> parseDbLineCandidate(const std::string &line, si
     return c;
 }
 
+static std::optional<DbLineMeta> parseDbLineMeta(const std::string &line, size_t lineIndex) {
+    // Parse any db line that has a comment with an 8-hex-digit address token.
+    // This is used for label anchoring/splitting even when the line isn't a promotion candidate.
+
+    std::string_view v(line);
+    auto vtrim = ltrimView(v);
+    if (!startsWith(vtrim, "db ")) return std::nullopt;
+
+    size_t indentLen = v.size() - vtrim.size();
+    std::string indent(line.substr(0, indentLen));
+
+    auto semi = v.find(';');
+    if (semi == std::string_view::npos) return std::nullopt;
+
+    std::string_view after = ltrimView(v.substr(semi + 1));
+    after = rtrimView(after);
+    if (after.size() < 9) return std::nullopt;
+    for (int i = 0; i < 8; i++) {
+        if (!isHexChar(after[static_cast<size_t>(i)])) return std::nullopt;
+    }
+    if (after[8] != 'h' && after[8] != 'H') return std::nullopt;
+
+    std::string addr8(after.substr(0, 8));
+    for (auto &c : addr8) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    auto logicalAddrOpt = parseHexU32(addr8);
+    if (!logicalAddrOpt) return std::nullopt;
+
+    after = ltrimView(after.substr(9));
+
+    std::string hexbytes;
+    size_t hbLen = 0;
+    while (hbLen < after.size() && isHexChar(after[hbLen])) hbLen++;
+    if (hbLen >= 2 && (hbLen % 2) == 0) {
+        hexbytes = std::string(after.substr(0, hbLen));
+        for (auto &c : hexbytes) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    } else {
+        auto hb = hexBytesFromDbOperands(v);
+        if (!hb) return std::nullopt;
+        hexbytes = *hb;
+    }
+
+    DbLineMeta m;
+    m.lineIndex = lineIndex;
+    m.indent = std::move(indent);
+    m.logicalAddr = *logicalAddrOpt;
+    m.addr8 = std::move(addr8);
+    m.hexbytes = std::move(hexbytes);
+    m.commentPos = static_cast<size_t>(semi);
+    return m;
+}
+
 static std::unordered_set<std::string> findNeededLabels(const std::vector<Candidate> &cands, const std::vector<std::string> &lines) {
     std::unordered_set<std::string> needed;
 
@@ -374,8 +436,34 @@ static std::string renderAsm(
         lineToCand[cands[ci].lineIndex] = ci;
     }
 
-    // addr->labels (addr is org-relative: logical addr - logicalOrigin)
-    std::unordered_map<std::string, std::vector<std::string>> addrToLabels;
+    auto hexByte = [](uint8_t b) -> std::string {
+        static const char *digits = "0123456789ABCDEF";
+        std::string s;
+        s.reserve(4);
+        char hi = digits[(b >> 4) & 0xF];
+        char lo = digits[b & 0xF];
+        // MASM: if it would start with A-F, prefix 0.
+        if (hi >= 'A' && hi <= 'F') s.push_back('0');
+        s.push_back(hi);
+        s.push_back(lo);
+        s.push_back('h');
+        return s;
+    };
+    auto hexBytes = [](const std::vector<uint8_t> &bytes, size_t start, size_t len) -> std::string {
+        static const char *digits = "0123456789ABCDEF";
+        std::string s;
+        s.reserve(len * 2);
+        for (size_t i = 0; i < len; i++) {
+            uint8_t b = bytes[start + i];
+            s.push_back(digits[(b >> 4) & 0xF]);
+            s.push_back(digits[b & 0xF]);
+        }
+        return s;
+    };
+
+    // orgAddr -> labels (orgAddr is org-relative: logical addr - logicalOrigin)
+    std::unordered_map<uint32_t, std::vector<std::string>> addrToLabels;
+    addrToLabels.reserve(neededLabels.size() * 2);
     for (const auto &name : neededLabels) {
         if (name.size() < 5) continue; // loc_ + at least 1
         uint32_t logicalAddr = 0;
@@ -390,25 +478,21 @@ static std::string renderAsm(
             }
         }
         uint32_t orgAddr = (logicalAddr >= logicalOrigin) ? (logicalAddr - logicalOrigin) : logicalAddr;
-        addrToLabels[toHex8(orgAddr)].push_back(name);
+        addrToLabels[orgAddr].push_back(name);
     }
 
-    // Some disassemblies reference loc_ labels that don't exist as an address anchor in the db dump.
-    // Define them as EQU symbols so assembly can proceed; byte-identity is still enforced by the oracle.
-    std::unordered_set<std::string> presentAddrs;
-    presentAddrs.reserve(cands.size());
-    for (const auto &c : cands) {
-        uint32_t logicalAddr = 0;
-        for (char ch : c.addr8) { // 8 hex digits
-            logicalAddr *= 16;
-            if (ch >= '0' && ch <= '9') logicalAddr += static_cast<uint32_t>(ch - '0');
-            else {
-                ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-                logicalAddr += static_cast<uint32_t>(10 + (ch - 'A'));
-            }
-        }
-        uint32_t orgAddr = (logicalAddr >= logicalOrigin) ? (logicalAddr - logicalOrigin) : logicalAddr;
-        presentAddrs.insert(toHex8(orgAddr));
+    // Parse all db lines with address comments, so we can anchor/split even when they're not candidates.
+    std::unordered_map<size_t, DbLineMeta> lineToDb;
+    lineToDb.reserve(lines.size() / 2);
+    std::unordered_set<uint32_t> coveredOrgAddrs;
+    coveredOrgAddrs.reserve(65536);
+    for (size_t i = 0; i < lines.size(); i++) {
+        auto meta = parseDbLineMeta(lines[i], i);
+        if (!meta) continue;
+        lineToDb.emplace(i, *meta);
+        uint32_t orgStart = (meta->logicalAddr >= logicalOrigin) ? (meta->logicalAddr - logicalOrigin) : meta->logicalAddr;
+        size_t len = meta->hexbytes.size() / 2;
+        for (size_t off = 0; off < len; off++) coveredOrgAddrs.insert(orgStart + static_cast<uint32_t>(off));
     }
 
     std::vector<std::string> equLabels;
@@ -427,7 +511,7 @@ static std::string renderAsm(
             }
         }
         uint32_t orgAddr = (logicalAddr >= logicalOrigin) ? (logicalAddr - logicalOrigin) : logicalAddr;
-        if (presentAddrs.find(toHex8(orgAddr)) == presentAddrs.end()) equLabels.push_back(name);
+        if (coveredOrgAddrs.find(orgAddr) == coveredOrgAddrs.end()) equLabels.push_back(name);
     }
     std::sort(equLabels.begin(), equLabels.end());
 
@@ -435,6 +519,37 @@ static std::string renderAsm(
     emitted.reserve(neededLabels.size());
 
     std::ostringstream out;
+
+    // Generate a prelude of real labels for all covered loc_ symbols.
+    // OpenWatcom WASM can be picky about some forward references (notably forced 'short' branches).
+    // Defining these symbols early (via ORG hops) keeps correctness while avoiding EQU for rel branches.
+    struct PinnedLabel {
+        uint32_t orgAddr;
+        std::string name;
+    };
+    std::vector<PinnedLabel> pinned;
+    pinned.reserve(neededLabels.size());
+    for (const auto &name : neededLabels) {
+        if (name.size() < 5) continue;
+        uint32_t logicalAddr = 0;
+        for (size_t i = 4; i < name.size(); i++) {
+            char c = name[i];
+            if (!isHexChar(c)) { logicalAddr = 0; break; }
+            logicalAddr *= 16;
+            if (c >= '0' && c <= '9') logicalAddr += static_cast<uint32_t>(c - '0');
+            else {
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                logicalAddr += static_cast<uint32_t>(10 + (c - 'A'));
+            }
+        }
+        uint32_t orgAddr = (logicalAddr >= logicalOrigin) ? (logicalAddr - logicalOrigin) : logicalAddr;
+        if (coveredOrgAddrs.find(orgAddr) == coveredOrgAddrs.end()) continue;
+        pinned.push_back(PinnedLabel{orgAddr, name});
+    }
+    std::sort(pinned.begin(), pinned.end(), [](const auto &a, const auto &b) {
+        if (a.orgAddr != b.orgAddr) return a.orgAddr < b.orgAddr;
+        return a.name < b.name;
+    });
 
     for (const auto &lname : equLabels) {
         uint32_t logicalAddr = 0;
@@ -455,6 +570,16 @@ static std::string renderAsm(
         emitted.insert(lname);
     }
 
+    bool injectedPinnedPrelude = false;
+
+    auto emitLabelsAt = [&](uint32_t orgAddr) {
+        auto it = addrToLabels.find(orgAddr);
+        if (it == addrToLabels.end()) return;
+        for (const auto &lname : it->second) {
+            if (emitted.insert(lname).second) out << lname << ":\n";
+        }
+    };
+
     for (size_t i = 0; i < lines.size(); i++) {
         const std::string &line = lines[i];
 
@@ -465,40 +590,102 @@ static std::string renderAsm(
             continue;
         }
 
-        // If this is a db-line candidate, we can use it as an address anchor for label insertion.
-        auto itCand = lineToCand.find(i);
-        if (itCand != lineToCand.end()) {
-            const Candidate &c = cands[itCand->second];
-            uint32_t logicalAddr = 0;
-            for (char ch : c.addr8) {
-                logicalAddr *= 16;
-                if (ch >= '0' && ch <= '9') logicalAddr += static_cast<uint32_t>(ch - '0');
-                else {
-                    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-                    logicalAddr += static_cast<uint32_t>(10 + (ch - 'A'));
-                }
-            }
-            uint32_t orgAddr = (logicalAddr >= logicalOrigin) ? (logicalAddr - logicalOrigin) : logicalAddr;
-            auto it = addrToLabels.find(toHex8(orgAddr));
-            if (it != addrToLabels.end()) {
-                for (const auto &lname : it->second) {
-                    if (emitted.insert(lname).second) {
-                        out << lname << ":\n";
+        // Inject the pinned label prelude right after the first ORG inside the segment.
+        // We restore ORG back to 0000h (BIN16 dumps always use org 0000h with a separate logical origin).
+        if (!injectedPinnedPrelude) {
+            static const std::regex orgLine(R"(^\s*org\b)", std::regex::icase);
+            if (std::regex_search(line, orgLine)) {
+                out << line << "\n";
+                if (!pinned.empty()) {
+                    out << "; --- generated loc_ label prelude ---\n";
+                    for (const auto &pl : pinned) {
+                        if (pl.orgAddr >= 0x10000u) continue;
+                        out << "org " << std::uppercase << std::hex << std::setw(4) << std::setfill('0')
+                            << static_cast<unsigned>(pl.orgAddr & 0xFFFFu) << "h\n";
+                        out << pl.name << ":\n";
+                        emitted.insert(pl.name);
                     }
+                    out << "org 0000h\n";
+                    out << "; --- end generated loc_ label prelude ---\n";
+                }
+                injectedPinnedPrelude = true;
+                continue;
+            }
+        }
+
+        auto itDb = lineToDb.find(i);
+        if (itDb != lineToDb.end()) {
+            const DbLineMeta &m = itDb->second;
+            uint32_t orgStart = (m.logicalAddr >= logicalOrigin) ? (m.logicalAddr - logicalOrigin) : m.logicalAddr;
+            emitLabelsAt(orgStart);
+
+            auto itCand = lineToCand.find(i);
+            if (itCand != lineToCand.end()) {
+                const Candidate &c = cands[itCand->second];
+                const bool en = enabledCand[itCand->second] != 0;
+                if (en) {
+                    // Keep the original comment from ';' onward.
+                    std::string comment;
+                    if (m.commentPos < line.size()) comment = line.substr(m.commentPos);
+                    out << c.indent << c.mnemonic << " " << comment << "\n";
+                    continue;
                 }
             }
 
-            const bool en = enabledCand[itCand->second] != 0;
-            if (!en) {
-                out << c.originalLine << "\n";
-            } else {
-                // Keep the original comment from ';' onward.
-                auto semi = line.find(';');
-                std::string comment;
-                if (semi != std::string::npos) {
-                    comment = line.substr(semi);
+            // Not enabled: keep db bytes. If labels fall inside this db span, split so those labels
+            // become real address anchors (labels on exact offsets) rather than EQU constants.
+            auto bytes = parseHexBytes(m.hexbytes);
+            if (bytes.empty()) {
+                out << line << "\n";
+                continue;
+            }
+
+            std::vector<size_t> cuts;
+            cuts.reserve(8);
+            cuts.push_back(0);
+            for (size_t off = 1; off < bytes.size(); off++) {
+                auto itLbls = addrToLabels.find(orgStart + static_cast<uint32_t>(off));
+                if (itLbls == addrToLabels.end()) continue;
+                bool needSplit = false;
+                for (const auto &lname : itLbls->second) {
+                    if (emitted.find(lname) == emitted.end()) { needSplit = true; break; }
                 }
-                out << c.indent << c.mnemonic << " " << comment << "\n";
+                if (needSplit) cuts.push_back(off);
+            }
+
+            if (cuts.size() == 1) {
+                out << line << "\n";
+                continue;
+            }
+
+            std::sort(cuts.begin(), cuts.end());
+            cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+            cuts.push_back(bytes.size());
+
+            // Preserve the original comment on the first segment; subsequent segments get a safe, non-candidate marker.
+            std::string firstComment;
+            if (m.commentPos < line.size()) firstComment = line.substr(m.commentPos);
+
+            for (size_t si = 0; si + 1 < cuts.size(); si++) {
+                size_t start = cuts[si];
+                size_t end = cuts[si + 1];
+                if (start > 0) emitLabelsAt(orgStart + static_cast<uint32_t>(start));
+
+                std::ostringstream db;
+                db << m.indent << "db ";
+                for (size_t bi = start; bi < end; bi++) {
+                    if (bi != start) db << ",";
+                    db << hexByte(bytes[bi]);
+                }
+
+                if (start == 0) {
+                    if (!firstComment.empty()) db << " " << firstComment;
+                } else {
+                    uint32_t logicalSeg = m.logicalAddr + static_cast<uint32_t>(start);
+                    std::string hb = hexBytes(bytes, start, end - start);
+                    db << " ; " << toHex8(logicalSeg) << "h " << hb << " | split";
+                }
+                out << db.str() << "\n";
             }
             continue;
         }
@@ -659,6 +846,138 @@ static std::optional<std::vector<uint8_t>> assembleAndExtractBytesWdis(
     }
 
     return std::nullopt;
+}
+
+static std::optional<uint32_t> parseHexU32(std::string_view s) {
+    s = rtrimView(ltrimView(s));
+    if (s.empty()) return std::nullopt;
+    uint32_t v = 0;
+    for (char c : s) {
+        if (!isHexChar(c)) return std::nullopt;
+        v *= 16;
+        if (c >= '0' && c <= '9') v += static_cast<uint32_t>(c - '0');
+        else {
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            v += static_cast<uint32_t>(10 + (c - 'A'));
+        }
+    }
+    return v;
+}
+
+static std::optional<uint32_t> parseLocLabelTargetFromMnemonic(std::string_view mnemonic) {
+    auto pos = mnemonic.find("loc_");
+    if (pos == std::string_view::npos) return std::nullopt;
+    pos += 4;
+    size_t end = pos;
+    while (end < mnemonic.size() && isHexChar(mnemonic[end])) end++;
+    if (end == pos) return std::nullopt;
+    auto hex = mnemonic.substr(pos, end - pos);
+    return parseHexU32(hex);
+}
+
+static std::string_view firstToken(std::string_view s) {
+    s = ltrimView(rtrimView(s));
+    size_t i = 0;
+    while (i < s.size() && s[i] != ' ' && s[i] != '\t') i++;
+    return s.substr(0, i);
+}
+
+static std::optional<uint8_t> jccOpcode(std::string_view j) {
+    // Accept common synonyms emitted by decoders.
+    // NOTE: keep lowercase comparisons for simplicity.
+    std::string t(j);
+    for (auto &c : t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    if (t == "jo") return 0x70;
+    if (t == "jno") return 0x71;
+    if (t == "jb" || t == "jnae" || t == "jc") return 0x72;
+    if (t == "jnb" || t == "jae" || t == "jnc") return 0x73;
+    if (t == "jz" || t == "je") return 0x74;
+    if (t == "jnz" || t == "jne") return 0x75;
+    if (t == "jbe" || t == "jna") return 0x76;
+    if (t == "ja" || t == "jnbe") return 0x77;
+    if (t == "js") return 0x78;
+    if (t == "jns") return 0x79;
+    if (t == "jp" || t == "jpe") return 0x7A;
+    if (t == "jnp" || t == "jpo") return 0x7B;
+    if (t == "jl" || t == "jnge") return 0x7C;
+    if (t == "jge" || t == "jnl") return 0x7D;
+    if (t == "jle" || t == "jng") return 0x7E;
+    if (t == "jg" || t == "jnle") return 0x7F;
+    return std::nullopt;
+}
+
+static bool proveRelControlFlowNoAsm(const Candidate &c, const std::unordered_set<uint32_t> &coveredLogicalAddrs) {
+    // Prove simple relative control-flow instructions that reference loc_ labels
+    // without invoking an assembler. This is safe: we only accept if the expected bytes
+    // exactly match the analytically computed encoding.
+    if (!c.hasLocLabelRef) return false;
+
+    auto expected = parseHexBytes(c.hexbytes);
+    if (expected.size() < 2) return false;
+
+    auto srcOpt = parseHexU32(c.addr8);
+    if (!srcOpt) return false;
+    uint32_t src = *srcOpt;
+
+    auto tgtOpt = parseLocLabelTargetFromMnemonic(c.mnemonic);
+    if (!tgtOpt) return false;
+    uint32_t tgt = *tgtOpt;
+
+    // Critical: only promote when the target address exists somewhere in the db dump bytes.
+    // With renderAsm's db-line splitting, we can emit a real label at any covered address.
+    // If the address isn't covered, renderAsm will fall back to `equ`, which is not reliable
+    // for rel8/rel16 control-flow in WASM.
+    if (coveredLogicalAddrs.find(tgt) == coveredLogicalAddrs.end()) return false;
+
+    std::string_view tok = firstToken(c.mnemonic);
+    std::string op(tok);
+    for (auto &ch : op) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+
+    auto checkRel8 = [&](uint8_t opcode) -> bool {
+        if (expected.size() != 2) return false;
+        int32_t disp = static_cast<int32_t>(tgt) - static_cast<int32_t>(src + 2);
+        if (disp < -128 || disp > 127) return false;
+        return expected[0] == opcode && expected[1] == static_cast<uint8_t>(disp & 0xFF);
+    };
+    auto checkRel16 = [&](uint8_t opcode) -> bool {
+        if (expected.size() != 3) return false;
+        int32_t disp = static_cast<int32_t>(tgt) - static_cast<int32_t>(src + 3);
+        if (disp < -32768 || disp > 32767) return false;
+        uint16_t w = static_cast<uint16_t>(disp & 0xFFFF);
+        return expected[0] == opcode && expected[1] == static_cast<uint8_t>(w & 0xFF) && expected[2] == static_cast<uint8_t>((w >> 8) & 0xFF);
+    };
+
+    if (op == "jmp") {
+        // short: EB cb, near: E9 cw
+        if (expected.size() == 2) return checkRel8(0xEB);
+        if (expected.size() == 3) return checkRel16(0xE9);
+        return false;
+    }
+    if (op == "call") {
+        // near: E8 cw
+        if (expected.size() == 3) return checkRel16(0xE8);
+        return false;
+    }
+    if (op == "jcxz") {
+        return checkRel8(0xE3);
+    }
+    if (op == "loop") {
+        return checkRel8(0xE2);
+    }
+    if (op == "loope" || op == "loopz") {
+        return checkRel8(0xE1);
+    }
+    if (op == "loopne" || op == "loopnz") {
+        return checkRel8(0xE0);
+    }
+
+    if (auto jop = jccOpcode(op)) {
+        // We only support short Jcc (70-7F cb) here.
+        return checkRel8(*jop);
+    }
+
+    return false;
 }
 
 static uint32_t detectLogicalOrigin(const std::vector<std::string> &lines) {
@@ -1170,6 +1489,34 @@ int main(int argc, char **argv) {
         std::cerr << "Fast path: accepted " << fastOk << "/" << fastTried << " mnemonics (wdis oracle";
         if (opt.jobs > 1) std::cerr << ", jobs=" << opt.jobs;
         std::cerr << ")\n";
+    }
+
+    std::unordered_set<uint32_t> coveredLogicalAddrs;
+    coveredLogicalAddrs.reserve(65536);
+    for (size_t li = 0; li < lines.size(); li++) {
+        auto meta = parseDbLineMeta(lines[li], li);
+        if (!meta) continue;
+        size_t len = meta->hexbytes.size() / 2;
+        for (size_t off = 0; off < len; off++) {
+            coveredLogicalAddrs.insert(meta->logicalAddr + static_cast<uint32_t>(off));
+        }
+    }
+
+    // Cheap label-candidate prover: handle common relative control-flow encodings analytically.
+    // This avoids expensive full-file rebuilds for the vast majority of real code branches/calls.
+    size_t relOk = 0;
+    size_t relTried = 0;
+    for (size_t ci = 0; ci < cands.size(); ci++) {
+        if (st.enabled[ci]) continue;
+        if (!cands[ci].hasLocLabelRef) continue;
+        relTried++;
+        if (proveRelControlFlowNoAsm(cands[ci], coveredLogicalAddrs)) {
+            st.enabled[ci] = 1;
+            relOk++;
+        }
+    }
+    if (!opt.quiet) {
+        std::cerr << "Rel-branch prover: accepted " << relOk << "/" << relTried << " label mnemonics (no-asm)\n";
     }
 
     // Slow path: remaining candidates (typically loc_ branches) still require the full-file oracle.
