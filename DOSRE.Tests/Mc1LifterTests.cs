@@ -135,5 +135,152 @@ namespace DOSRE.Tests
             Assert.Contains("LOAD16(ES, ADD16(0x0070, 0x0000))", desugared);
             Assert.Contains("STORE16(ES, ADD16(0x0070, 0x0002), DS)", desugared);
         }
+
+        [Fact]
+        public void LiftMc0ToMc1_Creates_Ivt_Farptr_View_For_Seg0_Word_Accesses()
+        {
+            var mc0 = new Bin16Mc0.Mc0File
+            {
+                Source = "in-memory",
+                StreamSha256 = "dummy",
+                Statements = new List<Bin16Mc0.Mc0Stmt>
+                {
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 0,
+                        Addr = 0x00003000,
+                        BytesHex = "A18400",
+                        Asm = "mov ax, [0000h:0084h]",
+                        Mc0 = "EMITHEX(\"a18400\")",
+                        Labels = new List<string>(),
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 1,
+                        Addr = 0x00003003,
+                        BytesHex = "A38600",
+                        Asm = "mov [0000h:0086h], ax",
+                        Mc0 = "EMITHEX(\"a38600\")",
+                        Labels = new List<string>(),
+                    },
+                }
+            };
+
+            var mc1 = Bin16Mc1Lifter.LiftMc0ToMc1Text(mc0);
+
+            // 0x0084 corresponds to vector 0x21 (0x21*4 = 0x84)
+            Assert.Contains("view ivt_21 at (0x0000, 0x0084) : farptr16;", mc1);
+            Assert.Contains("AX = ivt_21.off;", mc1);
+            Assert.Contains("ivt_21.seg = AX;", mc1);
+
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+
+            Assert.Contains("@00003000 A18400", desugared);
+            Assert.Contains("@00003003 A38600", desugared);
+
+            Assert.Contains("LOAD16(0x0000, ADD16(0x0084, 0x0000))", desugared);
+            Assert.Contains("STORE16(0x0000, ADD16(0x0084, 0x0002), AX)", desugared);
+        }
+
+        [Fact]
+        public void LiftMc0ToMc1_Rewrites_Ds_Indexed_Mov_Using_Bracket_Sugar()
+        {
+            var mc0 = new Bin16Mc0.Mc0File
+            {
+                Source = "in-memory",
+                StreamSha256 = "dummy",
+                Statements = new List<Bin16Mc0.Mc0Stmt>
+                {
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 0,
+                        Addr = 0x00004000,
+                        BytesHex = "8B814E04",
+                        Asm = "mov ax, [ds:bx+di+04E4h]",
+                        Mc0 = "EMITHEX(\"8b814e04\")",
+                        Labels = new List<string>(),
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 1,
+                        Addr = 0x00004004,
+                        BytesHex = "89814E04",
+                        Asm = "mov [ds:bx+di+04E4h], ax",
+                        Mc0 = "EMITHEX(\"89814e04\")",
+                        Labels = new List<string>(),
+                    },
+                }
+            };
+
+            var mc1 = Bin16Mc1Lifter.LiftMc0ToMc1Text(mc0);
+
+            // Aligned base is 0x04E0, element type u16.
+            Assert.Contains("view mem_ds_04e0_w at (DS, 0x04E0) : u16;", mc1);
+            Assert.Contains("AX = mem_ds_04e0_w[ADD16(ADD16(BX, DI), 0x0004)];", mc1);
+            Assert.Contains("mem_ds_04e0_w[ADD16(ADD16(BX, DI), 0x0004)] = AX;", mc1);
+
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+
+            Assert.Contains("@00004000 8B814E04", desugared);
+            Assert.Contains("@00004004 89814E04", desugared);
+
+            // Bracket sugar must lower into LOAD/STORE with the effective address built via ADD16.
+            Assert.Contains("LOAD16(DS, ADD16(0x04E0, ADD16(ADD16(BX, DI), 0x0004)))", desugared);
+            Assert.Contains("STORE16(DS, ADD16(0x04E0, ADD16(ADD16(BX, DI), 0x0004)), AX)", desugared);
+        }
+
+        [Fact]
+        public void LiftMc0ToMc1_Sugars_NonMov_Memory_Ops_Using_Bracket_Sugar()
+        {
+            var mc0 = new Bin16Mc0.Mc0File
+            {
+                Source = "in-memory",
+                StreamSha256 = "dummy",
+                Statements = new List<Bin16Mc0.Mc0Stmt>
+                {
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 0,
+                        Addr = 0x00005000,
+                        BytesHex = "3E0B01",
+                        Asm = "or ax, [ds:bx+di]",
+                        Mc0 = "EMITHEX(\"3e0b01\")",
+                        Labels = new List<string>(),
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 1,
+                        Addr = 0x00005003,
+                        BytesHex = "2E205072",
+                        Asm = "and [cs:bx+si+72h], dl",
+                        Mc0 = "EMITHEX(\"2e205072\")",
+                        Labels = new List<string>(),
+                    },
+                }
+            };
+
+            var mc1 = Bin16Mc1Lifter.LiftMc0ToMc1Text(mc0);
+
+            // reg-only EA => base 0x0000 primitive view
+            Assert.Contains("view mem_ds_0000_w at (DS, 0x0000) : u16;", mc1);
+            Assert.Contains("AX = OR(AX, mem_ds_0000_w[ADD16(BX, DI)])", mc1);
+
+            // EA with +72h => base 0x0070 primitive view
+            Assert.Contains("view mem_cs_0070_b at (CS, 0x0070) : u8;", mc1);
+            Assert.Contains("mem_cs_0070_b[ADD16(ADD16(BX, SI), 0x0002)] = AND(mem_cs_0070_b[ADD16(ADD16(BX, SI), 0x0002)], DL)", mc1);
+
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+
+            // Origin tags must survive.
+            Assert.Contains("@00005000 3E0B01", desugared);
+            Assert.Contains("@00005003 2E205072", desugared);
+
+            // Bracket sugar must lower into LOAD/STORE forms.
+            Assert.Contains("LOAD16(DS, ADD16(0x0000, ADD16(BX, DI)))", desugared);
+            Assert.Contains("STORE8(CS, ADD16(0x0070, ADD16(ADD16(BX, SI), 0x0002))", desugared);
+        }
     }
 }

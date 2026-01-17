@@ -1658,6 +1658,11 @@ namespace DOSRE.UI.impl
                             _logger.Warn($"BINMC1PROVE first_diff {res.FirstDiff}");
                         if (!string.IsNullOrWhiteSpace(res.RebuiltExe))
                             _logger.Info($"BINMC1PROVE rebuilt {res.RebuiltExe}");
+
+                        // Fail closed when a rebuild compare was requested.
+                        // (MC1->MC0 identity already throws on mismatch inside the proof helper.)
+                        if (!res.Mc0RebuildByteEqual.Value)
+                            throw new Exception("BINMC1PROVE failed: MC0 rebuild is not byte-identical to the original exe.");
                     }
                     return;
                 }

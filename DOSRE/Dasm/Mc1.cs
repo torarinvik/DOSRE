@@ -109,6 +109,16 @@ namespace DOSRE.Dasm
             @"\b(?<view>[A-Za-z_][A-Za-z0-9_]*)\.(?<field>[A-Za-z_][A-Za-z0-9_]*)\b\s*=\s*(?<rhs>[^;]+)\s*;",
             RegexOptions.Compiled);
 
+        // view[idx] (primitive views only; rewritten to LOADn(seg, ADD16(off, idx)))
+        private static readonly Regex ViewIndexRx = new Regex(
+            @"\b(?<view>[A-Za-z_][A-Za-z0-9_]*)\[(?<idx>[^\]]+)\]",
+            RegexOptions.Compiled);
+
+        // view[idx] = rhs; (primitive views only; rewritten to STOREn(seg, ADD16(off, idx), rhs);)
+        private static readonly Regex ViewIndexStoreRx = new Regex(
+            @"\b(?<view>[A-Za-z_][A-Za-z0-9_]*)\[(?<idx>[^\]]+)\]\s*=\s*(?<rhs>[^;]+)\s*;",
+            RegexOptions.Compiled);
+
         public static Mc1File Parse(string path)
         {
             if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Missing path", nameof(path));
@@ -243,6 +253,26 @@ namespace DOSRE.Dasm
         {
             if (views == null || views.Count == 0) return line;
 
+            // Rewrite indexed stores first.
+            line = ViewIndexStoreRx.Replace(line, m =>
+            {
+                var vname = m.Groups["view"].Value;
+                var idx = m.Groups["idx"].Value.Trim();
+                var rhs = m.Groups["rhs"].Value.Trim();
+
+                if (!views.TryGetValue(vname, out var vd))
+                    return m.Value;
+
+                // Indexing is only supported for primitive-typed views.
+                var size = SizeOfType(vd.Type, types);
+                if (size != 1 && size != 2)
+                    return m.Value;
+
+                var offExpr = $"ADD16({vd.OffExpr}, {idx})";
+                if (size == 1) return $"STORE8({vd.SegExpr}, {offExpr}, {rhs});";
+                return $"STORE16({vd.SegExpr}, {offExpr}, {rhs});";
+            });
+
             // Rewrite stores first so the subsequent LOAD rewrite doesn't turn an lvalue into a LOAD expression.
             line = ViewFieldStoreRx.Replace(line, m =>
             {
@@ -264,6 +294,24 @@ namespace DOSRE.Dasm
                 if (size == 2) return $"STORE16({vd.SegExpr}, {offExpr}, {rhs});";
 
                 return m.Value;
+            });
+
+            // Rewrite indexed loads.
+            line = ViewIndexRx.Replace(line, m =>
+            {
+                var vname = m.Groups["view"].Value;
+                var idx = m.Groups["idx"].Value.Trim();
+
+                if (!views.TryGetValue(vname, out var vd))
+                    return m.Value;
+
+                var size = SizeOfType(vd.Type, types);
+                if (size != 1 && size != 2)
+                    return m.Value;
+
+                var offExpr = $"ADD16({vd.OffExpr}, {idx})";
+                if (size == 1) return $"LOAD8({vd.SegExpr}, {offExpr})";
+                return $"LOAD16({vd.SegExpr}, {offExpr})";
             });
 
             return ViewFieldRx.Replace(line, m =>

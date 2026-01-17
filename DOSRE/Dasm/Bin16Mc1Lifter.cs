@@ -33,6 +33,17 @@ namespace DOSRE.Dasm
             public bool LiftEsAbsoluteGlobals { get; set; } = true;
 
             /// <summary>
+            /// Lift absolute reads/writes from segment 0 (0000:XXXX) into farptr16 views.
+            /// This is useful for interrupt vector table style accesses.
+            /// </summary>
+            public bool LiftIvtFarptrViews { get; set; } = true;
+
+            /// <summary>
+            /// Lift simple DS indexed movs like [ds:bx+di+0xNNNN] into primitive views using MC1 bracket sugar.
+            /// </summary>
+            public bool LiftDsIndexedGlobals { get; set; } = true;
+
+            /// <summary>
             /// Max size of a generated DS "globals" view window, in bytes.
             /// This is a heuristic to avoid emitting enormous structs.
             /// </summary>
@@ -55,6 +66,13 @@ namespace DOSRE.Dasm
             /// </summary>
             public ushort EsAbsMin { get; set; } = 0x0000;
             public ushort EsAbsMax { get; set; } = 0x00FF;
+
+            /// <summary>
+            /// Only lift IVT (segment 0) offsets in this inclusive range.
+            /// Default is the classic IVT window (0x0000..0x03FF).
+            /// </summary>
+            public ushort IvtOffMin { get; set; } = 0x0000;
+            public ushort IvtOffMax { get; set; } = 0x03FF;
         }
 
         private static readonly Dictionary<ushort, (string name, ushort value)> KnownIntConsts = new()
@@ -87,6 +105,38 @@ namespace DOSRE.Dasm
             @"^\s*mov\s+\[(?:(?<seg>cs|ds|es|ss)\s*:\s*)?(?<addr>(?:0x)?[0-9A-Fa-f]{1,5})h?\]\s*,\s*(?<src>[a-z]{2})\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+        // Matches: mov ax, [0000h:0084h]
+        //          mov [0x0000:0x0086], ax
+        private static readonly Regex MovSegConstLoadRx = new Regex(
+            @"^\s*mov\s+(?<dst>[a-z]{2})\s*,\s*\[(?<seg>(?:0x)?[0-9A-Fa-f]{1,4})h?\s*:\s*(?<off>(?:0x)?[0-9A-Fa-f]{1,5})h?\]\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex MovSegConstStoreRx = new Regex(
+            @"^\s*mov\s+\[(?<seg>(?:0x)?[0-9A-Fa-f]{1,4})h?\s*:\s*(?<off>(?:0x)?[0-9A-Fa-f]{1,5})h?\]\s*,\s*(?<src>[a-z]{2})\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        // Matches: mov ax, [ds:bx+di+04E4h]
+        //          mov [ds:bx+di+04ECh], ax
+        private static readonly Regex MovDsIndexedLoadRx = new Regex(
+            @"^\s*mov\s+(?<dst>[a-z]{2})\s*,\s*\[(?:ds\s*:\s*)?(?<ea>[^\]]+)\]\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex MovDsIndexedStoreRx = new Regex(
+            @"^\s*mov\s+\[(?:ds\s*:\s*)?(?<ea>[^\]]+)\]\s*,\s*(?<src>[a-z]{2})\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        // Generic binary ops involving a memory operand (used for bracket sugar).
+        // Examples:
+        //   or ax, [ds:bx+di]
+        //   and [cs:bx+si+72h], dl
+        private static readonly Regex BinOpRegMemRx = new Regex(
+            @"^\s*(?<op>add|adc|and|cmp|or|sbb|sub|xor)\s+(?<dst>[a-z]{2})\s*,\s*\[(?:(?<seg>cs|ds|es|ss)\s*:\s*)?(?<ea>[^\]]+)\]\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex BinOpMemRegRx = new Regex(
+            @"^\s*(?<op>add|adc|and|cmp|or|sbb|sub|xor)\s+\[(?:(?<seg>cs|ds|es|ss)\s*:\s*)?(?<ea>[^\]]+)\]\s*,\s*(?<src>[a-z]{2})\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
         private static readonly Regex Mc0LineRx = new Regex(
             @"^(?<indent>\s*)(?<stmt>.*?);\s*//\s*(?<comment>.*)$",
             RegexOptions.Compiled);
@@ -111,6 +161,23 @@ namespace DOSRE.Dasm
             public int Size;
             public string Reg;
             public bool IsStore;
+        }
+
+        private sealed class IvtWordAccess
+        {
+            public ushort Off;
+            public string Reg;
+            public bool IsStore;
+        }
+
+        private sealed class PrimView
+        {
+            public string ViewName;
+            public string Seg;
+            public ushort Base;
+            public string ElemType;
+
+            public string RenderViewDecl() => $"view {ViewName} at ({Seg}, 0x{Base:X4}) : {ElemType};";
         }
 
         private sealed class SegView
@@ -159,9 +226,11 @@ namespace DOSRE.Dasm
             if (mc0 == null) throw new ArgumentNullException(nameof(mc0));
             opts ??= new LiftOptions();
 
-            // Phase 1: collect potential rewrites (interrupt consts, DS absolute globals).
+            // Phase 1: collect potential rewrites.
             var neededIntConsts = new SortedDictionary<string, ushort>(StringComparer.Ordinal);
             var segAccesses = new List<SegAbsAccess>();
+            var ivtAccesses = new List<IvtWordAccess>();
+            var primViews = new SortedDictionary<string, PrimView>(StringComparer.Ordinal);
 
             foreach (var st in mc0.Statements)
             {
@@ -181,10 +250,80 @@ namespace DOSRE.Dasm
                     }
                 }
 
-                if (opts.LiftDsAbsoluteGlobals || opts.LiftEsAbsoluteGlobals)
+                if (opts.LiftIvtFarptrViews)
+                {
+                    var asm = (st.Asm ?? string.Empty).Trim();
+                    if (!string.IsNullOrWhiteSpace(asm))
+                    {
+                        var mSegLoad = MovSegConstLoadRx.Match(asm);
+                        if (mSegLoad.Success)
+                        {
+                            var dst = mSegLoad.Groups["dst"].Value;
+                            var segTok = mSegLoad.Groups["seg"].Value;
+                            var offTok = mSegLoad.Groups["off"].Value;
+                            if (TryParseU16Flexible(segTok, out var segVal) && segVal == 0 && TryParseU16Flexible(offTok, out var off))
+                            {
+                                if (off >= opts.IvtOffMin && off <= opts.IvtOffMax && IsWordReg(dst) && RegMap.TryGetValue(dst, out var reg))
+                                {
+                                    ivtAccesses.Add(new IvtWordAccess { Off = off, Reg = reg, IsStore = false });
+                                    continue;
+                                }
+                            }
+                        }
+
+                        var mSegStore = MovSegConstStoreRx.Match(asm);
+                        if (mSegStore.Success)
+                        {
+                            var src = mSegStore.Groups["src"].Value;
+                            var segTok = mSegStore.Groups["seg"].Value;
+                            var offTok = mSegStore.Groups["off"].Value;
+                            if (TryParseU16Flexible(segTok, out var segVal) && segVal == 0 && TryParseU16Flexible(offTok, out var off))
+                            {
+                                if (off >= opts.IvtOffMin && off <= opts.IvtOffMax && IsWordReg(src) && RegMap.TryGetValue(src, out var reg))
+                                {
+                                    ivtAccesses.Add(new IvtWordAccess { Off = off, Reg = reg, IsStore = true });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (opts.LiftDsAbsoluteGlobals || opts.LiftEsAbsoluteGlobals || opts.LiftDsIndexedGlobals)
                 {
                     var asm = (st.Asm ?? string.Empty).Trim();
                     if (string.IsNullOrWhiteSpace(asm)) continue;
+
+                    if (opts.LiftDsIndexedGlobals)
+                    {
+                        // Collect primitive views needed for non-mov memory ops too.
+                        var mOpRegMem = BinOpRegMemRx.Match(asm);
+                        if (mOpRegMem.Success)
+                        {
+                            var segTok = (mOpRegMem.Groups["seg"].Success ? mOpRegMem.Groups["seg"].Value : "ds").Trim().ToUpperInvariant();
+                            var ea = mOpRegMem.Groups["ea"].Value;
+                            var dst = mOpRegMem.Groups["dst"].Value;
+
+                            // Memory width follows the register width.
+                            var size = IsWordReg(dst) ? 2 : 1;
+                            if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: true))
+                                _ = GetOrCreatePrimViewAndIndex(segTok, immSum, regs, size, primViews);
+                        }
+                        else
+                        {
+                            var mOpMemReg = BinOpMemRegRx.Match(asm);
+                            if (mOpMemReg.Success)
+                            {
+                                var segTok = (mOpMemReg.Groups["seg"].Success ? mOpMemReg.Groups["seg"].Value : "ds").Trim().ToUpperInvariant();
+                                var ea = mOpMemReg.Groups["ea"].Value;
+                                var src = mOpMemReg.Groups["src"].Value;
+
+                                var size = IsWordReg(src) ? 2 : 1;
+                                if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: true))
+                                    _ = GetOrCreatePrimViewAndIndex(segTok, immSum, regs, size, primViews);
+                            }
+                        }
+                    }
 
                     // Only lift simple mov loads/stores for now.
                     var mLoad = MovLoadRx.Match(asm);
@@ -214,6 +353,40 @@ namespace DOSRE.Dasm
                         segAccesses.Add(new SegAbsAccess { Seg = segTok.ToUpperInvariant(), Addr = addr, Size = size, Reg = reg, IsStore = true });
                         continue;
                     }
+
+                    if (opts.LiftDsIndexedGlobals)
+                    {
+                        // Load: mov r, [ds:ea]
+                        var mIdxLoad = MovDsIndexedLoadRx.Match(asm);
+                        if (mIdxLoad.Success)
+                        {
+                            var dst = mIdxLoad.Groups["dst"].Value;
+                            var ea = mIdxLoad.Groups["ea"].Value;
+                            if (!RegMap.TryGetValue(dst, out var reg))
+                                continue;
+                            var size = IsWordReg(dst) ? 2 : 1;
+                            if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: false) && immSum >= opts.DsAbsMin && immSum <= opts.DsAbsMax)
+                            {
+                                _ = GetOrCreatePrimViewAndIndex("DS", immSum, regs, size, primViews);
+                                // Record rewrite via a synthetic access entry in segAccesses? We'll just rewrite later.
+                            }
+                        }
+
+                        // Store: mov [ds:ea], r
+                        var mIdxStore = MovDsIndexedStoreRx.Match(asm);
+                        if (mIdxStore.Success)
+                        {
+                            var src = mIdxStore.Groups["src"].Value;
+                            var ea = mIdxStore.Groups["ea"].Value;
+                            if (!RegMap.TryGetValue(src, out var reg))
+                                continue;
+                            var size = IsWordReg(src) ? 2 : 1;
+                            if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: false) && immSum >= opts.DsAbsMin && immSum <= opts.DsAbsMax)
+                            {
+                                _ = GetOrCreatePrimViewAndIndex("DS", immSum, regs, size, primViews);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -231,6 +404,21 @@ namespace DOSRE.Dasm
                 }
             }
 
+            // Phase 2b: IVT farptr views for segment 0.
+            var ivtViewsByBase = new SortedDictionary<ushort, string>();
+            if (opts.LiftIvtFarptrViews && ivtAccesses.Count > 0)
+            {
+                foreach (var a in ivtAccesses)
+                {
+                    var baseOff = (ushort)(a.Off & 0xFFFC);
+                    var mod = (ushort)(a.Off - baseOff);
+                    if (mod != 0 && mod != 2)
+                        continue;
+                    if (!ivtViewsByBase.ContainsKey(baseOff))
+                        ivtViewsByBase[baseOff] = $"ivt_{(baseOff / 4):X2}";
+                }
+            }
+
             // Phase 3: emit MC1 text.
             var sb = new StringBuilder();
             sb.AppendLine("// mc1 lifted from mc0");
@@ -239,7 +427,7 @@ namespace DOSRE.Dasm
             sb.AppendLine("// format: <stmt>; // @AAAAAAAA HEXBYTES ; original asm");
             sb.AppendLine();
 
-            if (neededIntConsts.Count > 0 || segViews.Count > 0)
+            if (neededIntConsts.Count > 0 || segViews.Count > 0 || ivtViewsByBase.Count > 0 || primViews.Count > 0)
             {
                 sb.AppendLine("// ---- MC1 declarations (auto) ----");
                 if (neededIntConsts.Count > 0)
@@ -259,6 +447,22 @@ namespace DOSRE.Dasm
                         sb.AppendLine(v.RenderViewDecl());
                         sb.AppendLine();
                     }
+                }
+
+                if (primViews.Count > 0)
+                {
+                    sb.AppendLine("// DS indexed globals (primitive views for bracket sugar):");
+                    foreach (var pv in primViews.Values)
+                        sb.AppendLine(pv.RenderViewDecl());
+                    sb.AppendLine();
+                }
+
+                if (ivtViewsByBase.Count > 0)
+                {
+                    sb.AppendLine("// IVT far pointers (segment 0):");
+                    foreach (var kv in ivtViewsByBase)
+                        sb.AppendLine($"view {kv.Value} at (0x0000, 0x{kv.Key:X4}) : farptr16;");
+                    sb.AppendLine();
                 }
                 sb.AppendLine("// ---- MC0 origin-tagged statements ----");
                 sb.AppendLine();
@@ -306,7 +510,53 @@ namespace DOSRE.Dasm
                     });
                 }
 
-                // Rewrite DS simple movs into view.field when possible.
+                // Rewrite segment-constant 0000:XXXX accesses into IVT farptr views.
+                if (opts.LiftIvtFarptrViews && ivtViewsByBase.Count > 0)
+                {
+                    var asm = (st.Asm ?? string.Empty).Trim();
+                    if (!string.IsNullOrWhiteSpace(asm))
+                    {
+                        var mSegLoad = MovSegConstLoadRx.Match(asm);
+                        if (mSegLoad.Success)
+                        {
+                            var dst = mSegLoad.Groups["dst"].Value;
+                            var segTok = mSegLoad.Groups["seg"].Value;
+                            var offTok = mSegLoad.Groups["off"].Value;
+                            if (TryParseU16Flexible(segTok, out var segVal) && segVal == 0 && TryParseU16Flexible(offTok, out var off) && RegMap.TryGetValue(dst, out var reg))
+                            {
+                                var baseOff = (ushort)(off & 0xFFFC);
+                                var mod = (ushort)(off - baseOff);
+                                if (ivtViewsByBase.TryGetValue(baseOff, out var viewName) && (mod == 0 || mod == 2))
+                                {
+                                    var field = mod == 0 ? "off" : "seg";
+                                    stmtText = $"{reg} = {viewName}.{field}";
+                                }
+                            }
+                        }
+                        else
+                        {
+                            var mSegStore = MovSegConstStoreRx.Match(asm);
+                            if (mSegStore.Success)
+                            {
+                                var src = mSegStore.Groups["src"].Value;
+                                var segTok = mSegStore.Groups["seg"].Value;
+                                var offTok = mSegStore.Groups["off"].Value;
+                                if (TryParseU16Flexible(segTok, out var segVal) && segVal == 0 && TryParseU16Flexible(offTok, out var off) && RegMap.TryGetValue(src, out var reg))
+                                {
+                                    var baseOff = (ushort)(off & 0xFFFC);
+                                    var mod = (ushort)(off - baseOff);
+                                    if (ivtViewsByBase.TryGetValue(baseOff, out var viewName) && (mod == 0 || mod == 2))
+                                    {
+                                        var field = mod == 0 ? "off" : "seg";
+                                        stmtText = $"{viewName}.{field} = {reg}";
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Rewrite absolute movs into view.field when possible.
                 if (opts.LiftDsAbsoluteGlobals || opts.LiftEsAbsoluteGlobals)
                 {
                     var asm = (st.Asm ?? string.Empty).Trim();
@@ -333,6 +583,90 @@ namespace DOSRE.Dasm
                             if (TryParseU16Flexible(addrTok, out var addr) && viewBySegAddr.TryGetValue((segTok, addr), out var vf) && RegMap.TryGetValue(src, out var reg))
                             {
                                 stmtText = $"{vf.view}.{vf.field} = {reg}";
+                            }
+                        }
+                    }
+                }
+
+                // Rewrite DS indexed movs into primitive view[idx] when possible.
+                if (opts.LiftDsIndexedGlobals && primViews.Count > 0)
+                {
+                    var asm = (st.Asm ?? string.Empty).Trim();
+                    if (!string.IsNullOrWhiteSpace(asm))
+                    {
+                        // First: non-mov memory ops (keep semantics opaque; only sugar the memory operand).
+                        var mOpRegMem = BinOpRegMemRx.Match(asm);
+                        if (mOpRegMem.Success)
+                        {
+                            var op = mOpRegMem.Groups["op"].Value.Trim().ToUpperInvariant();
+                            var dst = mOpRegMem.Groups["dst"].Value;
+                            var ea = mOpRegMem.Groups["ea"].Value;
+                            var segTok = (mOpRegMem.Groups["seg"].Success ? mOpRegMem.Groups["seg"].Value : "ds").Trim().ToUpperInvariant();
+
+                            if (RegMap.TryGetValue(dst, out var reg))
+                            {
+                                var size = IsWordReg(dst) ? 2 : 1;
+                                if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: true))
+                                {
+                                    var (viewName, idxExpr) = GetOrCreatePrimViewAndIndex(segTok, immSum, regs, size, primViews);
+                                    stmtText = $"{reg} = {op}({reg}, {viewName}[{idxExpr}])";
+                                }
+                            }
+                        }
+                        else
+                        {
+                            var mOpMemReg = BinOpMemRegRx.Match(asm);
+                            if (mOpMemReg.Success)
+                            {
+                                var op = mOpMemReg.Groups["op"].Value.Trim().ToUpperInvariant();
+                                var src = mOpMemReg.Groups["src"].Value;
+                                var ea = mOpMemReg.Groups["ea"].Value;
+                                var segTok = (mOpMemReg.Groups["seg"].Success ? mOpMemReg.Groups["seg"].Value : "ds").Trim().ToUpperInvariant();
+
+                                if (RegMap.TryGetValue(src, out var reg))
+                                {
+                                    var size = IsWordReg(src) ? 2 : 1;
+                                    if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: true))
+                                    {
+                                        var (viewName, idxExpr) = GetOrCreatePrimViewAndIndex(segTok, immSum, regs, size, primViews);
+                                        // This becomes a STORE during MC1 desugar.
+                                        stmtText = $"{viewName}[{idxExpr}] = {op}({viewName}[{idxExpr}], {reg})";
+                                    }
+                                }
+                            }
+                        }
+
+                        var mIdxLoad = MovDsIndexedLoadRx.Match(asm);
+                        if (mIdxLoad.Success)
+                        {
+                            var dst = mIdxLoad.Groups["dst"].Value;
+                            var ea = mIdxLoad.Groups["ea"].Value;
+                            if (RegMap.TryGetValue(dst, out var reg))
+                            {
+                                var size = IsWordReg(dst) ? 2 : 1;
+                                if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: false) && immSum >= opts.DsAbsMin && immSum <= opts.DsAbsMax)
+                                {
+                                    var (viewName, idxExpr) = GetOrCreatePrimViewAndIndex("DS", immSum, regs, size, primViews);
+                                    stmtText = $"{reg} = {viewName}[{idxExpr}]";
+                                }
+                            }
+                        }
+                        else
+                        {
+                            var mIdxStore = MovDsIndexedStoreRx.Match(asm);
+                            if (mIdxStore.Success)
+                            {
+                                var src = mIdxStore.Groups["src"].Value;
+                                var ea = mIdxStore.Groups["ea"].Value;
+                                if (RegMap.TryGetValue(src, out var reg))
+                                {
+                                    var size = IsWordReg(src) ? 2 : 1;
+                                    if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: false) && immSum >= opts.DsAbsMin && immSum <= opts.DsAbsMax)
+                                    {
+                                        var (viewName, idxExpr) = GetOrCreatePrimViewAndIndex("DS", immSum, regs, size, primViews);
+                                        stmtText = $"{viewName}[{idxExpr}] = {reg}";
+                                    }
+                                }
                             }
                         }
                     }
@@ -496,6 +830,91 @@ namespace DOSRE.Dasm
         {
             var r = (reg ?? string.Empty).Trim().ToLowerInvariant();
             return r is "ax" or "bx" or "cx" or "dx" or "si" or "di" or "bp" or "sp" or "cs" or "ds" or "es" or "ss";
+        }
+
+        private static bool TryParseIndexedEa(string ea, out ushort immSum, out List<string> regs, bool allowNoImmediate)
+        {
+            immSum = 0;
+            regs = new List<string>();
+
+            var s = (ea ?? string.Empty).Trim().ToLowerInvariant();
+            if (string.IsNullOrWhiteSpace(s))
+                return false;
+
+            // Remove whitespace to make splitting stable.
+            s = new string(s.Where(c => !char.IsWhiteSpace(c)).ToArray());
+
+            // Only handle '+' addressing for now.
+            var parts = s.Split(new[] { '+' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2)
+                return false;
+
+            uint immAcc = 0;
+            foreach (var pRaw in parts)
+            {
+                var p = pRaw.Trim();
+                if (p is "bx" or "bp" or "si" or "di")
+                {
+                    regs.Add(p.ToUpperInvariant());
+                    continue;
+                }
+
+                if (TryParseU16Flexible(p, out var imm))
+                {
+                    immAcc += imm;
+                    if (immAcc > 0xFFFF)
+                        return false;
+                    continue;
+                }
+
+                // Unknown token (scale, minus, etc)
+                return false;
+            }
+
+            if (regs.Count == 0)
+                return false;
+            if (!allowNoImmediate && immAcc == 0)
+                return false;
+
+            immSum = (ushort)immAcc;
+            return true;
+        }
+
+        private static (string viewName, string idxExpr) GetOrCreatePrimViewAndIndex(
+            string seg,
+            ushort immSum,
+            List<string> regs,
+            int size,
+            SortedDictionary<string, PrimView> primViews)
+        {
+            var baseAligned = (ushort)(immSum == 0 ? 0 : (immSum & 0xFFF0));
+            var delta = (ushort)(immSum - baseAligned);
+
+            // Build register sum expression.
+            string idx = null;
+            foreach (var r in regs)
+            {
+                idx = idx == null ? r : $"ADD16({idx}, {r})";
+            }
+
+            if (delta != 0)
+                idx = $"ADD16({idx}, 0x{delta:X4})";
+
+            var elemType = size == 1 ? "u8" : "u16";
+            var s = (seg ?? string.Empty).Trim().ToUpperInvariant();
+            var viewName = $"mem_{s.ToLowerInvariant()}_{baseAligned:x4}_{(size == 1 ? "b" : "w")}";
+            if (!primViews.ContainsKey(viewName))
+            {
+                primViews[viewName] = new PrimView
+                {
+                    ViewName = viewName,
+                    Seg = s,
+                    Base = baseAligned,
+                    ElemType = elemType,
+                };
+            }
+
+            return (viewName, idx);
         }
     }
 }
