@@ -27,6 +27,7 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fcntl.h>
 extern char **environ;
 #endif
 
@@ -697,7 +698,7 @@ static std::string renderAsm(
 }
 
 #if defined(__unix__) || defined(__APPLE__)
-static int runProcess(const std::vector<std::string> &argv) {
+static int runProcessRedirect(const std::vector<std::string> &argv, const char *stdoutPath, const char *stderrPath) {
     if (argv.empty()) return 127;
 
     std::vector<char *> cargv;
@@ -705,8 +706,18 @@ static int runProcess(const std::vector<std::string> &argv) {
     for (const auto &a : argv) cargv.push_back(const_cast<char *>(a.c_str()));
     cargv.push_back(nullptr);
 
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    if (stdoutPath) {
+        posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, stdoutPath, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    }
+    if (stderrPath) {
+        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, stderrPath, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    }
+
     pid_t pid;
-    int rc = posix_spawnp(&pid, cargv[0], nullptr, nullptr, cargv.data(), environ);
+    int rc = posix_spawnp(&pid, cargv[0], &actions, nullptr, cargv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
     if (rc != 0) {
         return 127;
     }
@@ -719,8 +730,21 @@ static int runProcess(const std::vector<std::string> &argv) {
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     return 127;
 }
+
+[[maybe_unused]] static int runProcess(const std::vector<std::string> &argv) {
+    return runProcessRedirect(argv, nullptr, nullptr);
+}
 #else
-static int runProcess(const std::vector<std::string> &argv) {
+static int runProcessRedirect(const std::vector<std::string> &argv, const char *stdoutPath, const char *stderrPath) {
+    // Fallback: use shell redirection.
+    std::ostringstream cmd;
+    for (const auto &a : argv) cmd << '"' << a << '"' << ' ';
+    if (stdoutPath) cmd << ">\"" << stdoutPath << "\" ";
+    if (stderrPath) cmd << "2>\"" << stderrPath << "\" ";
+    return std::system(cmd.str().c_str());
+}
+
+[[maybe_unused]] static int runProcess(const std::vector<std::string> &argv) {
     // Fallback: very minimal.
     std::ostringstream cmd;
     for (const auto &a : argv) {
@@ -741,6 +765,10 @@ static bool assembleLinkCompare(
 
     writeStringToFile(asmPath, asmText);
 
+    const char *devNull = "/dev/null";
+    const char *outRedir = opt.quiet ? devNull : nullptr;
+    const char *errRedir = opt.quiet ? devNull : nullptr;
+
     {
         std::vector<std::string> args;
         args.push_back(opt.wasm);
@@ -748,7 +776,7 @@ static bool assembleLinkCompare(
         if (opt.wasmWarnLevel >= 0) args.push_back("-w=" + std::to_string(opt.wasmWarnLevel));
         args.push_back("-fo=" + objPath.string());
         args.push_back(asmPath.string());
-        int rc = runProcess(args);
+        int rc = runProcessRedirect(args, outRedir, errRedir);
         if (rc != 0) return false;
     }
 
@@ -764,7 +792,7 @@ static bool assembleLinkCompare(
         args.push_back(outPath.string());
         args.push_back("file");
         args.push_back(objPath.string());
-        int rc = runProcess(args);
+        int rc = runProcessRedirect(args, outRedir, errRedir);
         if (rc != 0) return false;
     }
 
@@ -795,6 +823,10 @@ static std::optional<std::vector<uint8_t>> assembleAndExtractBytesWdis(
 
     writeStringToFile(asmPath, asmText.str());
 
+    const char *devNull = "/dev/null";
+    const char *outRedir = opt.quiet ? devNull : nullptr;
+    const char *errRedir = opt.quiet ? devNull : nullptr;
+
     {
         std::vector<std::string> args;
         args.push_back(opt.wasm);
@@ -802,7 +834,7 @@ static std::optional<std::vector<uint8_t>> assembleAndExtractBytesWdis(
         if (opt.wasmWarnLevel >= 0) args.push_back("-w=" + std::to_string(opt.wasmWarnLevel));
         args.push_back("-fo=" + objPath.string());
         args.push_back(asmPath.string());
-        int rc = runProcess(args);
+        int rc = runProcessRedirect(args, outRedir, errRedir);
         if (rc != 0) return std::nullopt;
     }
 
@@ -811,7 +843,7 @@ static std::optional<std::vector<uint8_t>> assembleAndExtractBytesWdis(
         args.push_back(opt.wdis);
         args.push_back("-l=" + lstPath.string());
         args.push_back(objPath.string());
-        int rc = runProcess(args);
+        int rc = runProcessRedirect(args, outRedir, errRedir);
         if (rc != 0) return std::nullopt;
     }
 
@@ -1049,6 +1081,10 @@ static std::optional<std::unordered_map<uint16_t, std::vector<uint8_t>>> assembl
 
     writeStringToFile(asmPath, asmText.str());
 
+    const char *devNull = "/dev/null";
+    const char *outRedir = opt.quiet ? devNull : nullptr;
+    const char *errRedir = opt.quiet ? devNull : nullptr;
+
     {
         std::vector<std::string> args;
         args.push_back(opt.wasm);
@@ -1056,7 +1092,7 @@ static std::optional<std::unordered_map<uint16_t, std::vector<uint8_t>>> assembl
         if (opt.wasmWarnLevel >= 0) args.push_back("-w=" + std::to_string(opt.wasmWarnLevel));
         args.push_back("-fo=" + objPath.string());
         args.push_back(asmPath.string());
-        int rc = runProcess(args);
+        int rc = runProcessRedirect(args, outRedir, errRedir);
         if (rc != 0) return std::nullopt;
     }
 
@@ -1065,7 +1101,7 @@ static std::optional<std::unordered_map<uint16_t, std::vector<uint8_t>>> assembl
         args.push_back(opt.wdis);
         args.push_back("-l=" + lstPath.string());
         args.push_back(objPath.string());
-        int rc = runProcess(args);
+        int rc = runProcessRedirect(args, outRedir, errRedir);
         if (rc != 0) return std::nullopt;
     }
 
@@ -1155,6 +1191,7 @@ struct PromoteState {
     std::chrono::steady_clock::time_point lastReport;
 
     void report(bool force) {
+        if (opt && opt->quiet) return;
         auto now = std::chrono::steady_clock::now();
         if (!force && std::chrono::duration_cast<std::chrono::milliseconds>(now - lastReport).count() < 2000) return;
         lastReport = now;
@@ -1284,8 +1321,10 @@ int main(int argc, char **argv) {
 
     auto neededLabels = findNeededLabels(cands, lines);
 
-    std::cerr << "Found " << cands.size() << " promotable db-lines\n";
-    std::cerr << "Need " << neededLabels.size() << " labels\n";
+    if (!opt.quiet) {
+        std::cerr << "Found " << cands.size() << " promotable db-lines\n";
+        std::cerr << "Need " << neededLabels.size() << " labels\n";
+    }
 
     PromoteState st;
     st.opt = &opt;
@@ -1556,8 +1595,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    std::cerr << "Wrote " << opt.outAsm << "\n";
-    std::cerr << "Enabled " << enabledCount << "/" << cands.size() << " mnemonics (" << enabledBytes << " bytes worth)\n";
+    if (!opt.quiet) {
+        std::cerr << "Wrote " << opt.outAsm << "\n";
+        std::cerr << "Enabled " << enabledCount << "/" << cands.size() << " mnemonics (" << enabledBytes << " bytes worth)\n";
+    }
 
     // Final end-to-end validation (full-file oracle) to catch any corner case.
     if (!opt.quiet) {
