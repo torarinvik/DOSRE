@@ -104,6 +104,11 @@ namespace DOSRE.Dasm
             @"\b(?<view>[A-Za-z_][A-Za-z0-9_]*)\.(?<field>[A-Za-z_][A-Za-z0-9_]*)\b",
             RegexOptions.Compiled);
 
+        // view.field = rhs; (rewritten to STOREn(seg, off, rhs);)
+        private static readonly Regex ViewFieldStoreRx = new Regex(
+            @"\b(?<view>[A-Za-z_][A-Za-z0-9_]*)\.(?<field>[A-Za-z_][A-Za-z0-9_]*)\b\s*=\s*(?<rhs>[^;]+)\s*;",
+            RegexOptions.Compiled);
+
         public static Mc1File Parse(string path)
         {
             if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Missing path", nameof(path));
@@ -237,6 +242,29 @@ namespace DOSRE.Dasm
         private static string RewriteViewFields(string line, Dictionary<string, ViewDecl> views, Dictionary<string, StructType> types)
         {
             if (views == null || views.Count == 0) return line;
+
+            // Rewrite stores first so the subsequent LOAD rewrite doesn't turn an lvalue into a LOAD expression.
+            line = ViewFieldStoreRx.Replace(line, m =>
+            {
+                var vname = m.Groups["view"].Value;
+                var fname = m.Groups["field"].Value;
+                var rhs = m.Groups["rhs"].Value.Trim();
+
+                if (!views.TryGetValue(vname, out var vd))
+                    return m.Value;
+
+                if (!types.TryGetValue(vd.Type, out var st))
+                    throw new InvalidDataException($"Unknown view type '{vd.Type}' for view '{vname}'");
+
+                var (off, fType) = ResolveFieldOffset(st, fname, types);
+                var size = SizeOfType(fType, types);
+                var offExpr = $"ADD16({vd.OffExpr}, 0x{off:X4})";
+
+                if (size == 1) return $"STORE8({vd.SegExpr}, {offExpr}, {rhs});";
+                if (size == 2) return $"STORE16({vd.SegExpr}, {offExpr}, {rhs});";
+
+                return m.Value;
+            });
 
             return ViewFieldRx.Replace(line, m =>
             {

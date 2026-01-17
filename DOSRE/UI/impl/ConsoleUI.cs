@@ -504,6 +504,18 @@ namespace DOSRE.UI.impl
         private string _binMc1In;
 
         /// <summary>
+        ///     Lift a promoted asm listing into MC1 (promoted asm -> MC0 -> MC1).
+        ///     Specified with -BINMC1LIFTASM <file.promoted.asm>
+        /// </summary>
+        private string _binMc1LiftAsm;
+
+        /// <summary>
+        ///     Output MC1 text for -BINMC1LIFTASM
+        ///     Specified with -BINMC1LIFTOUT <file.mc1>
+        /// </summary>
+        private string _binMc1LiftOut;
+
+        /// <summary>
         ///     MC0 output file from desugaring MC1.
         ///     Specified with -BINMC1OUT <file.mc0>
         /// </summary>
@@ -899,10 +911,22 @@ namespace DOSRE.UI.impl
                             _binMc1In = _args[i + 1];
                             i++;
                             break;
+                        case "BINMC1LIFTASM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1LIFTASM requires a <file.promoted.asm>");
+                            _binMc1LiftAsm = _args[i + 1];
+                            i++;
+                            break;
                         case "BINMC1OUT":
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -BINMC1OUT requires a <file.mc0>");
                             _binMc1Out = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC1LIFTOUT":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1LIFTOUT requires a <file.mc1>");
+                            _binMc1LiftOut = _args[i + 1];
                             i++;
                             break;
                         case "BINMC1EXPECT":
@@ -1594,6 +1618,17 @@ namespace DOSRE.UI.impl
                         _logger.Info($"{DateTime.Now} BINMC1EXPECT OK (origin/bytes stream identical)");
                     }
 
+                    return;
+                }
+
+                // BINMC1LIFT: lift promoted asm into MC1 (auto-sugar).
+                if (!string.IsNullOrWhiteSpace(_binMc1LiftAsm))
+                {
+                    if (string.IsNullOrWhiteSpace(_binMc1LiftOut))
+                        throw new Exception("Error: -BINMC1LIFTASM requires -BINMC1LIFTOUT <file.mc1>");
+
+                    Bin16Mc1Lifter.LiftPromotedAsmToFile(_binMc1LiftAsm, _binMc1LiftOut);
+                    _logger.Info($"{DateTime.Now} Wrote BINMC1 lifted MC1 to {_binMc1LiftOut}");
                     return;
                 }
 
