@@ -517,6 +517,109 @@ namespace DOSRE.Dasm
                         }
                     }
                 }
+
+                // 4) Mostly-fill blocks with light noise.
+                // Some binaries use padding values like 99/AA/F6 with occasional non-padding bytes (alignment/metadata).
+                // These regions are overwhelmingly not code, but they can defeat the strict run/repeated-word detectors.
+                //
+                // Conservative rules:
+                // - Only consider common padding bytes.
+                // - Require strong dominance within a fixed probe window.
+                // - Stop expansion on long non-dominant streaks or strings.
+                const int domProbeLen = 128;
+                const int domMinLen = 96;
+                const int domMaxLen = 4096;
+                const double domMinRatioProbe = 0.82;
+                const double domMinRatioExpand = 0.78;
+                const int domMaxConsecutiveNoise = 16;
+
+                static bool IsCommonPadByte(byte b)
+                    => b == 0x00 || b == 0xFF || b == 0xF6 || b == 0x99 || b == 0xAA;
+
+                var domCounts = new int[256];
+                for (var i = 0; i + domProbeLen <= code.Length;)
+                {
+                    if (isStrongFillByte[i])
+                    {
+                        i++;
+                        continue;
+                    }
+                    if (isStrongStringByte != null && isStrongStringByte[i])
+                    {
+                        i++;
+                        continue;
+                    }
+
+                    Array.Clear(domCounts);
+                    for (var k = 0; k < domProbeLen; k++)
+                        domCounts[code[i + k]]++;
+
+                    var domByte = 0;
+                    var domCount = 0;
+                    for (var b = 0; b < 256; b++)
+                    {
+                        var c = domCounts[b];
+                        if (c > domCount)
+                        {
+                            domCount = c;
+                            domByte = b;
+                        }
+                    }
+
+                    if (!IsCommonPadByte((byte)domByte))
+                    {
+                        i++;
+                        continue;
+                    }
+
+                    if (domCount < (int)Math.Ceiling(domProbeLen * domMinRatioProbe))
+                    {
+                        i++;
+                        continue;
+                    }
+
+                    var start = i;
+                    var endExcl = i + domProbeLen;
+                    var len = domProbeLen;
+                    var consecutiveNoise = 0;
+
+                    while (endExcl < code.Length && len < domMaxLen)
+                    {
+                        if (isStrongFillByte[endExcl])
+                            break;
+                        if (isStrongStringByte != null && isStrongStringByte[endExcl])
+                            break;
+
+                        var bb = code[endExcl];
+                        if (bb == (byte)domByte)
+                        {
+                            domCount++;
+                            consecutiveNoise = 0;
+                        }
+                        else
+                        {
+                            consecutiveNoise++;
+                            if (consecutiveNoise > domMaxConsecutiveNoise)
+                                break;
+                        }
+
+                        len++;
+                        endExcl++;
+
+                        if (((double)domCount / len) < domMinRatioExpand)
+                            break;
+                    }
+
+                    if (len >= domMinLen)
+                    {
+                        var ratio = (double)domCount / len;
+                        MarkFillRegion(start, len, $"scan: mostly-fill byte 0x{domByte:X2} (dominant~{ratio:0.00})");
+                        i = endExcl;
+                        continue;
+                    }
+
+                    i++;
+                }
             }
 
             // Mark obvious 3-byte record tables as strong data candidates.
