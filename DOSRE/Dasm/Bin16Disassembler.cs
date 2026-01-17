@@ -207,6 +207,86 @@ namespace DOSRE.Dasm
             public string Preview { get; }
         }
 
+        [Flags]
+        public enum Bin16SafeMnemonicFallbacks
+        {
+            None = 0,
+            RegReg = 1 << 0,
+            ImmWidth = 1 << 1,
+            Jumps = 1 << 2,
+            Default = RegReg | ImmWidth | Jumps,
+        }
+
+        public static bool TryDisassembleToString(
+            string inputFile,
+            uint origin,
+            int? bytesLimit,
+            bool masmCompat,
+            bool binInsights,
+            bool emitInlineStringLabels,
+            bool masmCompatEmitInstructions,
+            bool masmCompatEmitInstructionsSafe,
+            Bin16SafeMnemonicFallbacks masmCompatEmitInstructionsSafeFallbacks,
+            bool masmCompatEmitInstructionsSafeForceJumps,
+            bool masmCompatEmitInstructionComments,
+            bool masmCompatEmitCodeMap,
+            bool bin16LooseIntHeuristics,
+            bool bin16LooseIoHeuristics,
+            out string output,
+            out string error)
+        {
+            return TryDisassembleToStringCore(
+                inputFile,
+                origin,
+                bytesLimit,
+                masmCompat,
+                binInsights,
+                emitInlineStringLabels,
+                masmCompatEmitInstructions,
+                masmCompatEmitInstructionsSafe,
+                masmCompatEmitInstructionsSafeFallbacks,
+                masmCompatEmitInstructionsSafeForceJumps,
+                masmCompatEmitInstructionComments,
+                masmCompatEmitCodeMap,
+                bin16LooseIntHeuristics,
+                bin16LooseIoHeuristics,
+                out output,
+                out error);
+        }
+
+        public static bool TryDisassembleToString(
+            string inputFile,
+            uint origin,
+            int? bytesLimit,
+            bool masmCompat,
+            bool binInsights,
+            bool emitInlineStringLabels,
+            bool masmCompatEmitInstructions,
+            bool masmCompatEmitInstructionsSafe,
+            bool masmCompatEmitInstructionComments,
+            bool masmCompatEmitCodeMap,
+            bool bin16LooseIntHeuristics,
+            bool bin16LooseIoHeuristics,
+            out string output,
+            out string error)
+            => TryDisassembleToString(
+                inputFile,
+                origin,
+                bytesLimit,
+                masmCompat,
+                binInsights,
+                emitInlineStringLabels,
+                masmCompatEmitInstructions,
+                masmCompatEmitInstructionsSafe,
+                masmCompatEmitInstructionsSafeFallbacks: Bin16SafeMnemonicFallbacks.Default,
+                masmCompatEmitInstructionsSafeForceJumps: false,
+                masmCompatEmitInstructionComments,
+                masmCompatEmitCodeMap,
+                bin16LooseIntHeuristics,
+                bin16LooseIoHeuristics,
+                out output,
+                out error);
+
         public static bool TryDisassembleToString(
             string inputFile,
             uint origin,
@@ -217,6 +297,43 @@ namespace DOSRE.Dasm
             bool masmCompatEmitInstructions,
             bool masmCompatEmitInstructionComments,
             bool masmCompatEmitCodeMap,
+            bool bin16LooseIntHeuristics,
+            bool bin16LooseIoHeuristics,
+            out string output,
+            out string error)
+            => TryDisassembleToStringCore(
+                inputFile,
+                origin,
+                bytesLimit,
+                masmCompat,
+                binInsights,
+                emitInlineStringLabels,
+                masmCompatEmitInstructions,
+                masmCompatEmitInstructionsSafe: false,
+                masmCompatEmitInstructionsSafeFallbacks: Bin16SafeMnemonicFallbacks.Default,
+                masmCompatEmitInstructionsSafeForceJumps: false,
+                masmCompatEmitInstructionComments,
+                masmCompatEmitCodeMap,
+                bin16LooseIntHeuristics,
+                bin16LooseIoHeuristics,
+                out output,
+                out error);
+
+        private static bool TryDisassembleToStringCore(
+            string inputFile,
+            uint origin,
+            int? bytesLimit,
+            bool masmCompat,
+            bool binInsights,
+            bool emitInlineStringLabels,
+            bool masmCompatEmitInstructions,
+            bool masmCompatEmitInstructionsSafe,
+            Bin16SafeMnemonicFallbacks masmCompatEmitInstructionsSafeFallbacks,
+            bool masmCompatEmitInstructionsSafeForceJumps,
+            bool masmCompatEmitInstructionComments,
+            bool masmCompatEmitCodeMap,
+            bool bin16LooseIntHeuristics,
+            bool bin16LooseIoHeuristics,
             out string output,
             out string error)
         {
@@ -276,6 +393,204 @@ namespace DOSRE.Dasm
 
             static string ToMasmHexU32NoPad(uint value) => ToMasmHexU32(value, 0);
             static string ToMasmHexByte(byte value) => value == 0 ? "00h" : ToMasmHexU32(value, 2);
+
+            static bool ShouldForceDbForAmbiguousEncoding(byte[] insBytes, Bin16SafeMnemonicFallbacks fallbacks)
+            {
+                if (insBytes == null || insBytes.Length == 0)
+                    return false;
+
+                static bool IsPrefix(byte b)
+                    => b is 0x26 or 0x2E or 0x36 or 0x3E or 0x64 or 0x65 or 0xF0 or 0xF2 or 0xF3 or 0x66 or 0x67;
+
+                static bool IsDirAmbiguousOpcode(byte op)
+                    => op is
+                        // add/or/adc/sbb/and/sub/xor/cmp (r/m, r) or (r, r/m)
+                        0x00 or 0x01 or 0x02 or 0x03 or
+                        0x08 or 0x09 or 0x0A or 0x0B or
+                        0x10 or 0x11 or 0x12 or 0x13 or
+                        0x18 or 0x19 or 0x1A or 0x1B or
+                        0x20 or 0x21 or 0x22 or 0x23 or
+                        0x28 or 0x29 or 0x2A or 0x2B or
+                        0x30 or 0x31 or 0x32 or 0x33 or
+                        0x38 or 0x39 or 0x3A or 0x3B or
+                        // mov (r/m, r) or (r, r/m)
+                        0x88 or 0x89 or 0x8A or 0x8B;
+
+                var i = 0;
+                while (i < insBytes.Length && IsPrefix(insBytes[i]))
+                    i++;
+
+                if (i >= insBytes.Length)
+                    return false;
+
+                var op = insBytes[i];
+
+                // Relative control-flow encodings often have multiple valid forms (short vs near), and
+                // assemblers may pick a different one depending on perceived target distance. In safe
+                // mnemonic mode we keep these byte-perfect by emitting db.
+                //
+                //   Jcc short: 70..7F
+                //   Jcc near:  0F 80..8F
+                //   JMP short: EB
+                //   JMP near:  E9
+                // NOTE: LOOP/JCXZ (E0..E3) have fixed encodings and are safe to emit as mnemonics.
+                if ((fallbacks & Bin16SafeMnemonicFallbacks.Jumps) != 0)
+                {
+                    if ((op >= 0x70 && op <= 0x7F) || op == 0xEB || op == 0xE9)
+                        return true;
+                }
+                if (op == 0x0F && i + 1 < insBytes.Length)
+                {
+                    var op1 = insBytes[i + 1];
+                    if ((fallbacks & Bin16SafeMnemonicFallbacks.Jumps) != 0)
+                    {
+                        if (op1 >= 0x80 && op1 <= 0x8F)
+                            return true;
+                    }
+                }
+
+                // One-byte XCHG AX,<reg> encodings (91..97). Assemblers may choose 87 /r instead.
+                if ((fallbacks & Bin16SafeMnemonicFallbacks.RegReg) != 0 && op >= 0x91 && op <= 0x97)
+                    return true;
+
+                // Accumulator-immediate opcodes: assemblers may choose a shorter sign-extended imm8 form (83 /n ib)
+                // for small immediates.
+                if ((fallbacks & Bin16SafeMnemonicFallbacks.ImmWidth) != 0 && op is 0x05 or 0x0D or 0x15 or 0x1D or 0x25 or 0x2D or 0x35 or 0x3D)
+                {
+                    if (i + 2 < insBytes.Length)
+                    {
+                        var imm = (ushort)(insBytes[i + 1] | (insBytes[i + 2] << 8));
+                        if ((short)imm >= sbyte.MinValue && (short)imm <= sbyte.MaxValue)
+                            return true;
+                    }
+                }
+
+                // Group-1 immediate forms: 83 /n ib vs 81 /n iw are encoding choices not forced by syntax.
+                // If we emit these as mnemonics, the assembler may pick a different width than the original.
+                if ((fallbacks & Bin16SafeMnemonicFallbacks.ImmWidth) != 0 && op is 0x83)
+                    return true;
+
+                if ((fallbacks & Bin16SafeMnemonicFallbacks.ImmWidth) != 0 && op is 0x81)
+                {
+                    // If the imm16 would fit in signed imm8, an assembler might choose 83 instead.
+                    // (We only need the common case here; this is a heuristic.)
+                    // 81: opcode + modrm + imm16
+                    if (i + 1 < insBytes.Length)
+                    {
+                        var modrmIndex = i + 1;
+                        var immIndex = modrmIndex + 1;
+                        if (immIndex + 1 < insBytes.Length)
+                        {
+                            var imm = (ushort)(insBytes[immIndex] | (insBytes[immIndex + 1] << 8));
+                            if ((short)imm >= sbyte.MinValue && (short)imm <= sbyte.MaxValue)
+                                return true;
+                        }
+                    }
+                }
+
+                // Direction-ambiguous reg-reg encodings: when mod=11 (both operands registers), there are two
+                // distinct opcodes that assemble to the same textual form (e.g., 29 /r vs 2B /r for SUB, or
+                // 89 /r vs 8B /r for MOV). Assemblers are free to pick either encoding, so emit db to keep
+                // byte-perfect output.
+                if (IsDirAmbiguousOpcode(op))
+                {
+                    var modrmIndex = i + 1;
+                    if (modrmIndex < insBytes.Length)
+                    {
+                        var modrm = insBytes[modrmIndex];
+                        if ((fallbacks & Bin16SafeMnemonicFallbacks.RegReg) != 0 && (modrm & 0xC0) == 0xC0)
+                        {
+                            return true;
+                        }
+                    }
+                }
+
+                // push imm8 (6A) vs push imm16 (68)
+                if ((fallbacks & Bin16SafeMnemonicFallbacks.ImmWidth) != 0 && op is 0x6A)
+                    return true;
+                if ((fallbacks & Bin16SafeMnemonicFallbacks.ImmWidth) != 0 && op is 0x68)
+                {
+                    if (i + 2 < insBytes.Length)
+                    {
+                        var imm = (ushort)(insBytes[i + 1] | (insBytes[i + 2] << 8));
+                        if ((short)imm >= sbyte.MinValue && (short)imm <= sbyte.MaxValue)
+                            return true;
+                    }
+                }
+
+                // imul r16, r/m16, imm8 (6B) vs imm16 (69)
+                if ((fallbacks & Bin16SafeMnemonicFallbacks.ImmWidth) != 0 && op is 0x6B)
+                    return true;
+                if ((fallbacks & Bin16SafeMnemonicFallbacks.ImmWidth) != 0 && op is 0x69)
+                {
+                    // 69: opcode + modrm + imm16 (displacement, if any, is inside the modrm addressing)
+                    // Heuristic: if the last two bytes form an imm16 that fits imm8, keep byte-perfect via db.
+                    if (insBytes.Length >= 2)
+                    {
+                        var imm = (ushort)(insBytes[^2] | (insBytes[^1] << 8));
+                        if ((short)imm >= sbyte.MinValue && (short)imm <= sbyte.MaxValue)
+                            return true;
+                    }
+                }
+
+                return false;
+            }
+
+            static bool TryForceJumpSizeForWasm16(byte[] insBytes, ref string asmIns)
+            {
+                if (insBytes == null || insBytes.Length == 0 || string.IsNullOrWhiteSpace(asmIns))
+                    return false;
+
+                static bool IsPrefix(byte b)
+                    => b is 0x26 or 0x2E or 0x36 or 0x3E or 0x64 or 0x65 or 0xF0 or 0xF2 or 0xF3 or 0x66 or 0x67;
+
+                var i = 0;
+                while (i < insBytes.Length && IsPrefix(insBytes[i]))
+                    i++;
+                if (i >= insBytes.Length)
+                    return false;
+
+                var op0 = insBytes[i];
+                string sizeKeyword = null;
+
+                // Jcc short (70..7F)
+                if (op0 >= 0x70 && op0 <= 0x7F)
+                    sizeKeyword = "short";
+
+                // JMP short/near
+                if (op0 == 0xEB)
+                    sizeKeyword = "short";
+                if (op0 == 0xE9)
+                    sizeKeyword = "near";
+
+                // Jcc near (0F 80..8F)
+                if (op0 == 0x0F && i + 1 < insBytes.Length)
+                {
+                    var op1 = insBytes[i + 1];
+                    if (op1 >= 0x80 && op1 <= 0x8F)
+                        sizeKeyword = "near";
+                }
+
+                if (sizeKeyword == null)
+                    return false;
+
+                var firstSpace = asmIns.IndexOf(' ');
+                if (firstSpace <= 0)
+                    return false;
+
+                var mnemonic = asmIns.Substring(0, firstSpace).Trim();
+                var operandsText = asmIns.Substring(firstSpace + 1).TrimStart();
+
+                // Avoid double-inserting.
+                if (operandsText.StartsWith("short ", StringComparison.OrdinalIgnoreCase) ||
+                    operandsText.StartsWith("near ", StringComparison.OrdinalIgnoreCase) ||
+                    operandsText.StartsWith("short\t", StringComparison.OrdinalIgnoreCase) ||
+                    operandsText.StartsWith("near\t", StringComparison.OrdinalIgnoreCase))
+                    return true;
+
+                asmIns = $"{mnemonic} {sizeKeyword} {operandsText}";
+                return true;
+            }
 
             static string NormalizeHexLiteralsToMasm(string text)
             {
@@ -1844,6 +2159,10 @@ namespace DOSRE.Dasm
             var referencedStringAddrs = new HashSet<uint>();
             var reachableInsAddrs = new HashSet<uint>();
 
+            // Byte mask of reachable instruction bytes (built when needed).
+            bool[] reachableByte = null;
+            var wantReachableByteMask = false;
+
             // Checklist-driven low-level behavior summaries.
             var interruptVectors = new Dictionary<byte, int>();
             var portIoCount = 0;
@@ -2032,6 +2351,44 @@ namespace DOSRE.Dasm
                                 }
                             }
                         }
+
+                    }
+
+                    // Backstop: if the disassembler text already contains a loc_XXXXX branch label,
+                    // treat it as a label target so mnemonic output can emit a definition for it.
+                    // This avoids OpenWatcom errors when branch-target decoding misses an edge case.
+                    if (binInsights)
+                    {
+                        var insText = ins.ToString();
+                        var iLoc = insText.IndexOf("loc_", StringComparison.OrdinalIgnoreCase);
+                        if (iLoc >= 0)
+                        {
+                            var j = iLoc + 4;
+                            var start = j;
+                            while (j < insText.Length)
+                            {
+                                var ch = insText[j];
+                                var isHex = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+                                if (!isHex)
+                                    break;
+                                j++;
+                            }
+
+                            if (j > start)
+                            {
+                                var hex = insText.Substring(start, j - start);
+                                if (uint.TryParse(hex, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var t))
+                                {
+                                    if (t >= origin && t < origin + (uint)code.Length)
+                                    {
+                                        labelTargets.Add(t);
+                                        if (!jumpXrefs.TryGetValue(t, out var sources))
+                                            jumpXrefs[t] = sources = new List<uint>();
+                                        sources.Add((uint)ins.Offset);
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     if (!TryGetRelativeBranchTarget16(ins, out var target, out var isCall))
@@ -2061,8 +2418,96 @@ namespace DOSRE.Dasm
                     {
                         // OpenWatcom WASM requires labels (not numeric targets) for CALL and JCXZ/LOOP*.
                         // Only emit labels when the target is a decoded instruction boundary.
-                        if (RequiresLabelForWatcomRelTarget16(ins) && insByAddr.ContainsKey(target))
+                        // If we are forcing jump sizes for byte-perfect mnemonics, prefer labels for all rel targets.
+                        if (masmCompatEmitInstructionsSafeForceJumps)
+                        {
+                            // Forced-size jumps must use labels (numeric targets behave as absolute offsets in WASM).
+                            // Also allow targets that fall inside emitted db regions (data-as-code / tables) so the
+                            // db emitter can split and define the label before emitting bytes.
                             labelTargets.Add(target);
+                        }
+                        else if (RequiresLabelForWatcomRelTarget16(ins) && insByAddr.ContainsKey(target))
+                        {
+                            labelTargets.Add(target);
+                        }
+                    }
+                }
+
+                // Backstop: ensure we also collect branch targets from the exact instruction set we will emit.
+                // Depending on earlier carving/resync, `instructions` can miss some insByAddr entries; if we
+                // later emit a jcc/call text containing loc_XXXXX, we must have a matching label definition.
+                if (binInsights)
+                {
+                    foreach (var kvp in insByAddr)
+                    {
+                        var src = kvp.Key;
+                        var ins = kvp.Value;
+
+                        var b = ins.Bytes;
+                        if (b == null || b.Length == 0)
+                            continue;
+
+                        var op0 = b[0];
+                        var next = src + (uint)b.Length;
+                        var isCall = false;
+                        uint target;
+
+                        if (op0 == 0xE8 && b.Length >= 3)
+                        {
+                            var rel = (short)(b[1] | (b[2] << 8));
+                            target = (uint)(next + (uint)rel);
+                            isCall = true;
+                        }
+                        else if (op0 == 0xE9 && b.Length >= 3)
+                        {
+                            var rel = (short)(b[1] | (b[2] << 8));
+                            target = (uint)(next + (uint)rel);
+                        }
+                        else if (op0 == 0xEB && b.Length >= 2)
+                        {
+                            var rel = unchecked((sbyte)b[1]);
+                            target = (uint)(next + (uint)rel);
+                        }
+                        else if (op0 >= 0x70 && op0 <= 0x7F && b.Length >= 2)
+                        {
+                            var rel = unchecked((sbyte)b[1]);
+                            target = (uint)(next + (uint)rel);
+                        }
+                        else if ((op0 == 0xE3 || op0 == 0xE0 || op0 == 0xE1 || op0 == 0xE2) && b.Length >= 2)
+                        {
+                            var rel = unchecked((sbyte)b[1]);
+                            target = (uint)(next + (uint)rel);
+                        }
+                        else if (op0 == 0x0F && b.Length >= 4)
+                        {
+                            var op1 = b[1];
+                            if (op1 < 0x80 || op1 > 0x8F)
+                                continue;
+                            var rel = (short)(b[2] | (b[3] << 8));
+                            target = (uint)(next + (uint)rel);
+                        }
+                        else
+                        {
+                            continue;
+                        }
+
+                        if (target < origin || target >= origin + (uint)code.Length)
+                            continue;
+
+                        if (isCall)
+                        {
+                            functionStarts.Add(target);
+                            if (!callXrefs.TryGetValue(target, out var callers))
+                                callXrefs[target] = callers = new List<uint>();
+                            callers.Add(src);
+                        }
+                        else
+                        {
+                            labelTargets.Add(target);
+                            if (!jumpXrefs.TryGetValue(target, out var sources))
+                                jumpXrefs[target] = sources = new List<uint>();
+                            sources.Add(src);
+                        }
                     }
                 }
 
@@ -2097,6 +2542,209 @@ namespace DOSRE.Dasm
 
                     static bool IsRet(byte[] b) => b != null && b.Length >= 1 && (b[0] == 0xC3 || b[0] == 0xC2 || b[0] == 0xCB || b[0] == 0xCA || b[0] == 0xCF);
 
+                    static bool IsIn(byte[] b) => b != null && b.Length >= 1 && (b[0] == 0xEC || b[0] == 0xED || b[0] == 0xE4 || b[0] == 0xE5);
+                    static bool IsOut(byte[] b) => b != null && b.Length >= 1 && (b[0] == 0xEE || b[0] == 0xEF || b[0] == 0xE6 || b[0] == 0xE7);
+
+                    // Very conservative INT tagging for common DOS game subsystems.
+                    bool TryTagIntBasedDosGameFunction(uint start, out string tag, out string labelOverride)
+                    {
+                        tag = null;
+                        labelOverride = null;
+
+                        if (!insIndexByAddr.TryGetValue(start, out var startIdx))
+                            return false;
+
+                        var sawInt10 = 0;
+                        var sawInt16 = 0;
+                        var sawInt21 = 0;
+                        var sawInt33 = 0;
+                        var sawInt1A = 0;
+
+                        var maxScanIns = 240;
+                        var endIdx = Math.Min(instructions.Count, startIdx + maxScanIns);
+
+                        for (var i = startIdx; i < endIdx; i++)
+                        {
+                            var b = instructions[i].Bytes;
+                            if (b == null || b.Length == 0)
+                                break;
+
+                            if (i > startIdx && IsRet(b))
+                                break;
+
+                            // int imm8 => CD xx
+                            if (b.Length == 2 && b[0] == 0xCD)
+                            {
+                                switch (b[1])
+                                {
+                                    case 0x10: sawInt10++; break; // video BIOS
+                                    case 0x16: sawInt16++; break; // keyboard BIOS
+                                    case 0x21: sawInt21++; break; // DOS
+                                    case 0x33: sawInt33++; break; // mouse
+                                    case 0x1A: sawInt1A++; break; // timer/RTC
+                                }
+                            }
+                        }
+
+                        // Tag any presence (INT usage is already a strong semantic signal), but only rename on repetition.
+                        var tags = new List<string>();
+                        if (sawInt10 > 0) tags.Add("bios int10 video");
+                        if (sawInt16 > 0) tags.Add("bios int16 keyboard");
+                        if (sawInt33 > 0) tags.Add("bios int33 mouse");
+                        if (sawInt1A > 0) tags.Add("bios int1A timer");
+                        if (sawInt21 > 0) tags.Add("dos int21");
+
+                        if (tags.Count == 0)
+                            return false;
+
+                        tag = string.Join(" ", tags);
+
+                        // Rename only when a single subsystem dominates.
+                        var nonDos = (sawInt10 > 0 ? 1 : 0) + (sawInt16 > 0 ? 1 : 0) + (sawInt33 > 0 ? 1 : 0) + (sawInt1A > 0 ? 1 : 0);
+                        if (nonDos == 1 && sawInt21 == 0)
+                        {
+                            // Loose mode: allow renames on a single occurrence (useful for quick mapping),
+                            // while strict mode keeps it at 2+ to reduce noise.
+                            var minHitsToRename = bin16LooseIntHeuristics ? 1 : 2;
+                            if (sawInt10 >= minHitsToRename) labelOverride = $"func_{start:X5}_bios_video";
+                            else if (sawInt16 >= minHitsToRename) labelOverride = $"func_{start:X5}_bios_keyboard";
+                            else if (sawInt33 >= minHitsToRename) labelOverride = $"func_{start:X5}_mouse";
+                            else if (sawInt1A >= minHitsToRename) labelOverride = $"func_{start:X5}_timer";
+                        }
+                        else if (nonDos == 0 && sawInt21 >= 3)
+                        {
+                            labelOverride = $"func_{start:X5}_dos";
+                        }
+
+                        return true;
+                    }
+
+                    // Conservative hardware I/O tagging for classic DOS game ports.
+                    bool TryTagClassicIoFunction(uint start, out string tag, out string labelOverride)
+                    {
+                        tag = null;
+                        labelOverride = null;
+
+                        if (!insIndexByAddr.TryGetValue(start, out var startIdx))
+                            return false;
+
+                        ushort lastDxImm = 0;
+                        var haveLastDx = false;
+
+                        var vgaCrtcHits = 0;     // 03D4/03D5
+                        var vgaStatusHits = 0;   // 03DA reads
+                        var vgaMiscHits = 0;     // 03C0/03C1/03C4/03C5/03CE/03CF/03C8/03C9
+                        var adlibHits = 0;       // 0388/0389
+                        var pitHits = 0;         // 0040..0043
+                        var speakerHits = 0;     // 0061
+                        var kbdCtrlHits = 0;     // 0060/0064
+                        var joyHits = 0;         // 0201
+
+                        var maxScanIns = 260;
+                        var endIdx = Math.Min(instructions.Count, startIdx + maxScanIns);
+
+                        for (var i = startIdx; i < endIdx; i++)
+                        {
+                            var b = instructions[i].Bytes;
+                            if (b == null || b.Length == 0)
+                                break;
+
+                            if (i > startIdx && IsRet(b))
+                                break;
+
+                            // Track mov dx, imm16 => BA xx xx
+                            if (b.Length == 3 && b[0] == 0xBA)
+                            {
+                                lastDxImm = (ushort)(b[1] | (b[2] << 8));
+                                haveLastDx = true;
+                                continue;
+                            }
+
+                            // Immediate port forms: in al,imm8 (E4), out imm8,al (E6)
+                            if (b.Length == 2 && (b[0] == 0xE4 || b[0] == 0xE6))
+                            {
+                                var p = (ushort)b[1];
+                                if (p == 0x61) speakerHits++;
+                                else if (p == 0x60 || p == 0x64) kbdCtrlHits++;
+                                else if (p >= 0x40 && p <= 0x43) pitHits++;
+                                else if (p == 0xDA) vgaStatusHits++; // (rare as imm8)
+                                continue;
+                            }
+
+                            // DX port forms: in/out via DX
+                            if (haveLastDx && (IsIn(b) || IsOut(b)))
+                            {
+                                var p = lastDxImm;
+                                if (p == 0x3D4 || p == 0x3D5) vgaCrtcHits++;
+                                else if (p == 0x3DA) vgaStatusHits++;
+                                else if (p == 0x3C0 || p == 0x3C1 || p == 0x3C4 || p == 0x3C5 || p == 0x3CE || p == 0x3CF || p == 0x3C8 || p == 0x3C9) vgaMiscHits++;
+                                else if (p == 0x388 || p == 0x389) adlibHits++;
+                                else if (p >= 0x40 && p <= 0x43) pitHits++;
+                                else if (p == 0x61) speakerHits++;
+                                else if (p == 0x60 || p == 0x64) kbdCtrlHits++;
+                                else if (p == 0x201) joyHits++;
+                            }
+                        }
+
+                        // High-confidence: CRTC programming tends to hit 3D4/3D5 multiple times.
+                        // Loose mode: allow a single register write pair (typically 3D4 + 3D5) to rename.
+                        var minCrtcToRename = bin16LooseIoHeuristics ? 2 : 4;
+                        if (vgaCrtcHits >= minCrtcToRename)
+                        {
+                            tag = "io vga_crtc ports=3D4/3D5";
+                            labelOverride = $"func_{start:X5}_vga_crtc";
+                            return true;
+                        }
+
+                        // High-confidence: AdLib register writes tend to hit 388/389 repeatedly.
+                        // Loose mode: allow a single register write pair (typically 388 + 389) to rename.
+                        var minAdlibToRename = bin16LooseIoHeuristics ? 2 : 4;
+                        if (adlibHits >= minAdlibToRename)
+                        {
+                            tag = "io adlib_opl2 ports=388/389";
+                            labelOverride = $"func_{start:X5}_adlib";
+                            return true;
+                        }
+
+                        // Medium-confidence: VGA status polling (3DA) often appears in vblank wait loops.
+                        var minVgaStatusToRename = bin16LooseIoHeuristics ? 1 : 3;
+                        if (vgaStatusHits >= minVgaStatusToRename)
+                        {
+                            tag = "io vga_status ports=3DA";
+                            labelOverride = $"func_{start:X5}_vga_wait";
+                            return true;
+                        }
+
+                        // PIT/speaker helpers: tag but avoid renaming aggressively.
+                        if (pitHits >= 3 && speakerHits >= 1)
+                        {
+                            tag = "io pit_speaker ports=40-43,61";
+                            return true;
+                        }
+
+                        // Keyboard controller or joystick reads: tag only.
+                        if (kbdCtrlHits >= 3)
+                        {
+                            tag = "io kbd_ctrl ports=60/64";
+                            return true;
+                        }
+                        if (joyHits >= 3)
+                        {
+                            tag = "io joystick port=201";
+                            return true;
+                        }
+
+                        // If we see a mix of VGA misc ports, tag as VGA I/O.
+                        var minVgaMiscToTag = bin16LooseIoHeuristics ? 2 : 5;
+                        if (vgaMiscHits >= minVgaMiscToTag)
+                        {
+                            tag = "io vga ports=3C0-3CF";
+                            return true;
+                        }
+
+                        return false;
+                    }
+
                     bool TryTagTextModeMemcpyMemsetFunction(uint start, out string tag, out string labelOverride)
                     {
                         tag = null;
@@ -2107,6 +2755,7 @@ namespace DOSRE.Dasm
 
                         var setsEsB800 = false;
                         var setsEs0400 = false;
+                        var setsEsA000 = false;
                         var sawRepMovsw = false;
                         var sawRepStosw = false;
                         var dsSwitchTo0400ForMovsw = false;
@@ -2141,6 +2790,8 @@ namespace DOSRE.Dasm
                                         setsEsB800 = true;
                                     else if (imm == 0x0400)
                                         setsEs0400 = true;
+                                    else if (imm == 0xA000)
+                                        setsEsA000 = true;
                                 }
                             }
 
@@ -2209,25 +2860,23 @@ namespace DOSRE.Dasm
                         }
 
                         // Classify.
-                        if (setsEsB800 && sawRepMovsw && dsSwitchTo0400ForMovsw)
+                        // For Decathlon-style text-mode routines, require the strong stride+pagewrap hints
+                        // to reduce false positives across unrelated REP-heavy loops.
+                        if (setsEsB800 && sawRepMovsw && dsSwitchTo0400ForMovsw && usesStride50 && usesPageWrap2000)
                         {
                             var hints = new List<string> { "txtblit", "src=0400h", "dst=B800h", "rep movsw" };
-                            if (usesStride50)
-                                hints.Add("stride=50h");
-                            if (usesPageWrap2000)
-                                hints.Add("pagewrap=2000h");
+                            hints.Add("stride=50h");
+                            hints.Add("pagewrap=2000h");
                             tag = string.Join(" ", hints);
                             labelOverride = $"func_{start:X5}_txtblit";
                             return true;
                         }
 
-                        if (setsEs0400 && sawRepStosw)
+                        if (setsEs0400 && sawRepStosw && usesStride50 && usesPageWrap2000)
                         {
                             var hints = new List<string> { "txtfill", "dst=0400h", "rep stosw" };
-                            if (usesStride50)
-                                hints.Add("stride=50h");
-                            if (usesPageWrap2000)
-                                hints.Add("pagewrap=2000h");
+                            hints.Add("stride=50h");
+                            hints.Add("pagewrap=2000h");
                             tag = string.Join(" ", hints);
                             labelOverride = $"func_{start:X5}_txtfill";
                             return true;
@@ -2246,6 +2895,15 @@ namespace DOSRE.Dasm
                             return true;
                         }
 
+                        // Mode-13 / graphics VRAM bulk ops (A000h). Tag only; avoid renaming aggressively.
+                        if (setsEsA000 && (sawRepMovsw || sawRepStosw))
+                        {
+                            tag = sawRepMovsw
+                                ? "vram_a000 rep movsw"
+                                : "vram_a000 rep stosw";
+                            return true;
+                        }
+
                         return false;
                     }
 
@@ -2258,6 +2916,71 @@ namespace DOSRE.Dasm
                                 functionBehaviorByStart[f] = ftag;
                             if (!string.IsNullOrWhiteSpace(lname))
                                 funcLabelOverrides[f] = lname;
+                        }
+
+                        if (TryTagIntBasedDosGameFunction(f, out var itag, out var ilabel))
+                        {
+                            if (!string.IsNullOrWhiteSpace(itag) && !functionBehaviorByStart.ContainsKey(f))
+                                functionBehaviorByStart[f] = itag;
+                            if (!string.IsNullOrWhiteSpace(ilabel) && !funcLabelOverrides.ContainsKey(f))
+                                funcLabelOverrides[f] = ilabel;
+                        }
+
+                        if (TryTagClassicIoFunction(f, out var otag, out var olabel))
+                        {
+                            if (!string.IsNullOrWhiteSpace(otag) && !functionBehaviorByStart.ContainsKey(f))
+                                functionBehaviorByStart[f] = otag;
+                            if (!string.IsNullOrWhiteSpace(olabel) && !funcLabelOverrides.ContainsKey(f))
+                                funcLabelOverrides[f] = olabel;
+                        }
+                    }
+
+                    // When forcing jump sizes for byte-perfect mnemonic output, keep label operands for jumps.
+                    // SharpDisasm may emit loc_XXXXX tokens even for targets that aren't discovered by our
+                    // relative-branch target scanner; add them so we always emit label definitions.
+                    if (masmCompatEmitInstructionsSafeForceJumps)
+                    {
+                        // Late backstop: collect all rel-branch targets from the exact decode map we will emit.
+                        foreach (var kvp in insByAddr)
+                        {
+                            if (!TryGetRelativeBranchTarget16(kvp.Value, out var t, out _))
+                                continue;
+                            if (t >= origin && t < origin + (uint)code.Length)
+                                labelTargets.Add(t);
+                        }
+
+                        foreach (var kvp in insByAddr)
+                        {
+                            var insText = kvp.Value.ToString();
+                            var iLoc = insText.IndexOf("loc_", StringComparison.OrdinalIgnoreCase);
+                            if (iLoc < 0)
+                                continue;
+
+                            while (iLoc >= 0)
+                            {
+                                var j = iLoc + 4;
+                                var start = j;
+                                while (j < insText.Length)
+                                {
+                                    var ch = insText[j];
+                                    var isHex = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+                                    if (!isHex)
+                                        break;
+                                    j++;
+                                }
+
+                                if (j > start)
+                                {
+                                    var hex = insText.Substring(start, j - start);
+                                    if (uint.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var t))
+                                    {
+                                        if (t >= origin && t < origin + (uint)code.Length)
+                                            labelTargets.Add(t);
+                                    }
+                                }
+
+                                iLoc = insText.IndexOf("loc_", j, StringComparison.OrdinalIgnoreCase);
+                            }
                         }
                     }
 
@@ -2273,6 +2996,42 @@ namespace DOSRE.Dasm
                     // (notably JCXZ/LOOP* do not accept numeric targets).
                     foreach (var t in labelTargets)
                         labelByAddr[t] = $"loc_{t:X5}";
+                }
+            }
+
+            // Post-pass (forced-jump mnemonic mode): ensure that every relative branch target in the
+            // exact instruction set we will iterate (`insByAddr`) is present in the label sets.
+            // This is intentionally redundant with earlier collection, but prevents undefined-symbol
+            // failures when earlier scans miss an edge case.
+            if (emitAsmLabels && masmCompatEmitInstructionsSafeForceJumps)
+            {
+                var anyNew = false;
+                foreach (var ins in insByAddr.Values)
+                {
+                    if (!TryGetRelativeBranchTarget16(ins, out var target, out var isCall))
+                        continue;
+                    if (target < origin || target >= origin + (uint)code.Length)
+                        continue;
+
+                    if (!isCall)
+                    {
+                        if (labelTargets.Add(target))
+                            anyNew = true;
+                    }
+                    else
+                    {
+                        // Keep functionStarts in sync as well.
+                        functionStarts.Add(target);
+                    }
+                }
+
+                if (anyNew)
+                {
+                    foreach (var t in labelTargets)
+                    {
+                        if (!labelByAddr.ContainsKey(t))
+                            labelByAddr[t] = $"loc_{t:X5}";
+                    }
                 }
             }
 
@@ -2391,10 +3150,11 @@ namespace DOSRE.Dasm
             static bool IsPrefixByte(byte b)
             {
                 // Segment overrides: 2E CS, 36 SS, 3E DS, 26 ES
+                // FS/GS: 64/65
                 // Rep: F2/F3
                 // Operand/address size: 66/67 (rare in 16-bit but can exist)
                 // Lock: F0
-                return b is 0x2E or 0x36 or 0x3E or 0x26 or 0xF2 or 0xF3 or 0x66 or 0x67 or 0xF0;
+                return b is 0x2E or 0x36 or 0x3E or 0x26 or 0x64 or 0x65 or 0xF2 or 0xF3 or 0x66 or 0x67 or 0xF0;
             }
 
             static bool TryGetGroup5IndirectNearTargetDisp(Instruction ins, out bool isJmp, out ushort disp, out bool hasDisp, out bool hasIndexOrBase)
@@ -2767,8 +3527,8 @@ namespace DOSRE.Dasm
                 // Build a byte-level mask of reachable instruction bytes.
                 // Important: reachableInsAddrs only tracks instruction *starts*, but table scans work on raw bytes.
                 // Without a byte mask, a scan can start in the middle of a reachable instruction and produce false "codeptrtbl".
-                bool[] reachableByte = null;
-                if (masmCompatEmitCodeMap)
+                wantReachableByteMask = masmCompatEmitCodeMap || (masmCompat && masmCompatEmitInstructions);
+                if (wantReachableByteMask)
                 {
                     reachableByte = new bool[code.Length];
                     foreach (var a in reachableInsAddrs)
@@ -2789,7 +3549,7 @@ namespace DOSRE.Dasm
 
                 bool IsReachableByteAddr(uint addr)
                 {
-                    if (!masmCompatEmitCodeMap || reachableByte == null)
+                    if (!wantReachableByteMask || reachableByte == null)
                         return false;
                     if (addr < origin || addr >= origin + (uint)code.Length)
                         return false;
@@ -2798,7 +3558,7 @@ namespace DOSRE.Dasm
 
                 bool RangeTouchesReachableBytes(uint start, int length)
                 {
-                    if (!masmCompatEmitCodeMap || reachableByte == null)
+                    if (!wantReachableByteMask || reachableByte == null)
                         return false;
                     if (length <= 0)
                         return false;
@@ -3182,19 +3942,34 @@ namespace DOSRE.Dasm
 
             if (masmCompat)
             {
-                sb.AppendLine(masmCompatEmitInstructions ? ".686" : ".8086");
-                sb.AppendLine(".model tiny");
-                sb.AppendLine(".code");
-                // In byte-perfect db+mnemonic-comment mode, we still *decode* using the provided logical origin
-                // (COM-style default 0100h), but we must emit `org 0000h` so WLINK `format raw bin` does not
-                // prepend a 256-byte zero pad region.
-                var asmOrg = (masmCompatEmitInstructionComments && !masmCompatEmitInstructions) ? 0u : origin;
-                var asmOrgText = asmOrg == 0 ? "0000h" : ToMasmHexU32(asmOrg, 4);
-                sb.AppendLine($"org {asmOrgText}");
-                if (asmOrg != origin)
-                    sb.AppendLine($"; logical origin: {ToMasmHexU32(origin, 4)}");
-                sb.AppendLine("start:");
-                sb.AppendLine();
+                var explicitUse16Segment = masmCompatEmitInstructions;
+                if (explicitUse16Segment)
+                {
+                    // For mnemonic output we want `.386` features, but we must still assemble as 16-bit code
+                    // (otherwise WASM emits widespread operand-size override prefixes 0x66).
+                    // OpenWatcom supports `USE16` as a segment attribute.
+                    sb.AppendLine(".386");
+                    sb.AppendLine("_TEXT segment use16");
+                    sb.AppendLine("assume cs:_TEXT, ds:_TEXT, es:_TEXT, ss:_TEXT");
+                    sb.AppendLine("org 0000h");
+                    if (origin != 0)
+                        sb.AppendLine($"; logical origin: {ToMasmHexU32(origin, 4)}");
+                    sb.AppendLine("start:");
+                    sb.AppendLine();
+                }
+                else
+                {
+                    sb.AppendLine(".8086");
+                    sb.AppendLine(".model tiny");
+                    sb.AppendLine(".code");
+                    // We always emit `org 0000h` for raw-binary output so WLINK `format raw bin` does not
+                    // prepend a leading zero pad region. The logical origin is still used for analysis/labels.
+                    sb.AppendLine("org 0000h");
+                    if (origin != 0)
+                        sb.AppendLine($"; logical origin: {ToMasmHexU32(origin, 4)}");
+                    sb.AppendLine("start:");
+                    sb.AppendLine();
+                }
             }
 
             if (binInsights && stringsByAddr != null && stringsByAddr.Count > 0)
@@ -3221,11 +3996,20 @@ namespace DOSRE.Dasm
                 sb.AppendLine(";");
             }
 
+            // (No global loc_ EQU emission: it can conflict with later label definitions.)
+
             if (!masmCompat)
             {
                 sb.AppendLine("; OFFSET BYTES DISASSEMBLY");
                 sb.AppendLine(";-------------------------------------------");
             }
+
+            // Precompute a sorted list of label addresses so db emission can split on embedded labels.
+            // This keeps MASM/WASM output assemblable even if data detectors emit large db blocks that
+            // would otherwise skip over a control-flow target.
+            var sortedLabelAddrs = labelByAddr.Count > 0
+                ? labelByAddr.Keys.OrderBy(x => x).ToArray()
+                : Array.Empty<uint>();
 
             // Build carve regions (only referenced strings) and clamp to the disassembly window.
             // Note: we deliberately allow carving to start at any address, even if it is not aligned
@@ -3262,6 +4046,8 @@ namespace DOSRE.Dasm
             var carveStarts = carveByAddr.Keys.OrderBy(x => x).ToList();
             var nextCarveIndex = 0;
 
+            uint? lastEmittedLabelAddr = null;
+
             uint NextCarveStart()
             {
                 if (nextCarveIndex < carveStarts.Count)
@@ -3281,7 +4067,7 @@ namespace DOSRE.Dasm
                 return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
             }
 
-            void EmitDbBytes(uint addr, int count)
+            void EmitDbBytes(uint addr, int count, bool emitLabelAtStart)
             {
                 var pos = checked((int)(addr - origin));
                 var remaining = Math.Min(count, code.Length - pos);
@@ -3289,7 +4075,34 @@ namespace DOSRE.Dasm
 
                 while (remaining > 0)
                 {
+                    if (masmCompat && labelByAddr.Count > 0 && labelByAddr.TryGetValue(curAddr, out var curLbl))
+                    {
+                        // Always emit embedded labels in db runs (including at the start address), but avoid
+                        // duplicate definitions when the main loop already emitted a label for this address.
+                        if (lastEmittedLabelAddr != curAddr)
+                        {
+                            sb.AppendLine($"{curLbl}:");
+                            lastEmittedLabelAddr = curAddr;
+                        }
+                    }
+
                     var take = Math.Min(16, remaining);
+
+                    if (masmCompat && labelByAddr.Count > 0)
+                    {
+                        // If a label exists inside this db chunk, stop before it so the next iteration
+                        // can emit the label at the exact address.
+                        // Scan is cheap (<= 15 lookups) and works even if labels are added dynamically.
+                        for (var k = 1; k < take; k++)
+                        {
+                            if (labelByAddr.ContainsKey(curAddr + (uint)k))
+                            {
+                                take = k;
+                                break;
+                            }
+                        }
+                    }
+
                     var slice = code.AsSpan(pos, take);
                     var bytesHex = string.Concat(slice.ToArray().Select(b => b.ToString("X2")));
                     if (masmCompat)
@@ -3537,7 +4350,7 @@ namespace DOSRE.Dasm
                 // DW tables can trip WASM into interpreting small constants as offsets; emit raw bytes instead.
                 if (masmCompat)
                 {
-                    EmitDbBytes(addr, byteLen);
+                    EmitDbBytes(addr, byteLen, emitLabelAtStart: false);
                     return;
                 }
 
@@ -3818,6 +4631,7 @@ namespace DOSRE.Dasm
                         sb.AppendLine();
                         var fn = labelByAddr.TryGetValue(addr, out var lbl) ? lbl : $"func_{addr:X5}";
                         sb.Append($"{fn}:");
+                        lastEmittedLabelAddr = addr;
                         if (callXrefs.TryGetValue(addr, out var callers) && callers.Count > 0)
                         {
                             var xs = string.Join(", ", callers.Distinct().OrderBy(x => x).Take(8)
@@ -3833,6 +4647,7 @@ namespace DOSRE.Dasm
                     {
                         var ln = labelByAddr.TryGetValue(addr, out var lbl) ? lbl : $"loc_{addr:X5}";
                         sb.Append($"{ln}:");
+                        lastEmittedLabelAddr = addr;
                         if (jumpXrefs.TryGetValue(addr, out var sources) && sources.Count > 0)
                         {
                             var xs = string.Join(", ", sources.Distinct().OrderBy(x => x).Take(8)
@@ -3852,6 +4667,7 @@ namespace DOSRE.Dasm
                         ? lbl
                         : (functionStarts.Contains(addr) ? $"func_{addr:X5}" : $"loc_{addr:X5}");
                     sb.AppendLine($"{ln}:");
+                    lastEmittedLabelAddr = addr;
                 }
 
                 // Data heuristics (only when insights enabled, and only if this address isn't a known control-flow target).
@@ -3903,7 +4719,7 @@ namespace DOSRE.Dasm
                             }
                         }
 
-                        EmitDbBytes(addr, msgLen);
+                        EmitDbBytes(addr, msgLen, emitLabelAtStart: false);
                         RecordDataRegion(addr, msgLen, "text", "heuristic: len-prefixed text block");
                         posInCode += msgLen;
                         continue;
@@ -3921,7 +4737,7 @@ namespace DOSRE.Dasm
                         {
                             fillLen = Math.Min(fillLen, clampLimit);
                             sb.AppendLine($"; heuristic: padding/fill {(masmCompat ? ToMasmHexByte(fillVal) : $"0x{fillVal:X2}")} x{fillLen}");
-                            EmitDbBytes(addr, fillLen);
+                            EmitDbBytes(addr, fillLen, emitLabelAtStart: false);
                             RecordDataRegion(addr, fillLen, "fill", $"heuristic: fill {fillVal:X2}h x{fillLen}");
                             posInCode += fillLen;
                             continue;
@@ -3973,7 +4789,7 @@ namespace DOSRE.Dasm
                             ? $" rowsize={rowW.Value}B width~{rowW.Value * 8}px@1bpp/{rowW.Value * 4}px@2bpp/{rowW.Value * 2}px@4bpp rows~{Math.Max(1, lowEntLen / rowW.Value)}"
                             : string.Empty;
                         sb.AppendLine($"; heuristic: low-entropy block (likely bitmap/tile/pattern data) bytes={lowEntLen}{rowNote}");
-                        EmitDbBytes(addr, lowEntLen);
+                        EmitDbBytes(addr, lowEntLen, emitLabelAtStart: false);
                         RecordDataRegion(addr, lowEntLen, "data", "heuristic: low-entropy block (bitmap/tile/pattern candidate)");
                         posInCode += lowEntLen;
                         continue;
@@ -3993,7 +4809,7 @@ namespace DOSRE.Dasm
                             var dbCount = (int)(nextCarveStart - addr);
                             if (dbCount > 0)
                             {
-                                EmitDbBytes(addr, dbCount);
+                                EmitDbBytes(addr, dbCount, emitLabelAtStart: false);
                                 posInCode += dbCount;
                                 continue;
                             }
@@ -4001,10 +4817,47 @@ namespace DOSRE.Dasm
                     }
                 }
 
+                // In mnemonic-emitting mode, only emit instructions for bytes that are believed to be reachable code.
+                // Everything else should remain raw db bytes to keep the output assemblable and avoid turning data blobs
+                // (like strings) into bogus control-flow that references undefined labels.
+                if (masmCompat && masmCompatEmitInstructions && reachableByte != null)
+                {
+                    var p0 = posInCode;
+                    if (p0 >= 0 && p0 < reachableByte.Length && !reachableByte[p0])
+                    {
+                        // Emit up to 16 bytes, but stop before the next carve or any known control-flow target.
+                        var maxLen = Math.Min(16, code.Length - posInCode);
+                        if (nextCarveStart != uint.MaxValue && nextCarveStart > addr)
+                            maxLen = Math.Min(maxLen, (int)(nextCarveStart - addr));
+
+                        var len = 0;
+                        while (len < maxLen)
+                        {
+                            var a = origin + (uint)(posInCode + len);
+                            var p = posInCode + len;
+                            if (p < 0 || p >= reachableByte.Length)
+                                break;
+                            if (reachableByte[p])
+                                break;
+                            if (functionStarts.Contains(a) || labelTargets.Contains(a))
+                                break;
+                            len++;
+                        }
+
+                        if (len > 0)
+                        {
+                            EmitDbBytes(addr, len, emitLabelAtStart: false);
+                            RecordDataRegion(addr, len, "data", "non-reachable bytes (keep as db in mnemonic mode)");
+                            posInCode += len;
+                            continue;
+                        }
+                    }
+                }
+
                 if (!insByAddr.TryGetValue(addr, out var ins))
                 {
                     // Should not happen, but if we can't decode at this address, emit a single byte and move on.
-                    EmitDbBytes(addr, 1);
+                    EmitDbBytes(addr, 1, emitLabelAtStart: false);
                     RecordDataRegion(addr, 1, "data", "decode failed at address (fallback db)");
                     posInCode += 1;
                     continue;
@@ -4016,6 +4869,34 @@ namespace DOSRE.Dasm
                 var comment = string.Empty;
                 var forceDbInInstrMode = false;
 
+                // If a known control-flow label (loc_/func_) falls inside this decoded instruction's byte span,
+                // we cannot legally emit a label inside an instruction in MASM/WASM. This typically happens when
+                // data blobs are misdecoded as instructions and a jcc/call targets a byte inside them.
+                // Resync by emitting db bytes up to the label boundary.
+                if (masmCompat && masmCompatEmitInstructions && labelByAddr.Count > 0 && sortedLabelAddrs.Length > 0 && bytes.Length > 1)
+                {
+                    var idx = Array.BinarySearch(sortedLabelAddrs, addr + 1);
+                    if (idx < 0)
+                        idx = ~idx;
+
+                    if (idx < sortedLabelAddrs.Length)
+                    {
+                        var nextLbl = sortedLabelAddrs[idx];
+                        var endExcl = addr + (uint)bytes.Length;
+                        if (nextLbl > addr && nextLbl < endExcl)
+                        {
+                            var delta = (int)(nextLbl - addr);
+                            if (delta > 0)
+                            {
+                                EmitDbBytes(addr, delta, emitLabelAtStart: false);
+                                RecordDataRegion(addr, delta, "data", "resync: label falls inside decoded instruction (treat as db)");
+                                posInCode += delta;
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 var isInvalid = insText.StartsWith("invalid", StringComparison.OrdinalIgnoreCase);
                 if (masmCompat && masmCompatEmitInstructions && isInvalid)
                 {
@@ -4023,6 +4904,31 @@ namespace DOSRE.Dasm
                     sb.AppendLine($"db {string.Join(", ", bytes.Select(ToMasmHexByte))} ; {addr:X8}h invalid opcode (fallback to db)");
                     posInCode += bytes.Length > 0 ? bytes.Length : 1;
                     continue;
+                }
+
+                // In forced-jump-size mode, keep prefix-bearing relative branches byte-perfect by emitting db.
+                // OpenWatcom WASM does not reliably preserve segment overrides (FS/GS/etc) on branch mnemonics.
+                if (masmCompat && masmCompatEmitInstructions && masmCompatEmitInstructionsSafeForceJumps && bytes.Length > 0)
+                {
+                    static bool IsPrefix(byte bb)
+                        => bb is 0x26 or 0x2E or 0x36 or 0x3E or 0x64 or 0x65 or 0xF0 or 0xF2 or 0xF3 or 0x66 or 0x67;
+
+                    var pi = 0;
+                    while (pi < bytes.Length && IsPrefix(bytes[pi]))
+                        pi++;
+
+                    if (pi > 0 && pi < bytes.Length)
+                    {
+                        var op0 = bytes[pi];
+                        var isRelBranch =
+                            op0 == 0xE8 || op0 == 0xE9 || op0 == 0xEB ||
+                            (op0 >= 0x70 && op0 <= 0x7F) ||
+                            (op0 is 0xE0 or 0xE1 or 0xE2 or 0xE3) ||
+                            (op0 == 0x0F && pi + 1 < bytes.Length && bytes[pi + 1] >= 0x80 && bytes[pi + 1] <= 0x8F);
+
+                        if (isRelBranch)
+                            forceDbInInstrMode = true;
+                    }
                 }
 
                 if (binInsights && (reachableInsAddrs.Count == 0 || !reachableInsAddrs.Contains(addr)) && insText.StartsWith("invalid", StringComparison.OrdinalIgnoreCase))
@@ -4056,21 +4962,119 @@ namespace DOSRE.Dasm
                             insText = RewriteFirstAddressToken(insText, lbl);
                         }
                     }
-                    else if (emitAsmLabels && RequiresLabelForWatcomRelTarget16(ins))
+                    else if (emitAsmLabels && (RequiresLabelForWatcomRelTarget16(ins) || masmCompatEmitInstructionsSafeForceJumps))
                     {
-                        if (labelByAddr.TryGetValue(brTarget, out var lbl))
+                        if (!labelByAddr.TryGetValue(brTarget, out var lbl))
                         {
+                            if (masmCompatEmitInstructionsSafeForceJumps)
+                            {
+                                // Forced-size jumps must use labels. If earlier analysis missed this target,
+                                // synthesize a loc_ label now so later db emission can split and define it.
+                                lbl = $"loc_{brTarget:X5}";
+                                labelTargets.Add(brTarget);
+                                labelByAddr[brTarget] = lbl;
+                            }
+                            else
+                            {
+                                // OpenWatcom doesn't accept numeric targets for CALL/JCXZ/LOOP*.
+                                // In instruction-emitting mode we must fall back to db if we cannot label.
+                                // In comment-only mnemonic mode we can keep the numeric operand.
+                                if (masmCompatEmitInstructions)
+                                    forceDbInInstrMode = true;
+                            }
+                        }
+
+                        if (!string.IsNullOrEmpty(lbl))
                             insText = RewriteFirstAddressToken(insText, lbl);
-                        }
-                        else
-                        {
-                            // OpenWatcom doesn't accept numeric targets for CALL/JCXZ/LOOP*.
-                            // In instruction-emitting mode we must fall back to db if we cannot label.
-                            // In comment-only mnemonic mode we can keep the numeric operand.
-                            if (masmCompatEmitInstructions)
-                                forceDbInInstrMode = true;
-                        }
                     }
+                }
+
+                // In mnemonic-emitting mode, prefer numeric targets for jmp/jcc when the disassembler
+                // uses `loc_XXXXX` tokens. This avoids undefined-symbol failures when data-as-code creates
+                // branch-like bytes that don't end up with a matching label definition.
+                if (masmCompat && masmCompatEmitInstructions && insText.IndexOf("loc_", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    var mnem = insText.Split(new[] { ' ', '\t' }, 2, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty;
+                    var isJumpLike = mnem.StartsWith("j", StringComparison.OrdinalIgnoreCase);
+                    if (!isJumpLike)
+                        goto SkipLocNumericRewrite;
+
+                    if (masmCompatEmitInstructionsSafeForceJumps)
+                    {
+                        // If the disassembler emitted loc_XXXXX but we do not have a matching label target,
+                        // OpenWatcom will fail with an undefined symbol. These are usually data-as-code; keep
+                        // the bytes authoritative by falling back to db for this instruction.
+                        var iLoc2 = 0;
+                        while (iLoc2 < insText.Length)
+                        {
+                            iLoc2 = insText.IndexOf("loc_", iLoc2, StringComparison.OrdinalIgnoreCase);
+                            if (iLoc2 < 0)
+                                break;
+
+                            var j2 = iLoc2 + 4;
+                            var start2 = j2;
+                            while (j2 < insText.Length)
+                            {
+                                var ch = insText[j2];
+                                var isHex = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+                                if (!isHex)
+                                    break;
+                                j2++;
+                            }
+
+                            if (j2 > start2)
+                            {
+                                var hex = insText.Substring(start2, j2 - start2);
+                                if (uint.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var t))
+                                {
+                                    if (!labelTargets.Contains(t))
+                                    {
+                                        forceDbInInstrMode = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            iLoc2 = j2;
+                        }
+
+                        goto SkipLocNumericRewrite;
+                    }
+
+                    var iLoc = 0;
+                    while (iLoc < insText.Length)
+                    {
+                        iLoc = insText.IndexOf("loc_", iLoc, StringComparison.OrdinalIgnoreCase);
+                        if (iLoc < 0)
+                            break;
+
+                        var j = iLoc + 4;
+                        var start = j;
+                        while (j < insText.Length)
+                        {
+                            var ch = insText[j];
+                            var isHex = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+                            if (!isHex)
+                                break;
+                            j++;
+                        }
+
+                        if (j > start)
+                        {
+                            var hex = insText.Substring(start, j - start);
+                            if (uint.TryParse(hex, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var t))
+                            {
+                                var masmNum = ToMasmHexU32(t, 4);
+                                insText = insText.Substring(0, iLoc) + masmNum + insText.Substring(j);
+                                iLoc += masmNum.Length;
+                                continue;
+                            }
+                        }
+
+                        iLoc = j;
+                    }
+
+                SkipLocNumericRewrite: ;
                 }
 
                 if (hexRe != null)
@@ -4122,6 +5126,45 @@ namespace DOSRE.Dasm
 
                     if (masmCompatEmitInstructions || masmCompatEmitInstructionComments)
                         asmIns = FixupWasmInstructionSyntax(asmIns);
+
+                    if (masmCompatEmitInstructions && masmCompatEmitInstructionsSafe && masmCompatEmitInstructionsSafeForceJumps)
+                    {
+                        // Optional: maximize mnemonics while keeping byte-perfect output by forcing
+                        // relative jump widths (short/near) explicitly.
+                        TryForceJumpSizeForWasm16(bytes, ref asmIns);
+                    }
+
+                    if (masmCompatEmitInstructions)
+                    {
+                        // With `.8086`, OpenWatcom rejects various 80186/80286+/386-only mnemonics.
+                        // Many of these show up only in data-as-code regions; keep the output assemblable
+                        // by falling back to raw bytes.
+                        var mnem = asmIns.Split(new[] { ' ', '\t' }, 2, StringSplitOptions.RemoveEmptyEntries)
+                            .FirstOrDefault() ?? string.Empty;
+
+                        if (mnem.Length > 0)
+                        {
+                            var m = mnem.ToLowerInvariant();
+                            if (m is "pusha" or "popa" or "enter" or "leave" or "arpl" or "insb" or "insw" or "outsb" or "outsw")
+                                forceDbInInstrMode = true;
+
+                            // IMUL reg, r/m, imm (introduced after 8086) typically shows up as 2+ operands.
+                            if (m == "imul" && asmIns.Count(c => c == ',') >= 1)
+                                forceDbInInstrMode = true;
+                        }
+
+                        if (masmCompatEmitInstructionsSafe && !forceDbInInstrMode)
+                        {
+                            // Safe mnemonic mode: keep output mostly mnemonic, but ensure byte-identical rebuilds
+                            // by emitting raw bytes for known encoding-ambiguous instructions.
+                            if (ShouldForceDbForAmbiguousEncoding(bytes, masmCompatEmitInstructionsSafeFallbacks))
+                            {
+                                // If forced jump sizes are enabled, prefer mnemonic emission for jumps.
+                                if (!masmCompatEmitInstructionsSafeForceJumps || !TryForceJumpSizeForWasm16(bytes, ref asmIns))
+                                    forceDbInInstrMode = true;
+                            }
+                        }
+                    }
 
                     if (masmCompatEmitInstructions)
                     {
@@ -4466,12 +5509,42 @@ namespace DOSRE.Dasm
             if (masmCompat)
             {
                 sb.AppendLine();
+                if (masmCompatEmitInstructions)
+                    sb.AppendLine("_TEXT ends");
                 sb.AppendLine("end start");
             }
 
             output = sb.ToString();
             return true;
         }
+
+        // Back-compat overload (defaults to strict INT/I/O renaming).
+        public static bool TryDisassembleToString(
+            string inputFile,
+            uint origin,
+            int? bytesLimit,
+            bool masmCompat,
+            bool binInsights,
+            bool emitInlineStringLabels,
+            bool masmCompatEmitInstructions,
+            bool masmCompatEmitInstructionComments,
+            bool masmCompatEmitCodeMap,
+            out string output,
+            out string error)
+            => TryDisassembleToString(
+                inputFile,
+                origin,
+                bytesLimit,
+                masmCompat,
+                binInsights,
+                emitInlineStringLabels,
+                masmCompatEmitInstructions,
+                masmCompatEmitInstructionComments,
+                masmCompatEmitCodeMap,
+                bin16LooseIntHeuristics: false,
+            bin16LooseIoHeuristics: false,
+                out output,
+                out error);
 
         public static bool TryDisassembleToString(
             string inputFile,
@@ -4557,57 +5630,66 @@ namespace DOSRE.Dasm
             if (b == null || b.Length == 0)
                 return false;
 
-            var op0 = b[0];
+            static bool IsPrefix(byte bb)
+                => bb is 0x26 or 0x2E or 0x36 or 0x3E or 0x64 or 0x65 or 0xF0 or 0xF2 or 0xF3 or 0x66 or 0x67;
+
+            var i = 0;
+            while (i < b.Length && IsPrefix(b[i]))
+                i++;
+            if (i >= b.Length)
+                return false;
+
+            var op0 = b[i];
             var next = (uint)ins.Offset + (uint)b.Length;
 
             // CALL rel16
-            if (op0 == 0xE8 && b.Length >= 3)
+            if (op0 == 0xE8 && i + 2 < b.Length)
             {
-                var rel = (short)(b[1] | (b[2] << 8));
+                var rel = (short)(b[i + 1] | (b[i + 2] << 8));
                 target = (uint)(next + (uint)rel);
                 isCall = true;
                 return true;
             }
 
             // JMP rel16
-            if (op0 == 0xE9 && b.Length >= 3)
+            if (op0 == 0xE9 && i + 2 < b.Length)
             {
-                var rel = (short)(b[1] | (b[2] << 8));
+                var rel = (short)(b[i + 1] | (b[i + 2] << 8));
                 target = (uint)(next + (uint)rel);
                 return true;
             }
 
             // JMP rel8
-            if (op0 == 0xEB && b.Length >= 2)
+            if (op0 == 0xEB && i + 1 < b.Length)
             {
-                var rel = unchecked((sbyte)b[1]);
+                var rel = unchecked((sbyte)b[i + 1]);
                 target = (uint)(next + (uint)rel);
                 return true;
             }
 
             // Jcc short
-            if (op0 >= 0x70 && op0 <= 0x7F && b.Length >= 2)
+            if (op0 >= 0x70 && op0 <= 0x7F && i + 1 < b.Length)
             {
-                var rel = unchecked((sbyte)b[1]);
+                var rel = unchecked((sbyte)b[i + 1]);
                 target = (uint)(next + (uint)rel);
                 return true;
             }
 
             // JCXZ / LOOP / LOOPE / LOOPNE (short)
-            if ((op0 == 0xE3 || op0 == 0xE0 || op0 == 0xE1 || op0 == 0xE2) && b.Length >= 2)
+            if ((op0 == 0xE3 || op0 == 0xE0 || op0 == 0xE1 || op0 == 0xE2) && i + 1 < b.Length)
             {
-                var rel = unchecked((sbyte)b[1]);
+                var rel = unchecked((sbyte)b[i + 1]);
                 target = (uint)(next + (uint)rel);
                 return true;
             }
 
             // Jcc near: 0F 8x rel16
-            if (op0 == 0x0F && b.Length >= 4)
+            if (op0 == 0x0F && i + 3 < b.Length)
             {
-                var op1 = b[1];
+                var op1 = b[i + 1];
                 if (op1 >= 0x80 && op1 <= 0x8F)
                 {
-                    var rel = (short)(b[2] | (b[3] << 8));
+                    var rel = (short)(b[i + 2] | (b[i + 3] << 8));
                     target = (uint)(next + (uint)rel);
                     return true;
                 }
@@ -4622,7 +5704,18 @@ namespace DOSRE.Dasm
             if (b == null || b.Length == 0)
                 return false;
 
-            var op0 = b[0];
+            var i = 0;
+            static bool IsPrefixByteLocal(byte bb)
+            {
+                return bb is 0x2E or 0x36 or 0x3E or 0x26 or 0xF2 or 0xF3 or 0x66 or 0x67 or 0xF0;
+            }
+
+            while (i < b.Length && IsPrefixByteLocal(b[i]))
+                i++;
+            if (i >= b.Length)
+                return false;
+
+            var op0 = b[i];
 
             // Relative CALL needs a label in WASM (numeric targets are rejected).
             if (op0 == 0xE8)
@@ -4632,9 +5725,21 @@ namespace DOSRE.Dasm
             if (op0 == 0xEB || op0 == 0xE9)
                 return true;
 
+            // Jcc short.
+            if (op0 >= 0x70 && op0 <= 0x7F)
+                return true;
+
             // JCXZ / LOOP / LOOPE / LOOPNE need labels too.
             if (op0 == 0xE3 || op0 == 0xE0 || op0 == 0xE1 || op0 == 0xE2)
                 return true;
+
+            // Jcc near: 0F 8x rel16
+            if (op0 == 0x0F && i + 1 < b.Length)
+            {
+                var op1 = b[i + 1];
+                if (op1 >= 0x80 && op1 <= 0x8F)
+                    return true;
+            }
 
             return false;
         }

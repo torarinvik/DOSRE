@@ -383,3 +383,12 @@ Artifacts/test-exports/blst
 Artifacts/test-exports/HELLO.fixups.clusters.type-flags.json
 Artifacts/test-exports/CLIENT.fixups.json
 Expert System.md
+cport/bin16dump/bin16_dump_db
+cport/bin16dump/promote_mnemonics_wasm.py
+cport/bin16dump/README.md
+cport/bin16promote/bin16_promote_wasm
+.github/workflows/verify-c-reasm.yml
+*.err
+cport/reasm/reasm_from_comments
+cport/reasm/README.md
+cport/README.md

@@ -334,6 +334,18 @@ namespace DOSRE.UI.impl
         private bool _bBinInsights;
 
         /// <summary>
+        ///     (DOS16) Looser INT-based heuristic renames (useful for quick mapping; may increase noise).
+        ///     Specified with -BIN16LOOSEINT
+        /// </summary>
+        private bool _bBin16LooseInt;
+
+        /// <summary>
+        ///     (DOS16) Looser port-I/O heuristic renames (VGA/AdLib/etc). Useful for quick mapping; may increase noise.
+        ///     Specified with -BIN16LOOSEIO
+        /// </summary>
+        private bool _bBin16LooseIo;
+
+        /// <summary>
         ///     Emit inline string labels (str_XXXX:) at referenced string addresses.
         ///     Specified with -BINSTRLABELS
         /// </summary>
@@ -350,6 +362,19 @@ namespace DOSRE.UI.impl
         ///     Specified with -BININSTR.
         /// </summary>
         private bool _bBinInstr;
+
+        /// <summary>
+        ///     In BIN16 MASM/WASM mode, emit mnemonics when they are likely to reassemble to identical bytes,
+        ///     but fall back to `db ...` (with mnemonic comment) for known encoding-ambiguous cases.
+        ///     Specified with -BININSTRSAFE.
+        /// </summary>
+        private bool _bBinInstrSafe;
+
+        // Safe mnemonic fallback toggles (only relevant when -BININSTRSAFE is enabled).
+        private bool _bBinInstrSafeJumps = true;
+        private bool _bBinInstrSafeImm = true;
+        private bool _bBinInstrSafeRegReg = true;
+    private bool _bBinInstrSafeForceJumps = false;
 
         /// <summary>
         ///     In BIN16 MASM/WASM mode, keep output byte-perfect by always emitting `db ...`,
@@ -509,6 +534,12 @@ namespace DOSRE.UI.impl
                         case "BININSIGHTS":
                             _bBinInsights = true;
                             break;
+                        case "BIN16LOOSEINT":
+                            _bBin16LooseInt = true;
+                            break;
+                        case "BIN16LOOSEIO":
+                            _bBin16LooseIo = true;
+                            break;
                         case "BINSTRLABELS":
                             _bBinStrLabels = true;
                             break;
@@ -519,11 +550,65 @@ namespace DOSRE.UI.impl
                         case "BININSTR":
                             _bBinInstr = true;
                             break;
+                        case "BININSTRSAFE":
+                            // Prefer mnemonic output, but keep rebuilds byte-identical by falling back to db
+                            // for known ambiguous encodings (e.g., reg-reg ALU direction, imm width choices).
+                            _bBinInstrSafe = true;
+                            _bBinInstr = true;
+                            _bBinInstrDb = false;
+                            break;
+                        case "BININSTRSAFEJUMPS":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BININSTRSAFEJUMPS requires 0 or 1");
+                            _bBinInstrSafeJumps = _args[i + 1].Trim() switch
+                            {
+                                "0" => false,
+                                "1" => true,
+                                _ => throw new Exception("Error: -BININSTRSAFEJUMPS requires 0 or 1"),
+                            };
+                            i++;
+                            break;
+
+                        case "BININSTRSAFEJUMPSFORCE":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BININSTRSAFEJUMPSFORCE requires 0 or 1");
+
+                            _bBinInstrSafeForceJumps = _args[i + 1].Trim() switch
+                            {
+                                "0" => false,
+                                "1" => true,
+                                _ => throw new Exception("Error: -BININSTRSAFEJUMPSFORCE requires 0 or 1"),
+                            };
+                            i++;
+                            break;
+                        case "BININSTRSAFEIMM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BININSTRSAFEIMM requires 0 or 1");
+                            _bBinInstrSafeImm = _args[i + 1].Trim() switch
+                            {
+                                "0" => false,
+                                "1" => true,
+                                _ => throw new Exception("Error: -BININSTRSAFEIMM requires 0 or 1"),
+                            };
+                            i++;
+                            break;
+                        case "BININSTRSAFEREGREG":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BININSTRSAFEREGREG requires 0 or 1");
+                            _bBinInstrSafeRegReg = _args[i + 1].Trim() switch
+                            {
+                                "0" => false,
+                                "1" => true,
+                                _ => throw new Exception("Error: -BININSTRSAFEREGREG requires 0 or 1"),
+                            };
+                            i++;
+                            break;
                         case "BININSTRDB":
                             // Byte-perfect mnemonic mode: keep bytes as db but include mnemonics in comments.
                             // If both are set, prefer byte-perfect mode.
                             _bBinInstrDb = true;
                             _bBinInstr = false;
+                            _bBinInstrSafe = false;
                             break;
                         case "BINMAP":
                             _bBinMap = true;
@@ -853,9 +938,16 @@ namespace DOSRE.UI.impl
                             Console.WriteLine("-BINORG <hex> -- (with -BIN16) Base address/origin for the disassembly (default 0x100)");
                             Console.WriteLine("-BINBYTES <n> -- (with -BIN16) Limit disassembly to n bytes from start of file");
                             Console.WriteLine("-BININSIGHTS -- (with -BIN16) Best-effort string literal scan + inline string annotations");
+                            Console.WriteLine("-BIN16LOOSEINT -- (with -BIN16) Looser INT-based heuristic renames (useful for quick mapping; may increase noise)");
+                            Console.WriteLine("-BIN16LOOSEIO -- (with -BIN16) Looser port-I/O heuristic renames (VGA/AdLib/etc; may increase noise)");
                             Console.WriteLine("-BINSTRLABELS -- (with -BIN16/-BININSIGHTS) Emit inline str_XXXX: labels at referenced string addresses");
                             Console.WriteLine("-BINMASM / -BINWASM -- (with -BIN16) Emit MASM/WASM-compatible assembly source (default)");
                             Console.WriteLine("-BININSTR -- (with -BIN16 and -BINMASM/-BINWASM) Emit decoded instruction mnemonics instead of db-lines (best-effort)");
+                            Console.WriteLine("-BININSTRSAFE -- (with -BIN16 and -BINMASM/-BINWASM) Emit mnemonics when safe, but fall back to db for encoding-ambiguous cases (mostly-mnemonic + byte-identical rebuild)");
+                            Console.WriteLine("  -BININSTRSAFEJUMPS 0|1 -- (with -BININSTRSAFE) Control short-vs-near branch/jump fallback (default 1)");
+                            Console.WriteLine("  -BININSTRSAFEIMM 0|1 -- (with -BININSTRSAFE) Control immediate-width fallback (add/sub/cmp imm, push imm, imul imm) (default 1)");
+                            Console.WriteLine("  -BININSTRSAFEREGREG 0|1 -- (with -BININSTRSAFE) Control reg-reg encoding fallback (ALU dir + xchg ax,reg) (default 1)");
+                            Console.WriteLine("  -BININSTRSAFEJUMPSFORCE 0|1 -- (with -BININSTRSAFE) Force short/near in jump mnemonics to keep byte-perfect output while maximizing mnemonics (default 0)");
                             Console.WriteLine("-BININSTRDB -- (with -BIN16 and -BINMASM/-BINWASM) Emit byte-perfect db-lines, with decoded mnemonics as comments (assemblable + readable)");
                             Console.WriteLine("-BINMAP -- (with -BIN16) Append a best-effort code/data map (ranges + reasons) as comments");
                             Console.WriteLine("-BINLISTING -- (with -BIN16) Emit analysis listing format (NOT assembler-ready)");
@@ -1141,7 +1233,16 @@ namespace DOSRE.UI.impl
                     }
 
                     var emitInstr = _bBinInstr && !_bBinInstrDb;
-                    if (!Bin16Disassembler.TryDisassembleToString(_sInputFile, _binOrigin, _binBytesLimit, _bBinMasmCompat, _bBinInsights, _bBinStrLabels, emitInstr, _bBinInstrDb, _bBinMap, out var binOut, out var binErr))
+                    var emitInstrSafe = emitInstr && _bBinInstrSafe;
+                    var safeFallbacks = Bin16Disassembler.Bin16SafeMnemonicFallbacks.None;
+                    if (_bBinInstrSafeRegReg)
+                        safeFallbacks |= Bin16Disassembler.Bin16SafeMnemonicFallbacks.RegReg;
+                    if (_bBinInstrSafeImm)
+                        safeFallbacks |= Bin16Disassembler.Bin16SafeMnemonicFallbacks.ImmWidth;
+                    if (_bBinInstrSafeJumps)
+                        safeFallbacks |= Bin16Disassembler.Bin16SafeMnemonicFallbacks.Jumps;
+
+                    if (!Bin16Disassembler.TryDisassembleToString(_sInputFile, _binOrigin, _binBytesLimit, _bBinMasmCompat, _bBinInsights, _bBinStrLabels, emitInstr, emitInstrSafe, safeFallbacks, _bBinInstrSafeForceJumps, _bBinInstrDb, _bBinMap, _bBin16LooseInt, _bBin16LooseIo, out var binOut, out var binErr))
                         throw new Exception(binErr);
 
                     if (string.IsNullOrEmpty(_sOutputFile))
