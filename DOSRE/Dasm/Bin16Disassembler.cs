@@ -1098,6 +1098,40 @@ namespace DOSRE.Dasm
                             if (stringsByAddr == null || stringsByAddr.Count == 0)
                                 return false;
 
+                            // Heuristic: this fallback is intentionally permissive for mixed data blobs,
+                            // but it should not fire on obvious instruction streams (e.g. DOS INT 21h setup).
+                            // If the local bytes look very code-like, treat this as not-a-table and let
+                            // reachability handle it.
+                            bool LooksLikeLikelyCodeStart(int pos)
+                            {
+                                var n = Math.Min(12, code.Length - pos);
+                                if (n < 6)
+                                    return false;
+
+                                var score = 0;
+                                for (var i = 0; i < n; i++)
+                                {
+                                    var b = code[pos + i];
+                                    if (b == 0xCD || b == 0xE8 || b == 0xE9 || b == 0xEB || b == 0xC3 || b == 0xCB || b == 0xFA || b == 0xFB)
+                                        score++;
+                                    else if (b == 0x8B || b == 0x89 || b == 0x8E || b == 0x9A)
+                                        score++;
+                                    else if (b == 0xF3 || b == 0xF2)
+                                        score++;
+                                    else if (b >= 0x70 && b <= 0x7F) // short Jcc
+                                        score++;
+                                    else if (b >= 0xB0 && b <= 0xBF) // mov r8/16, imm
+                                        score++;
+                                }
+
+                                // Require a fairly high score to avoid rejecting real data that happens to contain
+                                // a couple of common opcode bytes.
+                                return score >= 5;
+                            }
+
+                            if (LooksLikeLikelyCodeStart(startPos))
+                                return false;
+
                             var probeWords = Math.Min(16, words);
                             if (probeWords < 6)
                                 return false;
@@ -1175,8 +1209,9 @@ namespace DOSRE.Dasm
                             if (consProbe < 4)
                                 return false;
 
-                            // Guardrail: sparse blobs usually contain a few sentinel words, unlike immediates in tight code.
-                            if (sentinelWords < 2)
+                            // Guardrail: sparse blobs often contain a few sentinel words, but some UI/data tables don't.
+                            // If there are no obvious sentinels, require other strong evidence of a data-like blob.
+                            if (sentinelWords < 1 && highBitWords < 4)
                                 return false;
 
                             // Require evidence of at least one decent text target.
