@@ -850,6 +850,41 @@ namespace DOSRE.Dasm
                     if (startPos < 0 || startPos + 16 > code.Length)
                         return false;
 
+                    // Guardrail: this scan runs before we know reachability. If the local window looks
+                    // very instruction-like, don't carve it as a string-pointer table.
+                    // This avoids misclassifying code streams as DATA (which can block reachability).
+                    bool LooksTooCodeLike(int pos)
+                    {
+                        // Sample enough bytes to be robust even if we start mid-instruction.
+                        var n = Math.Min(40, code.Length - pos);
+                        if (n < 16)
+                            return false;
+
+                        var score = 0;
+                        for (var i = 0; i < n; i++)
+                        {
+                            var b = code[pos + i];
+                            if (b == 0xCD || b == 0xE8 || b == 0xE9 || b == 0xEB || b == 0xC3 || b == 0xCB || b == 0xC2)
+                                score++;
+                            else if (b == 0xFA || b == 0xFB)
+                                score++;
+                            else if (b == 0x8B || b == 0x89 || b == 0x8E || b == 0x9A)
+                                score++;
+                            else if (b == 0xF3 || b == 0xF2)
+                                score++;
+                            else if (b >= 0x70 && b <= 0x7F) // short Jcc
+                                score++;
+                            else if (b >= 0xB0 && b <= 0xBF) // mov r8/16, imm
+                                score++;
+                            else if (b == 0x55 || b == 0x53 || b == 0x57 || b == 0x56) // push bp/bx/di/si
+                                score++;
+                        }
+
+                        // Keep this conservative: only reject when strongly code-like.
+                        // With n≈40, real code tends to exceed this easily; pointer tables rarely do.
+                        return score >= 10;
+                    }
+
                     // Many pointer tables are word-aligned, but tagged record tables (e.g. 3-byte [tag][ptr16])
                     // can legally start at odd addresses. We'll still require word alignment for word-based
                     // scanning, but allow tagged-record detection on odd starts.
@@ -860,6 +895,9 @@ namespace DOSRE.Dasm
                     if (isStrongFillByte != null && isStrongFillByte[startPos])
                         return false;
                     if (isStrongStringByte != null && isStrongStringByte[startPos])
+                        return false;
+
+                    if (LooksTooCodeLike(startPos))
                         return false;
 
                     // Use a larger window than codeptrtbl; string pointer tables are often smaller/sparser.
@@ -1167,6 +1205,127 @@ namespace DOSRE.Dasm
                         return false;
 
                     var best = Math.Max(absHits, relHits);
+
+                    // Conservative fallback for short/low-density tables: if multiple entries in the local
+                    // window point to *known* strings (not just text-like), treat it as a table even if the
+                    // generic hit-density threshold is not met. This helps avoid reachability decoding
+                    // pointer blobs as code when they just happen to form valid opcodes.
+                    bool TryDetectMiniKnownStringPtrTable(out int outLen, out bool outRel)
+                    {
+                        outLen = 0;
+                        outRel = false;
+                        if (stringsByAddr == null || stringsByAddr.Count == 0)
+                            return false;
+
+                        var probeWords = Math.Min(16, words);
+                        if (probeWords < 8)
+                            return false;
+
+                        var absK = 0;
+                        var relK = 0;
+                        var cons = 0;
+                        uint absMin = uint.MaxValue, absMax = 0;
+                        uint relMin = uint.MaxValue, relMax = 0;
+
+                        for (var w = 0; w < probeWords; w++)
+                        {
+                            var lo = code[startPos + (w * 2)];
+                            var hi = code[startPos + (w * 2) + 1];
+                            var val = (ushort)(lo | (hi << 8));
+                            if (val == 0x0000 || val == 0xFFFF)
+                                continue;
+                            cons++;
+
+                            var abs = (uint)val;
+                            var rel = origin + abs;
+                            if (stringsByAddr.ContainsKey(abs))
+                            {
+                                absK++;
+                                absMin = Math.Min(absMin, abs);
+                                absMax = Math.Max(absMax, abs);
+                            }
+                            if (stringsByAddr.ContainsKey(rel))
+                            {
+                                relK++;
+                                relMin = Math.Min(relMin, rel);
+                                relMax = Math.Max(relMax, rel);
+                            }
+                        }
+
+                        if (cons < 6)
+                            return false;
+
+                        var bestK = Math.Max(absK, relK);
+                        if (bestK < 3)
+                            return false;
+                        if (bestK < (int)Math.Ceiling(cons * 0.45))
+                            return false;
+
+                        outRel = relK > absK;
+                        var span = outRel ? (relMax - relMin) : (absMax - absMin);
+                        // Tables usually target a relatively tight string blob. Random code-word collisions
+                        // tend to scatter across the binary.
+                        if (span > 0x2000)
+                            return false;
+
+                        // Extend word-by-word with a small miss budget.
+                        var len = 0;
+                        var hits = 0;
+                        var missStreak = 0;
+                        var cons2 = 0;
+                        while (startPos + len + 2 <= code.Length && len < 128)
+                        {
+                            var lo = code[startPos + len];
+                            var hi = code[startPos + len + 1];
+                            var val = (ushort)(lo | (hi << 8));
+                            if (val == 0x0000 || val == 0xFFFF)
+                            {
+                                len += 2;
+                                continue;
+                            }
+
+                            cons2++;
+                            var abs = (uint)val;
+                            var tgt = outRel ? (origin + abs) : abs;
+                            if (stringsByAddr.ContainsKey(tgt))
+                            {
+                                hits++;
+                                missStreak = 0;
+                                len += 2;
+                                continue;
+                            }
+
+                            // Also accept a pointer to an empty-string sentinel (0x00 at target).
+                            if (tgt >= origin && tgt < origin + (uint)code.Length)
+                            {
+                                var tpos = (int)(tgt - origin);
+                                if (tpos >= 0 && tpos < code.Length && code[tpos] == 0x00)
+                                {
+                                    missStreak = 0;
+                                    len += 2;
+                                    continue;
+                                }
+                            }
+
+                            missStreak++;
+                            if (missStreak >= 4)
+                                break;
+                            len += 2;
+                        }
+
+                        if (len < 16)
+                            return false;
+                        if (hits < 3)
+                            return false;
+                        return true;
+                    }
+
+                    if (TryDetectMiniKnownStringPtrTable(out var miniLen, out var miniRel))
+                    {
+                        byteLen = miniLen;
+                        relative = miniRel;
+                        return true;
+                    }
 
                     // If this region actually looks like a strided record table (e.g. [tag][ptr][meta]), prefer that.
                     // This prevents the contiguous detector from succeeding but then truncating early due to meta words.
@@ -1681,6 +1840,7 @@ namespace DOSRE.Dasm
             var callXrefs = new Dictionary<uint, List<uint>>();
             var jumpXrefs = new Dictionary<uint, List<uint>>();
             var labelByAddr = new Dictionary<uint, string>();
+            var functionBehaviorByStart = new Dictionary<uint, string>();
             var referencedStringAddrs = new HashSet<uint>();
             var reachableInsAddrs = new HashSet<uint>();
 
@@ -1907,8 +2067,14 @@ namespace DOSRE.Dasm
                 }
 
                 // Heuristic: common function prologue in 16-bit code
-                if (binInsights)
+                // Run this both for insights and for BINMAP/CODE MAP mode so we can tag/label common patterns.
+                if (binInsights || masmCompatEmitCodeMap)
                 {
+                    // Precompute index lookup for sequential scans.
+                    var insIndexByAddr = new Dictionary<uint, int>();
+                    for (var idx = 0; idx < instructions.Count; idx++)
+                        insIndexByAddr[(uint)instructions[idx].Offset] = idx;
+
                     for (var i = 0; i + 1 < instructions.Count; i++)
                     {
                         var b0 = instructions[i].Bytes;
@@ -1917,11 +2083,189 @@ namespace DOSRE.Dasm
                             functionStarts.Add((uint)instructions[i].Offset);
                     }
 
+                    static bool BytesEq(byte[] a, params byte[] b)
+                    {
+                        if (a == null || a.Length != b.Length)
+                            return false;
+                        for (var i = 0; i < b.Length; i++)
+                        {
+                            if (a[i] != b[i])
+                                return false;
+                        }
+                        return true;
+                    }
+
+                    static bool IsRet(byte[] b) => b != null && b.Length >= 1 && (b[0] == 0xC3 || b[0] == 0xC2 || b[0] == 0xCB || b[0] == 0xCA || b[0] == 0xCF);
+
+                    bool TryTagTextModeMemcpyMemsetFunction(uint start, out string tag, out string labelOverride)
+                    {
+                        tag = null;
+                        labelOverride = null;
+
+                        if (!insIndexByAddr.TryGetValue(start, out var startIdx))
+                            return false;
+
+                        var setsEsB800 = false;
+                        var setsEs0400 = false;
+                        var sawRepMovsw = false;
+                        var sawRepStosw = false;
+                        var dsSwitchTo0400ForMovsw = false;
+                        var usesStride50 = false;
+                        var usesPageWrap2000 = false;
+
+                        // Scan a straight-line window; this is for pattern detection only.
+                        // The signatures we care about are stable and show up even with loops.
+                        var maxScanIns = 220;
+                        var endIdx = Math.Min(instructions.Count, startIdx + maxScanIns);
+
+                        for (var i = startIdx; i < endIdx; i++)
+                        {
+                            var ins = instructions[i];
+                            var b = ins.Bytes;
+                            if (b == null || b.Length == 0)
+                                break;
+
+                            // Stop at a likely terminator.
+                            if (i > startIdx && IsRet(b))
+                                break;
+
+                            // Detect mov ax, imm16; mov es, ax (B8 xx xx / 8E C0)
+                            if (i + 1 < endIdx)
+                            {
+                                var b0 = instructions[i].Bytes;
+                                var b1 = instructions[i + 1].Bytes;
+                                if (b0 != null && b1 != null && b0.Length == 3 && b1.Length == 2 && b0[0] == 0xB8 && BytesEq(b1, 0x8E, 0xC0))
+                                {
+                                    var imm = (ushort)(b0[1] | (b0[2] << 8));
+                                    if (imm == 0xB800)
+                                        setsEsB800 = true;
+                                    else if (imm == 0x0400)
+                                        setsEs0400 = true;
+                                }
+                            }
+
+                            // rep movsw / rep stosw
+                            if (BytesEq(b, 0xF3, 0xA5))
+                            {
+                                sawRepMovsw = true;
+
+                                // Detect the classic DS switch sandwich around the REP MOVSW:
+                                // push ds; mov ax,0400h; mov ds,ax; rep movsw; pop ds
+                                // We search nearby rather than requiring strict adjacency.
+                                var foundPush = false;
+                                var foundMovAx0400 = false;
+                                var foundMovDsAx = false;
+                                for (var j = Math.Max(startIdx, i - 6); j < i; j++)
+                                {
+                                    var bj = instructions[j].Bytes;
+                                    if (bj == null || bj.Length == 0)
+                                        continue;
+                                    if (!foundPush && BytesEq(bj, 0x1E))
+                                        foundPush = true;
+                                    else if (foundPush && !foundMovAx0400 && bj.Length == 3 && bj[0] == 0xB8 && bj[1] == 0x00 && bj[2] == 0x04)
+                                        foundMovAx0400 = true;
+                                    else if (foundPush && foundMovAx0400 && !foundMovDsAx && BytesEq(bj, 0x8E, 0xD8))
+                                        foundMovDsAx = true;
+                                }
+
+                                var foundPop = false;
+                                for (var j = i + 1; j < Math.Min(endIdx, i + 6); j++)
+                                {
+                                    var bj = instructions[j].Bytes;
+                                    if (bj == null || bj.Length == 0)
+                                        continue;
+                                    if (BytesEq(bj, 0x1F))
+                                    {
+                                        foundPop = true;
+                                        break;
+                                    }
+                                }
+
+                                if (foundPush && foundMovAx0400 && foundMovDsAx && foundPop)
+                                    dsSwitchTo0400ForMovsw = true;
+                            }
+                            else if (BytesEq(b, 0xF3, 0xAB))
+                            {
+                                sawRepStosw = true;
+                            }
+
+                            // Stride hint: mov dx, 50h  (BA 50 00)
+                            if (BytesEq(b, 0xBA, 0x50, 0x00))
+                                usesStride50 = true;
+
+                            // Page-wrap hint: compare/add/sub with 2000h.
+                            // We keep this loose: any instruction bytes containing 00 20 with an 0x81 opcode is a strong signal.
+                            if (b.Length >= 4 && b[0] == 0x81)
+                            {
+                                for (var k = 0; k + 1 < b.Length; k++)
+                                {
+                                    if (b[k] == 0x00 && b[k + 1] == 0x20)
+                                    {
+                                        usesPageWrap2000 = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Classify.
+                        if (setsEsB800 && sawRepMovsw && dsSwitchTo0400ForMovsw)
+                        {
+                            var hints = new List<string> { "txtblit", "src=0400h", "dst=B800h", "rep movsw" };
+                            if (usesStride50)
+                                hints.Add("stride=50h");
+                            if (usesPageWrap2000)
+                                hints.Add("pagewrap=2000h");
+                            tag = string.Join(" ", hints);
+                            labelOverride = $"func_{start:X5}_txtblit";
+                            return true;
+                        }
+
+                        if (setsEs0400 && sawRepStosw)
+                        {
+                            var hints = new List<string> { "txtfill", "dst=0400h", "rep stosw" };
+                            if (usesStride50)
+                                hints.Add("stride=50h");
+                            if (usesPageWrap2000)
+                                hints.Add("pagewrap=2000h");
+                            tag = string.Join(" ", hints);
+                            labelOverride = $"func_{start:X5}_txtfill";
+                            return true;
+                        }
+
+                        // Direct VRAM fill (less specific but useful).
+                        if (setsEsB800 && sawRepStosw)
+                        {
+                            var hints = new List<string> { "vramfill", "dst=B800h", "rep stosw" };
+                            if (usesStride50)
+                                hints.Add("stride=50h");
+                            if (usesPageWrap2000)
+                                hints.Add("pagewrap=2000h");
+                            tag = string.Join(" ", hints);
+                            labelOverride = $"func_{start:X5}_vramfill";
+                            return true;
+                        }
+
+                        return false;
+                    }
+
+                    var funcLabelOverrides = new Dictionary<uint, string>();
+                    foreach (var f in functionStarts)
+                    {
+                        if (TryTagTextModeMemcpyMemsetFunction(f, out var ftag, out var lname))
+                        {
+                            if (!string.IsNullOrWhiteSpace(ftag))
+                                functionBehaviorByStart[f] = ftag;
+                            if (!string.IsNullOrWhiteSpace(lname))
+                                funcLabelOverrides[f] = lname;
+                        }
+                    }
+
                     // Build a stable label map (prefer function labels over loc labels).
                     foreach (var t in labelTargets)
                         labelByAddr[t] = $"loc_{t:X5}";
                     foreach (var f in functionStarts)
-                        labelByAddr[f] = $"func_{f:X5}";
+                        labelByAddr[f] = funcLabelOverrides.TryGetValue(f, out var name) ? name : $"func_{f:X5}";
                 }
                 else
                 {
@@ -2331,38 +2675,6 @@ namespace DOSRE.Dasm
                     foreach (var s in seeds)
                         pending.Push(s);
 
-                    static bool IsVeryLikelyDecodedData(string asmIns)
-                    {
-                        if (string.IsNullOrWhiteSpace(asmIns))
-                            return true;
-
-                        var s = asmIns.Trim().ToLowerInvariant();
-                        if (s.StartsWith("invalid", StringComparison.Ordinal))
-                            return true;
-
-                        // Segment prefixes that don't exist in 8086-era code are a strong signal of misdecode.
-                        if (s.Contains("fs:", StringComparison.Ordinal) || s.Contains("gs:", StringComparison.Ordinal))
-                            return true;
-
-                        // 32-bit reg tokens don't belong in BIN16 and are overwhelmingly decoded data.
-                        if (Regex.IsMatch(s, @"\b(eax|ebx|ecx|edx|esi|edi|esp|ebp)\b", RegexOptions.CultureInvariant))
-                            return true;
-
-                        // MMX/SSE register tokens are also a strong signal of decoded data.
-                        if (Regex.IsMatch(s, @"\b(mm\d|xmm\d)\b", RegexOptions.CultureInvariant))
-                            return true;
-
-                        // System-call mnemonics are not expected in 16-bit DOS blobs.
-                        if (s.StartsWith("sysret", StringComparison.Ordinal) || s.StartsWith("syscall", StringComparison.Ordinal) || s.StartsWith("sysexit", StringComparison.Ordinal))
-                            return true;
-
-                        // Far memory forms can be a formatter artifact from a wrong decode.
-                        if (s.Contains(" far word ", StringComparison.Ordinal))
-                            return true;
-
-                        return false;
-                    }
-
                     while (pending.Count > 0)
                     {
                         var a = pending.Pop();
@@ -2415,6 +2727,38 @@ namespace DOSRE.Dasm
                         if (next >= origin && next < origin + (uint)code.Length && !IsStrongDataAddr(next))
                             pending.Push(next);
                     }
+                }
+
+                static bool IsVeryLikelyDecodedData(string asmIns)
+                {
+                    if (string.IsNullOrWhiteSpace(asmIns))
+                        return true;
+
+                    var s = asmIns.Trim().ToLowerInvariant();
+                    if (s.StartsWith("invalid", StringComparison.Ordinal))
+                        return true;
+
+                    // Segment prefixes that don't exist in 8086-era code are a strong signal of misdecode.
+                    if (s.Contains("fs:", StringComparison.Ordinal) || s.Contains("gs:", StringComparison.Ordinal))
+                        return true;
+
+                    // 32-bit reg tokens don't belong in BIN16 and are overwhelmingly decoded data.
+                    if (Regex.IsMatch(s, @"\b(eax|ebx|ecx|edx|esi|edi|esp|ebp)\b", RegexOptions.CultureInvariant))
+                        return true;
+
+                    // MMX/SSE register tokens are also a strong signal of decoded data.
+                    if (Regex.IsMatch(s, @"\b(mm\d|xmm\d)\b", RegexOptions.CultureInvariant))
+                        return true;
+
+                    // System-call mnemonics are not expected in 16-bit DOS blobs.
+                    if (s.StartsWith("sysret", StringComparison.Ordinal) || s.StartsWith("syscall", StringComparison.Ordinal) || s.StartsWith("sysexit", StringComparison.Ordinal))
+                        return true;
+
+                    // Far memory forms can be a formatter artifact from a wrong decode.
+                    if (s.Contains(" far word ", StringComparison.Ordinal))
+                        return true;
+
+                    return false;
                 }
 
                 // Pass 1: find the obvious straight-line code.
@@ -2581,6 +2925,102 @@ namespace DOSRE.Dasm
                 // Pass 2: incorporate code discovered via jump/dispatch tables.
                 if (masmCompatEmitCodeMap && extraEntryPoints.Count > 0)
                     WalkReachability(extraEntryPoints.OrderBy(x => x));
+
+                // Pass 3 (conservative): seed a few large unreached "code-looking" islands.
+                // Some binaries contain routines that are never reached from the default entrypoint
+                // (feature flags, alternative modes, leftover code, etc). These often show up as UNKNOWN.
+                // We keep this extremely conservative to avoid turning data into code.
+                if (masmCompatEmitCodeMap)
+                {
+                    bool IsLikelyUnreachedCodeIsland(uint addr)
+                    {
+                        if (addr < origin || addr >= origin + (uint)code.Length)
+                            return false;
+                        if (reachableInsAddrs.Contains(addr))
+                            return false;
+                        if (IsStrongDataAddr(addr))
+                            return false;
+                        if (IsReachableByteAddr(addr))
+                            return false;
+                        if (!insByAddr.TryGetValue(addr, out var i0))
+                            return false;
+
+                        // Validate by walking a short straight-line decode.
+                        // If this is really data, SharpDisasm will usually produce "invalid", weird segment
+                        // prefixes, or 32-bit reg tokens fairly quickly.
+                        var cur = addr;
+                        var decoded = 0;
+                        var sawTerminal = false;
+
+                        while (decoded < 64)
+                        {
+                            if (cur < origin || cur >= origin + (uint)code.Length)
+                                return false;
+                            if (IsStrongDataAddr(cur))
+                                return false;
+
+                            if (!insByAddr.TryGetValue(cur, out var ins))
+                                return false;
+
+                            var s = ins.ToString();
+                            if (IsVeryLikelyDecodedData(s))
+                                return false;
+
+                            var b = ins.Bytes ?? Array.Empty<byte>();
+                            if (b.Length == 0)
+                                return false;
+
+                            decoded++;
+
+                            var op0 = b[0];
+                            if (IsReturnOpcode(op0))
+                            {
+                                sawTerminal = true;
+                                break;
+                            }
+
+                            if (TryGetRelBranchInfo16(ins, out _, out _, out var isUncondJmp) && isUncondJmp)
+                            {
+                                // Treat an unconditional jump as a reasonable block terminator.
+                                sawTerminal = true;
+                                break;
+                            }
+
+                            cur += (uint)b.Length;
+                        }
+
+                        if (!sawTerminal)
+                            return false;
+
+                        // Require some minimum body length.
+                        return decoded >= 12;
+                    }
+
+                    // Seed only addresses that look like explicit branch/call targets somewhere in the binary.
+                    // This avoids picking random mid-stream offsets that just happen to decode.
+                    var candidateTargets = new HashSet<uint>();
+                    foreach (var ins in instructions)
+                    {
+                        if (TryGetRelBranchInfo16(ins, out var target, out _, out _))
+                        {
+                            if (target >= origin && target < origin + (uint)code.Length)
+                                candidateTargets.Add(target);
+                        }
+                    }
+
+                    var islandSeeds = new List<uint>();
+                    foreach (var a in candidateTargets.OrderBy(x => x))
+                    {
+                        if (islandSeeds.Count >= 32)
+                            break;
+                        if (!IsLikelyUnreachedCodeIsland(a))
+                            continue;
+                        islandSeeds.Add(a);
+                    }
+
+                    if (islandSeeds.Count > 0)
+                        WalkReachability(islandSeeds);
+                }
             }
 
             var hexRe = binInsights && stringsByAddr != null && stringsByAddr.Count > 0
@@ -3376,7 +3816,8 @@ namespace DOSRE.Dasm
                     if (functionStarts.Contains(addr))
                     {
                         sb.AppendLine();
-                        sb.Append($"func_{addr:X5}:");
+                        var fn = labelByAddr.TryGetValue(addr, out var lbl) ? lbl : $"func_{addr:X5}";
+                        sb.Append($"{fn}:");
                         if (callXrefs.TryGetValue(addr, out var callers) && callers.Count > 0)
                         {
                             var xs = string.Join(", ", callers.Distinct().OrderBy(x => x).Take(8)
@@ -3390,7 +3831,8 @@ namespace DOSRE.Dasm
                     }
                     else if (labelTargets.Contains(addr))
                     {
-                        sb.Append($"loc_{addr:X5}:");
+                        var ln = labelByAddr.TryGetValue(addr, out var lbl) ? lbl : $"loc_{addr:X5}";
+                        sb.Append($"{ln}:");
                         if (jumpXrefs.TryGetValue(addr, out var sources) && sources.Count > 0)
                         {
                             var xs = string.Join(", ", sources.Distinct().OrderBy(x => x).Take(8)
@@ -3403,10 +3845,13 @@ namespace DOSRE.Dasm
                         }
                     }
                 }
-                else if (emitAsmLabels && labelTargets.Contains(addr))
+                else if (emitAsmLabels && (labelTargets.Contains(addr) || functionStarts.Contains(addr)))
                 {
                     sb.AppendLine();
-                    sb.AppendLine($"loc_{addr:X5}:");
+                    var ln = labelByAddr.TryGetValue(addr, out var lbl)
+                        ? lbl
+                        : (functionStarts.Contains(addr) ? $"func_{addr:X5}" : $"loc_{addr:X5}");
+                    sb.AppendLine($"{ln}:");
                 }
 
                 // Data heuristics (only when insights enabled, and only if this address isn't a known control-flow target).
@@ -3926,7 +4371,8 @@ namespace DOSRE.Dasm
                         if (!TryComputeFunctionExtent(f, out var fmin, out var fmaxExcl, out var ic, out var rc))
                             continue;
                         var callers = callXrefs.TryGetValue(f, out var srcs) ? srcs.Distinct().Count() : 0;
-                        funcLines.Add($"; func: {f:X5}h..{(fmaxExcl - 1):X5}h (ins={ic} rets={rc} callers={callers})");
+                        var beh = functionBehaviorByStart.TryGetValue(f, out var t) ? $" tag={t}" : string.Empty;
+                        funcLines.Add($"; func: {f:X5}h..{(fmaxExcl - 1):X5}h (ins={ic} rets={rc} callers={callers}){beh}");
                     }
 
                     if (funcLines.Count > 0)
