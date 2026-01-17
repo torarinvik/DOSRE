@@ -96,7 +96,9 @@ namespace DOSRE.Dasm
 
             if (!string.IsNullOrWhiteSpace(outReasmAsm))
             {
-                File.WriteAllText(outReasmAsm, RenderDbAsm(mc0));
+                // For assembly/linking, preserve the original promoted listing structure (segments/org/end/etc)
+                // and replace each byte-authoritative line with an unambiguous db list.
+                File.WriteAllText(outReasmAsm, RenderDbAsmFromPromotedTemplate(inPromotedAsm, mc0));
             }
         }
 
@@ -332,6 +334,106 @@ namespace DOSRE.Dasm
             }
 
             return sb.ToString();
+        }
+
+        // Matches the byte-authoritative comment appended by DOSRE/BIN16 tooling:
+        // "; 000001A4h B8003D  mov ax, 0x3D00"
+        private static readonly Regex AddrBytesAsmComment = new Regex(
+            @";\s*(?<addr>[0-9A-Fa-f]{1,8})h\s+(?<hex>[0-9A-Fa-f]{2,})\s+(?<asm>.+?)\s*$",
+            RegexOptions.Compiled);
+
+        public static string RenderDbAsmFromPromotedTemplate(string inPromotedAsm, Mc0File file)
+        {
+            if (string.IsNullOrWhiteSpace(inPromotedAsm)) throw new ArgumentException("Missing input asm", nameof(inPromotedAsm));
+            if (!File.Exists(inPromotedAsm)) throw new FileNotFoundException("Input asm not found", inPromotedAsm);
+            if (file == null) throw new ArgumentNullException(nameof(file));
+
+            var bytesByAddr = file.Statements.ToDictionary(s => s.Addr, s => NormalizeHex(s.BytesHex));
+
+            var lines = File.ReadAllLines(inPromotedAsm);
+            var sb = new StringBuilder();
+
+            sb.AppendLine("; Re-emitted from MC0 by DOSRE (byte-faithful, template-preserving)");
+            sb.AppendLine($"; source: {inPromotedAsm}");
+            sb.AppendLine($"; stream_sha256: {file.StreamSha256}");
+            sb.AppendLine();
+
+            for (var i = 0; i < lines.Length; i++)
+            {
+                var line = lines[i] ?? string.Empty;
+                var semi = line.IndexOf(';');
+                if (semi >= 0)
+                {
+                    var comment = line.Substring(semi);
+                    var m = AddrBytesAsmComment.Match(comment);
+                    if (m.Success)
+                    {
+                        var addrHex = m.Groups["addr"].Value;
+                        var bytesHex = NormalizeHex(m.Groups["hex"].Value);
+
+                        if (!uint.TryParse(addrHex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var addr))
+                            throw new InvalidDataException($"Bad address token '{addrHex}' in template on line {i + 1}");
+
+                        if (!bytesByAddr.TryGetValue(addr, out var fromMc0))
+                            throw new InvalidDataException($"Template references addr 0x{addr:X8} not present in MC0 statements (line {i + 1})");
+
+                        if (!string.Equals(fromMc0, bytesHex, StringComparison.OrdinalIgnoreCase))
+                            throw new InvalidDataException($"Template bytes mismatch at 0x{addr:X8}: template={bytesHex} mc0={fromMc0}");
+
+                        var code = line.Substring(0, semi);
+                        var leading = new string(code.TakeWhile(char.IsWhiteSpace).ToArray());
+                        var rest = code.TrimStart();
+
+                        // Preserve an inline label prefix if present (e.g., "loc_1234:").
+                        string labelPrefix = null;
+                        var colonIdx = rest.IndexOf(':');
+                        if (colonIdx >= 0)
+                        {
+                            // Only treat it as a label if it matches identifier syntax.
+                            var candidate = rest.Substring(0, colonIdx).Trim();
+                            if (LabelOnly.IsMatch(candidate + ":"))
+                                labelPrefix = candidate + ":";
+                        }
+
+                        var bytes = ParseHex(fromMc0);
+
+                        sb.Append(leading);
+                        if (!string.IsNullOrWhiteSpace(labelPrefix))
+                        {
+                            sb.Append(labelPrefix);
+                            sb.Append(' ');
+                        }
+                        sb.Append("db ");
+                        for (var bi = 0; bi < bytes.Length; bi++)
+                        {
+                            if (bi > 0) sb.Append(',');
+                            sb.Append(FormatByteWasm(bytes[bi]));
+                        }
+
+                        // Keep the original byte-authoritative comment for audit/debug.
+                        sb.Append(' ');
+                        sb.AppendLine(comment);
+                        continue;
+                    }
+                }
+
+                sb.AppendLine(line);
+            }
+
+            return sb.ToString();
+        }
+
+        private static string FormatByteWasm(byte b)
+        {
+            // MASM/WASM-style hex byte literal. Many assemblers require a leading 0 if it starts with A-F.
+            var hex = b.ToString("X2", CultureInfo.InvariantCulture);
+            if (hex.Length > 0)
+            {
+                var c = hex[0];
+                if (c >= 'A' && c <= 'F')
+                    return "0" + hex + "h";
+            }
+            return hex + "h";
         }
 
         private static string TranslateAsmToMc0(string asm, string bytesHex)
