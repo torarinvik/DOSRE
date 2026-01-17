@@ -27,6 +27,12 @@ namespace DOSRE.Dasm
             public bool LiftDsAbsoluteGlobals { get; set; } = true;
 
             /// <summary>
+            /// Lift simple absolute ES memory loads/stores into views.
+            /// Defaults to a small low-memory window (0x0000..0x00FF).
+            /// </summary>
+            public bool LiftEsAbsoluteGlobals { get; set; } = true;
+
+            /// <summary>
             /// Max size of a generated DS "globals" view window, in bytes.
             /// This is a heuristic to avoid emitting enormous structs.
             /// </summary>
@@ -38,6 +44,17 @@ namespace DOSRE.Dasm
             /// </summary>
             public ushort DsAbsMin { get; set; } = 0x0400;
             public ushort DsAbsMax { get; set; } = 0x04FF;
+
+            /// <summary>
+            /// Max size of a generated ES view window, in bytes.
+            /// </summary>
+            public ushort EsViewMaxSpan { get; set; } = 0x0040;
+
+            /// <summary>
+            /// Only lift absolute ES addresses in this inclusive range.
+            /// </summary>
+            public ushort EsAbsMin { get; set; } = 0x0000;
+            public ushort EsAbsMax { get; set; } = 0x00FF;
         }
 
         private static readonly Dictionary<ushort, (string name, ushort value)> KnownIntConsts = new()
@@ -57,12 +74,17 @@ namespace DOSRE.Dasm
             @"\[(?:ds:)?0x(?<addr>[0-9A-Fa-f]{4})\]",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+        // Matches: mov ax, [ds:0x04E4]
+        //          mov ax, [es:0070h]
+        //          mov al, [0AF0Ah]
         private static readonly Regex MovLoadRx = new Regex(
-            @"^\s*mov\s+(?<dst>[a-z]{2})\s*,\s*\[(?:ds:)?0x(?<addr>[0-9A-Fa-f]{4})\]\s*$",
+            @"^\s*mov\s+(?<dst>[a-z]{2})\s*,\s*\[(?:(?<seg>cs|ds|es|ss)\s*:\s*)?(?<addr>(?:0x)?[0-9A-Fa-f]{1,5})h?\]\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+        // Matches: mov [ds:0x04EC], ax
+        //          mov [es:72h], ds
         private static readonly Regex MovStoreRx = new Regex(
-            @"^\s*mov\s+\[(?:ds:)?0x(?<addr>[0-9A-Fa-f]{4})\]\s*,\s*(?<src>[a-z]{2})\s*$",
+            @"^\s*mov\s+\[(?:(?<seg>cs|ds|es|ss)\s*:\s*)?(?<addr>(?:0x)?[0-9A-Fa-f]{1,5})h?\]\s*,\s*(?<src>[a-z]{2})\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private static readonly Regex Mc0LineRx = new Regex(
@@ -79,18 +101,21 @@ namespace DOSRE.Dasm
             { "si", "SI" }, { "di", "DI" }, { "bp", "BP" }, { "sp", "SP" },
             { "al", "AL" }, { "ah", "AH" }, { "bl", "BL" }, { "bh", "BH" },
             { "cl", "CL" }, { "ch", "CH" }, { "dl", "DL" }, { "dh", "DH" },
+            { "cs", "CS" }, { "ds", "DS" }, { "es", "ES" }, { "ss", "SS" },
         };
 
-        private sealed class DsAccess
+        private sealed class SegAbsAccess
         {
+            public string Seg;
             public ushort Addr;
             public int Size;
             public string Reg;
             public bool IsStore;
         }
 
-        private sealed class DsView
+        private sealed class SegView
         {
+            public string Seg;
             public ushort Base;
             public ushort End;
             public string ViewName;
@@ -113,7 +138,7 @@ namespace DOSRE.Dasm
                 return sb.ToString();
             }
 
-            public string RenderViewDecl() => $"view {ViewName} at (DS, 0x{Base:X4}) : {TypeName};";
+            public string RenderViewDecl() => $"view {ViewName} at ({Seg}, 0x{Base:X4}) : {TypeName};";
         }
 
         public static void LiftPromotedAsmToFile(string inPromotedAsm, string outMc1, LiftOptions opts = null)
@@ -136,7 +161,7 @@ namespace DOSRE.Dasm
 
             // Phase 1: collect potential rewrites (interrupt consts, DS absolute globals).
             var neededIntConsts = new SortedDictionary<string, ushort>(StringComparer.Ordinal);
-            var dsAccesses = new List<DsAccess>();
+            var segAccesses = new List<SegAbsAccess>();
 
             foreach (var st in mc0.Statements)
             {
@@ -156,7 +181,7 @@ namespace DOSRE.Dasm
                     }
                 }
 
-                if (opts.LiftDsAbsoluteGlobals)
+                if (opts.LiftDsAbsoluteGlobals || opts.LiftEsAbsoluteGlobals)
                 {
                     var asm = (st.Asm ?? string.Empty).Trim();
                     if (string.IsNullOrWhiteSpace(asm)) continue;
@@ -166,12 +191,13 @@ namespace DOSRE.Dasm
                     if (mLoad.Success)
                     {
                         var dst = mLoad.Groups["dst"].Value;
-                        var addrHex = mLoad.Groups["addr"].Value;
-                        if (!TryParseU16(addrHex, out var addr)) continue;
-                        if (addr < opts.DsAbsMin || addr > opts.DsAbsMax) continue;
+                        var segTok = (mLoad.Groups["seg"].Success ? mLoad.Groups["seg"].Value : "ds").Trim();
+                        var addrTok = mLoad.Groups["addr"].Value;
+                        if (!TryParseU16Flexible(addrTok, out var addr)) continue;
+                        if (!ShouldLiftAbsSeg(segTok, addr, opts)) continue;
                         if (!RegMap.TryGetValue(dst, out var reg)) continue;
                         var size = IsWordReg(dst) ? 2 : 1;
-                        dsAccesses.Add(new DsAccess { Addr = addr, Size = size, Reg = reg, IsStore = false });
+                        segAccesses.Add(new SegAbsAccess { Seg = segTok.ToUpperInvariant(), Addr = addr, Size = size, Reg = reg, IsStore = false });
                         continue;
                     }
 
@@ -179,28 +205,29 @@ namespace DOSRE.Dasm
                     if (mStore.Success)
                     {
                         var src = mStore.Groups["src"].Value;
-                        var addrHex = mStore.Groups["addr"].Value;
-                        if (!TryParseU16(addrHex, out var addr)) continue;
-                        if (addr < opts.DsAbsMin || addr > opts.DsAbsMax) continue;
+                        var segTok = (mStore.Groups["seg"].Success ? mStore.Groups["seg"].Value : "ds").Trim();
+                        var addrTok = mStore.Groups["addr"].Value;
+                        if (!TryParseU16Flexible(addrTok, out var addr)) continue;
+                        if (!ShouldLiftAbsSeg(segTok, addr, opts)) continue;
                         if (!RegMap.TryGetValue(src, out var reg)) continue;
                         var size = IsWordReg(src) ? 2 : 1;
-                        dsAccesses.Add(new DsAccess { Addr = addr, Size = size, Reg = reg, IsStore = true });
+                        segAccesses.Add(new SegAbsAccess { Seg = segTok.ToUpperInvariant(), Addr = addr, Size = size, Reg = reg, IsStore = true });
                         continue;
                     }
                 }
             }
 
-            // Phase 2: build DS view(s) for collected absolute addresses.
-            var dsViews = BuildDsViews(dsAccesses, opts);
-            var viewByAddr = new Dictionary<ushort, (string view, string field)>(dsAccesses.Count);
+            // Phase 2: build view(s) for collected absolute addresses.
+            var segViews = BuildSegViews(segAccesses, opts);
+            var viewBySegAddr = new Dictionary<(string seg, ushort addr), (string view, string field)>(segAccesses.Count);
 
-            foreach (var v in dsViews)
+            foreach (var v in segViews)
             {
                 foreach (var f in v.Fields)
                 {
                     var off = f.Off;
                     var abs = (ushort)(v.Base + off);
-                    viewByAddr[abs] = (v.ViewName, f.Name);
+                    viewBySegAddr[(v.Seg, abs)] = (v.ViewName, f.Name);
                 }
             }
 
@@ -212,7 +239,7 @@ namespace DOSRE.Dasm
             sb.AppendLine("// format: <stmt>; // @AAAAAAAA HEXBYTES ; original asm");
             sb.AppendLine();
 
-            if (neededIntConsts.Count > 0 || dsViews.Count > 0)
+            if (neededIntConsts.Count > 0 || segViews.Count > 0)
             {
                 sb.AppendLine("// ---- MC1 declarations (auto) ----");
                 if (neededIntConsts.Count > 0)
@@ -223,10 +250,10 @@ namespace DOSRE.Dasm
                     sb.AppendLine();
                 }
 
-                if (dsViews.Count > 0)
+                if (segViews.Count > 0)
                 {
-                    sb.AppendLine("// DS absolute globals (auto-lifted views):");
-                    foreach (var v in dsViews)
+                    sb.AppendLine("// Absolute globals (auto-lifted views):");
+                    foreach (var v in segViews)
                     {
                         sb.AppendLine(v.RenderTypeDecl());
                         sb.AppendLine(v.RenderViewDecl());
@@ -280,7 +307,7 @@ namespace DOSRE.Dasm
                 }
 
                 // Rewrite DS simple movs into view.field when possible.
-                if (opts.LiftDsAbsoluteGlobals)
+                if (opts.LiftDsAbsoluteGlobals || opts.LiftEsAbsoluteGlobals)
                 {
                     var asm = (st.Asm ?? string.Empty).Trim();
 
@@ -288,8 +315,9 @@ namespace DOSRE.Dasm
                     if (mLoad.Success)
                     {
                         var dst = mLoad.Groups["dst"].Value;
-                        var addrHex = mLoad.Groups["addr"].Value;
-                        if (TryParseU16(addrHex, out var addr) && viewByAddr.TryGetValue(addr, out var vf) && RegMap.TryGetValue(dst, out var reg))
+                        var segTok = (mLoad.Groups["seg"].Success ? mLoad.Groups["seg"].Value : "ds").Trim().ToUpperInvariant();
+                        var addrTok = mLoad.Groups["addr"].Value;
+                        if (TryParseU16Flexible(addrTok, out var addr) && viewBySegAddr.TryGetValue((segTok, addr), out var vf) && RegMap.TryGetValue(dst, out var reg))
                         {
                             stmtText = $"{reg} = {vf.view}.{vf.field}";
                         }
@@ -300,8 +328,9 @@ namespace DOSRE.Dasm
                         if (mStore.Success)
                         {
                             var src = mStore.Groups["src"].Value;
-                            var addrHex = mStore.Groups["addr"].Value;
-                            if (TryParseU16(addrHex, out var addr) && viewByAddr.TryGetValue(addr, out var vf) && RegMap.TryGetValue(src, out var reg))
+                            var segTok = (mStore.Groups["seg"].Success ? mStore.Groups["seg"].Value : "ds").Trim().ToUpperInvariant();
+                            var addrTok = mStore.Groups["addr"].Value;
+                            if (TryParseU16Flexible(addrTok, out var addr) && viewBySegAddr.TryGetValue((segTok, addr), out var vf) && RegMap.TryGetValue(src, out var reg))
                             {
                                 stmtText = $"{vf.view}.{vf.field} = {reg}";
                             }
@@ -336,86 +365,137 @@ namespace DOSRE.Dasm
             return sb.ToString();
         }
 
-        private static List<DsView> BuildDsViews(List<DsAccess> accesses, LiftOptions opts)
+        private static List<SegView> BuildSegViews(List<SegAbsAccess> accesses, LiftOptions opts)
         {
-            if (accesses == null || accesses.Count == 0) return new List<DsView>();
+            if (accesses == null || accesses.Count == 0) return new List<SegView>();
 
-            // Deduplicate addresses and decide whether each address is word or byte.
-            var sizeByAddr = new Dictionary<ushort, int>();
-            foreach (var a in accesses)
+            var bySeg = accesses
+                .GroupBy(a => (a.Seg ?? string.Empty).Trim().ToUpperInvariant(), StringComparer.Ordinal)
+                .OrderBy(g => g.Key, StringComparer.Ordinal)
+                .ToList();
+
+            var allViews = new List<SegView>();
+            foreach (var segGroup in bySeg)
             {
-                if (!sizeByAddr.TryGetValue(a.Addr, out var sz) || a.Size > sz)
-                    sizeByAddr[a.Addr] = a.Size;
-            }
+                var seg = segGroup.Key;
+                var maxSpan = GetViewMaxSpan(seg, opts);
 
-            var addrs = sizeByAddr.Keys.OrderBy(x => x).ToList();
-            var views = new List<DsView>();
-
-            var i = 0;
-            while (i < addrs.Count)
-            {
-                var first = addrs[i];
-                var baseAddr = (ushort)(first & 0xFFF0);
-                var end = (ushort)(baseAddr + opts.DsViewMaxSpan - 1);
-
-                // Pull in all addresses within the window.
-                var chunk = new List<ushort>();
-                while (i < addrs.Count && addrs[i] <= end)
+                // Deduplicate addresses and decide whether each address is word or byte.
+                var sizeByAddr = new Dictionary<ushort, int>();
+                foreach (var a in segGroup)
                 {
-                    chunk.Add(addrs[i]);
-                    i++;
+                    if (!sizeByAddr.TryGetValue(a.Addr, out var sz) || a.Size > sz)
+                        sizeByAddr[a.Addr] = a.Size;
                 }
 
-                var v = new DsView
+                var addrs = sizeByAddr.Keys.OrderBy(x => x).ToList();
+                var i = 0;
+                while (i < addrs.Count)
                 {
-                    Base = baseAddr,
-                    End = end,
-                    ViewName = $"g{baseAddr:x4}",
-                    TypeName = $"ds_vars_{baseAddr:x4}",
-                };
+                    var first = addrs[i];
+                    var baseAddr = (ushort)(first & 0xFFF0);
+                    var end = (ushort)(baseAddr + maxSpan - 1);
 
-                // MC1 struct layout is positional, so we must emit padding bytes for gaps.
-                // Build a contiguous layout from offset 0..maxOffInclusive.
-                var maxAbs = chunk.Count == 0 ? baseAddr : chunk.Max();
-                var maxOff = (ushort)(maxAbs - baseAddr);
-                if (sizeByAddr.TryGetValue(maxAbs, out var maxSz) && maxSz == 2)
-                    maxOff = (ushort)(maxOff + 1);
-
-                ushort offCursor = 0;
-                while (offCursor <= maxOff)
-                {
-                    var abs = (ushort)(baseAddr + offCursor);
-                    var wantWord = sizeByAddr.TryGetValue(abs, out var sz) && sz == 2;
-
-                    if (wantWord && offCursor + 1 <= maxOff)
+                    // Pull in all addresses within the window.
+                    var chunk = new List<ushort>();
+                    while (i < addrs.Count && addrs[i] <= end)
                     {
-                        v.Fields.Add((offCursor, $"w{offCursor:X2}", "u16"));
-                        offCursor = (ushort)(offCursor + 2);
-                        continue;
+                        chunk.Add(addrs[i]);
+                        i++;
                     }
 
-                    v.Fields.Add((offCursor, $"b{offCursor:X2}", "u8"));
-                    offCursor = (ushort)(offCursor + 1);
-                }
+                    var (viewName, typeName) = MakeNames(seg, baseAddr);
+                    var v = new SegView
+                    {
+                        Seg = seg,
+                        Base = baseAddr,
+                        End = end,
+                        ViewName = viewName,
+                        TypeName = typeName,
+                    };
 
-                views.Add(v);
+                    // MC1 struct layout is positional, so we must emit padding bytes for gaps.
+                    // Build a contiguous layout from offset 0..maxOffInclusive.
+                    var maxAbs = chunk.Count == 0 ? baseAddr : chunk.Max();
+                    var maxOff = (ushort)(maxAbs - baseAddr);
+                    if (sizeByAddr.TryGetValue(maxAbs, out var maxSz) && maxSz == 2)
+                        maxOff = (ushort)(maxOff + 1);
+
+                    ushort offCursor = 0;
+                    while (offCursor <= maxOff)
+                    {
+                        var abs = (ushort)(baseAddr + offCursor);
+                        var wantWord = sizeByAddr.TryGetValue(abs, out var sz) && sz == 2;
+
+                        if (wantWord && offCursor + 1 <= maxOff)
+                        {
+                            v.Fields.Add((offCursor, $"w{offCursor:X2}", "u16"));
+                            offCursor = (ushort)(offCursor + 2);
+                            continue;
+                        }
+
+                        v.Fields.Add((offCursor, $"b{offCursor:X2}", "u8"));
+                        offCursor = (ushort)(offCursor + 1);
+                    }
+
+                    allViews.Add(v);
+                }
             }
 
-            return views;
+            return allViews;
         }
 
-        private static bool TryParseU16(string hex4, out ushort value)
+        private static bool ShouldLiftAbsSeg(string segTok, ushort addr, LiftOptions opts)
+        {
+            var seg = (segTok ?? string.Empty).Trim().ToUpperInvariant();
+            return seg switch
+            {
+                "DS" => opts.LiftDsAbsoluteGlobals && addr >= opts.DsAbsMin && addr <= opts.DsAbsMax,
+                "ES" => opts.LiftEsAbsoluteGlobals && addr >= opts.EsAbsMin && addr <= opts.EsAbsMax,
+                _ => false,
+            };
+        }
+
+        private static ushort GetViewMaxSpan(string seg, LiftOptions opts)
+        {
+            return seg switch
+            {
+                "DS" => opts.DsViewMaxSpan,
+                "ES" => opts.EsViewMaxSpan,
+                _ => opts.DsViewMaxSpan,
+            };
+        }
+
+        private static (string viewName, string typeName) MakeNames(string seg, ushort baseAddr)
+        {
+            var s = (seg ?? string.Empty).Trim().ToUpperInvariant();
+            if (s == "DS")
+                return ($"g{baseAddr:x4}", $"ds_vars_{baseAddr:x4}");
+            return ($"{s.ToLowerInvariant()}_g{baseAddr:x4}", $"{s.ToLowerInvariant()}_vars_{baseAddr:x4}");
+        }
+
+        private static bool TryParseU16Flexible(string token, out ushort value)
         {
             value = 0;
-            var s = (hex4 ?? string.Empty).Trim();
-            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) s = s.Substring(2);
-            return ushort.TryParse(s, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out value);
+            var s = (token ?? string.Empty).Trim();
+            if (s.EndsWith("h", StringComparison.OrdinalIgnoreCase))
+                s = s.Substring(0, s.Length - 1);
+            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                s = s.Substring(2);
+            if (s.Length == 0 || s.Length > 5)
+                return false;
+            if (!uint.TryParse(s, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var tmp))
+                return false;
+            if (tmp > 0xFFFF)
+                return false;
+            value = (ushort)tmp;
+            return true;
         }
 
         private static bool IsWordReg(string reg)
         {
             var r = (reg ?? string.Empty).Trim().ToLowerInvariant();
-            return r is "ax" or "bx" or "cx" or "dx" or "si" or "di" or "bp" or "sp";
+            return r is "ax" or "bx" or "cx" or "dx" or "si" or "di" or "bp" or "sp" or "cs" or "ds" or "es" or "ss";
         }
     }
 }

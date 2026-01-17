@@ -89,5 +89,51 @@ namespace DOSRE.Tests
             Assert.Contains("LOAD16(DS, ADD16(0x04E0, 0x0004))", desugared);
             Assert.Contains("STORE16(DS, ADD16(0x04E0, 0x000C), AX)", desugared);
         }
+
+        [Fact]
+        public void LiftMc0ToMc1_Creates_Es_View_And_Rewrites_Simple_Mov_LoadStore()
+        {
+            var mc0 = new Bin16Mc0.Mc0File
+            {
+                Source = "in-memory",
+                StreamSha256 = "dummy",
+                Statements = new List<Bin16Mc0.Mc0Stmt>
+                {
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 0,
+                        Addr = 0x00002000,
+                        BytesHex = "26A17000",
+                        Asm = "mov ax, [es:0070h]",
+                        Mc0 = "EMITHEX(\"26a17000\")",
+                        Labels = new List<string>(),
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 1,
+                        Addr = 0x00002004,
+                        BytesHex = "268C1E7200",
+                        Asm = "mov [es:72h], ds",
+                        Mc0 = "EMITHEX(\"268c1e7200\")",
+                        Labels = new List<string>(),
+                    },
+                }
+            };
+
+            var mc1 = Bin16Mc1Lifter.LiftMc0ToMc1Text(mc0);
+
+            Assert.Contains("view es_g0070 at (ES, 0x0070)", mc1);
+            Assert.Contains("AX = es_g0070.w00;", mc1);
+            Assert.Contains("es_g0070.w02 = DS;", mc1);
+
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+
+            Assert.Contains("@00002000 26A17000", desugared);
+            Assert.Contains("@00002004 268C1E7200", desugared);
+
+            Assert.Contains("LOAD16(ES, ADD16(0x0070, 0x0000))", desugared);
+            Assert.Contains("STORE16(ES, ADD16(0x0070, 0x0002), DS)", desugared);
+        }
     }
 }
