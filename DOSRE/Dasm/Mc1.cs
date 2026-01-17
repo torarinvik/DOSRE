@@ -1,0 +1,323 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+
+namespace DOSRE.Dasm
+{
+    /// <summary>
+    /// MC1 (Machine-C Level 1) is a deterministic, declarative sugar layer over MC0.
+    ///
+    /// Important constraint for "byte-equal + verifiable" workflows:
+    /// - MC1 desugars to MC0 without introducing new origin-bearing statements.
+    /// - MC1 may introduce *declarations* (types/consts/views) and expression sugar that rewrites within
+    ///   existing origin statements.
+    ///
+    /// So MC1's meaning is defined purely as: Exec(MC1) == Exec(DesugarToMc0(MC1)).
+    /// </summary>
+    public static class Mc1
+    {
+        public sealed class Mc1File
+        {
+            [JsonPropertyName("source")]
+            public string Source { get; set; }
+
+            [JsonPropertyName("types")]
+            public Dictionary<string, StructType> Types { get; set; } = new(StringComparer.Ordinal);
+
+            [JsonPropertyName("consts")]
+            public Dictionary<string, ConstValue> Consts { get; set; } = new(StringComparer.Ordinal);
+
+            [JsonPropertyName("views")]
+            public Dictionary<string, ViewDecl> Views { get; set; } = new(StringComparer.Ordinal);
+
+            [JsonPropertyName("statements")]
+            public List<string> Statements { get; set; } = new();
+        }
+
+        public sealed class StructType
+        {
+            [JsonPropertyName("name")]
+            public string Name { get; set; }
+
+            [JsonPropertyName("fields")]
+            public List<Field> Fields { get; set; } = new();
+        }
+
+        public sealed class Field
+        {
+            [JsonPropertyName("name")]
+            public string Name { get; set; }
+
+            [JsonPropertyName("type")]
+            public string Type { get; set; }
+        }
+
+        public sealed class ConstValue
+        {
+            [JsonPropertyName("type")]
+            public string Type { get; set; }
+
+            [JsonPropertyName("value")]
+            public uint Value { get; set; }
+        }
+
+        public sealed class ViewDecl
+        {
+            [JsonPropertyName("name")]
+            public string Name { get; set; }
+
+            [JsonPropertyName("seg")]
+            public string SegExpr { get; set; }
+
+            [JsonPropertyName("off")]
+            public string OffExpr { get; set; }
+
+            [JsonPropertyName("type")]
+            public string Type { get; set; }
+        }
+
+        private static readonly Regex TypeDeclRx = new Regex(
+            @"^\s*type\s+(?<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*struct\s*\{\s*(?<body>.*)\s*\}\s*;\s*$",
+            RegexOptions.Compiled);
+
+        private static readonly Regex FieldRx = new Regex(
+            @"(?<name>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?<type>[A-Za-z_][A-Za-z0-9_]*)\s*;",
+            RegexOptions.Compiled);
+
+        private static readonly Regex ConstDeclRx = new Regex(
+            @"^\s*const\s+(?<name>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?<type>u8|u16|u32|bool)\s*=\s*(?<val>[^;]+)\s*;\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex ViewDeclRx = new Regex(
+            @"^\s*view\s+(?<name>[A-Za-z_][A-Za-z0-9_]*)\s+at\s*\(\s*(?<seg>[^,]+)\s*,\s*(?<off>[^\)]+)\s*\)\s*:\s*(?<type>[A-Za-z_][A-Za-z0-9_]*)\s*;\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex CommentLineRx = new Regex(@"^\s*//", RegexOptions.Compiled);
+
+        // view.field (simple token form; no parentheses support yet)
+        private static readonly Regex ViewFieldRx = new Regex(
+            @"\b(?<view>[A-Za-z_][A-Za-z0-9_]*)\.(?<field>[A-Za-z_][A-Za-z0-9_]*)\b",
+            RegexOptions.Compiled);
+
+        public static Mc1File Parse(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Missing path", nameof(path));
+            if (!File.Exists(path)) throw new FileNotFoundException("MC1 file not found", path);
+            return ParseLines(File.ReadAllLines(path), path);
+        }
+
+        public static Mc1File ParseLines(IReadOnlyList<string> lines, string sourceName = null)
+        {
+            if (lines == null) throw new ArgumentNullException(nameof(lines));
+
+            var file = new Mc1File { Source = sourceName ?? string.Empty };
+
+            // Built-in type farptr16
+            file.Types["farptr16"] = new StructType
+            {
+                Name = "farptr16",
+                Fields = new List<Field> { new Field { Name = "off", Type = "u16" }, new Field { Name = "seg", Type = "u16" } }
+            };
+
+            for (var i = 0; i < lines.Count; i++)
+            {
+                var line = lines[i] ?? string.Empty;
+                var trimmed = line.Trim();
+                if (string.IsNullOrWhiteSpace(trimmed)) continue;
+                if (CommentLineRx.IsMatch(trimmed)) continue;
+
+                var mType = TypeDeclRx.Match(line);
+                if (mType.Success)
+                {
+                    var name = mType.Groups["name"].Value;
+                    var body = mType.Groups["body"].Value;
+
+                    var st = new StructType { Name = name };
+                    foreach (Match fm in FieldRx.Matches(body))
+                    {
+                        st.Fields.Add(new Field { Name = fm.Groups["name"].Value, Type = fm.Groups["type"].Value });
+                    }
+
+                    if (st.Fields.Count == 0)
+                        throw new InvalidDataException($"Empty struct type '{name}' on line {i + 1}");
+
+                    file.Types[name] = st;
+                    continue;
+                }
+
+                var mConst = ConstDeclRx.Match(line);
+                if (mConst.Success)
+                {
+                    var name = mConst.Groups["name"].Value;
+                    var ty = mConst.Groups["type"].Value.ToLowerInvariant();
+                    var valTok = mConst.Groups["val"].Value.Trim();
+                    var v = ParseUInt(valTok);
+                    file.Consts[name] = new ConstValue { Type = ty, Value = v };
+                    continue;
+                }
+
+                var mView = ViewDeclRx.Match(line);
+                if (mView.Success)
+                {
+                    var name = mView.Groups["name"].Value;
+                    file.Views[name] = new ViewDecl
+                    {
+                        Name = name,
+                        SegExpr = mView.Groups["seg"].Value.Trim(),
+                        OffExpr = mView.Groups["off"].Value.Trim(),
+                        Type = mView.Groups["type"].Value.Trim(),
+                    };
+                    continue;
+                }
+
+                // Everything else is treated as an MC0 statement line (must keep origin tags if you want verification).
+                file.Statements.Add(line);
+            }
+
+            return file;
+        }
+
+        public static string DesugarToMc0Text(Mc1File mc1)
+        {
+            if (mc1 == null) throw new ArgumentNullException(nameof(mc1));
+
+            // Apply const substitution to view base expressions deterministically.
+            var views = new Dictionary<string, ViewDecl>(StringComparer.Ordinal);
+            foreach (var kv in mc1.Views.OrderBy(k => k.Key, StringComparer.Ordinal))
+            {
+                var v = kv.Value;
+                views[kv.Key] = new ViewDecl
+                {
+                    Name = v.Name,
+                    Type = v.Type,
+                    SegExpr = RewriteConsts(v.SegExpr ?? string.Empty, mc1.Consts),
+                    OffExpr = RewriteConsts(v.OffExpr ?? string.Empty, mc1.Consts),
+                };
+            }
+
+            var sb = new StringBuilder();
+            sb.AppendLine("// MC0 desugared from MC1 by DOSRE");
+            if (!string.IsNullOrWhiteSpace(mc1.Source)) sb.AppendLine($"// source: {mc1.Source}");
+            sb.AppendLine();
+
+            foreach (var raw in mc1.Statements)
+            {
+                var line = raw ?? string.Empty;
+                var rewritten = RewriteConsts(line, mc1.Consts);
+                rewritten = RewriteViewFields(rewritten, views, mc1.Types);
+                sb.AppendLine(rewritten);
+            }
+
+            return sb.ToString();
+        }
+
+        private static string RewriteConsts(string line, Dictionary<string, ConstValue> consts)
+        {
+            if (consts == null || consts.Count == 0) return line;
+
+            // Replace identifiers with numeric literals (hex) deterministically.
+            // Only replace whole-word matches.
+            foreach (var kv in consts.OrderBy(k => k.Key, StringComparer.Ordinal))
+            {
+                var name = kv.Key;
+                var v = kv.Value.Value;
+                // Use u16-style 0xXXXX when it fits; otherwise 0xXXXXXXXX.
+                var lit = v <= 0xFFFF ? $"0x{v:X4}" : $"0x{v:X8}";
+                line = Regex.Replace(line, $@"\b{Regex.Escape(name)}\b", lit);
+            }
+
+            return line;
+        }
+
+        private static string RewriteViewFields(string line, Dictionary<string, ViewDecl> views, Dictionary<string, StructType> types)
+        {
+            if (views == null || views.Count == 0) return line;
+
+            return ViewFieldRx.Replace(line, m =>
+            {
+                var vname = m.Groups["view"].Value;
+                var fname = m.Groups["field"].Value;
+
+                if (!views.TryGetValue(vname, out var vd))
+                    return m.Value;
+
+                if (!types.TryGetValue(vd.Type, out var st))
+                    throw new InvalidDataException($"Unknown view type '{vd.Type}' for view '{vname}'");
+
+                var (off, fType) = ResolveFieldOffset(st, fname, types);
+
+                var size = SizeOfType(fType, types);
+                // Always use ADD16(base, delta) for a stable normalized form.
+                var offExpr = $"ADD16({vd.OffExpr}, 0x{off:X4})";
+
+                // Default rewrite: treat field access as LOADn(seg,off).
+                if (size == 1) return $"LOAD8({vd.SegExpr}, {offExpr})";
+                if (size == 2) return $"LOAD16({vd.SegExpr}, {offExpr})";
+
+                // Larger fields: leave as-is for now.
+                return m.Value;
+            });
+        }
+
+        private static (ushort offset, string fieldType) ResolveFieldOffset(StructType st, string field, Dictionary<string, StructType> types)
+        {
+            ushort off = 0;
+            foreach (var f in st.Fields)
+            {
+                if (string.Equals(f.Name, field, StringComparison.Ordinal))
+                    return (off, f.Type);
+
+                var sz = SizeOfType(f.Type, types);
+                checked { off = (ushort)(off + sz); }
+            }
+
+            throw new InvalidDataException($"Unknown field '{field}' in struct '{st.Name}'");
+        }
+
+        private static int SizeOfType(string ty, Dictionary<string, StructType> types)
+        {
+            switch ((ty ?? string.Empty).ToLowerInvariant())
+            {
+                case "u8":
+                case "bool":
+                    return 1;
+                case "u16":
+                    return 2;
+                case "u32":
+                    return 4;
+            }
+
+            if (types.TryGetValue(ty, out var st))
+            {
+                var n = 0;
+                foreach (var f in st.Fields)
+                    n += SizeOfType(f.Type, types);
+                return n;
+            }
+
+            throw new InvalidDataException($"Unknown type '{ty}'");
+        }
+
+        private static uint ParseUInt(string token)
+        {
+            var s = (token ?? string.Empty).Trim();
+            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                s = s.Substring(2);
+            if (s.EndsWith("h", StringComparison.OrdinalIgnoreCase))
+                s = s.Substring(0, s.Length - 1);
+
+            if (uint.TryParse(s, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var hex))
+                return hex;
+
+            if (uint.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var dec))
+                return dec;
+
+            throw new InvalidDataException($"Bad integer literal '{token}'");
+        }
+    }
+}

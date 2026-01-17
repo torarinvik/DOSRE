@@ -112,6 +112,9 @@ namespace DOSRE.Dasm
             // Accumulate labels that apply to the next lifted node.
             var pendingLabels = new List<string>();
 
+            // Reused per-iteration to avoid stackalloc-in-loop (CA2014).
+            Span<byte> addrBuf = stackalloc byte[4];
+
             var streamHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
 
             for (var i = 0; i < lines.Count; i++)
@@ -162,12 +165,11 @@ namespace DOSRE.Dasm
                         node.Kind = trimmed.StartsWith("db ", StringComparison.OrdinalIgnoreCase) ? "db" : "insn";
 
                         // Update hash: addr (LE) + raw bytes.
-                        Span<byte> ab = stackalloc byte[4];
-                        ab[0] = (byte)(addr & 0xFF);
-                        ab[1] = (byte)((addr >> 8) & 0xFF);
-                        ab[2] = (byte)((addr >> 16) & 0xFF);
-                        ab[3] = (byte)((addr >> 24) & 0xFF);
-                        streamHash.AppendData(ab);
+                        addrBuf[0] = (byte)(addr & 0xFF);
+                        addrBuf[1] = (byte)((addr >> 8) & 0xFF);
+                        addrBuf[2] = (byte)((addr >> 16) & 0xFF);
+                        addrBuf[3] = (byte)((addr >> 24) & 0xFF);
+                        streamHash.AppendData(addrBuf);
                         streamHash.AppendData(ParseHex(bytesHex));
 
                         file.Nodes.Add(node);

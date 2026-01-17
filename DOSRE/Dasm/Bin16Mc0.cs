@@ -559,15 +559,17 @@ namespace DOSRE.Dasm
         {
             var h = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
 
+            // Reused per-iteration to avoid stackalloc-in-loop (CA2014).
+            Span<byte> addrBuf = stackalloc byte[4];
+
             foreach (var st in statements)
             {
                 var addr = st.Addr;
-                Span<byte> ab = stackalloc byte[4];
-                ab[0] = (byte)(addr & 0xFF);
-                ab[1] = (byte)((addr >> 8) & 0xFF);
-                ab[2] = (byte)((addr >> 16) & 0xFF);
-                ab[3] = (byte)((addr >> 24) & 0xFF);
-                h.AppendData(ab);
+                addrBuf[0] = (byte)(addr & 0xFF);
+                addrBuf[1] = (byte)((addr >> 8) & 0xFF);
+                addrBuf[2] = (byte)((addr >> 16) & 0xFF);
+                addrBuf[3] = (byte)((addr >> 24) & 0xFF);
+                h.AppendData(addrBuf);
 
                 var b = ParseHex(st.BytesHex);
                 h.AppendData(b);

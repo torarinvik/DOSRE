@@ -468,6 +468,78 @@ namespace DOSRE.UI.impl
         private string _binMc0Reasm;
 
         /// <summary>
+        ///     Verify MC0 pipeline rebuilds an original flat binary: promoted asm -> MC0 -> reasm -> wasm+wlink -> byte-compare.
+        ///     Specified with -BINMC0VERIFYASM <file.promoted.asm>
+        /// </summary>
+        private string _binMc0VerifyAsm;
+
+        /// <summary>
+        ///     Original binary to compare against for -BINMC0VERIFYASM.
+        ///     Specified with -BINMC0VERIFYORIG <file.exe>
+        /// </summary>
+        private string _binMc0VerifyOrig;
+
+        /// <summary>
+        ///     Output directory for verifier intermediates/results.
+        ///     Specified with -BINMC0VERIFYOUTDIR <dir>
+        /// </summary>
+        private string _binMc0VerifyOutDir;
+
+        /// <summary>
+        ///     Override path to OpenWatcom wasm.
+        ///     Specified with -BINMC0WASM <path>
+        /// </summary>
+        private string _binMc0WasmPath;
+
+        /// <summary>
+        ///     Override path to OpenWatcom wlink.
+        ///     Specified with -BINMC0WLINK <path>
+        /// </summary>
+        private string _binMc0WlinkPath;
+
+        /// <summary>
+        ///     MC1 input file (deterministic sugar layer over MC0).
+        ///     Specified with -BINMC1IN <file.mc1>
+        /// </summary>
+        private string _binMc1In;
+
+        /// <summary>
+        ///     MC0 output file from desugaring MC1.
+        ///     Specified with -BINMC1OUT <file.mc0>
+        /// </summary>
+        private string _binMc1Out;
+
+        /// <summary>
+        ///     Optional: expected MC0 file to compare against (byte/origin identity).
+        ///     Specified with -BINMC1EXPECT <file.mc0>
+        /// </summary>
+        private string _binMc1Expect;
+
+        /// <summary>
+        ///     Prove MC1 lowers to the exact same MC0 origin stream as a promoted asm, and optionally prove the rebuilt exe is byte-equal.
+        ///     Specified with -BINMC1PROVEIN <file.mc1>
+        /// </summary>
+        private string _binMc1ProveIn;
+
+        /// <summary>
+        ///     Promoted asm used as MC0 baseline for -BINMC1PROVEIN.
+        ///     Specified with -BINMC1PROVEASM <file.promoted.asm>
+        /// </summary>
+        private string _binMc1ProveAsm;
+
+        /// <summary>
+        ///     Original exe used for MC0 rebuild byte-compare in -BINMC1PROVEIN.
+        ///     Specified with -BINMC1PROVEORIG <file.exe>
+        /// </summary>
+        private string _binMc1ProveOrig;
+
+        /// <summary>
+        ///     Output directory for chain proof intermediates.
+        ///     Specified with -BINMC1PROVEOUTDIR <dir>
+        /// </summary>
+        private string _binMc1ProveOutDir;
+
+        /// <summary>
         ///     Trace a window of lifted BIN16 bytes using Unicorn (host emulator).
         ///     Specified with -BINTRACEASM <file.asm>
         /// </summary>
@@ -787,6 +859,81 @@ namespace DOSRE.UI.impl
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -BINMC0REASM requires a <file.asm>");
                             _binMc0Reasm = _args[i + 1];
+                            i++;
+                            break;
+
+                        case "BINMC0VERIFYASM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC0VERIFYASM requires a <file.promoted.asm>");
+                            _binMc0VerifyAsm = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC0VERIFYORIG":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC0VERIFYORIG requires a <file.exe>");
+                            _binMc0VerifyOrig = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC0VERIFYOUTDIR":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC0VERIFYOUTDIR requires a <dir>");
+                            _binMc0VerifyOutDir = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC0WASM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC0WASM requires a <path>");
+                            _binMc0WasmPath = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC0WLINK":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC0WLINK requires a <path>");
+                            _binMc0WlinkPath = _args[i + 1];
+                            i++;
+                            break;
+
+                        case "BINMC1IN":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1IN requires a <file.mc1>");
+                            _binMc1In = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC1OUT":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1OUT requires a <file.mc0>");
+                            _binMc1Out = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC1EXPECT":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1EXPECT requires a <file.mc0>");
+                            _binMc1Expect = _args[i + 1];
+                            i++;
+                            break;
+
+                        case "BINMC1PROVEIN":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1PROVEIN requires a <file.mc1>");
+                            _binMc1ProveIn = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC1PROVEASM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1PROVEASM requires a <file.promoted.asm>");
+                            _binMc1ProveAsm = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC1PROVEORIG":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1PROVEORIG requires a <file.exe>");
+                            _binMc1ProveOrig = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC1PROVEOUTDIR":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1PROVEOUTDIR requires a <dir>");
+                            _binMc1ProveOutDir = _args[i + 1];
                             i++;
                             break;
 
@@ -1147,6 +1294,18 @@ namespace DOSRE.UI.impl
                             Console.WriteLine("-BINMC0OUT <file.mc0> -- (with -BINMC0ASM) Write MC0 text (deterministic; includes origin tags)");
                             Console.WriteLine("-BINMC0JSON <file.json> -- (with -BINMC0ASM) Write MC0 as JSON");
                             Console.WriteLine("-BINMC0REASM <file.asm> -- (with -BINMC0ASM) Write byte-faithful re-emitted asm listing (db ... per stmt)");
+                            Console.WriteLine("-BINMC0VERIFYASM <file.promoted.asm> -- Verify: promoted asm -> MC0 -> reasm -> wasm+wlink -> byte-compare");
+                            Console.WriteLine("-BINMC0VERIFYORIG <file.exe> -- (with -BINMC0VERIFYASM) Original binary to compare against");
+                            Console.WriteLine("-BINMC0VERIFYOUTDIR <dir> -- (optional) Where to write intermediates/results");
+                            Console.WriteLine("-BINMC0WASM <path> -- (optional) Override OpenWatcom wasm path (default: wasm)");
+                            Console.WriteLine("-BINMC0WLINK <path> -- (optional) Override OpenWatcom wlink path (default: wlink)");
+                            Console.WriteLine("-BINMC1IN <file.mc1> -- Parse MC1 (deterministic sugar) and desugar into MC0 text");
+                            Console.WriteLine("-BINMC1OUT <file.mc0> -- (with -BINMC1IN) Write desugared MC0 output");
+                            Console.WriteLine("-BINMC1EXPECT <file.mc0> -- (optional) Verify desugared MC0 matches expected by origin/bytes stream");
+                            Console.WriteLine("-BINMC1PROVEIN <file.mc1> -- Prove chain: MC1 desugars to same MC0 as promoted asm (and optionally rebuild byte-compare)");
+                            Console.WriteLine("-BINMC1PROVEASM <file.promoted.asm> -- (with -BINMC1PROVEIN) Baseline promoted asm");
+                            Console.WriteLine("-BINMC1PROVEORIG <file.exe> -- (optional) Also run MC0 rebuild verifier against original exe");
+                            Console.WriteLine("-BINMC1PROVEOUTDIR <dir> -- (optional) Out dir for rebuild intermediates");
                             Console.WriteLine("-BINTRACEASM <file.asm> -- Trace lifted BIN16 bytes with Unicorn and write an instruction trace");
                             Console.WriteLine("-BINTRACEOUT <file.txt> -- (with -BINTRACEASM) Output trace file");
                             Console.WriteLine("-BINTRACESTART <hex> -- (with -BINTRACEASM) Logical start address for tracing window (same as listing comment addresses)");
@@ -1389,6 +1548,82 @@ namespace DOSRE.UI.impl
                     if (!string.IsNullOrWhiteSpace(_binMc0Out)) _logger.Info($"{DateTime.Now} Wrote BINMC0 text to {_binMc0Out}");
                     if (!string.IsNullOrWhiteSpace(_binMc0Json)) _logger.Info($"{DateTime.Now} Wrote BINMC0 JSON to {_binMc0Json}");
                     if (!string.IsNullOrWhiteSpace(_binMc0Reasm)) _logger.Info($"{DateTime.Now} Wrote BINMC0 re-asm to {_binMc0Reasm}");
+                    return;
+                }
+
+                // BINMC0VERIFY: end-to-end rebuild and byte-compare.
+                if (!string.IsNullOrWhiteSpace(_binMc0VerifyAsm))
+                {
+                    if (string.IsNullOrWhiteSpace(_binMc0VerifyOrig))
+                        throw new Exception("Error: -BINMC0VERIFYASM requires -BINMC0VERIFYORIG <file.exe>");
+
+                    var opts = new Bin16Mc0Verifier.VerifyOptions
+                    {
+                        OutDir = _binMc0VerifyOutDir,
+                    };
+                    if (!string.IsNullOrWhiteSpace(_binMc0WasmPath)) opts.WasmPath = _binMc0WasmPath;
+                    if (!string.IsNullOrWhiteSpace(_binMc0WlinkPath)) opts.WlinkPath = _binMc0WlinkPath;
+
+                    var res = Bin16Mc0Verifier.VerifyPromotedAsmBuildsOriginalExe(_binMc0VerifyAsm, _binMc0VerifyOrig, opts);
+
+                    _logger.Info($"BINMC0VERIFY byte_equal={res.ByteEqual} orig_size={res.OriginalSize} reb_size={res.RebuiltSize}");
+                    _logger.Info($"BINMC0VERIFY sha256 orig={res.OriginalSha256}");
+                    _logger.Info($"BINMC0VERIFY sha256 reb ={res.RebuiltSha256}");
+                    if (!res.ByteEqual && !string.IsNullOrWhiteSpace(res.FirstDiff))
+                        _logger.Warn($"BINMC0VERIFY first_diff {res.FirstDiff}");
+                    _logger.Info($"BINMC0VERIFY rebuilt {res.RebuiltExe}");
+                    return;
+                }
+
+                // BINMC1: desugar MC1 to MC0, optionally verify identity vs expected MC0.
+                if (!string.IsNullOrWhiteSpace(_binMc1In))
+                {
+                    if (string.IsNullOrWhiteSpace(_binMc1Out))
+                        throw new Exception("Error: -BINMC1IN requires -BINMC1OUT <file.mc0>");
+
+                    var mc1 = Mc1.Parse(_binMc1In);
+                    var mc0Text = Mc1.DesugarToMc0Text(mc1);
+                    File.WriteAllText(_binMc1Out, mc0Text);
+                    _logger.Info($"{DateTime.Now} Wrote BINMC1 desugared MC0 to {_binMc1Out}");
+
+                    if (!string.IsNullOrWhiteSpace(_binMc1Expect))
+                    {
+                        var expected = Bin16Mc0.ParseMc0Text(File.ReadAllLines(_binMc1Expect), _binMc1Expect);
+                        var actual = Bin16Mc0.ParseMc0Text(File.ReadAllLines(_binMc1Out), _binMc1Out);
+                        Bin16Mc0.VerifyByteIdentity(expected, actual);
+                        _logger.Info($"{DateTime.Now} BINMC1EXPECT OK (origin/bytes stream identical)");
+                    }
+
+                    return;
+                }
+
+                // BINMC1PROVE: chain proof for deterministic lowering.
+                if (!string.IsNullOrWhiteSpace(_binMc1ProveIn))
+                {
+                    if (string.IsNullOrWhiteSpace(_binMc1ProveAsm))
+                        throw new Exception("Error: -BINMC1PROVEIN requires -BINMC1PROVEASM <file.promoted.asm>");
+
+                    var opts = new Bin16McChainProof.ProveOptions
+                    {
+                        SkipRebuildCompare = string.IsNullOrWhiteSpace(_binMc1ProveOrig),
+                        OutDir = _binMc1ProveOutDir,
+                        WasmPath = string.IsNullOrWhiteSpace(_binMc0WasmPath) ? "wasm" : _binMc0WasmPath,
+                        WlinkPath = string.IsNullOrWhiteSpace(_binMc0WlinkPath) ? "wlink" : _binMc0WlinkPath,
+                    };
+
+                    var res = Bin16McChainProof.ProveMc1AgainstPromotedAndOriginal(_binMc1ProveIn, _binMc1ProveAsm, _binMc1ProveOrig, opts);
+
+                    _logger.Info($"BINMC1PROVE mc1_to_mc0_identity={res.Mc1DesugarsToSameMc0} stream_sha256={res.Mc0StreamSha256} stmts={res.Mc0StatementCount}");
+                    if (res.Mc0RebuildByteEqual.HasValue)
+                    {
+                        _logger.Info($"BINMC1PROVE mc0_rebuild_byte_equal={res.Mc0RebuildByteEqual.Value}");
+                        _logger.Info($"BINMC1PROVE sha256 orig={res.Mc0RebuildOriginalSha256}");
+                        _logger.Info($"BINMC1PROVE sha256 reb ={res.Mc0RebuildRebuiltSha256}");
+                        if (!res.Mc0RebuildByteEqual.Value && !string.IsNullOrWhiteSpace(res.FirstDiff))
+                            _logger.Warn($"BINMC1PROVE first_diff {res.FirstDiff}");
+                        if (!string.IsNullOrWhiteSpace(res.RebuiltExe))
+                            _logger.Info($"BINMC1PROVE rebuilt {res.RebuiltExe}");
+                    }
                     return;
                 }
 

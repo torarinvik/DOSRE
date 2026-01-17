@@ -1,0 +1,14 @@
+// Minimal MC1 sample
+// - adds const + view + struct typing
+// - statements must preserve MC0 origin tags for byte verification workflows
+
+type Pair = struct { a:u16; b:u16; };
+const BASE:u16 = 0x0010;
+view p at (DS, BASE) : Pair;
+
+start:
+    // This statement is just a stand-in; origin tag matches fixture bytes for mov ax,cs
+    AX = CS; // @00000000 8CC8 ; mov ax,cs
+
+    // Demonstrate view sugar: p.a becomes LOAD16(DS, ADD16(BASE, 0x0000))
+    AX = p.a; // @00000002 8EC0 ; mov es,ax (origin bytes intentionally irrelevant to statement text here)
