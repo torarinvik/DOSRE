@@ -420,6 +420,90 @@ namespace DOSRE.UI.impl
         private string _binReasmJson;
 
         /// <summary>
+        ///     Lift a promoted BIN16/WASM assembly listing (byte-authoritative comments) into a crude AST.
+        ///     Specified with -BINLIFTASM <file.asm>
+        /// </summary>
+        private string _binLiftAsm;
+
+        /// <summary>
+        ///     Output JSON for -BINLIFTASM
+        ///     Specified with -BINLIFTJSON <file.json>
+        /// </summary>
+        private string _binLiftJson;
+
+        /// <summary>
+        ///     Output C header for -BINLIFTASM
+        ///     Specified with -BINLIFTH <file.h>
+        /// </summary>
+        private string _binLiftH;
+
+        /// <summary>
+        ///     Output C file for -BINLIFTASM
+        ///     Specified with -BINLIFTC <file.c>
+        /// </summary>
+        private string _binLiftC;
+
+        /// <summary>
+        ///     Lift a promoted BIN16/WASM assembly listing (byte-authoritative comments) into MC0 (Machine-C Level 0).
+        ///     Specified with -BINMC0ASM <file.asm>
+        /// </summary>
+        private string _binMc0Asm;
+
+        /// <summary>
+        ///     Output MC0 text for -BINMC0ASM
+        ///     Specified with -BINMC0OUT <file.mc0>
+        /// </summary>
+        private string _binMc0Out;
+
+        /// <summary>
+        ///     Output MC0 JSON for -BINMC0ASM
+        ///     Specified with -BINMC0JSON <file.json>
+        /// </summary>
+        private string _binMc0Json;
+
+        /// <summary>
+        ///     Output byte-faithful re-emitted assembly listing (db ...) from MC0.
+        ///     Specified with -BINMC0REASM <file.asm>
+        /// </summary>
+        private string _binMc0Reasm;
+
+        /// <summary>
+        ///     Trace a window of lifted BIN16 bytes using Unicorn (host emulator).
+        ///     Specified with -BINTRACEASM <file.asm>
+        /// </summary>
+        private string _binTraceAsm;
+
+        /// <summary>
+        ///     Output trace file for -BINTRACEASM
+        ///     Specified with -BINTRACEOUT <file.txt>
+        /// </summary>
+        private string _binTraceOut;
+
+        /// <summary>
+        ///     Logical start address (hex) in the same address space as the byte-authoritative comments.
+        ///     Specified with -BINTRACESTART <hex>
+        /// </summary>
+        private uint? _binTraceStart;
+
+        /// <summary>
+        ///     Trace window size (hex, max 0x10000)
+        ///     Specified with -BINTRACEWINDOW <hex>
+        /// </summary>
+        private uint _binTraceWindow = 0x10000;
+
+        /// <summary>
+        ///     Max instruction steps to execute
+        ///     Specified with -BINTRACESTEPS <n>
+        /// </summary>
+        private int _binTraceSteps = 10_000;
+
+        /// <summary>
+        ///     Debug: probe Unicorn P/Invoke load and uc_open/uc_close.
+        ///     Enabled with -UNICORNPROBE
+        /// </summary>
+        private bool _bUnicornProbe;
+
+        /// <summary>
         ///     Batch BIN16 reassembly export input directory
         ///     Specified with -BINDIRREASM <inDir> <outDir>
         /// </summary>
@@ -654,6 +738,107 @@ namespace DOSRE.UI.impl
                                 throw new Exception("Error: -BINREASMJSON requires a <file.json>");
                             _binReasmJson = _args[i + 1];
                             i++;
+                            break;
+
+                        case "BINLIFTASM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINLIFTASM requires a <file.asm>");
+                            _binLiftAsm = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINLIFTJSON":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINLIFTJSON requires a <file.json>");
+                            _binLiftJson = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINLIFTH":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINLIFTH requires a <file.h>");
+                            _binLiftH = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINLIFTC":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINLIFTC requires a <file.c>");
+                            _binLiftC = _args[i + 1];
+                            i++;
+                            break;
+
+                        case "BINMC0ASM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC0ASM requires a <file.asm>");
+                            _binMc0Asm = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC0OUT":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC0OUT requires a <file.mc0>");
+                            _binMc0Out = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC0JSON":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC0JSON requires a <file.json>");
+                            _binMc0Json = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC0REASM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC0REASM requires a <file.asm>");
+                            _binMc0Reasm = _args[i + 1];
+                            i++;
+                            break;
+
+                        case "BINTRACEASM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINTRACEASM requires a <file.asm>");
+                            _binTraceAsm = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINTRACEOUT":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINTRACEOUT requires a <file.txt>");
+                            _binTraceOut = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINTRACESTART":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINTRACESTART requires a value (hex)");
+                            {
+                                var sHex = _args[i + 1].Trim();
+                                if (sHex.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                                    sHex = sHex.Substring(2);
+                                if (!uint.TryParse(sHex, System.Globalization.NumberStyles.HexNumber, null, out var v))
+                                    throw new Exception("Error: -BINTRACESTART must be a hex number (e.g. 1A4 or 0x1A4)");
+                                _binTraceStart = v;
+                            }
+                            i++;
+                            break;
+                        case "BINTRACEWINDOW":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINTRACEWINDOW requires a value (hex)");
+                            {
+                                var sWin = _args[i + 1].Trim();
+                                if (sWin.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                                    sWin = sWin.Substring(2);
+                                if (!uint.TryParse(sWin, System.Globalization.NumberStyles.HexNumber, null, out var v) || v == 0 || v > 0x10000)
+                                    throw new Exception("Error: -BINTRACEWINDOW must be hex in range 1..0x10000");
+                                _binTraceWindow = v;
+                            }
+                            i++;
+                            break;
+                        case "BINTRACESTEPS":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINTRACESTEPS requires a value");
+                            if (!int.TryParse(_args[i + 1], out var steps) || steps <= 0)
+                                throw new Exception("Error: -BINTRACESTEPS must be a positive integer");
+                            _binTraceSteps = steps;
+                            i++;
+                            break;
+
+                        case "UNICORNPROBE":
+                            _bUnicornProbe = true;
                             break;
                         case "BINDIRREASM":
                             if (i + 2 >= _args.Length)
@@ -954,6 +1139,20 @@ namespace DOSRE.UI.impl
                             Console.WriteLine("-BINREASM <file.asm> -- (with -BIN16) Export byte-perfect NASM -f bin reconstruction (db), using -BINORG for the org directive");
                             Console.WriteLine("-BINREASMJSON <file.json> -- (with -BIN16) Export BIN16 metadata (origin + size) for the -BINREASM output");
                             Console.WriteLine("-BINREASMWASM <file.asm> -- (with -BIN16) Export byte-perfect reassembly in OpenWatcom WASM/MASM-compatible syntax (db + 8086 directives)");
+                            Console.WriteLine("-BINLIFTASM <file.asm> -- Lift promoted BIN16/WASM asm (byte-authoritative comments) into a 1:1 crude AST");
+                            Console.WriteLine("-BINLIFTJSON <file.json> -- (with -BINLIFTASM) Write the crude AST as JSON");
+                            Console.WriteLine("-BINLIFTH <file.h> -- (with -BINLIFTASM) Write a C header for the lifted program table");
+                            Console.WriteLine("-BINLIFTC <file.c> -- (with -BINLIFTASM) Write a compilable C file containing addr+bytes+asm text");
+                            Console.WriteLine("-BINMC0ASM <file.asm> -- Lift promoted BIN16/WASM asm into MC0 (deterministic Machine-C w/ origin bytes)");
+                            Console.WriteLine("-BINMC0OUT <file.mc0> -- (with -BINMC0ASM) Write MC0 text (deterministic; includes origin tags)");
+                            Console.WriteLine("-BINMC0JSON <file.json> -- (with -BINMC0ASM) Write MC0 as JSON");
+                            Console.WriteLine("-BINMC0REASM <file.asm> -- (with -BINMC0ASM) Write byte-faithful re-emitted asm listing (db ... per stmt)");
+                            Console.WriteLine("-BINTRACEASM <file.asm> -- Trace lifted BIN16 bytes with Unicorn and write an instruction trace");
+                            Console.WriteLine("-BINTRACEOUT <file.txt> -- (with -BINTRACEASM) Output trace file");
+                            Console.WriteLine("-BINTRACESTART <hex> -- (with -BINTRACEASM) Logical start address for tracing window (same as listing comment addresses)");
+                            Console.WriteLine("-BINTRACEWINDOW <hex> -- (with -BINTRACEASM) Trace window size (default 0x10000; max 0x10000)");
+                            Console.WriteLine("-BINTRACESTEPS <n> -- (with -BINTRACEASM) Max instruction steps to execute (default 10000)");
+                            Console.WriteLine("-UNICORNPROBE -- Debug: probe Unicorn P/Invoke load + uc_open/uc_close");
                             Console.WriteLine("-BINDIRREASM <inDir> <outDir> -- Batch export BIN16 reassembly (db) + JSON for all non-MZ files in <inDir> (skips MZ/NE/LE/PE); uses -BINORG for org");
                             Console.WriteLine("-BINDIRREASMWASM <inDir> <outDir> -- Batch export BIN16 reassembly in OpenWatcom WASM/MASM-compatible syntax (db + JSON)");
                             Console.WriteLine("-BINDIREXT <ext> -- (with -BINDIRREASM) Only export files with this extension (example: .ovl)");
@@ -1160,6 +1359,63 @@ namespace DOSRE.UI.impl
                         throw new Exception($"Error: -BINDIRREASM completed with failures (ok={ok} skipped_mz={skipped} skipped_empty={skippedEmpty} failed={failed})");
 
                     _logger.Info($"{DateTime.Now} -BINDIRREASM done (ok={ok} skipped_mz={skipped} skipped_empty={skippedEmpty} origin=0x{_binOrigin:X})");
+                    return;
+                }
+
+                // BINLIFTASM mode: lift a byte-authoritative promoted asm listing into a 1:1 crude AST and C data.
+                // This mode is independent of -I and any binary format.
+                if (!string.IsNullOrWhiteSpace(_binLiftAsm))
+                {
+                    if (string.IsNullOrWhiteSpace(_binLiftJson) && string.IsNullOrWhiteSpace(_binLiftH) && string.IsNullOrWhiteSpace(_binLiftC))
+                        throw new Exception("Error: -BINLIFTASM requires at least one output: -BINLIFTJSON and/or -BINLIFTH and/or -BINLIFTC");
+
+                    Bin16AsmLifter.LiftToFiles(_binLiftAsm, _binLiftJson, _binLiftC, _binLiftH);
+
+                    if (!string.IsNullOrWhiteSpace(_binLiftJson)) _logger.Info($"{DateTime.Now} Wrote BINLIFT JSON to {_binLiftJson}");
+                    if (!string.IsNullOrWhiteSpace(_binLiftH)) _logger.Info($"{DateTime.Now} Wrote BINLIFT header to {_binLiftH}");
+                    if (!string.IsNullOrWhiteSpace(_binLiftC)) _logger.Info($"{DateTime.Now} Wrote BINLIFT C to {_binLiftC}");
+                    return;
+                }
+
+                // BINMC0ASM mode: lift promoted asm into MC0 (Machine-C Level 0) and optionally re-emit a db listing.
+                // This mode is independent of -I and any binary format.
+                if (!string.IsNullOrWhiteSpace(_binMc0Asm))
+                {
+                    if (string.IsNullOrWhiteSpace(_binMc0Out) && string.IsNullOrWhiteSpace(_binMc0Json) && string.IsNullOrWhiteSpace(_binMc0Reasm))
+                        throw new Exception("Error: -BINMC0ASM requires at least one output: -BINMC0OUT and/or -BINMC0JSON and/or -BINMC0REASM");
+
+                    Bin16Mc0.LiftToFiles(_binMc0Asm, _binMc0Out, _binMc0Json, _binMc0Reasm);
+
+                    if (!string.IsNullOrWhiteSpace(_binMc0Out)) _logger.Info($"{DateTime.Now} Wrote BINMC0 text to {_binMc0Out}");
+                    if (!string.IsNullOrWhiteSpace(_binMc0Json)) _logger.Info($"{DateTime.Now} Wrote BINMC0 JSON to {_binMc0Json}");
+                    if (!string.IsNullOrWhiteSpace(_binMc0Reasm)) _logger.Info($"{DateTime.Now} Wrote BINMC0 re-asm to {_binMc0Reasm}");
+                    return;
+                }
+
+                if (_bUnicornProbe)
+                {
+                    DOSRE.Unicorn.UnicornProbe.Run();
+                    return;
+                }
+
+                // BINTRACEASM mode: execute a window of lifted BIN16 bytes using Unicorn and emit an instruction trace.
+                // This mode is independent of -I and any binary format.
+                if (!string.IsNullOrWhiteSpace(_binTraceAsm))
+                {
+                    if (string.IsNullOrWhiteSpace(_binTraceOut))
+                        throw new Exception("Error: -BINTRACEASM requires -BINTRACEOUT <file.txt>");
+                    if (!_binTraceStart.HasValue)
+                        throw new Exception("Error: -BINTRACEASM requires -BINTRACESTART <hex>");
+
+                    var opts = new Bin16UnicornTracer.TraceOptions
+                    {
+                        StartAddr = _binTraceStart.Value,
+                        WindowSize = _binTraceWindow,
+                        MaxInstructions = (nuint)_binTraceSteps,
+                    };
+
+                    Bin16UnicornTracer.TracePromotedAsmToFile(_binTraceAsm, _binTraceOut, opts);
+                    _logger.Info($"{DateTime.Now} Wrote BINTRACE to {_binTraceOut}");
                     return;
                 }
 

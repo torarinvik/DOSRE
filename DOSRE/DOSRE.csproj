@@ -6,6 +6,13 @@
     <AssemblyName>DOSRE</AssemblyName>
     <RootNamespace>DOSRE</RootNamespace>
   </PropertyGroup>
+
+  <!-- macOS/Homebrew Unicorn interop: build a tiny native shim because uc_hook_add is variadic. -->
+  <Target Name="BuildUnicornShim" AfterTargets="Build"
+          Condition="Exists('/opt/homebrew/include/unicorn/unicorn.h') And Exists('/opt/homebrew/lib/libunicorn.dylib')">
+    <Message Importance="high" Text="Building Unicorn shim dylib (Homebrew)" />
+    <Exec Command="clang -O2 -dynamiclib -o &quot;$(TargetDir)libdosre_unicorn_shim.dylib&quot; &quot;$(ProjectDir)Unicorn/native/unicorn_shim.c&quot; -I/opt/homebrew/include -L/opt/homebrew/lib -lunicorn -Wl,-rpath,/opt/homebrew/lib" />
+  </Target>
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
     <PackageReference Include="NLog" Version="4.5.11" />
