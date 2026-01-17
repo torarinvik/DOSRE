@@ -354,11 +354,14 @@ static std::vector<uint8_t> parseHexBytes(const std::string &hex) {
     return out;
 }
 
+static std::string toHex8(uint32_t v);
+
 static std::string renderAsm(
     const std::vector<std::string> &lines,
     const std::vector<Candidate> &cands,
     const std::vector<char> &enabledCand,
-    const std::unordered_set<std::string> &neededLabels
+    const std::unordered_set<std::string> &neededLabels,
+    uint32_t logicalOrigin
 ) {
     // Many real-mode DOS binaries still use 80186+/386+ opcodes (e.g., PUSH imm16 = 68 iw).
     // Dumps frequently start with `.8086`, which makes WASM reject those mnemonics.
@@ -371,32 +374,60 @@ static std::string renderAsm(
         lineToCand[cands[ci].lineIndex] = ci;
     }
 
-    // addr->labels
+    // addr->labels (addr is org-relative: logical addr - logicalOrigin)
     std::unordered_map<std::string, std::vector<std::string>> addrToLabels;
     for (const auto &name : neededLabels) {
         if (name.size() < 5) continue; // loc_ + at least 1
-        std::string addr = name.substr(4);
-        for (auto &c : addr) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        while (addr.size() < 8) addr.insert(addr.begin(), '0');
-        addrToLabels[addr].push_back(name);
+        uint32_t logicalAddr = 0;
+        for (size_t i = 4; i < name.size(); i++) {
+            char c = name[i];
+            if (!isHexChar(c)) { logicalAddr = 0; break; }
+            logicalAddr *= 16;
+            if (c >= '0' && c <= '9') logicalAddr += static_cast<uint32_t>(c - '0');
+            else {
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                logicalAddr += static_cast<uint32_t>(10 + (c - 'A'));
+            }
+        }
+        uint32_t orgAddr = (logicalAddr >= logicalOrigin) ? (logicalAddr - logicalOrigin) : logicalAddr;
+        addrToLabels[toHex8(orgAddr)].push_back(name);
     }
 
     // Some disassemblies reference loc_ labels that don't exist as an address anchor in the db dump.
     // Define them as EQU symbols so assembly can proceed; byte-identity is still enforced by the oracle.
     std::unordered_set<std::string> presentAddrs;
     presentAddrs.reserve(cands.size());
-    for (const auto &c : cands) presentAddrs.insert(c.addr8);
+    for (const auto &c : cands) {
+        uint32_t logicalAddr = 0;
+        for (char ch : c.addr8) { // 8 hex digits
+            logicalAddr *= 16;
+            if (ch >= '0' && ch <= '9') logicalAddr += static_cast<uint32_t>(ch - '0');
+            else {
+                ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                logicalAddr += static_cast<uint32_t>(10 + (ch - 'A'));
+            }
+        }
+        uint32_t orgAddr = (logicalAddr >= logicalOrigin) ? (logicalAddr - logicalOrigin) : logicalAddr;
+        presentAddrs.insert(toHex8(orgAddr));
+    }
 
     std::vector<std::string> equLabels;
     equLabels.reserve(neededLabels.size());
     for (const auto &name : neededLabels) {
         if (name.size() < 5) continue;
-        std::string addr = name.substr(4);
-        for (auto &ch : addr) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-        while (addr.size() < 8) addr.insert(addr.begin(), '0');
-        if (presentAddrs.find(addr) == presentAddrs.end()) {
-            equLabels.push_back(name);
+        uint32_t logicalAddr = 0;
+        for (size_t i = 4; i < name.size(); i++) {
+            char c = name[i];
+            if (!isHexChar(c)) { logicalAddr = 0; break; }
+            logicalAddr *= 16;
+            if (c >= '0' && c <= '9') logicalAddr += static_cast<uint32_t>(c - '0');
+            else {
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                logicalAddr += static_cast<uint32_t>(10 + (c - 'A'));
+            }
         }
+        uint32_t orgAddr = (logicalAddr >= logicalOrigin) ? (logicalAddr - logicalOrigin) : logicalAddr;
+        if (presentAddrs.find(toHex8(orgAddr)) == presentAddrs.end()) equLabels.push_back(name);
     }
     std::sort(equLabels.begin(), equLabels.end());
 
@@ -406,9 +437,19 @@ static std::string renderAsm(
     std::ostringstream out;
 
     for (const auto &lname : equLabels) {
-        std::string addr = lname.substr(4);
-        for (auto &ch : addr) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-        while (addr.size() < 8) addr.insert(addr.begin(), '0');
+        uint32_t logicalAddr = 0;
+        for (size_t i = 4; i < lname.size(); i++) {
+            char c = lname[i];
+            if (!isHexChar(c)) { logicalAddr = 0; break; }
+            logicalAddr *= 16;
+            if (c >= '0' && c <= '9') logicalAddr += static_cast<uint32_t>(c - '0');
+            else {
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                logicalAddr += static_cast<uint32_t>(10 + (c - 'A'));
+            }
+        }
+        uint32_t orgAddr = (logicalAddr >= logicalOrigin) ? (logicalAddr - logicalOrigin) : logicalAddr;
+        std::string addr = toHex8(orgAddr);
         const bool needs0 = !addr.empty() && std::isalpha(static_cast<unsigned char>(addr[0]));
         out << lname << " equ " << (needs0 ? "0" : "") << addr << "h\n";
         emitted.insert(lname);
@@ -428,7 +469,17 @@ static std::string renderAsm(
         auto itCand = lineToCand.find(i);
         if (itCand != lineToCand.end()) {
             const Candidate &c = cands[itCand->second];
-            auto it = addrToLabels.find(c.addr8);
+            uint32_t logicalAddr = 0;
+            for (char ch : c.addr8) {
+                logicalAddr *= 16;
+                if (ch >= '0' && ch <= '9') logicalAddr += static_cast<uint32_t>(ch - '0');
+                else {
+                    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                    logicalAddr += static_cast<uint32_t>(10 + (ch - 'A'));
+                }
+            }
+            uint32_t orgAddr = (logicalAddr >= logicalOrigin) ? (logicalAddr - logicalOrigin) : logicalAddr;
+            auto it = addrToLabels.find(toHex8(orgAddr));
             if (it != addrToLabels.end()) {
                 for (const auto &lname : it->second) {
                     if (emitted.insert(lname).second) {
@@ -610,6 +661,156 @@ static std::optional<std::vector<uint8_t>> assembleAndExtractBytesWdis(
     return std::nullopt;
 }
 
+static uint32_t detectLogicalOrigin(const std::vector<std::string> &lines) {
+    // BIN16 db dumps usually start with e.g.:
+    //   ; Origin: 0100h
+    //   ; logical origin: 0100h
+    // and then use `org 0000h`.
+    static const std::regex re1(R"(^\s*;\s*logical\s+origin:\s*([0-9A-Fa-f]+)h\b)");
+    static const std::regex re2(R"(^\s*;\s*Origin:\s*([0-9A-Fa-f]+)h\b)");
+    for (size_t i = 0; i < std::min<size_t>(lines.size(), 256); i++) {
+        std::smatch m;
+        if (std::regex_search(lines[i], m, re1) || std::regex_search(lines[i], m, re2)) {
+            std::string hex = m.str(1);
+            uint32_t v = 0;
+            for (char c : hex) {
+                if (!isHexChar(c)) return 0;
+                v *= 16;
+                if (c >= '0' && c <= '9') v += static_cast<uint32_t>(c - '0');
+                else {
+                    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    v += static_cast<uint32_t>(10 + (c - 'A'));
+                }
+            }
+            return v;
+        }
+    }
+    return 0;
+}
+
+static std::string toHex8(uint32_t v) {
+    std::ostringstream oss;
+    oss << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << (v & 0xFFFFFFFFu);
+    return oss.str();
+}
+
+struct WdisBatchItem {
+    std::string mnemonic;
+    size_t expectedLen = 0;
+    uint16_t org = 0;
+};
+
+static std::optional<std::unordered_map<uint16_t, std::vector<uint8_t>>> assembleAndExtractBytesWdisBatch(
+    const Options &opt,
+    const std::vector<WdisBatchItem> &items,
+    const fs::path &workdir
+) {
+    if (items.empty()) return std::unordered_map<uint16_t, std::vector<uint8_t>>{};
+
+    fs::path asmPath = workdir / "batch.asm";
+    fs::path objPath = workdir / "batch.obj";
+    fs::path lstPath = workdir / "batch.wdis.lst";
+
+    std::ostringstream asmText;
+    asmText << ".386\n";
+    asmText << "_TEXT segment use16\n";
+    asmText << "assume cs:_TEXT, ds:_TEXT, es:_TEXT, ss:_TEXT\n";
+    asmText << "org 0000h\n";
+    asmText << "start:\n";
+    for (size_t i = 0; i < items.size(); i++) {
+        const auto &it = items[i];
+        // Place each candidate at a known offset so we can reliably parse its bytes.
+        // Using org avoids relying on previous instruction lengths.
+        asmText << "org " << std::uppercase << std::hex << std::setw(4) << std::setfill('0') << it.org << "h\n";
+        asmText << "L" << std::dec << i << ":\n";
+        asmText << "    " << it.mnemonic << "\n";
+    }
+    asmText << "_TEXT ends\n";
+    asmText << "end start\n";
+
+    writeStringToFile(asmPath, asmText.str());
+
+    {
+        std::vector<std::string> args;
+        args.push_back(opt.wasm);
+        args.push_back("-zq");
+        if (opt.wasmWarnLevel >= 0) args.push_back("-w=" + std::to_string(opt.wasmWarnLevel));
+        args.push_back("-fo=" + objPath.string());
+        args.push_back(asmPath.string());
+        int rc = runProcess(args);
+        if (rc != 0) return std::nullopt;
+    }
+
+    {
+        std::vector<std::string> args;
+        args.push_back(opt.wdis);
+        args.push_back("-l=" + lstPath.string());
+        args.push_back(objPath.string());
+        int rc = runProcess(args);
+        if (rc != 0) return std::nullopt;
+    }
+
+    std::unordered_map<uint16_t, size_t> wantLen;
+    wantLen.reserve(items.size());
+    for (const auto &it : items) {
+        if (it.expectedLen == 0) continue;
+        wantLen[it.org] = it.expectedLen;
+    }
+
+    std::unordered_map<uint16_t, std::vector<uint8_t>> out;
+    out.reserve(items.size());
+
+    std::ifstream f(lstPath);
+    if (!f) return std::nullopt;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.size() < 4) continue;
+        if (!isHexChar(line[0]) || !isHexChar(line[1]) || !isHexChar(line[2]) || !isHexChar(line[3])) continue;
+
+        std::string offTok = line.substr(0, 4);
+        uint16_t off = 0;
+        {
+            unsigned v = 0;
+            for (char c : offTok) {
+                v *= 16;
+                if (c >= '0' && c <= '9') v += static_cast<unsigned>(c - '0');
+                else {
+                    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    v += static_cast<unsigned>(10 + (c - 'A'));
+                }
+            }
+            off = static_cast<uint16_t>(v & 0xFFFFu);
+        }
+
+        auto itWant = wantLen.find(off);
+        if (itWant == wantLen.end()) continue;
+        size_t expectedLen = itWant->second;
+
+        std::istringstream iss(line);
+        std::string off2;
+        iss >> off2;
+        if (off2.size() != 4) continue;
+
+        std::vector<uint8_t> bytes;
+        bytes.reserve(expectedLen);
+        while (bytes.size() < expectedLen) {
+            std::string bt;
+            if (!(iss >> bt)) break;
+            if (bt.size() != 2 || !isHexChar(bt[0]) || !isHexChar(bt[1])) break;
+            auto v = parseHexBytes(bt);
+            if (v.size() != 1) break;
+            bytes.push_back(v[0]);
+        }
+
+        if (bytes.size() == expectedLen) {
+            out.emplace(off, std::move(bytes));
+        }
+    }
+
+    return out;
+}
+
 static fs::path makeTempDir() {
     auto base = fs::temp_directory_path();
     for (int i = 0; i < 1000; i++) {
@@ -665,7 +866,10 @@ static void tryEnableGroup(PromoteState &st, const std::vector<size_t> &group) {
     }
 
     st.tries++;
-    std::string asmText = renderAsm(*st.lines, *st.cands, st.enabled, *st.neededLabels);
+    // NOTE: slow oracle is only used for label-dependent candidates; renderAsm already accounts
+    // for logical origin when placing label anchors.
+    uint32_t logicalOrigin = detectLogicalOrigin(*st.lines);
+    std::string asmText = renderAsm(*st.lines, *st.cands, st.enabled, *st.neededLabels, logicalOrigin);
     bool ok = assembleLinkCompare(*st.opt, asmText, st.workdir);
     st.report(false);
 
@@ -746,6 +950,7 @@ int main(int argc, char **argv) {
     if (!fileExists(opt.origBin)) die("missing --orig file: " + opt.origBin);
 
     auto lines = readFileLines(opt.inAsm);
+    uint32_t logicalOrigin = detectLogicalOrigin(lines);
 
     std::vector<Candidate> cands;
     cands.reserve(lines.size());
@@ -776,7 +981,7 @@ int main(int argc, char **argv) {
     // Baseline must work (full-file oracle).
     {
         st.tries++;
-        std::string baseAsm = renderAsm(lines, cands, st.enabled, neededLabels);
+        std::string baseAsm = renderAsm(lines, cands, st.enabled, neededLabels, logicalOrigin);
         bool ok = assembleLinkCompare(opt, baseAsm, st.workdir);
         if (!ok) {
             die("Baseline (all db) did not assemble+match; cannot promote. (Check wasm/wlink on PATH and that the dump is WASM-compatible.)");
@@ -834,7 +1039,6 @@ int main(int argc, char **argv) {
             std::atomic<size_t> next{0};
             std::atomic<size_t> ok{0};
             std::atomic<size_t> tried{0};
-            std::mutex enableMu;
             std::mutex cacheMu;
             std::unordered_map<std::string, std::vector<uint8_t>> cache;
             cache.reserve(4096);
@@ -852,39 +1056,105 @@ int main(int argc, char **argv) {
                     std::error_code ec;
                     fs::create_directory(tdir, ec);
 
+                    constexpr size_t kBatchMax = 128;
+                    constexpr uint16_t kStride = 0x40; // big enough to avoid overlap even for long encodings
+
                     while (true) {
-                        size_t idx = next.fetch_add(1, std::memory_order_relaxed);
-                        if (idx >= fastIds.size()) break;
-                        size_t ci = fastIds[idx];
-                        auto expected = parseHexBytes(cands[ci].hexbytes);
-                        if (expected.empty()) {
-                            tried.fetch_add(1, std::memory_order_relaxed);
+                        // Pull a batch of work.
+                        std::array<size_t, kBatchMax> batchIdx{};
+                        size_t batchN = 0;
+                        for (; batchN < kBatchMax; batchN++) {
+                            size_t idx = next.fetch_add(1, std::memory_order_relaxed);
+                            if (idx >= fastIds.size()) break;
+                            batchIdx[batchN] = idx;
+                        }
+                        if (batchN == 0) break;
+
+                        // First resolve any cached mnemonics; accumulate the rest into a batch assemble.
+                        std::vector<WdisBatchItem> batch;
+                        batch.reserve(batchN);
+                        std::array<size_t, kBatchMax> batchCi{};
+                        std::array<size_t, kBatchMax> batchExpectedLen{};
+                        size_t batchCount = 0;
+
+                        for (size_t bi = 0; bi < batchN; bi++) {
+                            size_t ci = fastIds[batchIdx[bi]];
+                            auto expected = parseHexBytes(cands[ci].hexbytes);
+                            if (expected.empty()) {
+                                tried.fetch_add(1, std::memory_order_relaxed);
+                                continue;
+                            }
+
+                            std::string key = cands[ci].mnemonic + "#" + std::to_string(expected.size());
+                            bool hit = false;
+                            {
+                                std::lock_guard<std::mutex> lock(cacheMu);
+                                auto it = cache.find(key);
+                                if (it != cache.end()) {
+                                    hit = true;
+                                    if (it->second == expected) {
+                                        st.enabled[ci] = 1;
+                                        ok.fetch_add(1, std::memory_order_relaxed);
+                                    }
+                                }
+                            }
+                            if (hit) {
+                                tried.fetch_add(1, std::memory_order_relaxed);
+                                continue;
+                            }
+
+                            WdisBatchItem it;
+                            it.mnemonic = cands[ci].mnemonic;
+                            it.expectedLen = expected.size();
+                            it.org = static_cast<uint16_t>((batchCount * kStride) & 0xFFFFu);
+                            batch.push_back(it);
+                            batchCi[batchCount] = ci;
+                            batchExpectedLen[batchCount] = expected.size();
+                            batchCount++;
+                        }
+
+                        if (batchCount == 0) continue;
+
+                        auto gotMap = assembleAndExtractBytesWdisBatch(opt, batch, tdir);
+                        if (!gotMap) {
+                            // Fallback: run per-instruction for robustness.
+                            for (size_t i = 0; i < batchCount; i++) {
+                                size_t ci = batchCi[i];
+                                auto expected = parseHexBytes(cands[ci].hexbytes);
+                                auto got = assembleAndExtractBytesWdis(opt, cands[ci].mnemonic, expected.size(), tdir);
+                                std::string key = cands[ci].mnemonic + "#" + std::to_string(expected.size());
+                                if (got) {
+                                    std::lock_guard<std::mutex> lock(cacheMu);
+                                    cache.emplace(key, *got);
+                                }
+                                if (got && *got == expected) {
+                                    st.enabled[ci] = 1;
+                                    ok.fetch_add(1, std::memory_order_relaxed);
+                                }
+                                tried.fetch_add(1, std::memory_order_relaxed);
+                            }
                             continue;
                         }
 
-                        std::string key = cands[ci].mnemonic + "#" + std::to_string(expected.size());
+                        for (size_t i = 0; i < batchCount; i++) {
+                            size_t ci = batchCi[i];
+                            auto expected = parseHexBytes(cands[ci].hexbytes);
+                            uint16_t org = static_cast<uint16_t>((i * kStride) & 0xFFFFu);
+                            std::string key = cands[ci].mnemonic + "#" + std::to_string(expected.size());
 
-                        std::optional<std::vector<uint8_t>> got;
-                        {
-                            std::lock_guard<std::mutex> lock(cacheMu);
-                            auto it = cache.find(key);
-                            if (it != cache.end()) got = it->second;
-                        }
-                        if (!got) {
-                            got = assembleAndExtractBytesWdis(opt, cands[ci].mnemonic, expected.size(), tdir);
-                            if (got) {
-                                std::lock_guard<std::mutex> lock(cacheMu);
-                                cache.emplace(key, *got);
+                            auto it = gotMap->find(org);
+                            if (it != gotMap->end()) {
+                                {
+                                    std::lock_guard<std::mutex> lock(cacheMu);
+                                    cache.emplace(key, it->second);
+                                }
+                                if (it->second == expected) {
+                                    st.enabled[ci] = 1;
+                                    ok.fetch_add(1, std::memory_order_relaxed);
+                                }
                             }
+                            tried.fetch_add(1, std::memory_order_relaxed);
                         }
-
-                        if (got && *got == expected) {
-                            std::lock_guard<std::mutex> lock(enableMu);
-                            st.enabled[ci] = 1;
-                            ok.fetch_add(1, std::memory_order_relaxed);
-                        }
-
-                        tried.fetch_add(1, std::memory_order_relaxed);
                     }
                 });
             }
@@ -909,8 +1179,8 @@ int main(int argc, char **argv) {
     slowIds.reserve(cands.size());
     for (size_t ci = 0; ci < cands.size(); ci++) {
         if (st.enabled[ci]) continue;
-        // If we already ran the fast oracle for a non-label candidate and it didn't match,
-        // retrying it with the slow full-file oracle is just wasted work.
+        // Only a small remainder should need the slow full-file oracle now.
+        // We reserve it for candidates where we couldn't validate bytes via wdis.
         if (!cands[ci].hasLocLabelRef) continue;
         slowIds.push_back(ci);
     }
@@ -923,7 +1193,7 @@ int main(int argc, char **argv) {
     }
 
     // Final write
-    std::string outAsmText = renderAsm(lines, cands, st.enabled, neededLabels);
+    std::string outAsmText = renderAsm(lines, cands, st.enabled, neededLabels, logicalOrigin);
     {
         std::ofstream f(opt.outAsm, std::ios::binary);
         if (!f) die("failed to write: " + opt.outAsm);
