@@ -14,16 +14,38 @@ public static class Bin16Mc1Structurer
         @"^\s*(?:}\s*)*(?<label>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)\s*:\s*(?://.*)?$",
         RegexOptions.Compiled);
 
-    public static string StructureMc1AsMc2Blocks(string mc1Path)
+    private static readonly Regex IfGotoRx = new Regex(
+        @"^\s*if\s*\(\s*(?<cond>.*?)\s*\)\s*goto\s+(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)\s*;\s*//\s*@",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static readonly Regex ElseGotoRx = new Regex(
+        @"^\s*else\s+goto\s+(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)\s*;\s*//\s*@",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static readonly Regex ElseGotoPrefixRx = new Regex(
+        @"^(?<indent>\s*)else\s+goto\s+",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static readonly Regex GotoRx = new Regex(
+        @"^\s*goto\s+(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)\s*;\s*//\s*@",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    public enum StructureMode
+    {
+        Preserve,
+        Canonical,
+    }
+
+    public static string StructureMc1AsMc2Blocks(string mc1Path, StructureMode mode = StructureMode.Preserve)
     {
         if (string.IsNullOrWhiteSpace(mc1Path)) throw new ArgumentException("mc1Path is required", nameof(mc1Path));
         if (!File.Exists(mc1Path)) throw new FileNotFoundException("MC1 file not found", mc1Path);
 
         var mc1 = Mc1.Parse(mc1Path);
-        return StructureMc1AsMc2Blocks(mc1);
+        return StructureMc1AsMc2Blocks(mc1, mode);
     }
 
-    public static string StructureMc1AsMc2Blocks(Mc1.Mc1File mc1)
+    public static string StructureMc1AsMc2Blocks(Mc1.Mc1File mc1, StructureMode mode = StructureMode.Preserve)
     {
         if (mc1 == null) throw new ArgumentNullException(nameof(mc1));
 
@@ -88,6 +110,53 @@ public static class Bin16Mc1Structurer
                 currentBlockName = m.Groups["label"].Value;
                 pending.Add(line); // keep the label itself inside the block for readability
                 continue;
+            }
+
+            // Canonical: wrap common if/else-goto patterns into MC2 if/else blocks.
+            // This is presentation-only: it keeps the original origin-tagged statements intact.
+            if (mode == StructureMode.Canonical)
+            {
+                var ifm = IfGotoRx.Match(line);
+                if (ifm.Success)
+                {
+                    var cond = ifm.Groups["cond"].Value.Trim();
+                    var indentLen = line.Length - line.TrimStart().Length;
+                    var indent = indentLen > 0 ? line.Substring(0, indentLen) : string.Empty;
+                    var next = (i + 1) < mc1.Statements.Count ? (mc1.Statements[i + 1] ?? string.Empty) : string.Empty;
+                    var elsem = ElseGotoRx.Match(next);
+
+                    var gotom = GotoRx.Match(next);
+
+                    if (elsem.Success)
+                    {
+                        var normalizedElse = ElseGotoPrefixRx.Replace(next, "${indent}goto ");
+                        pending.Add($"{indent}if ({cond}) {{");
+                        pending.Add($"{indent}  {line.TrimStart().TrimEnd()}");
+                        pending.Add($"{indent}}} else {{");
+                        pending.Add($"{indent}  {normalizedElse.TrimStart().TrimEnd()}");
+                        pending.Add($"{indent}}}");
+                        i++; // consumed else line
+                        continue;
+                    }
+
+                    // Implicit else: decompiler sometimes emits `if (...) goto L;` then `goto M;` (unconditional)
+                    // rather than an explicit `else goto M;`.
+                    if (gotom.Success)
+                    {
+                        pending.Add($"{indent}if ({cond}) {{");
+                        pending.Add($"{indent}  {line.TrimStart().TrimEnd()}");
+                        pending.Add($"{indent}}} else {{");
+                        pending.Add($"{indent}  {next.TrimStart().TrimEnd()}");
+                        pending.Add($"{indent}}}");
+                        i++; // consumed goto line
+                        continue;
+                    }
+
+                    pending.Add($"{indent}if ({cond}) {{");
+                    pending.Add($"{indent}  {line.TrimStart().TrimEnd()}");
+                    pending.Add($"{indent}}}");
+                    continue;
+                }
             }
 
             pending.Add(line);

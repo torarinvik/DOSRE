@@ -564,6 +564,13 @@ namespace DOSRE.UI.impl
         private string _binMc1StructureOut;
 
         /// <summary>
+        ///     Structuring mode for BINMC1STRUCTURE.
+        ///     Values: preserve | canonical
+        ///     Specified with -BINMC1STRUCTUREMODE <mode>
+        /// </summary>
+        private string _binMc1StructureMode;
+
+        /// <summary>
         ///     Build (assemble/link) a binary from an MC1/MC2 file using a promoted asm template.
         ///     Specified with -BINMC1BUILDIN <file.mc1|file.mc2>
         /// </summary>
@@ -1026,6 +1033,13 @@ namespace DOSRE.UI.impl
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -BINMC1STRUCTUREOUT requires a <file.mc2>");
                             _binMc1StructureOut = _args[i + 1];
+                            i++;
+                            break;
+
+                        case "BINMC1STRUCTUREMODE":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1STRUCTUREMODE requires 'preserve' or 'canonical'");
+                            _binMc1StructureMode = _args[i + 1];
                             i++;
                             break;
 
@@ -1755,7 +1769,10 @@ namespace DOSRE.UI.impl
                     if (string.IsNullOrWhiteSpace(_binMc1StructureOut))
                         throw new Exception("Error: -BINMC1STRUCTUREIN requires -BINMC1STRUCTUREOUT <file.mc2>");
 
-                    var mc2Text = Bin16Mc1Structurer.StructureMc1AsMc2Blocks(_binMc1StructureIn);
+                    var mode = string.Equals((_binMc1StructureMode ?? string.Empty).Trim(), "canonical", StringComparison.OrdinalIgnoreCase)
+                        ? Bin16Mc1Structurer.StructureMode.Canonical
+                        : Bin16Mc1Structurer.StructureMode.Preserve;
+                    var mc2Text = Bin16Mc1Structurer.StructureMc1AsMc2Blocks(_binMc1StructureIn, mode);
                     File.WriteAllText(_binMc1StructureOut, mc2Text);
                     _logger.Info($"{DateTime.Now} Wrote BINMC1 structured MC2 to {_binMc1StructureOut}");
                     return;
@@ -1769,12 +1786,14 @@ namespace DOSRE.UI.impl
                     if (string.IsNullOrWhiteSpace(_binMc1BuildOutDir))
                         throw new Exception("Error: -BINMC1BUILDIN requires -BINMC1BUILDOUTDIR <dir>");
 
+                    var canonicalBuild = string.Equals((_binMc1BuildMode ?? string.Empty).Trim(), "canonical", StringComparison.OrdinalIgnoreCase);
+
                     // Desugar to MC1 text (PreserveBytes lowering keeps MC0 parseable and deterministic).
                     Mc1.Mc1File mc1;
                     if (string.Equals(Path.GetExtension(_binMc1BuildIn), ".mc2", StringComparison.OrdinalIgnoreCase))
                     {
                         var mc2 = Mc2.Parse(_binMc1BuildIn);
-                        var mode = string.Equals((_binMc1BuildMode ?? string.Empty).Trim(), "canonical", StringComparison.OrdinalIgnoreCase)
+                        var mode = canonicalBuild
                             ? Mc2.Mode.Canonical
                             : Mc2.Mode.PreserveBytes;
                         var mc1Text = Mc2.DesugarToMc1Text(mc2, mode);
@@ -1791,6 +1810,14 @@ namespace DOSRE.UI.impl
                     var mc0 = Bin16Mc0.ParseMc0Text(
                         mc0Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None),
                         sourceName: _binMc1BuildIn + " (desugared mc1->mc0)");
+
+                    // Canonical (non-preserving) build: apply only mechanically provable, length-preserving rewrites.
+                    // Requires allow-mismatch because it edits bytes relative to the promoted template.
+                    if (canonicalBuild && _binMc1BuildAllowMismatch)
+                    {
+                        var opt = Bin16Mc0CanonicalOptimizer.OptimizeInvertJccSkipJmp(mc0);
+                        _logger.Info($"BINMC1BUILD canonical_opt invert_jcc_skip_jmp candidates={opt.Candidates} applied={opt.Applied} skipped={opt.Skipped}");
+                    }
 
                     var opts = new Bin16Mc0Builder.BuildOptions
                     {
