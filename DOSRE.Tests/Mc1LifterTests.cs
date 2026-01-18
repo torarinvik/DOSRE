@@ -572,5 +572,51 @@ namespace DOSRE.Tests
             var desugared = Mc1.DesugarToMc0Text(parsed);
             Assert.Contains("@00009202 75FC", desugared);
         }
+
+        [Fact]
+        public void LiftMc0ToMc1_Annotates_JumpTable_When_JmpReg_Is_Loaded_From_Memory()
+        {
+            var mc0 = new Bin16Mc0.Mc0File
+            {
+                Source = "in-memory",
+                StreamSha256 = "dummy",
+                Statements = new List<Bin16Mc0.Mc0Stmt>
+                {
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 0,
+                        Addr = 0x0000A000,
+                        BytesHex = "2E8B807200",
+                        Asm = "mov ax, [cs:bx+si+72h]",
+                        Mc0 = "EMITHEX(\"2e8b807200\")",
+                        Labels = new List<string>(),
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 1,
+                        Addr = 0x0000A005,
+                        BytesHex = "FFE0",
+                        Asm = "jmp ax",
+                        Mc0 = "goto ax",
+                        Labels = new List<string>(),
+                    },
+                }
+            };
+
+            var mc1 = Bin16Mc1Lifter.LiftMc0ToMc1Text(mc0);
+
+            // Ensure the table-like indexed load is lifted.
+            Assert.Contains("view mem_cs_0070_w at (CS, 0x0070) : u16;", mc1);
+            Assert.Contains("AX = mem_cs_0070_w[ADD16(ADD16(BX, SI), 0x0002)];", mc1);
+
+            // And ensure we recognize the pattern and annotate it.
+            Assert.Contains("// JUMPTABLE:", mc1);
+            Assert.Contains("AX <- (CS, 0x0070)", mc1);
+
+            // The chain must still parse/desugar with origin tags intact.
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+            Assert.Contains("@0000A005 FFE0", desugared);
+        }
     }
 }

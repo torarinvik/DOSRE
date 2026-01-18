@@ -769,6 +769,26 @@ namespace DOSRE.Dasm
             @"^(?<indent>\s*)goto\s+(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)\s*;\s*//\s*(?<comment>.*)$",
             RegexOptions.Compiled);
 
+        private static readonly Regex OriginStmtGotoAnyRx = new Regex(
+            @"^(?<indent>\s*)goto\s+(?<target>.+?)\s*;\s*//\s*(?<comment>.*)$",
+            RegexOptions.Compiled);
+
+        private static readonly Regex OriginStmtAssignRx = new Regex(
+            @"^(?<indent>\s*)(?<dst>[A-Za-z]{2})\s*=\s*(?<rhs>.+?)\s*;\s*//\s*(?<comment>.*)$",
+            RegexOptions.Compiled);
+
+        private static readonly Regex MemIndexExprRx = new Regex(
+            @"^(?<mem>mem_(?<seg>[A-Za-z]{2})_(?<base>[0-9A-Fa-f]{4})_(?<w>[bwdq]))\s*\[\s*(?<idx>.+?)\s*\]\s*$",
+            RegexOptions.Compiled);
+
+        private static readonly Regex AsmIndirectJmpMemRx = new Regex(
+            @"^\s*jmp\s+(?:word\s+ptr\s+)?\[(?:(?<seg>cs|ds|es|ss)\s*:\s*)?(?<ea>[^\]]+)\]\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex AsmIndirectJmpRegRx = new Regex(
+            @"^\s*jmp\s+(?<reg>[a-z]{2})\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
         private static string StructureIfElseBlocks(string mc1Text)
         {
             if (string.IsNullOrWhiteSpace(mc1Text))
@@ -1037,31 +1057,121 @@ namespace DOSRE.Dasm
                 return mc1Text;
 
             var lines = mc1Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
+
+            static int EntrySizeFromSuffix(string w)
+            {
+                return (w ?? string.Empty).Trim().ToLowerInvariant() switch
+                {
+                    "b" => 1,
+                    "w" => 2,
+                    "d" => 4,
+                    "q" => 8,
+                    _ => 0,
+                };
+            }
+
             for (var i = 0; i < lines.Count; i++)
             {
-                var mGo = OriginStmtGotoRx.Match(lines[i] ?? string.Empty);
-                if (!mGo.Success)
+                var line = lines[i] ?? string.Empty;
+                var mLine = Mc0LineRx.Match(line);
+                if (!mLine.Success)
                     continue;
 
-                var stmt = (lines[i] ?? string.Empty).TrimStart();
-                // Skip direct gotos.
-                if (stmt.StartsWith("goto loc_", StringComparison.Ordinal) || stmt.StartsWith("goto .", StringComparison.Ordinal))
+                var stmt = (mLine.Groups["stmt"].Value ?? string.Empty).Trim();
+                var comment = mLine.Groups["comment"].Value;
+                var mOrigin = OriginRx.Match(comment ?? string.Empty);
+                if (!mOrigin.Success)
                     continue;
 
-                // Heuristic: only annotate when original asm looks like a jmp.
-                var comment = mGo.Groups["comment"].Value;
-                if (comment.IndexOf("; jmp", StringComparison.OrdinalIgnoreCase) < 0)
+                var asm = (mOrigin.Groups["asm"].Value ?? string.Empty).Trim();
+                if (string.IsNullOrWhiteSpace(asm))
+                    continue;
+
+                // Heuristic: only annotate jmps.
+                if (!asm.StartsWith("jmp ", StringComparison.OrdinalIgnoreCase))
                     continue;
 
                 // Avoid duplicate annotation.
-                if (i > 0 && (lines[i - 1] ?? string.Empty).TrimStart().StartsWith("// JUMPTABLE", StringComparison.Ordinal))
-                    continue;
+                if (i > 0)
+                {
+                    var prev = (lines[i - 1] ?? string.Empty).TrimStart();
+                    if (prev.StartsWith("// JUMPTABLE", StringComparison.Ordinal) || prev.StartsWith("// INDIRECT JMP", StringComparison.Ordinal))
+                        continue;
+                }
 
-                // If operand is a memory view index, it's very likely a jump table dispatch.
-                if (stmt.Contains("mem_", StringComparison.Ordinal) && stmt.Contains("[", StringComparison.Ordinal))
-                    lines.Insert(i++, "// JUMPTABLE dispatch (best-effort)" );
-                else
-                    lines.Insert(i++, "// INDIRECT JMP (best-effort)" );
+                string annotation = null;
+
+                // A) Memory-indirect jmp from asm (often still EMITHEX in MC0): jmp [..]
+                var mAsmMem = AsmIndirectJmpMemRx.Match(asm);
+                if (mAsmMem.Success)
+                {
+                    var segTok = (mAsmMem.Groups["seg"].Success ? mAsmMem.Groups["seg"].Value : string.Empty).Trim().ToUpperInvariant();
+                    var ea = (mAsmMem.Groups["ea"].Value ?? string.Empty).Trim();
+
+                    if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: true))
+                    {
+                        if (string.IsNullOrWhiteSpace(segTok))
+                            segTok = DefaultSegForEa(regs);
+
+                        var regsText = regs.Count == 0 ? "-" : string.Join("+", regs);
+
+                        // Conservative-ish: tables tend to involve SI/DI and/or multiple regs.
+                        var looksLikeTable = regs.Count >= 2 || regs.Contains("SI", StringComparer.Ordinal) || regs.Contains("DI", StringComparer.Ordinal);
+                        var kind = looksLikeTable ? "// JUMPTABLE" : "// INDIRECT JMP";
+                        annotation = $"{kind}: mem [{segTok}:{ea}] imm=0x{immSum:X4} regs={regsText} entrySize=2";
+                    }
+                    else
+                    {
+                        annotation = $"// INDIRECT JMP: mem [{(string.IsNullOrWhiteSpace(segTok) ? "?" : segTok)}:{ea}] entrySize=2";
+                    }
+
+                    lines.Insert(i++, annotation);
+                    continue;
+                }
+
+                // B) Reg-indirect jmp (e.g. jmp ax): try to find a recent table load into that reg.
+                var mAsmReg = AsmIndirectJmpRegRx.Match(asm);
+                if (mAsmReg.Success)
+                {
+                    var regTok = (mAsmReg.Groups["reg"].Value ?? string.Empty).Trim().ToLowerInvariant();
+                    if (RegMap.TryGetValue(regTok, out var targetReg))
+                    {
+                        for (var j = i - 1; j >= 0 && j >= i - 12; j--)
+                        {
+                            var t = (lines[j] ?? string.Empty).Trim();
+                            if (string.IsNullOrWhiteSpace(t))
+                                continue;
+                            if (t.StartsWith("//", StringComparison.Ordinal))
+                                continue;
+
+                            var mAssign = OriginStmtAssignRx.Match(lines[j] ?? string.Empty);
+                            if (!mAssign.Success)
+                                continue;
+
+                            var dst = (mAssign.Groups["dst"].Value ?? string.Empty).Trim();
+                            if (!RegMap.TryGetValue(dst.ToLowerInvariant(), out var dstReg) || !string.Equals(dstReg, targetReg, StringComparison.Ordinal))
+                                continue;
+
+                            var rhs = (mAssign.Groups["rhs"].Value ?? string.Empty).Trim();
+                            var mRhsMem = MemIndexExprRx.Match(rhs);
+                            if (!mRhsMem.Success)
+                                break;
+
+                            var seg = mRhsMem.Groups["seg"].Value.ToUpperInvariant();
+                            var @base = mRhsMem.Groups["base"].Value.ToUpperInvariant();
+                            var w = mRhsMem.Groups["w"].Value;
+                            var idx = mRhsMem.Groups["idx"].Value.Trim();
+                            var entrySize = EntrySizeFromSuffix(w);
+                            annotation = $"// JUMPTABLE: {targetReg} <- ({seg}, 0x{@base}) entrySize={entrySize} idx={idx}";
+                            break;
+                        }
+                    }
+
+                    lines.Insert(i++, annotation ?? "// INDIRECT JMP (best-effort)");
+                    continue;
+                }
+
+                // Otherwise, this is some jmp form we didn't recognize.
             }
 
             return string.Join("\n", lines);
