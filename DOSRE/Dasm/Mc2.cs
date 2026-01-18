@@ -120,6 +120,10 @@ namespace DOSRE.Dasm
             @"^\s*[\{\}]\s*$",
             RegexOptions.Compiled);
 
+        private static readonly Regex BracesOnlyWhitespaceRx = new Regex(
+            @"^[\{\}\s]+$",
+            RegexOptions.Compiled);
+
         private static readonly Regex OriginTaggedStmtRx = new Regex(
             @";\s*//\s*@(?<addr>[0-9A-Fa-f]{1,8})\s+[0-9A-Fa-f]{2,}",
             RegexOptions.Compiled);
@@ -615,6 +619,7 @@ namespace DOSRE.Dasm
             var t = l.Trim();
             if (string.IsNullOrWhiteSpace(t)) return;
             if (CommentLineRx.IsMatch(t)) return;
+            if (BracesOnlyWhitespaceRx.IsMatch(t)) return;
 
             // PreserveBytes: only allow label-only lines or origin-tagged statement lines.
             if (mode == Mode.PreserveBytes)
