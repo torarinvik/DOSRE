@@ -789,6 +789,18 @@ namespace DOSRE.Dasm
             @"^\s*jmp\s+(?<reg>[a-z]{2})\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+        private static readonly Regex AsmShift1Rx = new Regex(
+            @"\b(?:shl|sal)\s+(?<reg>ax|bx|cx|dx|si|di|bp|sp)\s*,\s*1\b",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex AsmAddRegRegRx = new Regex(
+            @"\badd\s+(?<reg>ax|bx|cx|dx|si|di|bp|sp)\s*,\s*(?<reg2>ax|bx|cx|dx|si|di|bp|sp)\b",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex AsmCmpImmRx = new Regex(
+            @"\bcmp\s+(?<reg>ax|bx|cx|dx|si|di|bp|sp)\s*,\s*(?<imm>(?:0x)?[0-9A-Fa-f]+h?)\b",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
         private static string StructureIfElseBlocks(string mc1Text)
         {
             if (string.IsNullOrWhiteSpace(mc1Text))
@@ -1070,6 +1082,97 @@ namespace DOSRE.Dasm
                 };
             }
 
+            static bool IsPlausibleTableBaseImm(string ea)
+            {
+                // Heuristic: jump tables often have a constant base/displacement.
+                // Require a numeric token (not just reg+reg like bp+si).
+                if (string.IsNullOrWhiteSpace(ea)) return false;
+                if (ea.IndexOf("0x", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                if (Regex.IsMatch(ea, @"\b[0-9A-Fa-f]+h\b", RegexOptions.IgnoreCase)) return true;
+                if (Regex.IsMatch(ea, @"\b-\d+\b")) return true;
+                return false;
+            }
+
+            static bool HasImmediateLikeToken(string expr)
+            {
+                // Detect typical immediates appearing in MC1 expressions.
+                // Examples: 0x0002, 72h, -2
+                if (string.IsNullOrWhiteSpace(expr)) return false;
+                if (expr.IndexOf("0x", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                if (Regex.IsMatch(expr, @"\b[0-9A-Fa-f]+h\b", RegexOptions.IgnoreCase)) return true;
+                if (Regex.IsMatch(expr, @"\b-\d+\b")) return true;
+                return false;
+            }
+
+            static HashSet<string> ExtractIndexRegsFromExpr(string expr)
+            {
+                var regs = new HashSet<string>(StringComparer.Ordinal);
+                if (string.IsNullOrWhiteSpace(expr)) return regs;
+                foreach (var r in new[] { "AX", "BX", "CX", "DX", "SI", "DI", "BP", "SP" })
+                {
+                    if (Regex.IsMatch(expr, $@"\b{r}\b", RegexOptions.None))
+                        regs.Add(r);
+                }
+                return regs;
+            }
+
+            bool HasNearbyTableEvidence(int jmpLineIndex, IReadOnlyCollection<string> regsUpper, string preferredIndexRegUpper = null)
+            {
+                // Scan a small window back for typical patterns:
+                // - scaling: shl reg, 1
+                // - doubling: add reg, reg
+                // - bounds: cmp reg, imm
+                // Evidence must involve one of the EA regs (or the preferred one).
+                var score = 0;
+
+                for (var j = jmpLineIndex - 1; j >= 0 && j >= jmpLineIndex - 12; j--)
+                {
+                    var raw = lines[j] ?? string.Empty;
+                    var mPrevLine = Mc0LineRx.Match(raw);
+                    if (!mPrevLine.Success)
+                        continue;
+
+                    var prevComment = mPrevLine.Groups["comment"].Value;
+                    var mPrevOrigin = OriginRx.Match(prevComment ?? string.Empty);
+                    if (!mPrevOrigin.Success)
+                        continue;
+
+                    var prevAsm = (mPrevOrigin.Groups["asm"].Value ?? string.Empty).Trim();
+                    if (string.IsNullOrWhiteSpace(prevAsm))
+                        continue;
+
+                    var mShift = AsmShift1Rx.Match(prevAsm);
+                    if (mShift.Success)
+                    {
+                        var r = mShift.Groups["reg"].Value.ToUpperInvariant();
+                        if ((preferredIndexRegUpper != null && r == preferredIndexRegUpper) || regsUpper.Contains(r))
+                            score += 2;
+                    }
+
+                    var mAdd = AsmAddRegRegRx.Match(prevAsm);
+                    if (mAdd.Success)
+                    {
+                        var r1 = mAdd.Groups["reg"].Value.ToUpperInvariant();
+                        var r2 = mAdd.Groups["reg2"].Value.ToUpperInvariant();
+                        if (r1 == r2 && ((preferredIndexRegUpper != null && r1 == preferredIndexRegUpper) || regsUpper.Contains(r1)))
+                            score += 1;
+                    }
+
+                    var mCmp = AsmCmpImmRx.Match(prevAsm);
+                    if (mCmp.Success)
+                    {
+                        var r = mCmp.Groups["reg"].Value.ToUpperInvariant();
+                        if ((preferredIndexRegUpper != null && r == preferredIndexRegUpper) || regsUpper.Contains(r))
+                            score += 1;
+                    }
+
+                    if (score >= 2)
+                        return true;
+                }
+
+                return false;
+            }
+
             for (var i = 0; i < lines.Count; i++)
             {
                 var line = lines[i] ?? string.Empty;
@@ -1115,9 +1218,21 @@ namespace DOSRE.Dasm
 
                         var regsText = regs.Count == 0 ? "-" : string.Join("+", regs);
 
-                        // Conservative-ish: tables tend to involve SI/DI and/or multiple regs.
-                        var looksLikeTable = regs.Count >= 2 || regs.Contains("SI", StringComparer.Ordinal) || regs.Contains("DI", StringComparer.Ordinal);
-                        var kind = looksLikeTable ? "// JUMPTABLE" : "// INDIRECT JMP";
+                        // Conservative: only call it a jump table if we see nearby evidence of indexing/scaling/bounds.
+                        // Otherwise this is just an indirect jump through memory.
+                        var regsUpper = new HashSet<string>(regs.Select(r => (r ?? string.Empty).Trim().ToUpperInvariant()), StringComparer.Ordinal);
+
+                        // Prefer SI/DI/BX as likely index regs.
+                        var preferred = regsUpper.Contains("BX") ? "BX" : (regsUpper.Contains("SI") ? "SI" : (regsUpper.Contains("DI") ? "DI" : null));
+                        var hasEvidence = HasNearbyTableEvidence(i, regsUpper, preferred);
+                        var hasBaseImm = IsPlausibleTableBaseImm(ea);
+
+                        // Stricter threshold when only a single reg is involved (e.g. [si]) to avoid false positives.
+                        var looksIndexed = regsUpper.Contains("BX") || regsUpper.Contains("SI") || regsUpper.Contains("DI");
+                        var canBeTable = looksIndexed && (regsUpper.Count >= 2 ? hasEvidence : (hasEvidence && hasBaseImm));
+                        var canBeMaybe = looksIndexed && !canBeTable && hasBaseImm;
+
+                        var kind = canBeTable ? "// JUMPTABLE" : (canBeMaybe ? "// JUMPTABLE?" : "// INDIRECT JMP");
                         annotation = $"{kind}: mem [{segTok}:{ea}] imm=0x{immSum:X4} regs={regsText} entrySize=2";
                     }
                     else
@@ -1136,6 +1251,8 @@ namespace DOSRE.Dasm
                     var regTok = (mAsmReg.Groups["reg"].Value ?? string.Empty).Trim().ToLowerInvariant();
                     if (RegMap.TryGetValue(regTok, out var targetReg))
                     {
+                        // Default to indirect jump unless we can justify "jump table".
+                        var foundTableLoad = false;
                         for (var j = i - 1; j >= 0 && j >= i - 12; j--)
                         {
                             var t = (lines[j] ?? string.Empty).Trim();
@@ -1162,9 +1279,22 @@ namespace DOSRE.Dasm
                             var w = mRhsMem.Groups["w"].Value;
                             var idx = mRhsMem.Groups["idx"].Value.Trim();
                             var entrySize = EntrySizeFromSuffix(w);
-                            annotation = $"// JUMPTABLE: {targetReg} <- ({seg}, 0x{@base}) entrySize={entrySize} idx={idx}";
+
+                            // Require nearby evidence involving the *index regs* used to form the table address.
+                            var idxRegs = ExtractIndexRegsFromExpr(idx);
+                            // Prefer common index regs.
+                            var preferred = idxRegs.Contains("BX") ? "BX" : (idxRegs.Contains("SI") ? "SI" : (idxRegs.Contains("DI") ? "DI" : null));
+                            var hasEvidence = HasNearbyTableEvidence(i, idxRegs, preferredIndexRegUpper: preferred);
+                            var hasImm = HasImmediateLikeToken(idx);
+
+                            foundTableLoad = true;
+                            var kind = hasEvidence ? "// JUMPTABLE" : (hasImm ? "// JUMPTABLE?" : "// INDIRECT JMP");
+                            annotation = $"{kind}: {targetReg} <- ({seg}, 0x{@base}) entrySize={entrySize} idx={idx}";
                             break;
                         }
+
+                        if (!foundTableLoad)
+                            annotation = null;
                     }
 
                     lines.Insert(i++, annotation ?? "// INDIRECT JMP (best-effort)");

@@ -585,6 +585,15 @@ namespace DOSRE.Tests
                     new Bin16Mc0.Mc0Stmt
                     {
                         Index = 0,
+                        Addr = 0x00009FFC,
+                        BytesHex = "D1E3",
+                        Asm = "shl bx, 1",
+                        Mc0 = "EMITHEX(\"d1e3\")",
+                        Labels = new List<string>(),
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 1,
                         Addr = 0x0000A000,
                         BytesHex = "2E8B807200",
                         Asm = "mov ax, [cs:bx+si+72h]",
@@ -593,7 +602,7 @@ namespace DOSRE.Tests
                     },
                     new Bin16Mc0.Mc0Stmt
                     {
-                        Index = 1,
+                        Index = 2,
                         Addr = 0x0000A005,
                         BytesHex = "FFE0",
                         Asm = "jmp ax",
@@ -617,6 +626,49 @@ namespace DOSRE.Tests
             var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
             var desugared = Mc1.DesugarToMc0Text(parsed);
             Assert.Contains("@0000A005 FFE0", desugared);
+        }
+
+        [Fact]
+        public void LiftMc0ToMc1_Annotates_MaybeJumpTable_When_TableLike_Load_Lacks_Strong_Evidence()
+        {
+            var mc0 = new Bin16Mc0.Mc0File
+            {
+                Source = "in-memory",
+                StreamSha256 = "dummy",
+                Statements = new List<Bin16Mc0.Mc0Stmt>
+                {
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 0,
+                        Addr = 0x0000B000,
+                        BytesHex = "2E8B4472",
+                        Asm = "mov ax, [cs:si+72h]",
+                        Mc0 = "EMITHEX(\"2e8b4472\")",
+                        Labels = new List<string>(),
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 1,
+                        Addr = 0x0000B004,
+                        BytesHex = "FFE0",
+                        Asm = "jmp ax",
+                        Mc0 = "goto ax",
+                        Labels = new List<string>(),
+                    },
+                }
+            };
+
+            var mc1 = Bin16Mc1Lifter.LiftMc0ToMc1Text(mc0);
+
+            Assert.Contains("view mem_cs_0070_w at (CS, 0x0070) : u16;", mc1);
+            Assert.Contains("AX = mem_cs_0070_w[ADD16(SI, 0x0002)];", mc1);
+
+            // No strong nearby scaling/bounds evidence, but it is table-like (indexed + displacement).
+            Assert.Contains("// JUMPTABLE?:", mc1);
+
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+            Assert.Contains("@0000B004 FFE0", desugared);
         }
     }
 }
