@@ -39,12 +39,20 @@ public static class Bin16McChainProof
         // Baseline: promoted asm -> MC0
         var baselineMc0 = Bin16Mc0.LiftPromotedAsmToMc0(promotedAsmPath);
 
+        // Ensure out dir exists (also used for emitting debug artifacts).
+        var outDir = string.IsNullOrWhiteSpace(opts.OutDir)
+            ? Path.Combine(Path.GetTempPath(), "dosre-binmc1prove")
+            : opts.OutDir;
+        Directory.CreateDirectory(outDir);
+
         // MC1/MC2 -> desugared MC0 -> parse
         string desugaredMc0Text;
+        string desugaredMc1Text = null;
         if (string.Equals(Path.GetExtension(mc1Path), ".mc2", StringComparison.OrdinalIgnoreCase))
         {
             var mc2File = Mc2.Parse(mc1Path);
             var mc1Text = Mc2.DesugarToMc1Text(mc2File, Mc2.Mode.PreserveBytes);
+            desugaredMc1Text = mc1Text;
             var mc1File = Mc1.ParseLines(
                 mc1Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None),
                 sourceName: mc1Path + " (desugared mc2->mc1)");
@@ -55,6 +63,15 @@ public static class Bin16McChainProof
             var mc1File = Mc1.Parse(mc1Path);
             desugaredMc0Text = Mc1.DesugarToMc0Text(mc1File);
         }
+
+        // Emit helpful debug artifacts to locate parse errors / identity mismatches.
+        // (These are pure text exports; they do not affect proofs.)
+        if (!string.IsNullOrWhiteSpace(desugaredMc1Text))
+        {
+            File.WriteAllText(Path.Combine(outDir, "desugared.mc2_to_mc1.mc1"), desugaredMc1Text);
+        }
+        File.WriteAllText(Path.Combine(outDir, "desugared.mc1_to_mc0.mc0"), desugaredMc0Text);
+
         var mc1Mc0 = Bin16Mc0.ParseMc0Text(
             desugaredMc0Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None),
             sourceName: mc1Path + " (desugared)");
@@ -78,7 +95,7 @@ public static class Bin16McChainProof
         // Grounding proof: promoted asm -> MC0 -> reasm -> assemble/link -> byte-compare original
         var verifyOpts = new Bin16Mc0Verifier.VerifyOptions
         {
-            OutDir = string.IsNullOrWhiteSpace(opts.OutDir) ? Path.Combine(Path.GetTempPath(), "dosre-binmc1prove") : opts.OutDir,
+            OutDir = outDir,
             WasmPath = string.IsNullOrWhiteSpace(opts.WasmPath) ? "wasm" : opts.WasmPath,
             WlinkPath = string.IsNullOrWhiteSpace(opts.WlinkPath) ? "wlink" : opts.WlinkPath,
         };
