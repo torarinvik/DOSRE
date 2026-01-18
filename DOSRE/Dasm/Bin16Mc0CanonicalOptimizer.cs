@@ -91,6 +91,7 @@ public static class Bin16Mc0CanonicalOptimizer
     public sealed record OptimizeReport(
         OptimizeResult InvertJccSkipJmp,
         OptimizeResult ThreadJccThroughJmp,
+        OptimizeResult ThreadJmpThroughJmp,
         OptimizeResult ElideJmpToFallthrough,
         OptimizeResult ElideJccToFallthrough);
 
@@ -100,6 +101,7 @@ public static class Bin16Mc0CanonicalOptimizer
         return new OptimizeReport(
             InvertJccSkipJmp: OptimizeInvertJccSkipJmp(mc0),
             ThreadJccThroughJmp: OptimizeThreadJccThroughJmp(mc0),
+            ThreadJmpThroughJmp: OptimizeThreadJmpThroughJmp(mc0),
             ElideJmpToFallthrough: OptimizeElideJmpToFallthrough(mc0),
             ElideJccToFallthrough: OptimizeElideJccToFallthrough(mc0));
     }
@@ -314,6 +316,108 @@ public static class Bin16Mc0CanonicalOptimizer
             a.BytesHex = $"{aOp:X2}{newDisp:X2}";
             a.Mc0 = $"if ({cond}()) goto {l2Lbl}";
             applied++;
+        }
+
+        return new OptimizeResult(candidates, applied, skipped);
+    }
+
+    /// <summary>
+    /// Thread an unconditional JMP through another unconditional JMP trampoline:
+    ///   A:  goto L1;          (JMP short/near)
+    ///   L1: goto L2;          (JMP short/near)
+    /// Rewrite A to jump directly to L2 if the displacement fits the encoding of A.
+    ///
+    /// Proof obligation is local and decode-based:
+    /// - A bytes decode to exactly L1
+    /// - L1 bytes decode to exactly L2
+    /// - New displacement fits A's opcode (EB => sbyte, E9 => int16)
+    ///
+    /// This is length-preserving (only changes the displacement bytes of A).
+    /// The trampoline remains intact (it may have other predecessors).
+    /// </summary>
+    public static OptimizeResult OptimizeThreadJmpThroughJmp(Bin16Mc0.Mc0File mc0)
+    {
+        if (mc0 == null) throw new ArgumentNullException(nameof(mc0));
+
+        var labelToAddr = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+        var stmtByAddr = new Dictionary<uint, Bin16Mc0.Mc0Stmt>();
+
+        foreach (var st in mc0.Statements)
+        {
+            if (!stmtByAddr.ContainsKey(st.Addr))
+                stmtByAddr[st.Addr] = st;
+
+            if (st.Labels == null) continue;
+            foreach (var lbl in st.Labels)
+            {
+                if (string.IsNullOrWhiteSpace(lbl)) continue;
+                if (!labelToAddr.ContainsKey(lbl))
+                    labelToAddr[lbl] = st.Addr;
+            }
+        }
+
+        var candidates = 0;
+        var applied = 0;
+        var skipped = 0;
+
+        for (var i = 0; i < mc0.Statements.Count; i++)
+        {
+            var a = mc0.Statements[i];
+
+            var am = GotoRx.Match(a.Mc0 ?? string.Empty);
+            if (!am.Success) continue;
+
+            if ((a.BytesHex?.Length ?? 0) < 4) continue;
+            if (!TryParseHexByte(a.BytesHex.AsSpan(0, 2), out var aOp)) continue;
+            if (aOp != 0xE9 && aOp != 0xEB) continue;
+
+            candidates++;
+
+            var l1Lbl = am.Groups["lbl"].Value;
+            if (!TryResolveLabelAddr(labelToAddr, l1Lbl, out var l1Addr)) { skipped++; continue; }
+
+            var aTargetDecoded = DecodeJmpTarget(a.Addr, a.BytesHex, out var okA);
+            if (!okA || aTargetDecoded != l1Addr) { skipped++; continue; }
+
+            if (!stmtByAddr.TryGetValue(l1Addr, out var l1Stmt)) { skipped++; continue; }
+
+            var l1m = GotoRx.Match(l1Stmt.Mc0 ?? string.Empty);
+            if (!l1m.Success) { skipped++; continue; }
+            if ((l1Stmt.BytesHex?.Length ?? 0) < 4) { skipped++; continue; }
+            if (!TryParseHexByte(l1Stmt.BytesHex.AsSpan(0, 2), out var l1Op)) { skipped++; continue; }
+            if (l1Op != 0xE9 && l1Op != 0xEB) { skipped++; continue; }
+
+            var l2Lbl = l1m.Groups["lbl"].Value;
+            if (!TryResolveLabelAddr(labelToAddr, l2Lbl, out var l2Addr)) { skipped++; continue; }
+
+            var l1TargetDecoded = DecodeJmpTarget(l1Stmt.Addr, l1Stmt.BytesHex, out var okL1);
+            if (!okL1 || l1TargetDecoded != l2Addr) { skipped++; continue; }
+
+            if (aOp == 0xEB)
+            {
+                var relBase = (int)(a.Addr + 2);
+                var rel = (int)l2Addr - relBase;
+                if (rel < sbyte.MinValue || rel > sbyte.MaxValue) { skipped++; continue; }
+                var disp = unchecked((byte)(sbyte)rel);
+                a.BytesHex = $"{aOp:X2}{disp:X2}";
+                a.Mc0 = $"goto {l2Lbl}";
+                applied++;
+                continue;
+            }
+
+            // aOp == E9 (near)
+            {
+                var relBase = (int)(a.Addr + 3);
+                var rel = (int)l2Addr - relBase;
+                if (rel < short.MinValue || rel > short.MaxValue) { skipped++; continue; }
+                var imm = unchecked((ushort)(short)rel);
+                var lo = (byte)(imm & 0xFF);
+                var hi = (byte)((imm >> 8) & 0xFF);
+                a.BytesHex = $"{aOp:X2}{lo:X2}{hi:X2}";
+                a.Mc0 = $"goto {l2Lbl}";
+                applied++;
+                continue;
+            }
         }
 
         return new OptimizeResult(candidates, applied, skipped);
