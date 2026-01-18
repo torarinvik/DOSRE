@@ -505,13 +505,36 @@ namespace DOSRE.Dasm
             if (m.Success)
                 return $"goto {m.Groups["lbl"].Value}";
 
-            // jcc label (handles 'short', 'near')
-            m = Regex.Match(a, @"^(?<cc>jz|jnz|jc|jnc|ja|jae|jb|jbe|jl|jle|jg|jge|jo|jno|js|jns)\s+(?:short\s+|near\s+)?(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)$", RegexOptions.IgnoreCase);
+            // jcc label (handles common aliases + 'short'/'near')
+            m = Regex.Match(a, @"^(?<cc>jz|je|jnz|jne|jc|jnc|ja|jae|jb|jbe|jna|jnae|jnb|jnbe|jl|jle|jg|jge|jnl|jnle|jng|jnge|jo|jno|js|jns|jp|jpe|jnp|jpo)\s+(?:short\s+|near\s+)?(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)$", RegexOptions.IgnoreCase);
             if (m.Success)
             {
                 var cc = m.Groups["cc"].Value.ToUpperInvariant();
                 var lbl = m.Groups["lbl"].Value;
                 return $"if ({cc}()) goto {lbl}";
+            }
+
+            // jcxz label (handles 'short', 'near')
+            m = Regex.Match(a, @"^jcxz\s+(?:short\s+|near\s+)?(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)$", RegexOptions.IgnoreCase);
+            if (m.Success)
+            {
+                var lbl = m.Groups["lbl"].Value;
+                return $"if (JCXZ()) goto {lbl}";
+            }
+
+            // loop/loope/loopne label (handles 'short', 'near' and z/nz aliases)
+            m = Regex.Match(a, @"^(?<op>loop|loope|loopz|loopne|loopnz)\s+(?:short\s+|near\s+)?(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)$", RegexOptions.IgnoreCase);
+            if (m.Success)
+            {
+                var op = m.Groups["op"].Value.Trim().ToLowerInvariant();
+                var lbl = m.Groups["lbl"].Value;
+                op = op switch
+                {
+                    "loopz" => "loope",
+                    "loopnz" => "loopne",
+                    _ => op,
+                };
+                return $"if ({op.ToUpperInvariant()}()) goto {lbl}";
             }
 
             // call label (handles 'near')
