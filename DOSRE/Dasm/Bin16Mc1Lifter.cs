@@ -59,6 +59,12 @@ namespace DOSRE.Dasm
             public ushort DsAbsMax { get; set; } = 0x04FF;
 
             /// <summary>
+            /// Render simple if/else blocks when the control-flow pattern is unambiguous.
+            /// This is purely presentational: origin tags remain 1:1 and the chain proof stays byte-faithful.
+            /// </summary>
+            public bool StructureIfElseBlocks { get; set; } = true;
+
+            /// <summary>
             /// Max size of a generated ES view window, in bytes.
             /// </summary>
             public ushort EsViewMaxSpan { get; set; } = 0x0040;
@@ -740,7 +746,153 @@ namespace DOSRE.Dasm
                 sb.AppendLine(comment);
             }
 
-            return sb.ToString();
+            var text = sb.ToString();
+            if (opts.StructureIfElseBlocks)
+                text = StructureIfElseBlocks(text);
+            return text;
+        }
+
+        private static readonly Regex LabelLineRx = new Regex(
+            @"^\s*(?<label>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)\s*:\s*(?://.*)?$",
+            RegexOptions.Compiled);
+
+        private static readonly Regex OriginStmtIfGotoRx = new Regex(
+            @"^(?<indent>\s*)if\s*\(\s*(?<cond>[A-Za-z0-9_]+)\(\)\s*\)\s*goto\s+(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)\s*;\s*//\s*(?<comment>.*)$",
+            RegexOptions.Compiled);
+
+        private static readonly Regex OriginStmtGotoRx = new Regex(
+            @"^(?<indent>\s*)goto\s+(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)\s*;\s*//\s*(?<comment>.*)$",
+            RegexOptions.Compiled);
+
+        private static string StructureIfElseBlocks(string mc1Text)
+        {
+            if (string.IsNullOrWhiteSpace(mc1Text))
+                return mc1Text;
+
+            var lines = mc1Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
+            if (lines.Count == 0)
+                return mc1Text;
+
+            var labelToIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+            for (var i = 0; i < lines.Count; i++)
+            {
+                var m = LabelLineRx.Match(lines[i] ?? string.Empty);
+                if (m.Success)
+                {
+                    var lbl = m.Groups["label"].Value;
+                    if (!string.IsNullOrWhiteSpace(lbl) && !labelToIndex.ContainsKey(lbl))
+                        labelToIndex[lbl] = i;
+                }
+            }
+
+            // Count incoming edges for conservatism.
+            var incoming = new Dictionary<string, int>(StringComparer.Ordinal);
+            for (var i = 0; i < lines.Count; i++)
+            {
+                var s = lines[i] ?? string.Empty;
+                var mIf = OriginStmtIfGotoRx.Match(s);
+                if (mIf.Success)
+                {
+                    var t = mIf.Groups["lbl"].Value;
+                    if (!string.IsNullOrWhiteSpace(t)) incoming[t] = incoming.TryGetValue(t, out var c) ? c + 1 : 1;
+                    continue;
+                }
+
+                var mGo = OriginStmtGotoRx.Match(s);
+                if (mGo.Success)
+                {
+                    var t = mGo.Groups["lbl"].Value;
+                    if (!string.IsNullOrWhiteSpace(t)) incoming[t] = incoming.TryGetValue(t, out var c) ? c + 1 : 1;
+                }
+            }
+
+            // Rewrite from top to bottom, but only touch each pattern once.
+            for (var i = 0; i < lines.Count; i++)
+            {
+                var mIf = OriginStmtIfGotoRx.Match(lines[i] ?? string.Empty);
+                if (!mIf.Success)
+                    continue;
+
+                var indent = mIf.Groups["indent"].Value;
+                var cond = mIf.Groups["cond"].Value.Trim();
+                var elseLbl = mIf.Groups["lbl"].Value.Trim();
+                var ifComment = mIf.Groups["comment"].Value;
+
+                if (string.IsNullOrWhiteSpace(cond) || string.IsNullOrWhiteSpace(elseLbl))
+                    continue;
+
+                if (!labelToIndex.TryGetValue(elseLbl, out var elseIdx))
+                    continue;
+
+                // Must be forward.
+                if (elseIdx <= i)
+                    continue;
+
+                // Classic shape expects the last origin statement before else label to be an unconditional goto to end.
+                var prevStmt = -1;
+                for (var p = elseIdx - 1; p > i; p--)
+                {
+                    var t = (lines[p] ?? string.Empty).Trim();
+                    if (string.IsNullOrWhiteSpace(t))
+                        continue;
+                    if (t.StartsWith("//", StringComparison.Ordinal))
+                        continue;
+                    prevStmt = p;
+                    break;
+                }
+
+                if (prevStmt < 0)
+                    continue;
+
+                var mGo = OriginStmtGotoRx.Match(lines[prevStmt] ?? string.Empty);
+                if (!mGo.Success)
+                    continue;
+
+                var endLbl = mGo.Groups["lbl"].Value.Trim();
+                var goComment = mGo.Groups["comment"].Value;
+                if (string.IsNullOrWhiteSpace(endLbl))
+                    continue;
+
+                if (!labelToIndex.TryGetValue(endLbl, out var endIdx))
+                    continue;
+                if (endIdx <= elseIdx)
+                    continue;
+
+                // Conservatism: avoid misleading structure when labels have multiple incoming edges.
+                if (incoming.TryGetValue(elseLbl, out var inElse) && inElse != 1)
+                    continue;
+                if (incoming.TryGetValue(endLbl, out var inEnd) && inEnd != 1)
+                    continue;
+
+                // Rewrite:
+                //   if (COND()) goto elseLbl; // @...
+                //   ...then...
+                //   goto endLbl; // @...
+                // elseLbl:
+                //   ...else...
+                // endLbl:
+                // Into:
+                //   if (!COND()) { // @...
+                //   ...then...
+                //   } else { // @...
+                // elseLbl:
+                //   ...else...
+                // } endLbl:
+
+                lines[i] = $"{indent}if (!{cond}()) {{ // {ifComment}";
+                lines[prevStmt] = $"{indent}}} else {{ // {goComment}";
+
+                var endLine = lines[endIdx] ?? string.Empty;
+                var endIndent = endLine.Substring(0, endLine.Length - endLine.TrimStart().Length);
+                var endTrimmed = endLine.TrimStart();
+                if (!endTrimmed.StartsWith("}", StringComparison.Ordinal))
+                    lines[endIdx] = $"{endIndent}}} {endTrimmed}";
+
+                // Skip ahead to avoid nesting overlaps.
+                i = endIdx;
+            }
+
+            return string.Join("\n", lines);
         }
 
         private static string RenderMc0Line(Bin16Mc0.Mc0Stmt st)

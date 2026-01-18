@@ -378,5 +378,82 @@ namespace DOSRE.Tests
             Assert.Contains("@00008000 3B42FE", desugared);
             Assert.Contains("CMP(AX, LOAD16(SS, ADD16(0xFFF0, ADD16(ADD16(BP, SI), 0x000E))))", desugared);
         }
+
+        [Fact]
+        public void LiftMc0ToMc1_Structures_Simple_IfElse_When_Unambiguous()
+        {
+            // Pattern:
+            //   if (JZ()) goto else
+            //   ...then...
+            //   goto end
+            // else:
+            //   ...else...
+            // end:
+            var mc0 = new Bin16Mc0.Mc0File
+            {
+                Source = "in-memory",
+                StreamSha256 = "dummy",
+                Statements = new List<Bin16Mc0.Mc0Stmt>
+                {
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 0,
+                        Addr = 0x00009000,
+                        BytesHex = "7404",
+                        Asm = "jz short loc_else",
+                        Mc0 = "if (JZ()) goto loc_else",
+                        Labels = new List<string>(),
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 1,
+                        Addr = 0x00009002,
+                        BytesHex = "90",
+                        Asm = "nop",
+                        Mc0 = "EMITHEX(\"90\")",
+                        Labels = new List<string>(),
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 2,
+                        Addr = 0x00009003,
+                        BytesHex = "EB02",
+                        Asm = "jmp short loc_end",
+                        Mc0 = "goto loc_end",
+                        Labels = new List<string>(),
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 3,
+                        Addr = 0x00009005,
+                        BytesHex = "90",
+                        Asm = "nop",
+                        Mc0 = "EMITHEX(\"90\")",
+                        Labels = new List<string> { "loc_else" },
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 4,
+                        Addr = 0x00009006,
+                        BytesHex = "C3",
+                        Asm = "ret",
+                        Mc0 = "RET_NEAR()",
+                        Labels = new List<string> { "loc_end" },
+                    },
+                }
+            };
+
+            var mc1 = Bin16Mc1Lifter.LiftMc0ToMc1Text(mc0);
+
+            Assert.Contains("if (!JZ()) { // @00009000 7404", mc1);
+            Assert.Contains("} else { // @00009003 EB02", mc1);
+            Assert.Contains("} loc_end:", mc1);
+
+            // Must still desugar into something MC0 can parse (origin tags intact).
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+            Assert.Contains("@00009000 7404", desugared);
+            Assert.Contains("@00009003 EB02", desugared);
+        }
     }
 }

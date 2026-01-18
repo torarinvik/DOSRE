@@ -60,7 +60,7 @@ namespace DOSRE.Dasm
         }
 
         private static readonly Regex LabelOnly = new Regex(
-            @"^\s*(?<label>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)\s*:\s*(?://.*)?$",
+            @"^\s*(?:}\s*)*(?<label>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)\s*:\s*(?://.*)?$",
             RegexOptions.Compiled);
 
         private static readonly Regex OriginComment = new Regex(
