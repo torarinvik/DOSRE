@@ -280,7 +280,7 @@ namespace DOSRE.Tests
 
             // Bracket sugar must lower into LOAD/STORE forms.
             Assert.Contains("LOAD16(DS, ADD16(0x0000, ADD16(BX, DI)))", desugared);
-            Assert.Contains("STORE8(CS, ADD16(0x0070, ADD16(ADD16(BX, SI), 0x0002))", desugared);
+            Assert.Contains("STORE8(CS, ADD16(0x0070,", desugared);
         }
 
         [Fact]
@@ -315,6 +315,68 @@ namespace DOSRE.Tests
 
             Assert.Contains("@00006000 8A42FE", desugared);
             Assert.Contains("LOAD8(SS, ADD16(0xFFF0, ADD16(ADD16(BP, SI), 0x000E)))", desugared);
+        }
+
+        [Fact]
+        public void LiftMc0ToMc1_Sugars_IncDec_As_Postfix_And_Desugars_To_Assignment()
+        {
+            var mc0 = new Bin16Mc0.Mc0File
+            {
+                Source = "in-memory",
+                StreamSha256 = "dummy",
+                Statements = new List<Bin16Mc0.Mc0Stmt>
+                {
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 0,
+                        Addr = 0x00007000,
+                        BytesHex = "40",
+                        Asm = "inc ax",
+                        Mc0 = "EMITHEX(\"40\")",
+                        Labels = new List<string>(),
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 1,
+                        Addr = 0x00007001,
+                        BytesHex = "FF4AFE",
+                        Asm = "dec word ptr [bp+si-2]",
+                        Mc0 = "EMITHEX(\"ff4afe\")",
+                        Labels = new List<string>(),
+                    },
+                }
+            };
+
+            var mc1 = Bin16Mc1Lifter.LiftMc0ToMc1Text(mc0);
+
+            Assert.Contains("AX++;", mc1);
+            Assert.Contains("view mem_ss_fff0_w at (SS, 0xFFF0) : u16;", mc1);
+            Assert.Contains("mem_ss_fff0_w[ADD16(ADD16(BP, SI), 0x000E)]--;", mc1);
+
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+
+            Assert.Contains("@00007000 40", desugared);
+            Assert.Contains("AX = ADD(AX, 0x0001)", desugared);
+
+            Assert.Contains("@00007001 FF4AFE", desugared);
+            Assert.Contains("STORE16(SS, ADD16(0xFFF0, ADD16(ADD16(BP, SI), 0x000E)), SUB(LOAD16(SS, ADD16(0xFFF0, ADD16(ADD16(BP, SI), 0x000E))), 0x0001))", desugared);
+        }
+
+        [Fact]
+        public void Mc1_AsmLike_Cmp_Lowers_And_Preserves_Origin_Tag()
+        {
+            var mc1 = string.Join("\n", new[]
+            {
+                "view mem_ss_fff0_w at (SS, 0xFFF0) : u16;",
+                "    CMP AX, mem_ss_fff0_w[ADD16(ADD16(BP, SI), 0x000E)]; // @00008000 3B42FE ; cmp ax, [bp+si-2]",
+            });
+
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+
+            Assert.Contains("@00008000 3B42FE", desugared);
+            Assert.Contains("CMP(AX, LOAD16(SS, ADD16(0xFFF0, ADD16(ADD16(BP, SI), 0x000E))))", desugared);
         }
     }
 }

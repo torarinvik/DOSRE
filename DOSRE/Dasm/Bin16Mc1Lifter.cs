@@ -140,6 +140,15 @@ namespace DOSRE.Dasm
             @"^\s*(?<op>add|adc|and|cmp|or|sbb|sub|xor)\s+\[(?:(?<seg>cs|ds|es|ss)\s*:\s*)?(?<ea>[^\]]+)\]\s*,\s*(?<src>[a-z]{2})\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+        // Unary ops (inc/dec) for register or memory.
+        private static readonly Regex UnaryRegRx = new Regex(
+            @"^\s*(?<op>inc|dec)\s+(?<reg>[a-z]{2})\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex UnaryMemRx = new Regex(
+            @"^\s*(?<op>inc|dec)\s+(?:(?<ptr>byte|word)\s+ptr\s+)?\[(?:(?<seg>cs|ds|es|ss)\s*:\s*)?(?<ea>[^\]]+)\]\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
         private static readonly Regex Mc0LineRx = new Regex(
             @"^(?<indent>\s*)(?<stmt>.*?);\s*//\s*(?<comment>.*)$",
             RegexOptions.Compiled);
@@ -300,6 +309,22 @@ namespace DOSRE.Dasm
                     if (opts.LiftDsIndexedGlobals)
                     {
                         // Collect primitive views needed for non-mov memory ops too.
+                        var mUnaryMem = UnaryMemRx.Match(asm);
+                        if (mUnaryMem.Success)
+                        {
+                            var segTok = (mUnaryMem.Groups["seg"].Success ? mUnaryMem.Groups["seg"].Value : "ds").Trim().ToUpperInvariant();
+                            var ea = mUnaryMem.Groups["ea"].Value;
+
+                            // Infer width from opcode bytes (FE=r/m8, FF=r/m16) when possible; fall back to qualifier.
+                            var size = InferUnaryMemSize(st.BytesHex, mUnaryMem.Groups["ptr"].Value);
+                            if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: true))
+                            {
+                                if (!mUnaryMem.Groups["seg"].Success)
+                                    segTok = DefaultSegForEa(regs);
+                                _ = GetOrCreatePrimViewAndIndex(segTok, immSum, regs, size, primViews);
+                            }
+                        }
+
                         var mOpRegMem = BinOpRegMemRx.Match(asm);
                         if (mOpRegMem.Success)
                         {
@@ -599,6 +624,38 @@ namespace DOSRE.Dasm
                     var asm = (st.Asm ?? string.Empty).Trim();
                     if (!string.IsNullOrWhiteSpace(asm))
                     {
+                        // Unary ops (INC/DEC) -> postfix sugar.
+                        var mUnaryReg = UnaryRegRx.Match(asm);
+                        if (mUnaryReg.Success)
+                        {
+                            var op = mUnaryReg.Groups["op"].Value.Trim().ToLowerInvariant();
+                            var r = mUnaryReg.Groups["reg"].Value;
+                            if (RegMap.TryGetValue(r, out var reg))
+                            {
+                                stmtText = op == "inc" ? $"{reg}++" : $"{reg}--";
+                            }
+                        }
+                        else
+                        {
+                            var mUnaryMem = UnaryMemRx.Match(asm);
+                            if (mUnaryMem.Success)
+                            {
+                                var op = mUnaryMem.Groups["op"].Value.Trim().ToLowerInvariant();
+                                var ea = mUnaryMem.Groups["ea"].Value;
+                                var segTok = (mUnaryMem.Groups["seg"].Success ? mUnaryMem.Groups["seg"].Value : "ds").Trim().ToUpperInvariant();
+                                var size = InferUnaryMemSize(st.BytesHex, mUnaryMem.Groups["ptr"].Value);
+
+                                if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: true))
+                                {
+                                    if (!mUnaryMem.Groups["seg"].Success)
+                                        segTok = DefaultSegForEa(regs);
+                                    var (viewName, idxExpr) = GetOrCreatePrimViewAndIndex(segTok, immSum, regs, size, primViews);
+                                    var suffix = op == "inc" ? "++" : "--";
+                                    stmtText = $"{viewName}[{idxExpr}]{suffix}";
+                                }
+                            }
+                        }
+
                         // First: non-mov memory ops (keep semantics opaque; only sugar the memory operand).
                         var mOpRegMem = BinOpRegMemRx.Match(asm);
                         if (mOpRegMem.Success)
@@ -902,6 +959,22 @@ namespace DOSRE.Dasm
             // x86 16-bit addressing defaults to SS when BP is involved; otherwise DS.
             if (regs == null) return "DS";
             return regs.Contains("BP", StringComparer.Ordinal) ? "SS" : "DS";
+        }
+
+        private static int InferUnaryMemSize(string bytesHex, string ptrQualifier)
+        {
+            var hx = (bytesHex ?? string.Empty).Trim();
+            if (hx.Length >= 2)
+            {
+                var b0 = hx.Substring(0, 2).ToUpperInvariant();
+                if (b0 == "FE") return 1;
+                if (b0 == "FF") return 2;
+            }
+
+            var q = (ptrQualifier ?? string.Empty).Trim().ToLowerInvariant();
+            if (q == "byte") return 1;
+            if (q == "word") return 2;
+            return 2;
         }
 
         private static (string viewName, string idxExpr) GetOrCreatePrimViewAndIndex(

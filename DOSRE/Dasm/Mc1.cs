@@ -127,12 +127,23 @@ namespace DOSRE.Dasm
         // Asm-like MC1 sugar:
         //   AND AX, mem_ds_0000_w[ADD16(BX, DI)];
         //   AND mem_ds_0020_b[ADD16(DI, 0x0002)], DH;
+        //   CMP AX, mem_ds_0000_w[ADD16(BX, DI)];
+        //   INC AX;  /  DEC AX;
+        //   AX++;    /  AX--;
         // Lowers to:
         //   AX = AND(AX, ...);
         //   mem[...] = AND(mem[...], DH);
         private static readonly Regex MnemonicBinOpRx = new Regex(
-            @"^\s*(?<op>add|adc|and|or|sub|sbb|xor)\s+(?<dst>[^,]+)\s*,\s*(?<src>[^;]+)\s*$",
+            @"^\s*(?<op>add|adc|and|cmp|or|sub|sbb|xor)\s+(?<args>[^;]+)\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex MnemonicUnaryRx = new Regex(
+            @"^\s*(?<op>inc|dec)\s+(?<dst>[^;]+)\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex PostfixIncDecRx = new Regex(
+            @"^\s*(?<dst>[^;]+?)(?<op>\+\+|--)\s*$",
+            RegexOptions.Compiled);
 
         public static Mc1File Parse(string path)
         {
@@ -240,6 +251,7 @@ namespace DOSRE.Dasm
                 var line = raw ?? string.Empty;
                 var rewritten = RewriteConsts(line, mc1.Consts);
                 rewritten = RewriteAsmLikeOps(rewritten);
+                rewritten = RewritePostfixIncDec(rewritten, views, mc1.Types);
                 rewritten = RewriteViewFields(rewritten, views, mc1.Types);
                 sb.AppendLine(rewritten);
             }
@@ -368,21 +380,155 @@ namespace DOSRE.Dasm
             var stmt = (m.Groups["stmt"].Value ?? string.Empty).Trim();
             var comment = m.Groups["comment"].Value;
 
+            var mu = MnemonicUnaryRx.Match(stmt);
+            if (mu.Success)
+            {
+                var unaryOp = mu.Groups["op"].Value.Trim().ToLowerInvariant();
+                var unaryDst = mu.Groups["dst"].Value.Trim();
+                var suffix = unaryOp == "inc" ? "++" : "--";
+                return $"{indent}{unaryDst}{suffix}; // {comment}";
+            }
+
             var mm = MnemonicBinOpRx.Match(stmt);
             if (!mm.Success)
                 return line;
 
             var op = mm.Groups["op"].Value.Trim().ToUpperInvariant();
-            var dst = mm.Groups["dst"].Value.Trim();
-            var src = mm.Groups["src"].Value.Trim();
+            var args = (mm.Groups["args"].Value ?? string.Empty).Trim();
+            if (!TrySplitTopLevelComma(args, out var dst, out var src))
+                return line;
+
+            dst = dst.Trim();
+            src = src.Trim();
 
             // Normalize "reg" names to their MC0-style uppercase when possible.
             // (Safe: if it's not a reg token, leave as-is.)
             if (dst.Length == 2) dst = dst.ToUpperInvariant();
             if (src.Length == 2) src = src.ToUpperInvariant();
 
+            // CMP is flag-setting and does not write back.
+            if (op == "CMP")
+                return $"{indent}CMP({dst}, {src}); // {comment}";
+
             var newStmt = $"{dst} = {op}({dst}, {src})";
             return $"{indent}{newStmt}; // {comment}";
+        }
+
+        private static bool TrySplitTopLevelComma(string args, out string left, out string right)
+        {
+            left = string.Empty;
+            right = string.Empty;
+            if (string.IsNullOrWhiteSpace(args))
+                return false;
+
+            var depthParen = 0;
+            var depthBracket = 0;
+            for (var i = 0; i < args.Length; i++)
+            {
+                var ch = args[i];
+                switch (ch)
+                {
+                    case '(':
+                        depthParen++;
+                        break;
+                    case ')':
+                        if (depthParen > 0) depthParen--;
+                        break;
+                    case '[':
+                        depthBracket++;
+                        break;
+                    case ']':
+                        if (depthBracket > 0) depthBracket--;
+                        break;
+                    case ',':
+                        if (depthParen == 0 && depthBracket == 0)
+                        {
+                            left = args.Substring(0, i);
+                            right = args.Substring(i + 1);
+                            return !string.IsNullOrWhiteSpace(left) && !string.IsNullOrWhiteSpace(right);
+                        }
+
+                        break;
+                }
+            }
+
+            return false;
+        }
+
+        private static string RewritePostfixIncDec(string line, Dictionary<string, ViewDecl> views, Dictionary<string, StructType> types)
+        {
+            var m = Mc0LineRx.Match(line);
+            if (!m.Success)
+                return line;
+
+            var indent = m.Groups["indent"].Value;
+            var stmt = (m.Groups["stmt"].Value ?? string.Empty).Trim();
+            var comment = m.Groups["comment"].Value;
+
+            var pm = PostfixIncDecRx.Match(stmt);
+            if (!pm.Success)
+                return line;
+
+            var dst = pm.Groups["dst"].Value.Trim();
+            var op = pm.Groups["op"].Value;
+
+            // Determine width for a nicer immediate literal.
+            // - Registers: infer from name.
+            // - Views: infer from view type/field type.
+            var imm = "0x0001";
+            if (TryInferByteWidth(dst, views, types, out var isByte) && isByte)
+                imm = "0x01";
+
+            var fn = op == "++" ? "ADD" : "SUB";
+            var newStmt = $"{dst} = {fn}({dst}, {imm})";
+            return $"{indent}{newStmt}; // {comment}";
+        }
+
+        private static bool TryInferByteWidth(string expr, Dictionary<string, ViewDecl> views, Dictionary<string, StructType> types, out bool isByte)
+        {
+            isByte = false;
+            if (string.IsNullOrWhiteSpace(expr))
+                return false;
+
+            var e = expr.Trim();
+
+            // Register heuristic.
+            if (e.Length == 2)
+            {
+                var r = e.ToUpperInvariant();
+                isByte = r is "AL" or "AH" or "BL" or "BH" or "CL" or "CH" or "DL" or "DH";
+                return true;
+            }
+
+            // view.field
+            var dot = e.IndexOf('.', StringComparison.Ordinal);
+            if (dot > 0)
+            {
+                var vname = e.Substring(0, dot);
+                var fname = e.Substring(dot + 1);
+                if (views != null && types != null && views.TryGetValue(vname, out var vd) && types.TryGetValue(vd.Type, out var st))
+                {
+                    var (_, fType) = ResolveFieldOffset(st, fname, types);
+                    var size = SizeOfType(fType, types);
+                    isByte = size == 1;
+                    return true;
+                }
+            }
+
+            // view[idx]
+            var lb = e.IndexOf('[', StringComparison.Ordinal);
+            if (lb > 0 && e.EndsWith("]", StringComparison.Ordinal))
+            {
+                var vname = e.Substring(0, lb);
+                if (views != null && types != null && views.TryGetValue(vname, out var vd))
+                {
+                    var size = SizeOfType(vd.Type, types);
+                    isByte = size == 1;
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static (ushort offset, string fieldType) ResolveFieldOffset(StructType st, string field, Dictionary<string, StructType> types)
