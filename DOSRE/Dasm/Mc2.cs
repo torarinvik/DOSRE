@@ -104,6 +104,30 @@ namespace DOSRE.Dasm
             @"^\s*switch\s*\(.*\)\s*\{\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+        private static readonly Regex SwitchStartCaptureRx = new Regex(
+            @"^\s*switch\s*\(\s*(?<expr>.*)\s*\)\s*\{\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex CaseLabelRx = new Regex(
+            @"^\s*case\s+(?<val>[^:]+)\s*:\s*(?<rest>.*)$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex DefaultLabelRx = new Regex(
+            @"^\s*default\s*:\s*(?<rest>.*)$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex BraceOnlyRx = new Regex(
+            @"^\s*[\{\}]\s*$",
+            RegexOptions.Compiled);
+
+        private static readonly Regex OriginTaggedStmtRx = new Regex(
+            @";\s*//\s*@(?<addr>[0-9A-Fa-f]{1,8})\s+[0-9A-Fa-f]{2,}",
+            RegexOptions.Compiled);
+
+        private static readonly Regex LabelOnlyRx = new Regex(
+            @"^\s*(?:}\s*)*(?<label>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)\s*:\s*(?://.*)?$",
+            RegexOptions.Compiled);
+
         public static Mc2File Parse(string path)
         {
             if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Missing path", nameof(path));
@@ -370,6 +394,7 @@ namespace DOSRE.Dasm
             var outLines = new List<string>();
             OriginRange pendingOrigin = null;
             var forId = 0;
+            var switchId = 0;
 
             for (var i = 0; i < lines.Count; i++)
             {
@@ -386,11 +411,107 @@ namespace DOSRE.Dasm
                 }
 
                 // PreserveBytes enforcement stub for currently-unimplemented constructs.
-                if (mode == Mode.PreserveBytes && SwitchStartRx.IsMatch(line))
+                if (SwitchStartRx.IsMatch(line))
                 {
-                    if (pendingOrigin == null)
-                        throw new InvalidDataException("PreserveBytes: 'switch' requires an @origin(...) annotation (and switch lowering is not implemented yet).");
-                    throw new InvalidDataException("'switch' lowering is not implemented yet.");
+                    if (mode == Mode.PreserveBytes && pendingOrigin == null)
+                        throw new InvalidDataException("PreserveBytes: 'switch' requires an @origin(...) annotation.");
+
+                    // Find matching closing brace for the switch-block.
+                    var openLine = i;
+                    var depth = 0;
+                    var closeLine = -1;
+                    for (var j = i; j < lines.Count; j++)
+                    {
+                        var l = lines[j] ?? string.Empty;
+                        for (var k = 0; k < l.Length; k++)
+                        {
+                            if (l[k] == '{') depth++;
+                            else if (l[k] == '}') depth--;
+                        }
+
+                        if (j == i && depth == 0)
+                            throw new InvalidDataException("Malformed switch block: missing '{'");
+
+                        if (j > i && depth == 0)
+                        {
+                            closeLine = j;
+                            break;
+                        }
+                    }
+
+                    if (closeLine < 0)
+                        throw new InvalidDataException("Malformed switch block: missing closing '}'");
+
+                    var body = SliceBlockBody(lines, openLine, closeLine);
+                    i = closeLine; // advance past the block
+
+                    switchId++;
+                    var expr = string.Empty;
+                    var sm = SwitchStartCaptureRx.Match(line);
+                    if (sm.Success)
+                        expr = sm.Groups["expr"].Value.Trim();
+
+                    // PreserveBytes: strip braces and control keywords; emit only labels/comments + existing origin-bearing statements.
+                    if (pendingOrigin != null)
+                        outLines.Add($"// switch ({expr}) @origin({pendingOrigin})");
+                    else
+                        outLines.Add($"// switch ({expr})");
+
+                    var sawAnyLabel = false;
+                    foreach (var bl in body)
+                    {
+                        var rawLine = bl ?? string.Empty;
+                        var t = rawLine.Trim();
+
+                        if (string.IsNullOrWhiteSpace(t))
+                            continue;
+                        if (CommentLineRx.IsMatch(t))
+                            continue;
+                        if (BraceOnlyRx.IsMatch(t))
+                            continue;
+
+                        var cm = CaseLabelRx.Match(rawLine);
+                        if (cm.Success)
+                        {
+                            var valTok = cm.Groups["val"].Value.Trim();
+                            var rest = (cm.Groups["rest"].Value ?? string.Empty).Trim();
+
+                            var suffix = MakeSwitchCaseSuffix(valTok);
+                            outLines.Add($"_L_switch_{switchId}_case_{suffix}:");
+                            sawAnyLabel = true;
+
+                            if (!string.IsNullOrWhiteSpace(rest) && rest != "{" && rest != "}")
+                            {
+                                EmitSwitchBodyLine(outLines, rest, mode);
+                            }
+
+                            continue;
+                        }
+
+                        var dm = DefaultLabelRx.Match(rawLine);
+                        if (dm.Success)
+                        {
+                            var rest = (dm.Groups["rest"].Value ?? string.Empty).Trim();
+                            outLines.Add($"_L_switch_{switchId}_default:");
+                            sawAnyLabel = true;
+                            if (!string.IsNullOrWhiteSpace(rest) && rest != "{" && rest != "}")
+                            {
+                                EmitSwitchBodyLine(outLines, rest, mode);
+                            }
+
+                            continue;
+                        }
+
+                        EmitSwitchBodyLine(outLines, rawLine, mode);
+                    }
+
+                    if (!sawAnyLabel)
+                        outLines.Add($"// (empty switch body)");
+
+                    outLines.Add($"// end switch");
+
+                    pendingOrigin = null;
+                    continue;
                 }
 
                 var mFor = ForStartRx.Match(line);
@@ -407,33 +528,33 @@ namespace DOSRE.Dasm
                     throw new InvalidDataException($"Invalid for header: '{line}'");
 
                 // Find matching closing brace for this for-block.
-                var openLine = i;
-                var depth = 0;
-                var closeLine = -1;
+                var forOpenLine = i;
+                var forDepth = 0;
+                var forCloseLine = -1;
                 for (var j = i; j < lines.Count; j++)
                 {
                     var l = lines[j] ?? string.Empty;
                     for (var k = 0; k < l.Length; k++)
                     {
-                        if (l[k] == '{') depth++;
-                        else if (l[k] == '}') depth--;
+                        if (l[k] == '{') forDepth++;
+                        else if (l[k] == '}') forDepth--;
                     }
 
-                    if (j == i && depth == 0)
+                    if (j == i && forDepth == 0)
                         throw new InvalidDataException("Malformed for block: missing '{'");
 
-                    if (j > i && depth == 0)
+                    if (j > i && forDepth == 0)
                     {
-                        closeLine = j;
+                        forCloseLine = j;
                         break;
                     }
                 }
 
-                if (closeLine < 0)
+                if (forCloseLine < 0)
                     throw new InvalidDataException("Malformed for block: missing closing '}'");
 
-                var body = SliceBlockBody(lines, openLine, closeLine);
-                i = closeLine; // advance past the block
+                var forBody = SliceBlockBody(lines, forOpenLine, forCloseLine);
+                i = forCloseLine; // advance past the block
 
                 forId++;
                 var L_test = $"_L_for_{forId}_test";
@@ -448,7 +569,7 @@ namespace DOSRE.Dasm
                 outLines.Add($"goto {L_test};");
                 outLines.Add($"{L_body}:");
 
-                foreach (var bl in body)
+                foreach (var bl in forBody)
                 {
                     var bt = (bl ?? string.Empty).Trim();
                     if (string.Equals(bt, "continue;", StringComparison.Ordinal))
@@ -485,6 +606,67 @@ namespace DOSRE.Dasm
             }
 
             return outLines;
+        }
+
+        private static void EmitSwitchBodyLine(List<string> outLines, string line, Mode mode)
+        {
+            if (outLines == null) throw new ArgumentNullException(nameof(outLines));
+            var l = line ?? string.Empty;
+            var t = l.Trim();
+            if (string.IsNullOrWhiteSpace(t)) return;
+            if (CommentLineRx.IsMatch(t)) return;
+
+            // PreserveBytes: only allow label-only lines or origin-tagged statement lines.
+            if (mode == Mode.PreserveBytes)
+            {
+                if (LabelOnlyRx.IsMatch(l))
+                {
+                    outLines.Add(l);
+                    return;
+                }
+
+                if (OriginTaggedStmtRx.IsMatch(l))
+                {
+                    outLines.Add(l);
+                    return;
+                }
+
+                throw new InvalidDataException($"PreserveBytes: switch body contains a non-origin statement: '{t}'");
+            }
+
+            outLines.Add(l);
+        }
+
+        private static string MakeSwitchCaseSuffix(string valueToken)
+        {
+            var v = (valueToken ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(v))
+                return "empty";
+
+            // Normalize numeric tokens to a stable hex form when possible.
+            try
+            {
+                var n = ParseUInt(v);
+                return n <= 0xFFFF ? $"0x{n:X4}" : $"0x{n:X8}";
+            }
+            catch
+            {
+                // Non-numeric: sanitize for label usage.
+            }
+
+            var sb = new StringBuilder();
+            foreach (var ch in v)
+            {
+                if (char.IsLetterOrDigit(ch) || ch == '_')
+                    sb.Append(ch);
+                else
+                    sb.Append('_');
+            }
+
+            var s = sb.ToString();
+            while (s.Contains("__", StringComparison.Ordinal))
+                s = s.Replace("__", "_", StringComparison.Ordinal);
+            return s.Trim('_');
         }
     }
 }

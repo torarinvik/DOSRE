@@ -120,18 +120,33 @@ namespace DOSRE.Tests
         }
 
         [Fact]
-        public void Mc2_Switch_With_Origin_Still_Errors_Until_Implemented()
+        public void Mc2_Switch_With_Origin_Lowers_To_Case_Labels_And_Remains_Parseable_To_Mc0()
         {
             var mc2Text = string.Join("\n", new[]
             {
                 "@origin(0x1000..0x1010)",
                 "switch (AX) {",
-                "  case 0: { }",
+                "  case 0: {",
+                "    AX = 0x0001; // @00001000 DEADBEEF ; mov ax, 1",
+                "  }",
+                "  default: {",
+                "    AX = 0x0002; // @00001002 FEEDBEEF ; mov ax, 2",
+                "  }",
                 "}",
             });
 
             var mc2 = Mc2.ParseLines(mc2Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc2");
-            Assert.ThrowsAny<Exception>(() => Mc2.DesugarToMc1Text(mc2, Mc2.Mode.PreserveBytes));
+            var mc1Text = Mc2.DesugarToMc1Text(mc2, Mc2.Mode.PreserveBytes);
+
+            Assert.Contains("_L_switch_1_case_0x0000:", mc1Text);
+            Assert.Contains("_L_switch_1_default:", mc1Text);
+
+            var mc1 = Mc1.ParseLines(mc1Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var mc0Text = Mc1.DesugarToMc0Text(mc1);
+
+            // Must be parseable as MC0: only label-only lines + origin-tagged statements.
+            var mc0 = Bin16Mc0.ParseMc0Text(mc0Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc0");
+            Assert.True(mc0.Statements.Count >= 2);
         }
     }
 }
