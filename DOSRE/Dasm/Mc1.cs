@@ -119,6 +119,13 @@ namespace DOSRE.Dasm
             @"\b(?<view>[A-Za-z_][A-Za-z0-9_]*)\[(?<idx>[^\]]+)\]\s*=\s*(?<rhs>[^;]+)\s*;",
             RegexOptions.Compiled);
 
+        // Primitive view direct use (helps MC2 region lowering):
+        //   AX = some_u16_view;  -> AX = LOAD16(seg, off);
+        //   some_u16_view = AX;  -> STORE16(seg, off, AX);
+        private static readonly Regex ViewDirectAssignRx = new Regex(
+            @"^(?<dst>[A-Za-z_][A-Za-z0-9_]*|[A-Z]{2})\s*=\s*(?<rhs>.+?)\s*$",
+            RegexOptions.Compiled);
+
         // Parse an origin-tagged statement line, preserving the comment verbatim.
         private static readonly Regex Mc0LineRx = new Regex(
             @"^(?<indent>\s*)(?<stmt>.*?);\s*//\s*(?<comment>.*)$",
@@ -253,6 +260,7 @@ namespace DOSRE.Dasm
                 rewritten = RewriteAsmLikeOps(rewritten);
                 rewritten = RewritePostfixIncDec(rewritten, views, mc1.Types);
                 rewritten = RewriteViewFields(rewritten, views, mc1.Types);
+                rewritten = RewriteDirectPrimitiveViewLoadsStores(rewritten, views);
                 sb.AppendLine(rewritten);
             }
 
@@ -366,6 +374,62 @@ namespace DOSRE.Dasm
                 // Larger fields: leave as-is for now.
                 return m.Value;
             });
+        }
+
+        private static bool TryGetPrimitiveViewWidthBytes(string viewType, out int widthBytes)
+        {
+            widthBytes = 0;
+            if (string.IsNullOrWhiteSpace(viewType)) return false;
+            switch (viewType.Trim().ToLowerInvariant())
+            {
+                case "u8":
+                case "bool":
+                    widthBytes = 1;
+                    return true;
+                case "u16":
+                    widthBytes = 2;
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static string RewriteDirectPrimitiveViewLoadsStores(string line, Dictionary<string, ViewDecl> views)
+        {
+            if (string.IsNullOrWhiteSpace(line)) return line;
+            if (views == null || views.Count == 0) return line;
+
+            // Only rewrite origin-tagged statements; keep origin comment verbatim.
+            var m = Mc0LineRx.Match(line);
+            if (!m.Success)
+                return line;
+
+            var indent = m.Groups["indent"].Value;
+            var stmt = (m.Groups["stmt"].Value ?? string.Empty).Trim();
+            var comment = m.Groups["comment"].Value;
+
+            var ma = ViewDirectAssignRx.Match(stmt);
+            if (!ma.Success)
+                return line;
+
+            var dst = ma.Groups["dst"].Value.Trim();
+            var rhs = ma.Groups["rhs"].Value.Trim();
+
+            // Load: dst = viewName
+            if (views.TryGetValue(rhs, out var rhsView) && TryGetPrimitiveViewWidthBytes(rhsView.Type, out var rhsWidth))
+            {
+                var loadFn = rhsWidth == 1 ? "LOAD8" : "LOAD16";
+                return $"{indent}{dst} = {loadFn}({rhsView.SegExpr}, {rhsView.OffExpr}); // {comment}";
+            }
+
+            // Store: viewName = rhs
+            if (views.TryGetValue(dst, out var dstView) && TryGetPrimitiveViewWidthBytes(dstView.Type, out var dstWidth))
+            {
+                var storeFn = dstWidth == 1 ? "STORE8" : "STORE16";
+                return $"{indent}{storeFn}({dstView.SegExpr}, {dstView.OffExpr}, {rhs}); // {comment}";
+            }
+
+            return line;
         }
 
         private static string RewriteAsmLikeOps(string line)

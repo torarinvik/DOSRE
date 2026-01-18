@@ -39,9 +39,22 @@ public static class Bin16McChainProof
         // Baseline: promoted asm -> MC0
         var baselineMc0 = Bin16Mc0.LiftPromotedAsmToMc0(promotedAsmPath);
 
-        // MC1 -> desugared MC0 -> parse
-        var mc1File = Mc1.Parse(mc1Path);
-        var desugaredMc0Text = Mc1.DesugarToMc0Text(mc1File);
+        // MC1/MC2 -> desugared MC0 -> parse
+        string desugaredMc0Text;
+        if (string.Equals(Path.GetExtension(mc1Path), ".mc2", StringComparison.OrdinalIgnoreCase))
+        {
+            var mc2File = Mc2.Parse(mc1Path);
+            var mc1Text = Mc2.DesugarToMc1Text(mc2File, Mc2.Mode.PreserveBytes);
+            var mc1File = Mc1.ParseLines(
+                mc1Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None),
+                sourceName: mc1Path + " (desugared mc2->mc1)");
+            desugaredMc0Text = Mc1.DesugarToMc0Text(mc1File);
+        }
+        else
+        {
+            var mc1File = Mc1.Parse(mc1Path);
+            desugaredMc0Text = Mc1.DesugarToMc0Text(mc1File);
+        }
         var mc1Mc0 = Bin16Mc0.ParseMc0Text(
             desugaredMc0Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None),
             sourceName: mc1Path + " (desugared)");
