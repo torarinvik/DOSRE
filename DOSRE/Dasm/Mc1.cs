@@ -119,6 +119,21 @@ namespace DOSRE.Dasm
             @"\b(?<view>[A-Za-z_][A-Za-z0-9_]*)\[(?<idx>[^\]]+)\]\s*=\s*(?<rhs>[^;]+)\s*;",
             RegexOptions.Compiled);
 
+        // Parse an origin-tagged statement line, preserving the comment verbatim.
+        private static readonly Regex Mc0LineRx = new Regex(
+            @"^(?<indent>\s*)(?<stmt>.*?);\s*//\s*(?<comment>.*)$",
+            RegexOptions.Compiled);
+
+        // Asm-like MC1 sugar:
+        //   AND AX, mem_ds_0000_w[ADD16(BX, DI)];
+        //   AND mem_ds_0020_b[ADD16(DI, 0x0002)], DH;
+        // Lowers to:
+        //   AX = AND(AX, ...);
+        //   mem[...] = AND(mem[...], DH);
+        private static readonly Regex MnemonicBinOpRx = new Regex(
+            @"^\s*(?<op>add|adc|and|or|sub|sbb|xor)\s+(?<dst>[^,]+)\s*,\s*(?<src>[^;]+)\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
         public static Mc1File Parse(string path)
         {
             if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Missing path", nameof(path));
@@ -224,6 +239,7 @@ namespace DOSRE.Dasm
             {
                 var line = raw ?? string.Empty;
                 var rewritten = RewriteConsts(line, mc1.Consts);
+                rewritten = RewriteAsmLikeOps(rewritten);
                 rewritten = RewriteViewFields(rewritten, views, mc1.Types);
                 sb.AppendLine(rewritten);
             }
@@ -338,6 +354,35 @@ namespace DOSRE.Dasm
                 // Larger fields: leave as-is for now.
                 return m.Value;
             });
+        }
+
+        private static string RewriteAsmLikeOps(string line)
+        {
+            // Only rewrite lines that look like origin-tagged statements.
+            // (We keep labels and other non-origin lines untouched.)
+            var m = Mc0LineRx.Match(line);
+            if (!m.Success)
+                return line;
+
+            var indent = m.Groups["indent"].Value;
+            var stmt = (m.Groups["stmt"].Value ?? string.Empty).Trim();
+            var comment = m.Groups["comment"].Value;
+
+            var mm = MnemonicBinOpRx.Match(stmt);
+            if (!mm.Success)
+                return line;
+
+            var op = mm.Groups["op"].Value.Trim().ToUpperInvariant();
+            var dst = mm.Groups["dst"].Value.Trim();
+            var src = mm.Groups["src"].Value.Trim();
+
+            // Normalize "reg" names to their MC0-style uppercase when possible.
+            // (Safe: if it's not a reg token, leave as-is.)
+            if (dst.Length == 2) dst = dst.ToUpperInvariant();
+            if (src.Length == 2) src = src.ToUpperInvariant();
+
+            var newStmt = $"{dst} = {op}({dst}, {src})";
+            return $"{indent}{newStmt}; // {comment}";
         }
 
         private static (ushort offset, string fieldType) ResolveFieldOffset(StructType st, string field, Dictionary<string, StructType> types)

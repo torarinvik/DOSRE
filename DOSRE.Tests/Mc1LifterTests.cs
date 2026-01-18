@@ -265,11 +265,11 @@ namespace DOSRE.Tests
 
             // reg-only EA => base 0x0000 primitive view
             Assert.Contains("view mem_ds_0000_w at (DS, 0x0000) : u16;", mc1);
-            Assert.Contains("AX = OR(AX, mem_ds_0000_w[ADD16(BX, DI)])", mc1);
+            Assert.Contains("OR AX, mem_ds_0000_w[ADD16(BX, DI)];", mc1);
 
             // EA with +72h => base 0x0070 primitive view
             Assert.Contains("view mem_cs_0070_b at (CS, 0x0070) : u8;", mc1);
-            Assert.Contains("mem_cs_0070_b[ADD16(ADD16(BX, SI), 0x0002)] = AND(mem_cs_0070_b[ADD16(ADD16(BX, SI), 0x0002)], DL)", mc1);
+            Assert.Contains("AND mem_cs_0070_b[ADD16(ADD16(BX, SI), 0x0002)], DL;", mc1);
 
             var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
             var desugared = Mc1.DesugarToMc0Text(parsed);
@@ -281,6 +281,40 @@ namespace DOSRE.Tests
             // Bracket sugar must lower into LOAD/STORE forms.
             Assert.Contains("LOAD16(DS, ADD16(0x0000, ADD16(BX, DI)))", desugared);
             Assert.Contains("STORE8(CS, ADD16(0x0070, ADD16(ADD16(BX, SI), 0x0002))", desugared);
+        }
+
+        [Fact]
+        public void LiftMc0ToMc1_Rewrites_Bp_Based_Indexing_Defaults_To_SS_And_Supports_Negative_Displacement()
+        {
+            var mc0 = new Bin16Mc0.Mc0File
+            {
+                Source = "in-memory",
+                StreamSha256 = "dummy",
+                Statements = new List<Bin16Mc0.Mc0Stmt>
+                {
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 0,
+                        Addr = 0x00006000,
+                        BytesHex = "8A42FE",
+                        Asm = "mov al, [bp+si-2]",
+                        Mc0 = "EMITHEX(\"8a42fe\")",
+                        Labels = new List<string>(),
+                    },
+                }
+            };
+
+            var mc1 = Bin16Mc1Lifter.LiftMc0ToMc1Text(mc0);
+
+            // -2 => 0xFFFE, aligned base 0xFFF0, delta 0x000E.
+            Assert.Contains("view mem_ss_fff0_b at (SS, 0xFFF0) : u8;", mc1);
+            Assert.Contains("AL = mem_ss_fff0_b[ADD16(ADD16(BP, SI), 0x000E)];", mc1);
+
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+
+            Assert.Contains("@00006000 8A42FE", desugared);
+            Assert.Contains("LOAD8(SS, ADD16(0xFFF0, ADD16(ADD16(BP, SI), 0x000E)))", desugared);
         }
     }
 }

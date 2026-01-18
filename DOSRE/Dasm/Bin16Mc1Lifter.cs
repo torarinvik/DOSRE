@@ -39,7 +39,9 @@ namespace DOSRE.Dasm
             public bool LiftIvtFarptrViews { get; set; } = true;
 
             /// <summary>
-            /// Lift simple DS indexed movs like [ds:bx+di+0xNNNN] into primitive views using MC1 bracket sugar.
+                /// Lift simple indexed memory operands like [bx+di+0xNNNN] into primitive views using MC1 bracket sugar.
+                ///
+                /// This covers DS-default and SS-default addressing (BP-based), plus explicit segment overrides.
             /// </summary>
             public bool LiftDsIndexedGlobals { get; set; } = true;
 
@@ -116,13 +118,14 @@ namespace DOSRE.Dasm
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         // Matches: mov ax, [ds:bx+di+04E4h]
-        //          mov [ds:bx+di+04ECh], ax
-        private static readonly Regex MovDsIndexedLoadRx = new Regex(
-            @"^\s*mov\s+(?<dst>[a-z]{2})\s*,\s*\[(?:ds\s*:\s*)?(?<ea>[^\]]+)\]\s*$",
+        //          mov al, [bp+si-2]
+        //          mov [cs:bx+si+72h], dl
+        private static readonly Regex MovIndexedLoadRx = new Regex(
+            @"^\s*mov\s+(?<dst>[a-z]{2})\s*,\s*\[(?:(?<seg>cs|ds|es|ss)\s*:\s*)?(?<ea>[^\]]+)\]\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
-        private static readonly Regex MovDsIndexedStoreRx = new Regex(
-            @"^\s*mov\s+\[(?:ds\s*:\s*)?(?<ea>[^\]]+)\]\s*,\s*(?<src>[a-z]{2})\s*$",
+        private static readonly Regex MovIndexedStoreRx = new Regex(
+            @"^\s*mov\s+\[(?:(?<seg>cs|ds|es|ss)\s*:\s*)?(?<ea>[^\]]+)\]\s*,\s*(?<src>[a-z]{2})\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         // Generic binary ops involving a memory operand (used for bracket sugar).
@@ -356,8 +359,8 @@ namespace DOSRE.Dasm
 
                     if (opts.LiftDsIndexedGlobals)
                     {
-                        // Load: mov r, [ds:ea]
-                        var mIdxLoad = MovDsIndexedLoadRx.Match(asm);
+                        // Load: mov r, [seg?:ea]
+                        var mIdxLoad = MovIndexedLoadRx.Match(asm);
                         if (mIdxLoad.Success)
                         {
                             var dst = mIdxLoad.Groups["dst"].Value;
@@ -365,15 +368,16 @@ namespace DOSRE.Dasm
                             if (!RegMap.TryGetValue(dst, out var reg))
                                 continue;
                             var size = IsWordReg(dst) ? 2 : 1;
-                            if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: false) && immSum >= opts.DsAbsMin && immSum <= opts.DsAbsMax)
+                            if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: true))
                             {
-                                _ = GetOrCreatePrimViewAndIndex("DS", immSum, regs, size, primViews);
+                                var segTok = (mIdxLoad.Groups["seg"].Success ? mIdxLoad.Groups["seg"].Value : DefaultSegForEa(regs)).Trim().ToUpperInvariant();
+                                _ = GetOrCreatePrimViewAndIndex(segTok, immSum, regs, size, primViews);
                                 // Record rewrite via a synthetic access entry in segAccesses? We'll just rewrite later.
                             }
                         }
 
-                        // Store: mov [ds:ea], r
-                        var mIdxStore = MovDsIndexedStoreRx.Match(asm);
+                        // Store: mov [seg?:ea], r
+                        var mIdxStore = MovIndexedStoreRx.Match(asm);
                         if (mIdxStore.Success)
                         {
                             var src = mIdxStore.Groups["src"].Value;
@@ -381,9 +385,10 @@ namespace DOSRE.Dasm
                             if (!RegMap.TryGetValue(src, out var reg))
                                 continue;
                             var size = IsWordReg(src) ? 2 : 1;
-                            if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: false) && immSum >= opts.DsAbsMin && immSum <= opts.DsAbsMax)
+                            if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: true))
                             {
-                                _ = GetOrCreatePrimViewAndIndex("DS", immSum, regs, size, primViews);
+                                var segTok = (mIdxStore.Groups["seg"].Success ? mIdxStore.Groups["seg"].Value : DefaultSegForEa(regs)).Trim().ToUpperInvariant();
+                                _ = GetOrCreatePrimViewAndIndex(segTok, immSum, regs, size, primViews);
                             }
                         }
                     }
@@ -451,7 +456,7 @@ namespace DOSRE.Dasm
 
                 if (primViews.Count > 0)
                 {
-                    sb.AppendLine("// DS indexed globals (primitive views for bracket sugar):");
+                    sb.AppendLine("// Indexed globals (primitive views for bracket sugar):");
                     foreach (var pv in primViews.Values)
                         sb.AppendLine(pv.RenderViewDecl());
                     sb.AppendLine();
@@ -601,15 +606,15 @@ namespace DOSRE.Dasm
                             var op = mOpRegMem.Groups["op"].Value.Trim().ToUpperInvariant();
                             var dst = mOpRegMem.Groups["dst"].Value;
                             var ea = mOpRegMem.Groups["ea"].Value;
-                            var segTok = (mOpRegMem.Groups["seg"].Success ? mOpRegMem.Groups["seg"].Value : "ds").Trim().ToUpperInvariant();
-
                             if (RegMap.TryGetValue(dst, out var reg))
                             {
                                 var size = IsWordReg(dst) ? 2 : 1;
                                 if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: true))
                                 {
+                                    var segTok = (mOpRegMem.Groups["seg"].Success ? mOpRegMem.Groups["seg"].Value : DefaultSegForEa(regs)).Trim().ToUpperInvariant();
                                     var (viewName, idxExpr) = GetOrCreatePrimViewAndIndex(segTok, immSum, regs, size, primViews);
-                                    stmtText = $"{reg} = {op}({reg}, {viewName}[{idxExpr}])";
+                                    // Prefer an asm-like surface form; Mc1 desugar will lower this later.
+                                    stmtText = $"{op} {reg}, {viewName}[{idxExpr}]";
                                 }
                             }
                         }
@@ -621,22 +626,20 @@ namespace DOSRE.Dasm
                                 var op = mOpMemReg.Groups["op"].Value.Trim().ToUpperInvariant();
                                 var src = mOpMemReg.Groups["src"].Value;
                                 var ea = mOpMemReg.Groups["ea"].Value;
-                                var segTok = (mOpMemReg.Groups["seg"].Success ? mOpMemReg.Groups["seg"].Value : "ds").Trim().ToUpperInvariant();
-
                                 if (RegMap.TryGetValue(src, out var reg))
                                 {
                                     var size = IsWordReg(src) ? 2 : 1;
                                     if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: true))
                                     {
+                                        var segTok = (mOpMemReg.Groups["seg"].Success ? mOpMemReg.Groups["seg"].Value : DefaultSegForEa(regs)).Trim().ToUpperInvariant();
                                         var (viewName, idxExpr) = GetOrCreatePrimViewAndIndex(segTok, immSum, regs, size, primViews);
-                                        // This becomes a STORE during MC1 desugar.
-                                        stmtText = $"{viewName}[{idxExpr}] = {op}({viewName}[{idxExpr}], {reg})";
+                                        stmtText = $"{op} {viewName}[{idxExpr}], {reg}";
                                     }
                                 }
                             }
                         }
 
-                        var mIdxLoad = MovDsIndexedLoadRx.Match(asm);
+                        var mIdxLoad = MovIndexedLoadRx.Match(asm);
                         if (mIdxLoad.Success)
                         {
                             var dst = mIdxLoad.Groups["dst"].Value;
@@ -644,16 +647,17 @@ namespace DOSRE.Dasm
                             if (RegMap.TryGetValue(dst, out var reg))
                             {
                                 var size = IsWordReg(dst) ? 2 : 1;
-                                if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: false) && immSum >= opts.DsAbsMin && immSum <= opts.DsAbsMax)
+                                if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: true))
                                 {
-                                    var (viewName, idxExpr) = GetOrCreatePrimViewAndIndex("DS", immSum, regs, size, primViews);
+                                    var segTok = (mIdxLoad.Groups["seg"].Success ? mIdxLoad.Groups["seg"].Value : DefaultSegForEa(regs)).Trim().ToUpperInvariant();
+                                    var (viewName, idxExpr) = GetOrCreatePrimViewAndIndex(segTok, immSum, regs, size, primViews);
                                     stmtText = $"{reg} = {viewName}[{idxExpr}]";
                                 }
                             }
                         }
                         else
                         {
-                            var mIdxStore = MovDsIndexedStoreRx.Match(asm);
+                            var mIdxStore = MovIndexedStoreRx.Match(asm);
                             if (mIdxStore.Success)
                             {
                                 var src = mIdxStore.Groups["src"].Value;
@@ -661,9 +665,10 @@ namespace DOSRE.Dasm
                                 if (RegMap.TryGetValue(src, out var reg))
                                 {
                                     var size = IsWordReg(src) ? 2 : 1;
-                                    if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: false) && immSum >= opts.DsAbsMin && immSum <= opts.DsAbsMax)
+                                    if (TryParseIndexedEa(ea, out var immSum, out var regs, allowNoImmediate: true))
                                     {
-                                        var (viewName, idxExpr) = GetOrCreatePrimViewAndIndex("DS", immSum, regs, size, primViews);
+                                        var segTok = (mIdxStore.Groups["seg"].Success ? mIdxStore.Groups["seg"].Value : DefaultSegForEa(regs)).Trim().ToUpperInvariant();
+                                        var (viewName, idxExpr) = GetOrCreatePrimViewAndIndex(segTok, immSum, regs, size, primViews);
                                         stmtText = $"{viewName}[{idxExpr}] = {reg}";
                                     }
                                 }
@@ -844,15 +849,26 @@ namespace DOSRE.Dasm
             // Remove whitespace to make splitting stable.
             s = new string(s.Where(c => !char.IsWhiteSpace(c)).ToArray());
 
-            // Only handle '+' addressing for now.
+            // Handle '+' and '-' addressing by normalizing "-" into "+-".
+            // Example: "bp+si-2" => "bp+si+-2".
+            s = s.Replace("-", "+-");
+
             var parts = s.Split(new[] { '+' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < 2)
+            if (parts.Length < 1)
                 return false;
 
-            uint immAcc = 0;
+            var hadImm = false;
+            var immAcc = 0;
             foreach (var pRaw in parts)
             {
                 var p = pRaw.Trim();
+                var neg = false;
+                if (p.StartsWith("-", StringComparison.Ordinal))
+                {
+                    neg = true;
+                    p = p.Substring(1);
+                }
+
                 if (p is "bx" or "bp" or "si" or "di")
                 {
                     regs.Add(p.ToUpperInvariant());
@@ -861,9 +877,8 @@ namespace DOSRE.Dasm
 
                 if (TryParseU16Flexible(p, out var imm))
                 {
-                    immAcc += imm;
-                    if (immAcc > 0xFFFF)
-                        return false;
+                    hadImm = true;
+                    immAcc = checked(immAcc + (neg ? -imm : imm));
                     continue;
                 }
 
@@ -873,11 +888,20 @@ namespace DOSRE.Dasm
 
             if (regs.Count == 0)
                 return false;
-            if (!allowNoImmediate && immAcc == 0)
+
+            if (!allowNoImmediate && !hadImm)
                 return false;
 
-            immSum = (ushort)immAcc;
+            // Displacements are 16-bit modulo arithmetic.
+            immSum = unchecked((ushort)immAcc);
             return true;
+        }
+
+        private static string DefaultSegForEa(List<string> regs)
+        {
+            // x86 16-bit addressing defaults to SS when BP is involved; otherwise DS.
+            if (regs == null) return "DS";
+            return regs.Contains("BP", StringComparer.Ordinal) ? "SS" : "DS";
         }
 
         private static (string viewName, string idxExpr) GetOrCreatePrimViewAndIndex(
