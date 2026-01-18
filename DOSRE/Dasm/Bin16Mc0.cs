@@ -500,19 +500,25 @@ namespace DOSRE.Dasm
                 return $"{reg} = POP16()";
             }
 
-            // jmp label
-            m = Regex.Match(a, @"^jmp\s+(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)$", RegexOptions.IgnoreCase);
+            // jmp label (handles 'short', 'near')
+            m = Regex.Match(a, @"^jmp\s+(?:short\s+|near\s+)?(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)$", RegexOptions.IgnoreCase);
             if (m.Success)
                 return $"goto {m.Groups["lbl"].Value}";
 
-            // jcc label (subset)
-            m = Regex.Match(a, @"^(?<cc>jz|jnz|jc|jnc|ja|jae|jb|jbe|jl|jle|jg|jge|jo|jno|js|jns)\s+(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)$", RegexOptions.IgnoreCase);
+            // jcc label (handles 'short', 'near')
+            m = Regex.Match(a, @"^(?<cc>jz|jnz|jc|jnc|ja|jae|jb|jbe|jl|jle|jg|jge|jo|jno|js|jns)\s+(?:short\s+|near\s+)?(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)$", RegexOptions.IgnoreCase);
             if (m.Success)
             {
                 var cc = m.Groups["cc"].Value.ToUpperInvariant();
                 var lbl = m.Groups["lbl"].Value;
                 return $"if ({cc}()) goto {lbl}";
             }
+
+            // call label (handles 'near')
+            m = Regex.Match(a, @"^call\s+(?:near\s+)?(?<lbl>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)$", RegexOptions.IgnoreCase);
+            if (m.Success)
+                return $"CALL({m.Groups["lbl"].Value})";
+
 
             // ret / retf
             m = Regex.Match(a, @"^retf$", RegexOptions.IgnoreCase);
