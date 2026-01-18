@@ -92,5 +92,51 @@ namespace DOSRE.Tests
             Assert.Equal("9090", mc0.Statements[0].BytesHex);
             Assert.Equal("EMITHEX(\"9090\")", mc0.Statements[0].Mc0);
         }
+
+        [Fact]
+        public void OptimizeThreadJccThroughJmp_Retargets_Jcc_To_FinalLabel_WhenShort()
+        {
+            var lines = new[]
+            {
+                "loc_00000100:",
+                "if (JNZ()) goto loc_00000105; // @00000100 7503 ; jnz short loc_00000105",
+                "loc_00000105:",
+                "goto loc_00000110; // @00000105 E90800 ; jmp loc_00000110",
+                "loc_00000110:",
+                "INT(INT_BREAKPOINT); // @00000110 CC ; int 3",
+            };
+
+            var mc0 = Bin16Mc0.ParseMc0Text(lines, sourceName: "unit-test");
+            var res = Bin16Mc0CanonicalOptimizer.OptimizeThreadJccThroughJmp(mc0);
+
+            Assert.Equal(1, res.Applied);
+            Assert.Equal("750E", mc0.Statements[0].BytesHex); // 0x110 - (0x100+2) = 0x0E
+            Assert.Equal("if (JNZ()) goto loc_00000110", mc0.Statements[0].Mc0);
+
+            // Trampoline remains intact (it may have other predecessors).
+            Assert.Equal("E90800", mc0.Statements[1].BytesHex);
+            Assert.StartsWith("goto loc_00000110", mc0.Statements[1].Mc0, StringComparison.Ordinal);
+        }
+
+        [Fact]
+        public void OptimizeThreadJccThroughJmp_Skips_WhenNewTargetNotShortReachable()
+        {
+            var lines = new[]
+            {
+                "loc_00000100:",
+                "if (JNZ()) goto loc_00000105; // @00000100 7503 ; jnz short loc_00000105",
+                "loc_00000105:",
+                "goto loc_00000300; // @00000105 E9F801 ; jmp loc_00000300",
+                "loc_00000300:",
+                "INT(INT_BREAKPOINT); // @00000300 CC ; int 3",
+            };
+
+            var mc0 = Bin16Mc0.ParseMc0Text(lines, sourceName: "unit-test");
+            var res = Bin16Mc0CanonicalOptimizer.OptimizeThreadJccThroughJmp(mc0);
+
+            Assert.Equal(0, res.Applied);
+            Assert.Equal("7503", mc0.Statements[0].BytesHex);
+            Assert.Equal("if (JNZ()) goto loc_00000105", mc0.Statements[0].Mc0);
+        }
     }
 }

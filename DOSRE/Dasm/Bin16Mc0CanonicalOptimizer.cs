@@ -88,13 +88,18 @@ public static class Bin16Mc0CanonicalOptimizer
 
     public sealed record OptimizeResult(int Candidates, int Applied, int Skipped);
 
-    public sealed record OptimizeReport(OptimizeResult InvertJccSkipJmp, OptimizeResult ElideJmpToFallthrough, OptimizeResult ElideJccToFallthrough);
+    public sealed record OptimizeReport(
+        OptimizeResult InvertJccSkipJmp,
+        OptimizeResult ThreadJccThroughJmp,
+        OptimizeResult ElideJmpToFallthrough,
+        OptimizeResult ElideJccToFallthrough);
 
     public static OptimizeReport OptimizeAll(Bin16Mc0.Mc0File mc0)
     {
         if (mc0 == null) throw new ArgumentNullException(nameof(mc0));
         return new OptimizeReport(
             InvertJccSkipJmp: OptimizeInvertJccSkipJmp(mc0),
+            ThreadJccThroughJmp: OptimizeThreadJccThroughJmp(mc0),
             ElideJmpToFallthrough: OptimizeElideJmpToFallthrough(mc0),
             ElideJccToFallthrough: OptimizeElideJccToFallthrough(mc0));
     }
@@ -224,6 +229,97 @@ public static class Bin16Mc0CanonicalOptimizer
     }
 
     /// <summary>
+    /// Thread a short conditional jump through a JMP trampoline:
+    ///   A: if (Jcc()) goto L1;     (short Jcc)
+    ///   L1: goto L2;              (JMP short/near)
+    /// Rewrite A to jump directly to L2 if the new displacement still fits in sbyte.
+    ///
+    /// Proof obligation is purely local:
+    /// - The Jcc truly targets L1 (verified via label/addr + decoded disp)
+    /// - L1 is an unconditional JMP that truly targets L2 (verified via decoded disp)
+    /// - New target L2 is short-reachable from A+2
+    ///
+    /// This is length-preserving (only changes the disp8 byte of the Jcc).
+    /// </summary>
+    public static OptimizeResult OptimizeThreadJccThroughJmp(Bin16Mc0.Mc0File mc0)
+    {
+        if (mc0 == null) throw new ArgumentNullException(nameof(mc0));
+
+        var labelToAddr = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+        var stmtByAddr = new Dictionary<uint, Bin16Mc0.Mc0Stmt>();
+
+        foreach (var st in mc0.Statements)
+        {
+            if (!stmtByAddr.ContainsKey(st.Addr))
+                stmtByAddr[st.Addr] = st;
+
+            if (st.Labels == null) continue;
+            foreach (var lbl in st.Labels)
+            {
+                if (string.IsNullOrWhiteSpace(lbl)) continue;
+                if (!labelToAddr.ContainsKey(lbl))
+                    labelToAddr[lbl] = st.Addr;
+            }
+        }
+
+        var candidates = 0;
+        var applied = 0;
+        var skipped = 0;
+
+        for (var i = 0; i < mc0.Statements.Count; i++)
+        {
+            var a = mc0.Statements[i];
+
+            var ifm = IfJccGotoRx.Match(a.Mc0 ?? string.Empty);
+            if (!ifm.Success) continue;
+            if ((a.BytesHex?.Length ?? 0) != 4) continue; // short Jcc only
+
+            candidates++;
+
+            if (!TryParseHexByte(a.BytesHex.AsSpan(0, 2), out var aOp)) { skipped++; continue; }
+            if (aOp < 0x70 || aOp > 0x7F) { skipped++; continue; }
+
+            var cond = ifm.Groups["cond"].Value;
+            if (!CondToOpcode.TryGetValue(cond, out var expectedOp) || expectedOp != aOp) { skipped++; continue; }
+
+            if (!TryParseHexByte(a.BytesHex.AsSpan(2, 2), out var aDisp)) { skipped++; continue; }
+            var aTargetDecoded = (uint)((int)(a.Addr + 2) + unchecked((sbyte)aDisp));
+
+            var l1Lbl = ifm.Groups["lbl"].Value;
+            if (!TryResolveLabelAddr(labelToAddr, l1Lbl, out var l1Addr)) { skipped++; continue; }
+            if (aTargetDecoded != l1Addr) { skipped++; continue; }
+
+            if (!stmtByAddr.TryGetValue(l1Addr, out var l1Stmt)) { skipped++; continue; }
+
+            var jm = GotoRx.Match(l1Stmt.Mc0 ?? string.Empty);
+            if (!jm.Success) { skipped++; continue; }
+
+            var l2Lbl = jm.Groups["lbl"].Value;
+            if (!TryResolveLabelAddr(labelToAddr, l2Lbl, out var l2Addr)) { skipped++; continue; }
+
+            var l1Len = (uint)((l1Stmt.BytesHex?.Length ?? 0) / 2);
+            if (l1Len == 0) { skipped++; continue; }
+
+            if (!TryParseHexByte(l1Stmt.BytesHex.AsSpan(0, 2), out var l1Op)) { skipped++; continue; }
+            var l1TargetDecoded = DecodeJmpTarget(l1Stmt.Addr, l1Stmt.BytesHex, out var ok);
+            if (!ok) { skipped++; continue; }
+            if (l1Op != 0xE9 && l1Op != 0xEB) { skipped++; continue; }
+            if (l1TargetDecoded != l2Addr) { skipped++; continue; }
+
+            var relBase = (int)(a.Addr + 2);
+            var rel = (int)l2Addr - relBase;
+            if (rel < sbyte.MinValue || rel > sbyte.MaxValue) { skipped++; continue; }
+
+            var newDisp = unchecked((byte)(sbyte)rel);
+            a.BytesHex = $"{aOp:X2}{newDisp:X2}";
+            a.Mc0 = $"if ({cond}()) goto {l2Lbl}";
+            applied++;
+        }
+
+        return new OptimizeResult(candidates, applied, skipped);
+    }
+
+    /// <summary>
     /// Replace unconditional gotos that target the next instruction (fallthrough) with NOPs.
     /// This is mechanically provable and length-preserving.
     /// </summary>
@@ -346,5 +442,35 @@ public static class Bin16Mc0CanonicalOptimizer
         b = 0;
         if (hex2.Length != 2) return false;
         return byte.TryParse(hex2, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out b);
+    }
+
+    private static uint DecodeJmpTarget(uint addr, string bytesHex, out bool ok)
+    {
+        ok = false;
+        if (string.IsNullOrWhiteSpace(bytesHex)) return 0;
+        var hex = bytesHex.Trim();
+        if (hex.Length < 2) return 0;
+
+        if (!TryParseHexByte(hex.AsSpan(0, 2), out var op)) return 0;
+        if (op == 0xEB)
+        {
+            if (hex.Length != 4) return 0;
+            if (!TryParseHexByte(hex.AsSpan(2, 2), out var disp)) return 0;
+            ok = true;
+            return (uint)((int)(addr + 2) + unchecked((sbyte)disp));
+        }
+
+        if (op == 0xE9)
+        {
+            if (hex.Length != 6) return 0;
+            if (!TryParseHexByte(hex.AsSpan(2, 2), out var lo)) return 0;
+            if (!TryParseHexByte(hex.AsSpan(4, 2), out var hi)) return 0;
+            var imm = (ushort)(lo | (hi << 8));
+            var simm = unchecked((short)imm);
+            ok = true;
+            return (uint)((int)(addr + 3) + simm);
+        }
+
+        return 0;
     }
 }
