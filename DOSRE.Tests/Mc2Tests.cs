@@ -148,5 +148,36 @@ namespace DOSRE.Tests
             var mc0 = Bin16Mc0.ParseMc0Text(mc0Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc0");
             Assert.True(mc0.Statements.Count >= 2);
         }
+
+        [Fact]
+        public void Mc2_Block_If_While_Wrappers_Are_ProofSafe_In_PreserveBytes()
+        {
+            // These constructs are presentation-only in PreserveBytes mode:
+            // they must desugar to comments + the original origin-bearing statements.
+            var mc2Text = string.Join("\n", new[]
+            {
+                "block Entry {",
+                "  AX = 0x0001; // @00001000 DEADBEEF ; mov ax, 1",
+                "  if (JZ()) {",
+                "    BX = 0x0002; // @00001002 FEEDBEEF ; mov bx, 2",
+                "  } else {",
+                "    CX = 0x0003; // @00001004 BAADF00D ; mov cx, 3",
+                "  }",
+                "  while (JNZ()) {",
+                "    DX = 0x0004; // @00001006 0D15EA5E ; mov dx, 4",
+                "  }",
+                "}",
+            });
+
+            var mc2 = Mc2.ParseLines(mc2Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc2");
+            var mc1Text = Mc2.DesugarToMc1Text(mc2, Mc2.Mode.PreserveBytes);
+
+            var mc1 = Mc1.ParseLines(mc1Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var mc0Text = Mc1.DesugarToMc0Text(mc1);
+
+            // Must be parseable as MC0: only origin-tagged statements (comments are ignored).
+            var mc0 = Bin16Mc0.ParseMc0Text(mc0Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc0");
+            Assert.Equal(4, mc0.Statements.Count);
+        }
     }
 }

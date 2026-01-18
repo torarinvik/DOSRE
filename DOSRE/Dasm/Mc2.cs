@@ -100,6 +100,26 @@ namespace DOSRE.Dasm
             @"^\s*for\s*\(\s*(?<hdr>.*)\s*\)\s*\{\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+        // Presentation-only structuring wrappers (proof-safe in PreserveBytes):
+        //   block Name { ... }
+        //   if (cond) { ... } [else { ... }]
+        //   while (cond) { ... }
+        private static readonly Regex BlockStartRx = new Regex(
+            @"^\s*block\s+(?<name>[A-Za-z_.$@?][A-Za-z0-9_.$@?]*)\s*\{\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex IfStartRx = new Regex(
+            @"^\s*if\s*\(\s*(?<cond>.*)\s*\)\s*\{\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex ElseStartRx = new Regex(
+            @"^\s*else\s*\{\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex WhileStartRx = new Regex(
+            @"^\s*while\s*\(\s*(?<cond>.*)\s*\)\s*\{\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
         private static readonly Regex SwitchStartRx = new Regex(
             @"^\s*switch\s*\(.*\)\s*\{\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -392,9 +412,48 @@ namespace DOSRE.Dasm
             return body;
         }
 
+        private static int FindMatchingCloseBraceLine(IReadOnlyList<string> lines, int openLine)
+        {
+            var depth = 0;
+            for (var j = openLine; j < lines.Count; j++)
+            {
+                var l = lines[j] ?? string.Empty;
+                for (var k = 0; k < l.Length; k++)
+                {
+                    if (l[k] == '{') depth++;
+                    else if (l[k] == '}') depth--;
+                }
+
+                if (j == openLine && depth == 0)
+                    throw new InvalidDataException("Malformed block: missing '{'");
+
+                if (j > openLine && depth == 0)
+                    return j;
+            }
+
+            throw new InvalidDataException("Malformed block: missing closing '}'");
+        }
+
         private static List<string> ExpandForAndAnnotations(IReadOnlyList<string> inputLines, Mode mode)
         {
-            var lines = inputLines ?? Array.Empty<string>();
+            // Normalize a small set of common brace styles to keep the parser line-oriented.
+            // This is intentionally conservative and only targets non-origin control scaffolding.
+            var normalized = new List<string>();
+            var rawLines = inputLines ?? Array.Empty<string>();
+            for (var n = 0; n < rawLines.Count; n++)
+            {
+                var l = rawLines[n] ?? string.Empty;
+                if (Regex.IsMatch(l, @"^\s*}\s*else\s*\{\s*$", RegexOptions.IgnoreCase))
+                {
+                    normalized.Add("}");
+                    normalized.Add("else {");
+                    continue;
+                }
+
+                normalized.Add(l);
+            }
+
+            var lines = normalized;
             var outLines = new List<string>();
             OriginRange pendingOrigin = null;
             var forId = 0;
@@ -412,6 +471,95 @@ namespace DOSRE.Dasm
                     // Preserve as a comment marker for readability/tooling.
                     outLines.Add($"// @origin({origin})");
                     continue;
+                }
+
+                // Presentation-only wrappers: block/if/while.
+                // In PreserveBytes mode these must not affect the origin stream, so we strip them to comments
+                // and recursively expand the body.
+                {
+                    var bm = BlockStartRx.Match(line);
+                    if (bm.Success)
+                    {
+                        var name = bm.Groups["name"].Value;
+                        var openLine = i;
+                        var closeLine = FindMatchingCloseBraceLine(lines, openLine);
+                        var body = SliceBlockBody(lines, openLine, closeLine);
+                        i = closeLine;
+
+                        outLines.Add($"// block {name}");
+                        foreach (var bl in ExpandForAndAnnotations(body, mode))
+                            outLines.Add(bl);
+                        outLines.Add($"// end block {name}");
+
+                        pendingOrigin = null;
+                        continue;
+                    }
+                }
+
+                {
+                    var wm = WhileStartRx.Match(line);
+                    if (wm.Success)
+                    {
+                        var whileCond = (wm.Groups["cond"].Value ?? string.Empty).Trim();
+                        var openLine = i;
+                        var closeLine = FindMatchingCloseBraceLine(lines, openLine);
+                        var body = SliceBlockBody(lines, openLine, closeLine);
+                        i = closeLine;
+
+                        outLines.Add($"// while ({whileCond})");
+                        foreach (var bl in ExpandForAndAnnotations(body, mode))
+                            outLines.Add(bl);
+                        outLines.Add("// end while");
+
+                        pendingOrigin = null;
+                        continue;
+                    }
+                }
+
+                {
+                    var im = IfStartRx.Match(line);
+                    if (im.Success)
+                    {
+                        var ifCond = (im.Groups["cond"].Value ?? string.Empty).Trim();
+
+                        // Parse the 'then' block
+                        var thenOpen = i;
+                        var thenClose = FindMatchingCloseBraceLine(lines, thenOpen);
+                        var thenBody = SliceBlockBody(lines, thenOpen, thenClose);
+
+                        // Optional: immediate else block
+                        var elseOpen = -1;
+                        var elseClose = -1;
+                        var elseBody = new List<string>();
+                        var j = thenClose + 1;
+                        if (j < lines.Count && ElseStartRx.IsMatch(lines[j] ?? string.Empty))
+                        {
+                            elseOpen = j;
+                            elseClose = FindMatchingCloseBraceLine(lines, elseOpen);
+                            elseBody = SliceBlockBody(lines, elseOpen, elseClose);
+                            i = elseClose;
+                        }
+                        else
+                        {
+                            i = thenClose;
+                        }
+
+                        outLines.Add($"// if ({ifCond})");
+                        foreach (var bl in ExpandForAndAnnotations(thenBody, mode))
+                            outLines.Add(bl);
+
+                        if (elseOpen >= 0)
+                        {
+                            outLines.Add("// else");
+                            foreach (var bl in ExpandForAndAnnotations(elseBody, mode))
+                                outLines.Add(bl);
+                        }
+
+                        outLines.Add("// end if");
+
+                        pendingOrigin = null;
+                        continue;
+                    }
                 }
 
                 // PreserveBytes enforcement stub for currently-unimplemented constructs.

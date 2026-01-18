@@ -552,6 +552,18 @@ namespace DOSRE.UI.impl
         private string _binMc1ProveOutDir;
 
         /// <summary>
+        ///     Generate a structured MC2 view from an MC1 file (presentation-only wrappers).
+        ///     Specified with -BINMC1STRUCTUREIN <file.mc1>
+        /// </summary>
+        private string _binMc1StructureIn;
+
+        /// <summary>
+        ///     Output MC2 file for -BINMC1STRUCTUREIN
+        ///     Specified with -BINMC1STRUCTUREOUT <file.mc2>
+        /// </summary>
+        private string _binMc1StructureOut;
+
+        /// <summary>
         ///     Trace a window of lifted BIN16 bytes using Unicorn (host emulator).
         ///     Specified with -BINTRACEASM <file.asm>
         /// </summary>
@@ -958,6 +970,19 @@ namespace DOSRE.UI.impl
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -BINMC1PROVEOUTDIR requires a <dir>");
                             _binMc1ProveOutDir = _args[i + 1];
+                            i++;
+                            break;
+
+                        case "BINMC1STRUCTUREIN":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1STRUCTUREIN requires a <file.mc1>");
+                            _binMc1StructureIn = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC1STRUCTUREOUT":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1STRUCTUREOUT requires a <file.mc2>");
+                            _binMc1StructureOut = _args[i + 1];
                             i++;
                             break;
 
@@ -1629,6 +1654,18 @@ namespace DOSRE.UI.impl
 
                     Bin16Mc1Lifter.LiftPromotedAsmToFile(_binMc1LiftAsm, _binMc1LiftOut);
                     _logger.Info($"{DateTime.Now} Wrote BINMC1 lifted MC1 to {_binMc1LiftOut}");
+                    return;
+                }
+
+                // BINMC1STRUCTURE: emit a structured MC2 view from an MC1 file.
+                if (!string.IsNullOrWhiteSpace(_binMc1StructureIn))
+                {
+                    if (string.IsNullOrWhiteSpace(_binMc1StructureOut))
+                        throw new Exception("Error: -BINMC1STRUCTUREIN requires -BINMC1STRUCTUREOUT <file.mc2>");
+
+                    var mc2Text = Bin16Mc1Structurer.StructureMc1AsMc2Blocks(_binMc1StructureIn);
+                    File.WriteAllText(_binMc1StructureOut, mc2Text);
+                    _logger.Info($"{DateTime.Now} Wrote BINMC1 structured MC2 to {_binMc1StructureOut}");
                     return;
                 }
 
