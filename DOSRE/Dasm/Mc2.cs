@@ -43,6 +43,13 @@ namespace DOSRE.Dasm
             public List<string> PassthroughLines { get; set; } = new();
         }
 
+        private sealed class OriginRange
+        {
+            public uint Start;
+            public uint End;
+            public override string ToString() => $"0x{Start:X}..0x{End:X}";
+        }
+
         public sealed class EnumDecl
         {
             public string Name { get; set; }
@@ -84,6 +91,18 @@ namespace DOSRE.Dasm
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private static readonly Regex BlockEndRx = new Regex(@"^\s*\}\s*;\s*$", RegexOptions.Compiled);
+
+        private static readonly Regex OriginAnnotRx = new Regex(
+            @"^\s*@origin\s*\(\s*(?<start>[^.\)]+)\s*\.\.\s*(?<end>[^\)]+)\s*\)\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex ForStartRx = new Regex(
+            @"^\s*for\s*\(\s*(?<hdr>.*)\s*\)\s*\{\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex SwitchStartRx = new Regex(
+            @"^\s*switch\s*\(.*\)\s*\{\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         public static Mc2File Parse(string path)
         {
@@ -215,9 +234,11 @@ namespace DOSRE.Dasm
                 sb.AppendLine();
             }
 
-            // Body: rewrite enum refs and region refs.
-            // Note: this implementation keeps origin-bearing statement lines 1:1; it only rewrites token text.
-            foreach (var raw in mc2.PassthroughLines)
+            // Body: expand control constructs, then rewrite enum refs and region refs.
+            // Note: this implementation keeps origin-bearing statement lines 1:1; it only rewrites token text
+            // or inserts non-origin lines (labels/gotos/comments).
+            var bodyLines = ExpandForAndAnnotations(mc2.PassthroughLines, mode);
+            foreach (var raw in bodyLines)
             {
                 var line = raw ?? string.Empty;
                 var rewritten = line;
@@ -269,6 +290,201 @@ namespace DOSRE.Dasm
             if (t.EndsWith("h", StringComparison.OrdinalIgnoreCase))
                 return uint.Parse(t.Substring(0, t.Length - 1), NumberStyles.HexNumber, CultureInfo.InvariantCulture);
             return uint.Parse(t, NumberStyles.Integer, CultureInfo.InvariantCulture);
+        }
+
+        private static OriginRange ParseOrigin(string line)
+        {
+            var m = OriginAnnotRx.Match(line ?? string.Empty);
+            if (!m.Success) return null;
+
+            var start = ParseUInt(m.Groups["start"].Value);
+            var end = ParseUInt(m.Groups["end"].Value);
+            if (end < start)
+                throw new InvalidDataException($"@origin end must be >= start: {line}");
+
+            return new OriginRange { Start = start, End = end };
+        }
+
+        private static bool TrySplitForHeader(string hdr, out string init, out string cond, out string step)
+        {
+            init = string.Empty;
+            cond = string.Empty;
+            step = string.Empty;
+
+            if (hdr == null) return false;
+
+            var parts = new List<string>();
+            var depthParen = 0;
+            var depthBracket = 0;
+            var start = 0;
+            for (var i = 0; i < hdr.Length; i++)
+            {
+                var ch = hdr[i];
+                switch (ch)
+                {
+                    case '(':
+                        depthParen++;
+                        break;
+                    case ')':
+                        if (depthParen > 0) depthParen--;
+                        break;
+                    case '[':
+                        depthBracket++;
+                        break;
+                    case ']':
+                        if (depthBracket > 0) depthBracket--;
+                        break;
+                    case ';':
+                        if (depthParen == 0 && depthBracket == 0)
+                        {
+                            parts.Add(hdr.Substring(start, i - start));
+                            start = i + 1;
+                        }
+
+                        break;
+                }
+            }
+
+            parts.Add(hdr.Substring(start));
+
+            if (parts.Count != 3)
+                return false;
+
+            init = parts[0].Trim();
+            cond = parts[1].Trim();
+            step = parts[2].Trim();
+            return true;
+        }
+
+        private static List<string> SliceBlockBody(IReadOnlyList<string> lines, int openLine, int closeLine)
+        {
+            var body = new List<string>();
+            for (var k = openLine + 1; k < closeLine; k++)
+                body.Add(lines[k] ?? string.Empty);
+            return body;
+        }
+
+        private static List<string> ExpandForAndAnnotations(IReadOnlyList<string> inputLines, Mode mode)
+        {
+            var lines = inputLines ?? Array.Empty<string>();
+            var outLines = new List<string>();
+            OriginRange pendingOrigin = null;
+            var forId = 0;
+
+            for (var i = 0; i < lines.Count; i++)
+            {
+                var line = lines[i] ?? string.Empty;
+                var trimmed = line.Trim();
+
+                var origin = ParseOrigin(trimmed);
+                if (origin != null)
+                {
+                    pendingOrigin = origin;
+                    // Preserve as a comment marker for readability/tooling.
+                    outLines.Add($"// @origin({origin})");
+                    continue;
+                }
+
+                // PreserveBytes enforcement stub for currently-unimplemented constructs.
+                if (mode == Mode.PreserveBytes && SwitchStartRx.IsMatch(line))
+                {
+                    if (pendingOrigin == null)
+                        throw new InvalidDataException("PreserveBytes: 'switch' requires an @origin(...) annotation (and switch lowering is not implemented yet).");
+                    throw new InvalidDataException("'switch' lowering is not implemented yet.");
+                }
+
+                var mFor = ForStartRx.Match(line);
+                if (!mFor.Success)
+                {
+                    outLines.Add(line);
+                    pendingOrigin = null;
+                    continue;
+                }
+
+                // Parse header
+                var hdr = mFor.Groups["hdr"].Value;
+                if (!TrySplitForHeader(hdr, out var init, out var cond, out var step))
+                    throw new InvalidDataException($"Invalid for header: '{line}'");
+
+                // Find matching closing brace for this for-block.
+                var openLine = i;
+                var depth = 0;
+                var closeLine = -1;
+                for (var j = i; j < lines.Count; j++)
+                {
+                    var l = lines[j] ?? string.Empty;
+                    for (var k = 0; k < l.Length; k++)
+                    {
+                        if (l[k] == '{') depth++;
+                        else if (l[k] == '}') depth--;
+                    }
+
+                    if (j == i && depth == 0)
+                        throw new InvalidDataException("Malformed for block: missing '{'");
+
+                    if (j > i && depth == 0)
+                    {
+                        closeLine = j;
+                        break;
+                    }
+                }
+
+                if (closeLine < 0)
+                    throw new InvalidDataException("Malformed for block: missing closing '}'");
+
+                var body = SliceBlockBody(lines, openLine, closeLine);
+                i = closeLine; // advance past the block
+
+                forId++;
+                var L_test = $"_L_for_{forId}_test";
+                var L_body = $"_L_for_{forId}_body";
+                var L_step = $"_L_for_{forId}_step";
+                var L_end = $"_L_for_{forId}_end";
+
+                // Lowering per spec (with a dedicated step label to support 'continue').
+                if (!string.IsNullOrWhiteSpace(init))
+                    outLines.Add(init.TrimEnd().EndsWith(";", StringComparison.Ordinal) ? init : init + ";");
+
+                outLines.Add($"goto {L_test};");
+                outLines.Add($"{L_body}:");
+
+                foreach (var bl in body)
+                {
+                    var bt = (bl ?? string.Empty).Trim();
+                    if (string.Equals(bt, "continue;", StringComparison.Ordinal))
+                    {
+                        outLines.Add($"goto {L_step};");
+                        continue;
+                    }
+
+                    if (string.Equals(bt, "break;", StringComparison.Ordinal))
+                    {
+                        outLines.Add($"goto {L_end};");
+                        continue;
+                    }
+
+                    outLines.Add(bl);
+                }
+
+                outLines.Add($"{L_step}:");
+                if (!string.IsNullOrWhiteSpace(step))
+                    outLines.Add(step.TrimEnd().EndsWith(";", StringComparison.Ordinal) ? step : step + ";");
+
+                outLines.Add($"{L_test}:");
+                if (string.IsNullOrWhiteSpace(cond))
+                {
+                    outLines.Add($"goto {L_body};");
+                }
+                else
+                {
+                    outLines.Add($"if ({cond}) goto {L_body};");
+                }
+                outLines.Add($"{L_end}:");
+
+                pendingOrigin = null;
+            }
+
+            return outLines;
         }
     }
 }
