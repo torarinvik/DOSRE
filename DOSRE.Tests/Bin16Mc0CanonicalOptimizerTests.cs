@@ -56,5 +56,41 @@ namespace DOSRE.Tests
             Assert.Equal("7503", mc0.Statements[0].BytesHex);
             Assert.StartsWith("if (JNZ())", mc0.Statements[0].Mc0, StringComparison.Ordinal);
         }
+
+        [Fact]
+        public void OptimizeElideJmpToFallthrough_Replaces_GotoNext_WithNops()
+        {
+            var lines = new[]
+            {
+                "loc_00000100:",
+                "goto loc_00000103; // @00000100 E90100 ; jmp loc_00000103",
+                "INT(INT_BREAKPOINT); // @00000103 CC ; int 3",
+            };
+
+            var mc0 = Bin16Mc0.ParseMc0Text(lines, sourceName: "unit-test");
+            var res = Bin16Mc0CanonicalOptimizer.OptimizeElideJmpToFallthrough(mc0);
+
+            Assert.Equal(1, res.Applied);
+            Assert.Equal("909090", mc0.Statements[0].BytesHex);
+            Assert.Equal("EMITHEX(\"909090\")", mc0.Statements[0].Mc0);
+        }
+
+        [Fact]
+        public void OptimizeElideJccToFallthrough_Replaces_ShortJccNext_WithNops()
+        {
+            var lines = new[]
+            {
+                "loc_00000100:",
+                "if (JZ()) goto loc_00000102; // @00000100 7400 ; jz short loc_00000102",
+                "INT(INT_BREAKPOINT); // @00000102 CC ; int 3",
+            };
+
+            var mc0 = Bin16Mc0.ParseMc0Text(lines, sourceName: "unit-test");
+            var res = Bin16Mc0CanonicalOptimizer.OptimizeElideJccToFallthrough(mc0);
+
+            Assert.Equal(1, res.Applied);
+            Assert.Equal("9090", mc0.Statements[0].BytesHex);
+            Assert.Equal("EMITHEX(\"9090\")", mc0.Statements[0].Mc0);
+        }
     }
 }

@@ -88,6 +88,17 @@ public static class Bin16Mc0CanonicalOptimizer
 
     public sealed record OptimizeResult(int Candidates, int Applied, int Skipped);
 
+    public sealed record OptimizeReport(OptimizeResult InvertJccSkipJmp, OptimizeResult ElideJmpToFallthrough, OptimizeResult ElideJccToFallthrough);
+
+    public static OptimizeReport OptimizeAll(Bin16Mc0.Mc0File mc0)
+    {
+        if (mc0 == null) throw new ArgumentNullException(nameof(mc0));
+        return new OptimizeReport(
+            InvertJccSkipJmp: OptimizeInvertJccSkipJmp(mc0),
+            ElideJmpToFallthrough: OptimizeElideJmpToFallthrough(mc0),
+            ElideJccToFallthrough: OptimizeElideJccToFallthrough(mc0));
+    }
+
     /// <summary>
     /// Canonical optimization that is mechanically provable and length-preserving:
     ///
@@ -207,6 +218,112 @@ public static class Bin16Mc0CanonicalOptimizer
 
             applied++;
             i++; // skip over rewritten B
+        }
+
+        return new OptimizeResult(candidates, applied, skipped);
+    }
+
+    /// <summary>
+    /// Replace unconditional gotos that target the next instruction (fallthrough) with NOPs.
+    /// This is mechanically provable and length-preserving.
+    /// </summary>
+    public static OptimizeResult OptimizeElideJmpToFallthrough(Bin16Mc0.Mc0File mc0)
+    {
+        if (mc0 == null) throw new ArgumentNullException(nameof(mc0));
+
+        var labelToAddr = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+        foreach (var st in mc0.Statements)
+        {
+            if (st.Labels == null) continue;
+            foreach (var lbl in st.Labels)
+            {
+                if (string.IsNullOrWhiteSpace(lbl)) continue;
+                if (!labelToAddr.ContainsKey(lbl))
+                    labelToAddr[lbl] = st.Addr;
+            }
+        }
+
+        var candidates = 0;
+        var applied = 0;
+        var skipped = 0;
+
+        for (var i = 0; i < mc0.Statements.Count; i++)
+        {
+            var st = mc0.Statements[i];
+            var m = GotoRx.Match(st.Mc0 ?? string.Empty);
+            if (!m.Success) continue;
+
+            var len = (uint)((st.BytesHex?.Length ?? 0) / 2);
+            if (len == 0) continue;
+
+            candidates++;
+
+            var lbl = m.Groups["lbl"].Value;
+            if (!TryResolveLabelAddr(labelToAddr, lbl, out var tgt)) { skipped++; continue; }
+
+            var fallthrough = st.Addr + len;
+            if (tgt != fallthrough) { skipped++; continue; }
+
+            var sbNop = new StringBuilder((int)len * 2);
+            for (var k = 0; k < len; k++) sbNop.Append("90");
+            var nopHex = sbNop.ToString();
+            st.BytesHex = nopHex;
+            st.Mc0 = $"EMITHEX(\"{nopHex.ToLowerInvariant()}\")";
+            applied++;
+        }
+
+        return new OptimizeResult(candidates, applied, skipped);
+    }
+
+    /// <summary>
+    /// Replace short conditional branches that target the next instruction (fallthrough) with NOPs.
+    /// This is mechanically provable (branch has no effect) and length-preserving.
+    /// </summary>
+    public static OptimizeResult OptimizeElideJccToFallthrough(Bin16Mc0.Mc0File mc0)
+    {
+        if (mc0 == null) throw new ArgumentNullException(nameof(mc0));
+
+        var labelToAddr = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+        foreach (var st in mc0.Statements)
+        {
+            if (st.Labels == null) continue;
+            foreach (var lbl in st.Labels)
+            {
+                if (string.IsNullOrWhiteSpace(lbl)) continue;
+                if (!labelToAddr.ContainsKey(lbl))
+                    labelToAddr[lbl] = st.Addr;
+            }
+        }
+
+        var candidates = 0;
+        var applied = 0;
+        var skipped = 0;
+
+        for (var i = 0; i < mc0.Statements.Count; i++)
+        {
+            var st = mc0.Statements[i];
+            var ifm = IfJccGotoRx.Match(st.Mc0 ?? string.Empty);
+            if (!ifm.Success) continue;
+
+            if ((st.BytesHex?.Length ?? 0) != 4) continue; // short Jcc only
+
+            candidates++;
+
+            if (!TryParseHexByte(st.BytesHex.AsSpan(0, 2), out var op)) { skipped++; continue; }
+            if (op < 0x70 || op > 0x7F) { skipped++; continue; }
+
+            var cond = ifm.Groups["cond"].Value;
+            if (!CondToOpcode.TryGetValue(cond, out var expectedOp) || expectedOp != op) { skipped++; continue; }
+
+            var lbl = ifm.Groups["lbl"].Value;
+            if (!TryResolveLabelAddr(labelToAddr, lbl, out var tgt)) { skipped++; continue; }
+
+            var fallthrough = st.Addr + 2;
+            if (tgt != fallthrough) { skipped++; continue; }
+
+            st.BytesHex = "9090";
+            st.Mc0 = "EMITHEX(\"9090\")";
+            applied++;
         }
 
         return new OptimizeResult(candidates, applied, skipped);

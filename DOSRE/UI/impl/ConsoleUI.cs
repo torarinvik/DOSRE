@@ -1815,8 +1815,10 @@ namespace DOSRE.UI.impl
                     // Requires allow-mismatch because it edits bytes relative to the promoted template.
                     if (canonicalBuild && _binMc1BuildAllowMismatch)
                     {
-                        var opt = Bin16Mc0CanonicalOptimizer.OptimizeInvertJccSkipJmp(mc0);
-                        _logger.Info($"BINMC1BUILD canonical_opt invert_jcc_skip_jmp candidates={opt.Candidates} applied={opt.Applied} skipped={opt.Skipped}");
+                        var rep = Bin16Mc0CanonicalOptimizer.OptimizeAll(mc0);
+                        _logger.Info($"BINMC1BUILD canonical_opt invert_jcc_skip_jmp candidates={rep.InvertJccSkipJmp.Candidates} applied={rep.InvertJccSkipJmp.Applied} skipped={rep.InvertJccSkipJmp.Skipped}");
+                        _logger.Info($"BINMC1BUILD canonical_opt elide_jmp_fallthrough candidates={rep.ElideJmpToFallthrough.Candidates} applied={rep.ElideJmpToFallthrough.Applied} skipped={rep.ElideJmpToFallthrough.Skipped}");
+                        _logger.Info($"BINMC1BUILD canonical_opt elide_jcc_fallthrough candidates={rep.ElideJccToFallthrough.Candidates} applied={rep.ElideJccToFallthrough.Applied} skipped={rep.ElideJccToFallthrough.Skipped}");
                     }
 
                     var opts = new Bin16Mc0Builder.BuildOptions
