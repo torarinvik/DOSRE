@@ -564,6 +564,49 @@ namespace DOSRE.UI.impl
         private string _binMc1StructureOut;
 
         /// <summary>
+        ///     Build (assemble/link) a binary from an MC1/MC2 file using a promoted asm template.
+        ///     Specified with -BINMC1BUILDIN <file.mc1|file.mc2>
+        /// </summary>
+        private string _binMc1BuildIn;
+
+        /// <summary>
+        ///     Promoted asm template used for reassembly (template-preserving db emission).
+        ///     Specified with -BINMC1BUILDASM <file.promoted.asm>
+        /// </summary>
+        private string _binMc1BuildAsm;
+
+        /// <summary>
+        ///     Output directory for build intermediates.
+        ///     Specified with -BINMC1BUILDOUTDIR <dir>
+        /// </summary>
+        private string _binMc1BuildOutDir;
+
+        /// <summary>
+        ///     Output filename (relative to outdir).
+        ///     Specified with -BINMC1BUILDOUT <name>
+        /// </summary>
+        private string _binMc1BuildOut;
+
+        /// <summary>
+        ///     Allow MC0 bytes to differ from the template bytes (non-preserving patch builds).
+        ///     Specified with -BINMC1BUILDALLOWMISMATCH 0|1
+        /// </summary>
+        private bool _binMc1BuildAllowMismatch;
+
+        /// <summary>
+        ///     wlink format args (e.g., "format raw bin" or "format dos com")
+        ///     Specified with -BINMC1BUILDWLINKFORMAT <args>
+        /// </summary>
+        private string _binMc1BuildWlinkFormat;
+
+        /// <summary>
+        ///     MC2 lowering mode for BINMC1BUILD when input is .mc2.
+        ///     Values: preserve | canonical
+        ///     Specified with -BINMC1BUILDMODE <mode>
+        /// </summary>
+        private string _binMc1BuildMode;
+
+        /// <summary>
         ///     Trace a window of lifted BIN16 bytes using Unicorn (host emulator).
         ///     Specified with -BINTRACEASM <file.asm>
         /// </summary>
@@ -983,6 +1026,55 @@ namespace DOSRE.UI.impl
                             if (i + 1 >= _args.Length)
                                 throw new Exception("Error: -BINMC1STRUCTUREOUT requires a <file.mc2>");
                             _binMc1StructureOut = _args[i + 1];
+                            i++;
+                            break;
+
+                        case "BINMC1BUILDIN":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1BUILDIN requires a <file.mc1|file.mc2>");
+                            _binMc1BuildIn = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC1BUILDASM":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1BUILDASM requires a <file.promoted.asm>");
+                            _binMc1BuildAsm = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC1BUILDOUTDIR":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1BUILDOUTDIR requires a <dir>");
+                            _binMc1BuildOutDir = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC1BUILDOUT":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1BUILDOUT requires a <name>");
+                            _binMc1BuildOut = _args[i + 1];
+                            i++;
+                            break;
+                        case "BINMC1BUILDALLOWMISMATCH":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1BUILDALLOWMISMATCH requires 0 or 1");
+                            _binMc1BuildAllowMismatch = _args[i + 1].Trim() switch
+                            {
+                                "0" => false,
+                                "1" => true,
+                                _ => throw new Exception("Error: -BINMC1BUILDALLOWMISMATCH requires 0 or 1"),
+                            };
+                            i++;
+                            break;
+                        case "BINMC1BUILDWLINKFORMAT":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1BUILDWLINKFORMAT requires an args string (e.g. \"format raw bin\")");
+                            _binMc1BuildWlinkFormat = _args[i + 1];
+                            i++;
+                            break;
+
+                        case "BINMC1BUILDMODE":
+                            if (i + 1 >= _args.Length)
+                                throw new Exception("Error: -BINMC1BUILDMODE requires 'preserve' or 'canonical'");
+                            _binMc1BuildMode = _args[i + 1];
                             i++;
                             break;
 
@@ -1666,6 +1758,54 @@ namespace DOSRE.UI.impl
                     var mc2Text = Bin16Mc1Structurer.StructureMc1AsMc2Blocks(_binMc1StructureIn);
                     File.WriteAllText(_binMc1StructureOut, mc2Text);
                     _logger.Info($"{DateTime.Now} Wrote BINMC1 structured MC2 to {_binMc1StructureOut}");
+                    return;
+                }
+
+                // BINMC1BUILD: build (assemble/link) from MC1/MC2 against a promoted template.
+                if (!string.IsNullOrWhiteSpace(_binMc1BuildIn))
+                {
+                    if (string.IsNullOrWhiteSpace(_binMc1BuildAsm))
+                        throw new Exception("Error: -BINMC1BUILDIN requires -BINMC1BUILDASM <file.promoted.asm>");
+                    if (string.IsNullOrWhiteSpace(_binMc1BuildOutDir))
+                        throw new Exception("Error: -BINMC1BUILDIN requires -BINMC1BUILDOUTDIR <dir>");
+
+                    // Desugar to MC1 text (PreserveBytes lowering keeps MC0 parseable and deterministic).
+                    Mc1.Mc1File mc1;
+                    if (string.Equals(Path.GetExtension(_binMc1BuildIn), ".mc2", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var mc2 = Mc2.Parse(_binMc1BuildIn);
+                        var mode = string.Equals((_binMc1BuildMode ?? string.Empty).Trim(), "canonical", StringComparison.OrdinalIgnoreCase)
+                            ? Mc2.Mode.Canonical
+                            : Mc2.Mode.PreserveBytes;
+                        var mc1Text = Mc2.DesugarToMc1Text(mc2, mode);
+                        mc1 = Mc1.ParseLines(
+                            mc1Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None),
+                            sourceName: _binMc1BuildIn + $" (desugared mc2->mc1 mode={mode})");
+                    }
+                    else
+                    {
+                        mc1 = Mc1.Parse(_binMc1BuildIn);
+                    }
+
+                    var mc0Text = Mc1.DesugarToMc0Text(mc1);
+                    var mc0 = Bin16Mc0.ParseMc0Text(
+                        mc0Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None),
+                        sourceName: _binMc1BuildIn + " (desugared mc1->mc0)");
+
+                    var opts = new Bin16Mc0Builder.BuildOptions
+                    {
+                        OutDir = _binMc1BuildOutDir,
+                        WasmPath = string.IsNullOrWhiteSpace(_binMc0WasmPath) ? "wasm" : _binMc0WasmPath,
+                        WlinkPath = string.IsNullOrWhiteSpace(_binMc0WlinkPath) ? "wlink" : _binMc0WlinkPath,
+                        WlinkFormatArgs = string.IsNullOrWhiteSpace(_binMc1BuildWlinkFormat) ? "format dos com" : _binMc1BuildWlinkFormat,
+                        AllowTemplateByteMismatch = _binMc1BuildAllowMismatch,
+                        OutputName = _binMc1BuildOut,
+                    };
+
+                    var res = Bin16Mc0Builder.BuildFromMc0AndPromotedTemplate(_binMc1BuildAsm, mc0, opts);
+                    _logger.Info($"BINMC1BUILD outdir={res.OutDir}");
+                    _logger.Info($"BINMC1BUILD reasm={res.ReasmAsm}");
+                    _logger.Info($"BINMC1BUILD built={res.BuiltBinary}");
                     return;
                 }
 

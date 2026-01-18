@@ -344,6 +344,11 @@ namespace DOSRE.Dasm
 
         public static string RenderDbAsmFromPromotedTemplate(string inPromotedAsm, Mc0File file)
         {
+            return RenderDbAsmFromPromotedTemplate(inPromotedAsm, file, allowByteMismatch: false);
+        }
+
+        public static string RenderDbAsmFromPromotedTemplate(string inPromotedAsm, Mc0File file, bool allowByteMismatch)
+        {
             if (string.IsNullOrWhiteSpace(inPromotedAsm)) throw new ArgumentException("Missing input asm", nameof(inPromotedAsm));
             if (!File.Exists(inPromotedAsm)) throw new FileNotFoundException("Input asm not found", inPromotedAsm);
             if (file == null) throw new ArgumentNullException(nameof(file));
@@ -356,6 +361,7 @@ namespace DOSRE.Dasm
             sb.AppendLine("; Re-emitted from MC0 by DOSRE (byte-faithful, template-preserving)");
             sb.AppendLine($"; source: {inPromotedAsm}");
             sb.AppendLine($"; stream_sha256: {file.StreamSha256}");
+            if (allowByteMismatch) sb.AppendLine("; NOTE: allowByteMismatch=1 (patched bytes; per-statement lengths must match template)");
             sb.AppendLine();
 
             for (var i = 0; i < lines.Length; i++)
@@ -378,7 +384,14 @@ namespace DOSRE.Dasm
                             throw new InvalidDataException($"Template references addr 0x{addr:X8} not present in MC0 statements (line {i + 1})");
 
                         if (!string.Equals(fromMc0, bytesHex, StringComparison.OrdinalIgnoreCase))
-                            throw new InvalidDataException($"Template bytes mismatch at 0x{addr:X8}: template={bytesHex} mc0={fromMc0}");
+                        {
+                            if (!allowByteMismatch)
+                                throw new InvalidDataException($"Template bytes mismatch at 0x{addr:X8}: template={bytesHex} mc0={fromMc0}");
+
+                            // Allow value edits, but enforce length equality to avoid shifting the remainder of the module.
+                            if (fromMc0.Length != bytesHex.Length)
+                                throw new InvalidDataException($"Patched bytes length mismatch at 0x{addr:X8}: template_len={bytesHex.Length / 2} mc0_len={fromMc0.Length / 2}");
+                        }
 
                         var code = line.Substring(0, semi);
                         var leading = new string(code.TakeWhile(char.IsWhiteSpace).ToArray());
