@@ -670,5 +670,88 @@ namespace DOSRE.Tests
             var desugared = Mc1.DesugarToMc0Text(parsed);
             Assert.Contains("@0000B004 FFE0", desugared);
         }
+
+        [Fact]
+        public void LiftMc0ToMc1_Annotates_Stack_Frame_Prolog_And_Epilog_As_Comments()
+        {
+            var mc0 = new Bin16Mc0.Mc0File
+            {
+                Source = "in-memory",
+                StreamSha256 = "dummy",
+                Statements = new List<Bin16Mc0.Mc0Stmt>
+                {
+                    new Bin16Mc0.Mc0Stmt { Index = 0, Addr = 0x0000C000, BytesHex = "55", Asm = "push bp", Mc0 = "EMITHEX(\"55\")", Labels = new List<string>() },
+                    new Bin16Mc0.Mc0Stmt { Index = 1, Addr = 0x0000C001, BytesHex = "8BEC", Asm = "mov bp, sp", Mc0 = "EMITHEX(\"8bec\")", Labels = new List<string>() },
+                    new Bin16Mc0.Mc0Stmt { Index = 2, Addr = 0x0000C003, BytesHex = "83EC10", Asm = "sub sp, 0x10", Mc0 = "EMITHEX(\"83ec10\")", Labels = new List<string>() },
+                    new Bin16Mc0.Mc0Stmt { Index = 3, Addr = 0x0000C006, BytesHex = "90", Asm = "nop", Mc0 = "EMITHEX(\"90\")", Labels = new List<string>() },
+                    new Bin16Mc0.Mc0Stmt { Index = 4, Addr = 0x0000C007, BytesHex = "8BE5", Asm = "mov sp, bp", Mc0 = "EMITHEX(\"8be5\")", Labels = new List<string>() },
+                    new Bin16Mc0.Mc0Stmt { Index = 5, Addr = 0x0000C009, BytesHex = "5D", Asm = "pop bp", Mc0 = "EMITHEX(\"5d\")", Labels = new List<string>() },
+                    new Bin16Mc0.Mc0Stmt { Index = 6, Addr = 0x0000C00A, BytesHex = "C3", Asm = "ret", Mc0 = "RET_NEAR()", Labels = new List<string>() },
+                }
+            };
+
+            var mc1 = Bin16Mc1Lifter.LiftMc0ToMc1Text(mc0);
+            Assert.Contains("// PROLOG:", mc1);
+            Assert.Contains("// EPILOG:", mc1);
+
+            // Still parse/desugar cleanly.
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+            Assert.Contains("@0000C000 55", desugared);
+            Assert.Contains("@0000C00A C3", desugared);
+        }
+
+        [Fact]
+        public void LiftMc0ToMc1_Annotates_EnterLeave_Frame_As_Comments()
+        {
+            var mc0 = new Bin16Mc0.Mc0File
+            {
+                Source = "in-memory",
+                StreamSha256 = "dummy",
+                Statements = new List<Bin16Mc0.Mc0Stmt>
+                {
+                    new Bin16Mc0.Mc0Stmt { Index = 0, Addr = 0x0000D000, BytesHex = "C8100000", Asm = "enter 0x10, 0", Mc0 = "EMITHEX(\"c8100000\")", Labels = new List<string>() },
+                    new Bin16Mc0.Mc0Stmt { Index = 1, Addr = 0x0000D004, BytesHex = "90", Asm = "nop", Mc0 = "EMITHEX(\"90\")", Labels = new List<string>() },
+                    new Bin16Mc0.Mc0Stmt { Index = 2, Addr = 0x0000D005, BytesHex = "C9", Asm = "leave", Mc0 = "EMITHEX(\"c9\")", Labels = new List<string>() },
+                    new Bin16Mc0.Mc0Stmt { Index = 3, Addr = 0x0000D006, BytesHex = "C3", Asm = "ret", Mc0 = "RET_NEAR()", Labels = new List<string>() },
+                }
+            };
+
+            var mc1 = Bin16Mc1Lifter.LiftMc0ToMc1Text(mc0);
+            Assert.Contains("// PROLOG:", mc1);
+            Assert.Contains("// EPILOG:", mc1);
+
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+            Assert.Contains("@0000D000 C8100000", desugared);
+            Assert.Contains("@0000D006 C3", desugared);
+        }
+
+        [Fact]
+        public void LiftMc0ToMc1_Annotates_SpOnly_Locals_AllocDealloc_As_Comments()
+        {
+            var mc0 = new Bin16Mc0.Mc0File
+            {
+                Source = "in-memory",
+                StreamSha256 = "dummy",
+                Statements = new List<Bin16Mc0.Mc0Stmt>
+                {
+                    // The label is important here: SP-only stack alloc is only annotated right after a label.
+                    new Bin16Mc0.Mc0Stmt { Index = 0, Addr = 0x0000E000, BytesHex = "83EC10", Asm = "sub sp, 0x10", Mc0 = "EMITHEX(\"83ec10\")", Labels = new List<string> { "fn_sp_only" } },
+                    new Bin16Mc0.Mc0Stmt { Index = 1, Addr = 0x0000E003, BytesHex = "90", Asm = "nop", Mc0 = "EMITHEX(\"90\")", Labels = new List<string>() },
+                    new Bin16Mc0.Mc0Stmt { Index = 2, Addr = 0x0000E004, BytesHex = "83C410", Asm = "add sp, 0x10", Mc0 = "EMITHEX(\"83c410\")", Labels = new List<string>() },
+                    new Bin16Mc0.Mc0Stmt { Index = 3, Addr = 0x0000E007, BytesHex = "C3", Asm = "ret", Mc0 = "RET_NEAR()", Labels = new List<string>() },
+                }
+            };
+
+            var mc1 = Bin16Mc1Lifter.LiftMc0ToMc1Text(mc0);
+            Assert.Contains("// PROLOG: stack alloc", mc1);
+            Assert.Contains("// EPILOG: stack dealloc", mc1);
+
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+            Assert.Contains("@0000E000 83EC10", desugared);
+            Assert.Contains("@0000E007 C3", desugared);
+        }
     }
 }

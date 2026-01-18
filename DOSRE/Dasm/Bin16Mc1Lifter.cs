@@ -65,6 +65,12 @@ namespace DOSRE.Dasm
             public bool StructureIfElseBlocks { get; set; } = true;
 
             /// <summary>
+            /// Add comment-only annotations for common stack frame setup/teardown patterns.
+            /// Purely presentational; does not affect desugaring/proofs.
+            /// </summary>
+            public bool AnnotateStackFrames { get; set; } = true;
+
+            /// <summary>
             /// Max size of a generated ES view window, in bytes.
             /// </summary>
             public ushort EsViewMaxSpan { get; set; } = 0x0040;
@@ -754,7 +760,264 @@ namespace DOSRE.Dasm
                 text = StructureDoWhileBackedges(text);
                 text = AnnotateIndirectJumps(text);
             }
+
+            if (opts.AnnotateStackFrames)
+            {
+                text = AnnotateStackPrologEpilog(text);
+            }
             return text;
+        }
+
+        private static readonly Regex AsmPushBpRx = new Regex(
+            @"^\s*push\s+bp\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex AsmPushRx = new Regex(
+            @"^\s*push\s+(?<op>[a-z]{2})\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex AsmMovBpSpRx = new Regex(
+            @"^\s*mov\s+bp\s*,\s*sp\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex AsmSubSpImmRx = new Regex(
+            @"^\s*sub\s+sp\s*,\s*(?<imm>(?:0x)?[0-9A-Fa-f]+)h?\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex AsmAddSpImmRx = new Regex(
+            @"^\s*add\s+sp\s*,\s*(?<imm>(?:0x)?[0-9A-Fa-f]+)h?\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex AsmEnterRx = new Regex(
+            @"^\s*enter\s+(?<imm>(?:0x)?[0-9A-Fa-f]+)h?\s*,\s*(?<nest>(?:0x)?[0-9A-Fa-f]+)h?\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex AsmLeaveRx = new Regex(
+            @"^\s*leave\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex AsmMovSpBpRx = new Regex(
+            @"^\s*mov\s+sp\s*,\s*bp\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex AsmPopBpRx = new Regex(
+            @"^\s*pop\s+bp\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex AsmPopRx = new Regex(
+            @"^\s*pop\s+(?<op>[a-z]{2})\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex AsmRetRx = new Regex(
+            @"^\s*ret(?:f)?\b.*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static string AnnotateStackPrologEpilog(string mc1Text)
+        {
+            if (string.IsNullOrWhiteSpace(mc1Text))
+                return mc1Text;
+
+            var lines = mc1Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
+
+            static string GetAsm(string line)
+            {
+                if (string.IsNullOrWhiteSpace(line)) return null;
+                var mLine = Mc0LineRx.Match(line);
+                if (!mLine.Success) return null;
+                var comment = mLine.Groups["comment"].Value;
+                var mOrigin = OriginRx.Match(comment ?? string.Empty);
+                if (!mOrigin.Success) return null;
+                var asm = (mOrigin.Groups["asm"].Value ?? string.Empty).Trim();
+                return string.IsNullOrWhiteSpace(asm) ? null : asm;
+            }
+
+            static bool IsLabelLine(string line)
+            {
+                if (string.IsNullOrWhiteSpace(line)) return false;
+                return LabelLineRx.IsMatch(line);
+            }
+
+            static bool IsZeroToken(string tok)
+            {
+                if (string.IsNullOrWhiteSpace(tok)) return false;
+                var t = tok.Trim();
+                if (t.EndsWith("h", StringComparison.OrdinalIgnoreCase)) t = t[..^1];
+                if (t.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) t = t[2..];
+                return t.All(c => c == '0');
+            }
+
+            for (var i = 0; i < lines.Count; i++)
+            {
+                var asm0 = GetAsm(lines[i]);
+                if (asm0 == null) continue;
+
+                // PROLOG: push bp; mov bp, sp; [sub sp, imm]
+                if (AsmPushBpRx.IsMatch(asm0))
+                {
+                    var asm1 = (i + 1 < lines.Count) ? GetAsm(lines[i + 1]) : null;
+                    if (asm1 != null && AsmMovBpSpRx.IsMatch(asm1))
+                    {
+                        // Avoid duplicating if already annotated.
+                        if (i > 0 && (lines[i - 1] ?? string.Empty).TrimStart().StartsWith("// PROLOG", StringComparison.Ordinal))
+                            continue;
+
+                        var asm2 = (i + 2 < lines.Count) ? GetAsm(lines[i + 2]) : null;
+                        var mSub = asm2 != null ? AsmSubSpImmRx.Match(asm2) : Match.Empty;
+                        if (mSub.Success)
+                        {
+                            var immTok = mSub.Groups["imm"].Value;
+                            lines.Insert(i++, $"// PROLOG: frame setup (locals -= {immTok})");
+                        }
+                        else
+                        {
+                            lines.Insert(i++, "// PROLOG: frame setup");
+                        }
+
+                        // Skip ahead a bit.
+                        i += 1;
+                        continue;
+                    }
+                }
+
+                // PROLOG: enter imm, 0
+                var mEnter = AsmEnterRx.Match(asm0);
+                if (mEnter.Success && IsZeroToken(mEnter.Groups["nest"].Value))
+                {
+                    if (i > 0 && (lines[i - 1] ?? string.Empty).TrimStart().StartsWith("// PROLOG", StringComparison.Ordinal))
+                        continue;
+
+                    var immTok = mEnter.Groups["imm"].Value;
+                    if (!string.IsNullOrWhiteSpace(immTok) && !IsZeroToken(immTok))
+                        lines.Insert(i++, $"// PROLOG: frame setup (enter, locals -= {immTok})");
+                    else
+                        lines.Insert(i++, "// PROLOG: frame setup (enter)");
+                    continue;
+                }
+
+                // PROLOG: SP-only locals allocation (sub sp, imm) immediately after a label.
+                // Kept conservative: only annotate when it looks like a function entry label
+                // and any intervening origin statements are register saves (push *).
+                var mSubSp = AsmSubSpImmRx.Match(asm0);
+                if (mSubSp.Success)
+                {
+                    if (i > 0 && (lines[i - 1] ?? string.Empty).TrimStart().StartsWith("// PROLOG", StringComparison.Ordinal))
+                        continue;
+
+                    var labelSeen = false;
+                    var ok = true;
+
+                    // Walk backwards looking for a label, allowing only push * as intervening origin statements.
+                    for (var j = i - 1; j >= 0; j--)
+                    {
+                        var line = lines[j];
+                        if (string.IsNullOrWhiteSpace(line)) continue;
+                        if (line.TrimStart().StartsWith("//", StringComparison.Ordinal)) continue;
+
+                        if (IsLabelLine(line))
+                        {
+                            labelSeen = true;
+                            break;
+                        }
+
+                        var asmJ = GetAsm(line);
+                        if (asmJ == null)
+                        {
+                            ok = false;
+                            break;
+                        }
+
+                        // If we hit a BP-frame pattern, do not also classify as SP-only.
+                        if (AsmMovBpSpRx.IsMatch(asmJ) || AsmPushBpRx.IsMatch(asmJ))
+                        {
+                            ok = false;
+                            break;
+                        }
+
+                        if (!AsmPushRx.IsMatch(asmJ))
+                        {
+                            ok = false;
+                            break;
+                        }
+
+                        // Safety: don't scan too far; this is a "near-entry" heuristic.
+                        if (i - j > 10)
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+
+                    if (labelSeen && ok)
+                    {
+                        var immTok = mSubSp.Groups["imm"].Value;
+                        lines.Insert(i++, $"// PROLOG: stack alloc (sp -= {immTok})");
+                        continue;
+                    }
+                }
+
+                // EPILOG: mov sp, bp; pop bp; ret*
+                if (AsmMovSpBpRx.IsMatch(asm0))
+                {
+                    var asm1 = (i + 1 < lines.Count) ? GetAsm(lines[i + 1]) : null;
+                    var asm2 = (i + 2 < lines.Count) ? GetAsm(lines[i + 2]) : null;
+                    if (asm1 != null && asm2 != null && AsmPopBpRx.IsMatch(asm1) && AsmRetRx.IsMatch(asm2))
+                    {
+                        if (i > 0 && (lines[i - 1] ?? string.Empty).TrimStart().StartsWith("// EPILOG", StringComparison.Ordinal))
+                            continue;
+                        lines.Insert(i++, "// EPILOG: frame teardown");
+                        i += 2;
+                        continue;
+                    }
+                }
+
+                // EPILOG: leave; [pop *]*; ret*
+                if (AsmLeaveRx.IsMatch(asm0))
+                {
+                    var sawRet = false;
+                    for (var j = i + 1; j < lines.Count && j <= i + 8; j++)
+                    {
+                        var asmJ = GetAsm(lines[j]);
+                        if (asmJ == null) continue;
+                        if (AsmPopRx.IsMatch(asmJ)) continue;
+                        if (AsmRetRx.IsMatch(asmJ)) { sawRet = true; }
+                        break;
+                    }
+
+                    if (sawRet)
+                    {
+                        if (i > 0 && (lines[i - 1] ?? string.Empty).TrimStart().StartsWith("// EPILOG", StringComparison.Ordinal))
+                            continue;
+                        lines.Insert(i++, "// EPILOG: frame teardown (leave)");
+                        continue;
+                    }
+                }
+
+                // EPILOG: SP-only locals deallocation (add sp, imm); [pop *]*; ret*
+                var mAddSp = AsmAddSpImmRx.Match(asm0);
+                if (mAddSp.Success)
+                {
+                    var sawRet = false;
+                    for (var j = i + 1; j < lines.Count && j <= i + 8; j++)
+                    {
+                        var asmJ = GetAsm(lines[j]);
+                        if (asmJ == null) continue;
+                        if (AsmPopRx.IsMatch(asmJ)) continue;
+                        if (AsmRetRx.IsMatch(asmJ)) { sawRet = true; }
+                        break;
+                    }
+
+                    if (sawRet)
+                    {
+                        if (i > 0 && (lines[i - 1] ?? string.Empty).TrimStart().StartsWith("// EPILOG", StringComparison.Ordinal))
+                            continue;
+                        var immTok = mAddSp.Groups["imm"].Value;
+                        lines.Insert(i++, $"// EPILOG: stack dealloc (sp += {immTok})");
+                        continue;
+                    }
+                }
+            }
+
+            return string.Join("\n", lines);
         }
 
         private static readonly Regex LabelLineRx = new Regex(
