@@ -748,7 +748,12 @@ namespace DOSRE.Dasm
 
             var text = sb.ToString();
             if (opts.StructureIfElseBlocks)
+            {
                 text = StructureIfElseBlocks(text);
+                text = StructureIfElseGotoPairs(text);
+                text = StructureDoWhileBackedges(text);
+                text = AnnotateIndirectJumps(text);
+            }
             return text;
         }
 
@@ -844,6 +849,26 @@ namespace DOSRE.Dasm
                 if (prevStmt < 0)
                     continue;
 
+                // Avoid structuring across labeled trampolines like:
+                //   L:
+                //     goto X; // @...
+                //   else:
+                // In these cases, the "goto" is typically an externally-reached shim and would make the block misleading.
+                var prevPrev = -1;
+                for (var p = prevStmt - 1; p > i; p--)
+                {
+                    var t = (lines[p] ?? string.Empty).Trim();
+                    if (string.IsNullOrWhiteSpace(t))
+                        continue;
+                    if (t.StartsWith("//", StringComparison.Ordinal))
+                        continue;
+                    prevPrev = p;
+                    break;
+                }
+
+                if (prevPrev >= 0 && LabelLineRx.IsMatch(lines[prevPrev] ?? string.Empty))
+                    continue;
+
                 var mGo = OriginStmtGotoRx.Match(lines[prevStmt] ?? string.Empty);
                 if (!mGo.Success)
                     continue;
@@ -890,6 +915,153 @@ namespace DOSRE.Dasm
 
                 // Skip ahead to avoid nesting overlaps.
                 i = endIdx;
+            }
+
+            return string.Join("\n", lines);
+        }
+
+        private static string StructureIfElseGotoPairs(string mc1Text)
+        {
+            if (string.IsNullOrWhiteSpace(mc1Text))
+                return mc1Text;
+
+            var lines = mc1Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
+            for (var i = 0; i + 1 < lines.Count; i++)
+            {
+                var mIf = OriginStmtIfGotoRx.Match(lines[i] ?? string.Empty);
+                if (!mIf.Success)
+                    continue;
+
+                var mGo = OriginStmtGotoRx.Match(lines[i + 1] ?? string.Empty);
+                if (!mGo.Success)
+                    continue;
+
+                // Only rewrite when the goto is immediately after the conditional.
+                // We keep two lines to preserve 1:1 origin mapping.
+                var indent = mGo.Groups["indent"].Value;
+                var tgt = mGo.Groups["lbl"].Value.Trim();
+                var comment = mGo.Groups["comment"].Value;
+                if (string.IsNullOrWhiteSpace(tgt))
+                    continue;
+
+                // Avoid double-rewriting.
+                var stmtTrim = (lines[i + 1] ?? string.Empty).TrimStart();
+                if (stmtTrim.StartsWith("else ", StringComparison.Ordinal))
+                    continue;
+
+                lines[i + 1] = $"{indent}else goto {tgt}; // {comment}";
+                i++; // skip over the rewritten line
+            }
+
+            return string.Join("\n", lines);
+        }
+
+        private static string StructureDoWhileBackedges(string mc1Text)
+        {
+            if (string.IsNullOrWhiteSpace(mc1Text))
+                return mc1Text;
+
+            var lines = mc1Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
+
+            var labelToIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+            for (var i = 0; i < lines.Count; i++)
+            {
+                var m = LabelLineRx.Match(lines[i] ?? string.Empty);
+                if (m.Success)
+                {
+                    var lbl = m.Groups["label"].Value;
+                    if (!string.IsNullOrWhiteSpace(lbl) && !labelToIndex.ContainsKey(lbl))
+                        labelToIndex[lbl] = i;
+                }
+            }
+
+            // Incoming edges for conservatism.
+            var incoming = new Dictionary<string, int>(StringComparer.Ordinal);
+            for (var i = 0; i < lines.Count; i++)
+            {
+                var s = lines[i] ?? string.Empty;
+                var mIf = OriginStmtIfGotoRx.Match(s);
+                if (mIf.Success)
+                {
+                    var t = mIf.Groups["lbl"].Value;
+                    if (!string.IsNullOrWhiteSpace(t)) incoming[t] = incoming.TryGetValue(t, out var c) ? c + 1 : 1;
+                }
+            }
+
+            for (var i = 0; i < lines.Count; i++)
+            {
+                var mIf = OriginStmtIfGotoRx.Match(lines[i] ?? string.Empty);
+                if (!mIf.Success)
+                    continue;
+
+                var indent = mIf.Groups["indent"].Value;
+                var cond = mIf.Groups["cond"].Value.Trim();
+                var tgt = mIf.Groups["lbl"].Value.Trim();
+                var comment = mIf.Groups["comment"].Value;
+                if (string.IsNullOrWhiteSpace(cond) || string.IsNullOrWhiteSpace(tgt))
+                    continue;
+
+                if (!labelToIndex.TryGetValue(tgt, out var lblIdx))
+                    continue;
+
+                // Backedge only.
+                if (lblIdx >= i)
+                    continue;
+
+                // Conservatism: only when the loop label has exactly one incoming edge (the backedge).
+                if (incoming.TryGetValue(tgt, out var inc) && inc != 1)
+                    continue;
+
+                // Annotate the loop header on the label line (safe: label-only lines can carry comments).
+                // Avoid duplicating if already annotated.
+                var lblLine = lines[lblIdx] ?? string.Empty;
+                if (!lblLine.Contains("do {", StringComparison.Ordinal))
+                {
+                    if (lblLine.Contains("//", StringComparison.Ordinal))
+                        lines[lblIdx] = lblLine + " do {";
+                    else
+                        lines[lblIdx] = lblLine + " // do {";
+                }
+
+                // Rewrite the backedge to a do-while tail.
+                // (Still origin-tagged; parse/verify remains byte-faithful.)
+                lines[i] = $"{indent}}} while ({cond}()); // {comment}";
+            }
+
+            return string.Join("\n", lines);
+        }
+
+        private static string AnnotateIndirectJumps(string mc1Text)
+        {
+            if (string.IsNullOrWhiteSpace(mc1Text))
+                return mc1Text;
+
+            var lines = mc1Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
+            for (var i = 0; i < lines.Count; i++)
+            {
+                var mGo = OriginStmtGotoRx.Match(lines[i] ?? string.Empty);
+                if (!mGo.Success)
+                    continue;
+
+                var stmt = (lines[i] ?? string.Empty).TrimStart();
+                // Skip direct gotos.
+                if (stmt.StartsWith("goto loc_", StringComparison.Ordinal) || stmt.StartsWith("goto .", StringComparison.Ordinal))
+                    continue;
+
+                // Heuristic: only annotate when original asm looks like a jmp.
+                var comment = mGo.Groups["comment"].Value;
+                if (comment.IndexOf("; jmp", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                // Avoid duplicate annotation.
+                if (i > 0 && (lines[i - 1] ?? string.Empty).TrimStart().StartsWith("// JUMPTABLE", StringComparison.Ordinal))
+                    continue;
+
+                // If operand is a memory view index, it's very likely a jump table dispatch.
+                if (stmt.Contains("mem_", StringComparison.Ordinal) && stmt.Contains("[", StringComparison.Ordinal))
+                    lines.Insert(i++, "// JUMPTABLE dispatch (best-effort)" );
+                else
+                    lines.Insert(i++, "// INDIRECT JMP (best-effort)" );
             }
 
             return string.Join("\n", lines);

@@ -455,5 +455,122 @@ namespace DOSRE.Tests
             Assert.Contains("@00009000 7404", desugared);
             Assert.Contains("@00009003 EB02", desugared);
         }
+
+        [Fact]
+        public void LiftMc0ToMc1_Pairs_IfGoto_Then_Goto_As_ElseGoto()
+        {
+            var mc0 = new Bin16Mc0.Mc0File
+            {
+                Source = "in-memory",
+                StreamSha256 = "dummy",
+                Statements = new List<Bin16Mc0.Mc0Stmt>
+                {
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 0,
+                        Addr = 0x00009100,
+                        BytesHex = "7402",
+                        Asm = "jz short loc_true",
+                        Mc0 = "if (JZ()) goto loc_true",
+                        Labels = new List<string>(),
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 1,
+                        Addr = 0x00009102,
+                        BytesHex = "EB02",
+                        Asm = "jmp short loc_false",
+                        Mc0 = "goto loc_false",
+                        Labels = new List<string>(),
+                    },
+                    // Add a second incoming edge to loc_true, so the higher-level if/else block structuring
+                    // stays conservative and the simple else-goto pairing can be exercised.
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 2,
+                        Addr = 0x00009104,
+                        BytesHex = "7200",
+                        Asm = "jc short loc_true",
+                        Mc0 = "if (JC()) goto loc_true",
+                        Labels = new List<string>(),
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 3,
+                        Addr = 0x00009106,
+                        BytesHex = "90",
+                        Asm = "nop",
+                        Mc0 = "EMITHEX(\"90\")",
+                        Labels = new List<string> { "loc_true" },
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 4,
+                        Addr = 0x00009107,
+                        BytesHex = "C3",
+                        Asm = "ret",
+                        Mc0 = "RET_NEAR()",
+                        Labels = new List<string> { "loc_false" },
+                    },
+                }
+            };
+
+            var mc1 = Bin16Mc1Lifter.LiftMc0ToMc1Text(mc0);
+            Assert.Contains("else goto loc_false; // @00009102 EB02", mc1);
+
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+            Assert.Contains("@00009100 7402", desugared);
+            Assert.Contains("@00009102 EB02", desugared);
+        }
+
+        [Fact]
+        public void LiftMc0ToMc1_Structures_Simple_Backedge_As_DoWhile()
+        {
+            var mc0 = new Bin16Mc0.Mc0File
+            {
+                Source = "in-memory",
+                StreamSha256 = "dummy",
+                Statements = new List<Bin16Mc0.Mc0Stmt>
+                {
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 0,
+                        Addr = 0x00009200,
+                        BytesHex = "90",
+                        Asm = "nop",
+                        Mc0 = "EMITHEX(\"90\")",
+                        Labels = new List<string> { "loc_loop" },
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 1,
+                        Addr = 0x00009201,
+                        BytesHex = "90",
+                        Asm = "nop",
+                        Mc0 = "EMITHEX(\"90\")",
+                        Labels = new List<string>(),
+                    },
+                    new Bin16Mc0.Mc0Stmt
+                    {
+                        Index = 2,
+                        Addr = 0x00009202,
+                        BytesHex = "75FC",
+                        Asm = "jnz short loc_loop",
+                        Mc0 = "if (JNZ()) goto loc_loop",
+                        Labels = new List<string>(),
+                    },
+                }
+            };
+
+            var mc1 = Bin16Mc1Lifter.LiftMc0ToMc1Text(mc0);
+            Assert.Contains("loc_loop:", mc1);
+            Assert.Contains("do {", mc1);
+            Assert.Contains("} while (JNZ()); // @00009202 75FC", mc1);
+
+            var parsed = Mc1.ParseLines(mc1.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None), sourceName: "in-memory.mc1");
+            var desugared = Mc1.DesugarToMc0Text(parsed);
+            Assert.Contains("@00009202 75FC", desugared);
+        }
     }
 }
